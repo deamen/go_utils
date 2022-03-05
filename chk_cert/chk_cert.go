@@ -1,6 +1,9 @@
 /*
 Check certificate against the days to expire provided by the user
-Assume the input file contains certificates chain and private keys
+Assumptions:
+  1. PKCS12 bundle contains full chain certs and key, one pair
+  2. PKCS8 bundle in pem format contains full chain certs and key, one pair
+  3. PKCS8 cert in der format contains full chain certs
 */
 
 package main
@@ -70,7 +73,7 @@ func getInFile(inFile string) []byte {
 	return rawFile
 }
 
-func getCertFromP12(rawFile []byte, password string) (*tls.Certificate, error) {
+func getCertFromP12(rawFile []byte, password string) *tls.Certificate {
 	pemBlocks, err := pkcs12.ToPEM(rawFile, password)
 
 	if err != nil {
@@ -94,10 +97,10 @@ func getCertFromP12(rawFile []byte, password string) (*tls.Certificate, error) {
 		exitWithMsg(rc, rm)
 	}
 
-	return &cert, nil
+	return &cert
 }
 
-func getCertFromPem(rawFile []byte) (*tls.Certificate, error) {
+func getCertFromPem(rawFile []byte) *tls.Certificate {
 
 	var cert tls.Certificate
 	for {
@@ -118,7 +121,20 @@ func getCertFromPem(rawFile []byte) (*tls.Certificate, error) {
 		exitWithMsg(rc, rm)
 	}
 
-	return &cert, nil
+	return &cert
+}
+
+func getCertFromDer(rawFile []byte) *x509.Certificate {
+	certs, err := x509.ParseCertificates(rawFile)
+
+	if err != nil {
+		rc = 3
+		rm = fmt.Sprintf("Unknown - %s", err)
+
+		exitWithMsg(rc, rm)
+	}
+
+	return certs[0]
 }
 
 func getX509Cert(tlsCert *tls.Certificate) *x509.Certificate {
@@ -143,6 +159,7 @@ func main() {
 
 	x509Cmd := flag.NewFlagSet("x509", flag.ExitOnError)
 	x509In := x509Cmd.String("in", "", "The x509 cert")
+	x509InForm := x509Cmd.String("inform", "pem", "The format of the input file")
 	x509Warn := x509Cmd.Int("warn", 30, "The warning days")
 	x509Crit := x509Cmd.Int("crit", 15, "The critical days")
 	x509File := false
@@ -179,9 +196,14 @@ func main() {
 		x509Cmd.Parse(os.Args[2:])
 		if *x509In == "" {
 			fmt.Println("expected input file")
+			os.Exit(1)
 		}
 		inFile = *x509In
 
+		if *x509InForm != "pem" && *x509InForm != "der" {
+			fmt.Println("expected inform to be pem or der")
+			os.Exit(1)
+		}
 		if *x509Warn <= *x509Crit {
 			fmt.Println("Critical days is less than warning days")
 			os.Exit(1)
@@ -197,14 +219,21 @@ func main() {
 
 	rawFile := getInFile(inFile)
 	var tlsCert *tls.Certificate
+	var x509Cert *x509.Certificate
 
 	if pkcs12File {
-		tlsCert, _ = getCertFromP12(rawFile, *pkcs12Pass)
+		tlsCert = getCertFromP12(rawFile, *pkcs12Pass)
+		x509Cert = getX509Cert(tlsCert)
 	} else if x509File {
-		tlsCert, _ = getCertFromPem(rawFile)
+		if *x509InForm == "pem" {
+			tlsCert = getCertFromPem(rawFile)
+			x509Cert = getX509Cert(tlsCert)
+		} else if *x509InForm == "der" {
+			x509Cert = getCertFromDer(rawFile)
+		}
+
 	}
 
-	x509Cert := getX509Cert(tlsCert)
 	daysLeft := int(chkCertExpDays(*x509Cert))
 	if daysLeft <= critDays {
 		rc = 2
