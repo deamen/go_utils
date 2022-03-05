@@ -116,7 +116,7 @@ func getCertFromPem(rawFile []byte) *tls.Certificate {
 
 	if len(cert.Certificate) == 0 {
 		rc = 3
-		rm = fmt.Sprintf("Unknown - no certificate found in \"%s\"", inFile)
+		rm = fmt.Sprintf("Unknown - no certificate found in \"%s\", or is not in PEM format", inFile)
 
 		exitWithMsg(rc, rm)
 	}
@@ -129,7 +129,7 @@ func getCertFromDer(rawFile []byte) *x509.Certificate {
 
 	if err != nil {
 		rc = 3
-		rm = fmt.Sprintf("Unknown - %s", err)
+		rm = fmt.Sprintf("Unknown - %s, or is not in DER format", err)
 
 		exitWithMsg(rc, rm)
 	}
