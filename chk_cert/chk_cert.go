@@ -45,6 +45,11 @@ func prtCmds() {
 	fmt.Println(b.String())
 }
 
+func exitWithMsg(rc int, rm string) {
+	fmt.Println(rm)
+	os.Exit(rc)
+}
+
 func chkCertExpDays(cert x509.Certificate) int {
 	tNow := time.Now()
 	hrsExp := cert.NotAfter.Sub(tNow).Hours()
@@ -56,37 +61,43 @@ func getInFile(inFile string) []byte {
 	rawFile, err := ioutil.ReadFile(inFile)
 
 	if err != nil {
-		panic(err)
+		rc = 3
+		rm = fmt.Sprintf("Unknown - %s", err)
+
+		exitWithMsg(rc, rm)
 	}
+
 	return rawFile
 }
 
 func getCertFromP12(rawFile []byte, password string) (*tls.Certificate, error) {
-	pemBlocks, error := pkcs12.ToPEM(rawFile, password)
+	pemBlocks, err := pkcs12.ToPEM(rawFile, password)
 
-	if error != nil {
-		panic(error)
+	if err != nil {
+		rc = 3
+		rm = fmt.Sprintf("Unknown - %s", err)
+
+		exitWithMsg(rc, rm)
 	}
+
 	var cert tls.Certificate
 	for _, block := range pemBlocks {
-		//b, _ := pem.Decode(block.Bytes)
 		if block.Type == "CERTIFICATE" {
 			cert.Certificate = append(cert.Certificate, block.Bytes)
-		} else {
-			fmt.Println("Private key")
 		}
 	}
 
 	if len(cert.Certificate) == 0 {
-		return nil, fmt.Errorf("no certificate found in \"%s\"", inFile)
-	} else if cert.PrivateKey != nil {
-		return nil, fmt.Errorf("private key found in \"%s\"", inFile)
+		rc = 3
+		rm = fmt.Sprintf("Unknown - no certificate found in \"%s\"", inFile)
+
+		exitWithMsg(rc, rm)
 	}
 
 	return &cert, nil
 }
 
-func getCertAndKey(rawFile []byte) (*tls.Certificate, error) {
+func getCertFromPem(rawFile []byte) (*tls.Certificate, error) {
 
 	var cert tls.Certificate
 	for {
@@ -96,27 +107,29 @@ func getCertAndKey(rawFile []byte) (*tls.Certificate, error) {
 		}
 		if block.Type == "CERTIFICATE" {
 			cert.Certificate = append(cert.Certificate, block.Bytes)
-		} else {
-			fmt.Println("Private key")
 		}
 		rawFile = rest
 	}
 
 	if len(cert.Certificate) == 0 {
-		return nil, fmt.Errorf("no certificate found in \"%s\"", inFile)
-	} else if cert.PrivateKey != nil {
-		return nil, fmt.Errorf("private key found in \"%s\"", inFile)
+		rc = 3
+		rm = fmt.Sprintf("Unknown - no certificate found in \"%s\"", inFile)
+
+		exitWithMsg(rc, rm)
 	}
 
 	return &cert, nil
 }
 
-func getX509Cert(tlsCert *tls.Certificate) (*x509.Certificate, error) {
-	x509Cert, error := x509.ParseCertificate(tlsCert.Certificate[0])
-	if error != nil {
-		fmt.Println(error)
+func getX509Cert(tlsCert *tls.Certificate) *x509.Certificate {
+	x509Cert, err := x509.ParseCertificate(tlsCert.Certificate[0])
+	if err != nil {
+		rc = 3
+		rm = fmt.Sprintf("Unknown - %s", err)
+
+		exitWithMsg(rc, rm)
 	}
-	return x509Cert, error
+	return x509Cert
 }
 
 func main() {
@@ -125,7 +138,7 @@ func main() {
 	pkcs12Warn := pkcs12Cmd.Int("warn", 30, "The warning days")
 	pkcs12Crit := pkcs12Cmd.Int("crit", 15, "The critical days")
 	pkcs12Pass := pkcs12Cmd.String("pass", "", "The password")
-	pkcs12NoPass := pkcs12Cmd.Bool("nopass", false, "Indicate the file is not protected by password")
+	pkcs12NoPass := pkcs12Cmd.Bool("nopass", false, "Indicates the file is not protected by password")
 	pkcs12File := false
 
 	x509Cmd := flag.NewFlagSet("x509", flag.ExitOnError)
@@ -188,15 +201,11 @@ func main() {
 	if pkcs12File {
 		tlsCert, _ = getCertFromP12(rawFile, *pkcs12Pass)
 	} else if x509File {
-		tlsCert, _ = getCertAndKey(rawFile)
-	}
-	x509Cert, error := getX509Cert(tlsCert)
-	if error != nil {
-		fmt.Println(error)
+		tlsCert, _ = getCertFromPem(rawFile)
 	}
 
+	x509Cert := getX509Cert(tlsCert)
 	daysLeft := int(chkCertExpDays(*x509Cert))
-
 	if daysLeft <= critDays {
 		rc = 2
 		rm = fmt.Sprintf("Critical - Exipres in %d days", daysLeft)
@@ -210,6 +219,5 @@ func main() {
 		rm = fmt.Sprintf("OK - Exipres in %d days", daysLeft)
 	}
 
-	fmt.Println(rm)
-	os.Exit(rc)
+	exitWithMsg(rc, rm)
 }
