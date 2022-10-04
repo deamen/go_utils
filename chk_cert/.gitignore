@@ -24,4 +24,4 @@ go.work
 *.cer
 *.der
 *.pfx
-chk_cert
+chk_cert-*

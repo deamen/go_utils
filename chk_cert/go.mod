@@ -1,5 +1,5 @@
 module chk_cert
 
-go 1.17
+go 1.18
 
-require golang.org/x/crypto v0.0.0-20220214200702-86341886e292
+require golang.org/x/crypto v0.0.0-20220926161630-eccd6366d1be

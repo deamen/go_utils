@@ -28,6 +28,8 @@ var availCmds = []string{
 	"x509",
 }
 
+var version string
+var build string
 var inFile string
 var warnDays int
 var critDays int
@@ -38,7 +40,9 @@ func prtCmds() {
 	var b bytes.Buffer
 	tw := tabwriter.NewWriter(&b, 0, 8, 4, ' ', 0)
 
-	fmt.Fprintf(tw, "Usage: chk_cert <command> [args]\n\n")
+	fmt.Fprintf(tw, "Usage: chk_cert <command> [args]\n")
+	fmt.Fprintf(tw, "Version: %s-%s\n\n", version, build)
+
 	fmt.Fprintf(tw, "Available commands:\n")
 	for _, v := range availCmds {
 		fmt.Fprintf(tw, "\t%s\n", v)
@@ -164,7 +168,7 @@ func main() {
 	x509Crit := x509Cmd.Int("crit", 15, "The critical days")
 	x509File := false
 
-	if len(os.Args) < 2 {
+	if len(os.Args) < 3 {
 		prtCmds()
 		os.Exit(1)
 	}
