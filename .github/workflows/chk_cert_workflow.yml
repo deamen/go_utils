@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  Build-and-upload-openssl-static-1xx:
+  Build-and-upload-chk_cert:
     uses: ./.github/workflows/chk_cert_base_workflow.yml
     with:
       chk_cert_ver: 0.0.1

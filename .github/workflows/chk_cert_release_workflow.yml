@@ -1,0 +1,34 @@
+name: release
+
+on:
+  push:
+    tags:
+      - '*'
+
+  workflow_dispatch:
+
+env:
+  chk_cert_ver: 0.0.1
+  go-version: 1.18.7
+
+jobs:
+  build-and-upload-chk_cert:
+    uses: ./.github/workflows/chk_cert_base_workflow.yml
+    with:
+      chk_cert_ver: 0.0.1
+      go-version: 1.18.7
+
+  create-release:
+    runs-on: ubuntu-latest
+    needs: [build-and-upload-chk_cert]
+    steps:
+      - name: Download chk_cert release tarball
+        uses: actions/download-artifact@fb598a63ae348fa914e94cd0ff38f362e927b741 #v3.0.0
+        with:
+          name: chk_cert-${{ inputs.chk_cert_ver}}.tar.xz
+
+      - name: Release
+        uses: softprops/action-gh-release@1e07f4398721186383de40550babbdf2b84acfc5 #v1
+        with:
+          files: |
+            ./chk_cert-${{ inputs.chk_cert_ver}}.tar.xz
