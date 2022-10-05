@@ -15,8 +15,8 @@ jobs:
   build-and-upload-chk_cert:
     uses: ./.github/workflows/chk_cert_base_workflow.yml
     with:
-      chk_cert_ver: ${{ env.chk_cert_ver}}
-      go-version: ${{ env.chk_cert_ver}}
+      chk_cert_ver: 0.0.1
+      go-version: 1.18.7
 
   create-release:
     runs-on: ubuntu-latest
