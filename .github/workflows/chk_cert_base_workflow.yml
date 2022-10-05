@@ -1,0 +1,41 @@
+name: chk_cert base workflow
+
+on:
+  workflow_call:
+    inputs:
+      chk_cert_ver:
+        required: true
+        type: string
+      go-version:
+        required: true
+        type: string
+env:
+    pkg_name: chk_cert_${{ inputs.chk_cert_ver}}
+
+jobs:
+
+  build-chk_cert-bin:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Go ${{ inputs.go-version }}
+        uses: actions/setup-go@v3
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - uses: actions/checkout@v3
+
+      - name: Build chk_cert binaries
+        run: |
+          make
+        working-directory: ./chk_cert
+
+      - name: Make chk_cert release tarball
+        run: /bin/tar clJf chk_cert-${{ inputs.chk_cert_ver}}.tar.xz chk_cert*
+        working-directory: ./chk_cert
+
+      - name: Upload the chk_cert tarball
+        uses: actions/upload-artifact@v3
+        with:
+          name: chk_cert-${{ inputs.chk_cert_ver}}.tar.xz
+          path: ./chk_cert/chk_cert-${{ inputs.chk_cert_ver}}.tar.xz
