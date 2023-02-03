@@ -26,6 +26,7 @@ import (
 var availCmds = []string{
 	"pkcs12",
 	"x509",
+	"crl",
 }
 
 var version string
@@ -35,6 +36,7 @@ var warnDays int
 var critDays int
 var rc = 3
 var rm = "Unknown - Check stderr"
+var daysLeft int
 
 func prtCmds() {
 	var b bytes.Buffer
@@ -60,6 +62,13 @@ func exitWithMsg(rc int, rm string) {
 func chkCertExpDays(cert x509.Certificate) int {
 	tNow := time.Now()
 	hrsExp := cert.NotAfter.Sub(tNow).Hours()
+
+	return int(hrsExp / 24)
+}
+
+func chkCrlExpDays(cert x509.RevocationList) int {
+	tNow := time.Now()
+	hrsExp := cert.NextUpdate.Sub(tNow).Hours()
 
 	return int(hrsExp / 24)
 }
@@ -128,6 +137,30 @@ func getCertFromPem(rawFile []byte) *tls.Certificate {
 	return &cert
 }
 
+func getCrlFromPem(rawFile []byte) *tls.Certificate {
+
+	var cert tls.Certificate
+	for {
+		block, rest := pem.Decode(rawFile)
+		if block == nil {
+			break
+		}
+		if block.Type == "X509 CRL" {
+			cert.Certificate = append(cert.Certificate, block.Bytes)
+		}
+		rawFile = rest
+	}
+
+	if len(cert.Certificate) == 0 {
+		rc = 3
+		rm = fmt.Sprintf("Unknown - no certificate found in \"%s\", or is not in PEM format", inFile)
+
+		exitWithMsg(rc, rm)
+	}
+
+	return &cert
+}
+
 func getCertFromDer(rawFile []byte) *x509.Certificate {
 	certs, err := x509.ParseCertificates(rawFile)
 
@@ -141,6 +174,19 @@ func getCertFromDer(rawFile []byte) *x509.Certificate {
 	return certs[0]
 }
 
+func getCrlFromDer(rawFile []byte) *x509.RevocationList {
+	certs, err := x509.ParseRevocationList(rawFile)
+
+	if err != nil {
+		rc = 3
+		rm = fmt.Sprintf("Unknown - %s, or is not in DER format", err)
+
+		exitWithMsg(rc, rm)
+	}
+
+	return certs
+}
+
 func getX509Cert(tlsCert *tls.Certificate) *x509.Certificate {
 	x509Cert, err := x509.ParseCertificate(tlsCert.Certificate[0])
 	if err != nil {
@@ -150,6 +196,17 @@ func getX509Cert(tlsCert *tls.Certificate) *x509.Certificate {
 		exitWithMsg(rc, rm)
 	}
 	return x509Cert
+}
+
+func getCrlCert(tlsCert *tls.Certificate) *x509.RevocationList {
+	crlCert, err := x509.ParseRevocationList(tlsCert.Certificate[0])
+	if err != nil {
+		rc = 3
+		rm = fmt.Sprintf("Unknown - %s", err)
+
+		exitWithMsg(rc, rm)
+	}
+	return crlCert
 }
 
 func main() {
@@ -167,6 +224,13 @@ func main() {
 	x509Warn := x509Cmd.Int("warn", 30, "The warning days")
 	x509Crit := x509Cmd.Int("crit", 15, "The critical days")
 	x509File := false
+
+	crlCmd := flag.NewFlagSet("crl", flag.ExitOnError)
+	crlIn := crlCmd.String("in", "", "The crl cert")
+	crlInForm := crlCmd.String("inform", "pem", "The format of the input file")
+	crlWarn := crlCmd.Int("warn", 30, "The warning days")
+	crlCrit := crlCmd.Int("crit", 15, "The critical days")
+	crlFile := false
 
 	if len(os.Args) < 3 {
 		prtCmds()
@@ -215,6 +279,25 @@ func main() {
 		warnDays = *x509Warn
 		critDays = *x509Crit
 		x509File = true
+	case "crl":
+		crlCmd.Parse(os.Args[2:])
+		if *crlIn == "" {
+			fmt.Println("expected input file")
+			os.Exit(1)
+		}
+		inFile = *crlIn
+
+		if *crlInForm != "pem" && *crlInForm != "der" {
+			fmt.Println("expected inform to be pem or der")
+			os.Exit(1)
+		}
+		if *crlWarn <= *crlCrit {
+			fmt.Println("Critical days is less than warning days")
+			os.Exit(1)
+		}
+		warnDays = *crlWarn
+		critDays = *crlCrit
+		crlFile = true
 
 	default:
 		prtCmds()
@@ -224,6 +307,7 @@ func main() {
 	rawFile := getInFile(inFile)
 	var tlsCert *tls.Certificate
 	var x509Cert *x509.Certificate
+	var crlCert *x509.RevocationList
 
 	if pkcs12File {
 		tlsCert = getCertFromP12(rawFile, *pkcs12Pass)
@@ -236,9 +320,21 @@ func main() {
 			x509Cert = getCertFromDer(rawFile)
 		}
 
+	} else if crlFile {
+		if *crlInForm == "pem" {
+			tlsCert = getCrlFromPem(rawFile)
+			crlCert = getCrlCert(tlsCert)
+		} else if *crlInForm == "der" {
+			crlCert = getCrlFromDer(rawFile)
+		}
 	}
 
-	daysLeft := int(chkCertExpDays(*x509Cert))
+	if crlFile {
+		daysLeft = int(chkCrlExpDays(*crlCert))
+	} else {
+		daysLeft = int(chkCertExpDays(*x509Cert))
+	}
+
 	if daysLeft <= critDays {
 		rc = 2
 		rm = fmt.Sprintf("Critical - Exipres in %d days", daysLeft)
