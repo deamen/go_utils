@@ -17,7 +17,7 @@ BINARY = chk_cert-$(os)-$(arch)
 release: $(PLATFORMS)
 
 $(PLATFORMS):
-	GOOS=$(os) GOARCH=$(arch) go build ${LDFLAGS_f1} -o '${BINARY}' .
+	GOOS=$(os) GOARCH=$(arch) CGO_ENABLED=0 go build ${LDFLAGS_f1} -o '${BINARY}' .
 
 clean:
 	find ${ROOT_DIR} -name 'chk_cert[-?][a-zA-Z0-9]*[-?][a-zA-Z0-9]*' -delete
