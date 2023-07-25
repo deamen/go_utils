@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/deamen/go_utils/blowfish/cipherkey"
 	"github.com/deamen/go_utils/blowfish/files"
 	"github.com/deamen/go_utils/blowfish/options"
 
@@ -18,20 +19,20 @@ func init() {
 	flag.BoolVar(&pars.Decryption, "decrypt", false, "Decrypt a file.")
 	flag.StringVar(&pars.InputFile, "input", "", "Input file.")
 	flag.StringVar(&pars.OutputFile, "output", "", "Output file.")
-	flag.StringVar(&pars.KeyFile, "key", "", "Key file.")
+	flag.StringVar(&pars.Key, "key", "", "Key path in Vault.")
 }
 
 func main() {
 	flag.Parse()
 
-	if err := pars.Validate(); err != "" {
+	if err := pars.Validate(); err != nil {
 		glog.Errorln(err)
 		return
 	}
 
 	glog.Infof("Program arguments: %v\n", pars)
 
-	key, err := os.ReadFile(pars.KeyFile)
+	key, err := cipherkey.GetSecretWithAppRole(pars.Key)
 	if err != nil {
 		glog.Errorln(err.Error())
 		return
@@ -42,20 +43,22 @@ func main() {
 		glog.Infof("Error: %v", err)
 		return
 	}
+	defer inputFile.Close()
 
 	outputFile, err := os.Create(pars.OutputFile)
 	if err != nil {
 		glog.Infof("Error: %v", err)
 		return
 	}
+	defer outputFile.Close()
 
 	var errOperation error
 	if pars.Encryption {
-		fmt.Printf("Encrypting")
-		errOperation = files.EncryptFile(inputFile, outputFile, key)
+		fmt.Println("Encrypting")
+		errOperation = files.EncryptFile(inputFile, outputFile, []byte(key))
 	} else {
-		fmt.Printf("Decrypting")
-		errOperation = files.DecryptFile(inputFile, outputFile, key)
+		fmt.Println("Decrypting")
+		errOperation = files.DecryptFile(inputFile, outputFile, []byte(key))
 
 	}
 
@@ -64,6 +67,4 @@ func main() {
 		return
 	}
 
-	inputFile.Close()
-	outputFile.Close()
 }
