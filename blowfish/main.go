@@ -12,18 +12,20 @@ import (
 	"github.com/golang/glog"
 )
 
-var pars options.Options
+func main() {
+	var pars options.Options
 
-func init() {
 	flag.BoolVar(&pars.Encryption, "encrypt", false, "Encrypt a file.")
 	flag.BoolVar(&pars.Decryption, "decrypt", false, "Decrypt a file.")
 	flag.StringVar(&pars.InputFile, "input", "", "Input file.")
 	flag.StringVar(&pars.OutputFile, "output", "", "Output file.")
 	flag.StringVar(&pars.Key, "key", "", "Key path in Vault.")
-}
-
-func main() {
 	flag.Parse()
+
+	if flag.NFlag() == 0 {
+		flag.Usage()
+		return
+	}
 
 	if err := pars.Validate(); err != nil {
 		glog.Errorln(err)
