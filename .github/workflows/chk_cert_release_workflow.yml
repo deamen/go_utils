@@ -8,15 +8,15 @@ on:
   workflow_dispatch:
 
 env:
-  chk_cert_ver: 0.0.2
-  go-version: 1.20.0
+  chk_cert_ver: 0.0.3
+  go-version: 1.20.12
 
 jobs:
   build-and-upload-chk_cert:
     uses: ./.github/workflows/chk_cert_base_workflow.yml
     with:
-      chk_cert_ver: 0.0.2
-      go-version: 1.20.0
+      chk_cert_ver: 0.0.3
+      go-version: 1.20.12
 
   create-release:
     runs-on: ubuntu-latest
