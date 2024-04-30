@@ -20,7 +20,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"golang.org/x/crypto/pkcs12"
+	"software.sslmate.com/src/go-pkcs12"
 )
 
 var availCmds = []string{
