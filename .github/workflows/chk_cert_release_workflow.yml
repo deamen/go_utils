@@ -7,24 +7,25 @@ on:
   workflow_dispatch:
 
 jobs:
-  setup_variables:
+  setup-variables:
     runs-on: ubuntu-latest
     steps:
       - name: Setup variables
-        id: vars
+        id: version_vars
         run: |
-          echo "::set-output name=chk_cert_ver::0.0.3"
-          echo "::set-output name=go_version::1.20.12"
+          echo "chk_cert_ver=0.0.3" >> $GITHUB_OUTPUT
+          echo "go_version=1.20.12" >> $GITHUB_OUTPUT
+
     outputs:
-      chk_cert_ver: ${{ steps.vars.outputs.chk_cert_ver }}
-      go_version: ${{ steps.vars.outputs.go_version }}
+      chk_cert_ver: ${{ steps.version_vars.outputs.chk_cert_ver }}
+      go_version: ${{ steps.version_vars.outputs.go_version }}
 
   build-and-upload-chk_cert:
-    needs: setup_variables
+    needs: setup-variables
     uses: ./.github/workflows/chk_cert_base_workflow.yml
     with:
-      chk_cert_ver: ${{ needs.setup_variables.outputs.chk_cert_ver }}
-      go-version: ${{ needs.setup_variables.outputs.go_version }}
+      chk_cert_ver: ${{ needs.setup-variables.outputs.chk_cert_ver }}
+      go-version: ${{ needs.setup-variables.outputs.go_version }}
 
   create-release:
     runs-on: ubuntu-latest
@@ -33,10 +34,10 @@ jobs:
       - name: Download chk_cert release tarball
         uses: actions/download-artifact@v3
         with:
-          name: chk_cert-${{ needs.setup_variables.outputs.chk_cert_ver }}.tar.xz
+          name: chk_cert-${{ needs.setup-variables.outputs.chk_cert_ver }}.tar.xz
 
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            ./chk_cert-${{ needs.setup_variables.outputs.chk_cert_ver }}.tar.xz
+            ./chk_cert-${{ needs.setup-variables.outputs.chk_cert_ver }}.tar.xz
