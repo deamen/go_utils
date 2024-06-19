@@ -9,33 +9,32 @@ on:
       go-version:
         required: true
         type: string
-env:
-    pkg_name: chk_cert_${{ inputs.chk_cert_ver}}
 
 jobs:
-
   build-chk_cert-bin:
     runs-on: ubuntu-latest
 
+    env:
+      VERSION: ${{ inputs.chk_cert_ver }}
+
     steps:
       - name: Setup Go ${{ inputs.go-version }}
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5.0.1
         with:
           go-version: ${{ inputs.go-version }}
 
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4.1.7
 
       - name: Build chk_cert binaries
-        run: |
-          make
+        run: make
         working-directory: ./chk_cert
 
       - name: Make chk_cert release tarball
-        run: /bin/tar clJf chk_cert-${{ inputs.chk_cert_ver}}.tar.xz chk_cert*
+        run: /bin/tar clJf chk_cert-${{ inputs.chk_cert_ver }}.tar.xz chk_cert*
         working-directory: ./chk_cert
 
       - name: Upload the chk_cert tarball
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4.3.3
         with:
-          name: chk_cert-${{ inputs.chk_cert_ver}}.tar.xz
-          path: ./chk_cert/chk_cert-${{ inputs.chk_cert_ver}}.tar.xz
+          name: chk_cert-${{ inputs.chk_cert_ver }}.tar.xz
+          path: ./chk_cert/chk_cert-${{ inputs.chk_cert_ver }}.tar.xz
