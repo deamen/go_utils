@@ -17,15 +17,15 @@ jobs:
       uses: actions/checkout@v4.1.7
 
     - name: Get the base and head SHA
-    id: vars
-    run: |
-      if [ "${{ github.event_name }}" = "push" ]; then
-        echo "::set-output name=base::${{ github.event.before }}"
-        echo "::set-output name=head::${{ github.sha }}"
-      elif [ "${{ github.event_name }}" = "pull_request" ]; then
-        echo "::set-output name=base::${{ github.event.pull_request.base.sha }}"
-        echo "::set-output name=head::${{ github.event.pull_request.head.sha }}"
-      fi
+      id: vars
+      run: |
+        if [ "${{ github.event_name }}" = "push" ]; then
+          echo "::set-output name=base::${{ github.event.before }}"
+          echo "::set-output name=head::${{ github.sha }}"
+        elif [ "${{ github.event_name }}" = "pull_request" ]; then
+          echo "::set-output name=base::${{ github.event.pull_request.base.sha }}"
+          echo "::set-output name=head::${{ github.event.pull_request.head.sha }}"
+        fi
 
     - name: Run check-binary-files action
       id: check-binary-files
