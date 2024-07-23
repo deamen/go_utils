@@ -1,0 +1,17 @@
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0  # Use the ref you want to point at
+    hooks:
+    -   id: trailing-whitespace
+    -   id: check-yaml
+    -   id: check-added-large-files
+    -   id: detect-private-key
+    -   id: end-of-file-fixer
+    -   id: forbid-submodules
+    -   id: check-executables-have-shebangs
+    -   id: check-shebang-scripts-are-executable
+- repo: https://github.com/deamen/pre-commit-hooks
+  rev: 37b54b228e41c1f7c78224b40e47747bde5862ab  # or use a specific tag like v1.0.0
+  hooks:
+    - id: check-binary-files
+    - id: dos2unix
