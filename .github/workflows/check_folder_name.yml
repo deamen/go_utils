@@ -1,0 +1,26 @@
+name: Ensure folder name starts with 'test_'
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'chk_cert/**'
+
+jobs:
+  check-folder-name:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4.1.7
+
+    - name: Run check-folder-name action
+      id: check-folder-name
+      uses: deamen/gh-actions/check-folder-name@65c4c202f87fdd9e20536ea97164076a9ef52e28
+      with:
+        folder: chk_cert
+        regex: '^test_.+'
