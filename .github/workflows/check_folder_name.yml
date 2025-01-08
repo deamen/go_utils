@@ -20,7 +20,7 @@ jobs:
 
     - name: Run check-folder-name action
       id: check-folder-name
-      uses: deamen/gh-actions/check-folder-name@40acc17a8e17551a46b32fc23433b33cdf87b24a
+      uses: deamen/gh-actions/check-folder-name@f041270907839a481d2979e0b78ea59bd89835cb
       with:
         folder: chk_cert
         regex: '^test_.+'
