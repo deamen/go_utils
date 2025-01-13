@@ -29,7 +29,7 @@ jobs:
 
     - name: Run check-binary-files action
       id: check-binary-files
-      uses: deamen/gh-actions/check-binary-files@f8d2959c6b4a15b02fb33476bd1cfbd28858d758
+      uses: deamen/gh-actions/check-binary-files@15cbd3290ac8979d65c9babd9890620af000c0ac
       with:
         base-ref: "${{ github.event.repository.default_branch }}"
         head-ref: HEAD
