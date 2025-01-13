@@ -29,10 +29,10 @@ jobs:
 
     - name: Run check-binary-files action
       id: check-binary-files
-      uses: deamen/gh-actions/check-binary-files@0f520e5b2595b90715935208247fb04db25c8d48
+      uses: deamen/gh-actions/check-binary-files@68d6829feed43fe7ca06530227b148e3874d5c4c
       with:
-        base-ref: "3cbfa567c2ca0759b77b85fe2e5946b663ad7f26"
-        head-ref: ${{ github.sha }}
+        base-ref: "${{ github.event.repository.default_branch }}"
+        head-ref: HEAD
 
     - name: Report result
       if: success() || failure()
