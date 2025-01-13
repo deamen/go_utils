@@ -32,7 +32,7 @@ jobs:
       uses: deamen/gh-actions/check-binary-files@8321ae0dadf28c65f7b1e3f42220b8a91d627581
       with:
         base-ref: "3cbfa567c2ca0759b77b85fe2e5946b663ad7f26"
-        head-ref: ${{ github.ref_name }}
+        head-ref: ${{ github.sha }}
 
     - name: Report result
       if: success() || failure()
