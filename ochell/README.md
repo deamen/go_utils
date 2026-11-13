@@ -23,7 +23,7 @@ Behaviour common to all sources:
   - 401 when authentication fails;
   - 400 when the payload is unusable, for example a Jira Automation request that names no assignee;
 - **Duplicate deliveries:** dropped using `X-Atlassian-Webhook-Identifier` / `Linear-Delivery`.
-- **One run per ticket:** a ticket that is already queued or running is not started again.
+- **One run per ticket:** a ticket that is already queued or running is not started again. The request is answered with 200 `already in progress`. A new Linear session on such a ticket gets a `response` activity that says so, which closes that session; the result is posted in the first session.
 - **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the agent exits it posts a `response` (the tail of the agent output) or an `error`.
 - **Linear follow-ups:** `prompted` events are logged but not yet delivered to a running agent.
 

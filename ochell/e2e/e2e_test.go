@@ -240,6 +240,42 @@ func TestSystemdLauncherRefusedLaunch(t *testing.T) {
 	}
 }
 
+// A second Linear session on a ticket that is running starts no second run,
+// and is answered within the 10 seconds Linear allows.
+func TestSecondLinearSessionOnRunningTicket(t *testing.T) {
+	o := Start(t, Options{Script: []Step{{Print: "working"}, {Sleep: "3s"}, {Print: "all done"}}})
+	id := o.LinearCreated("ENG-78", "session-first", "").TaskID(t)
+	o.WaitRecords(1, 10*time.Second)
+
+	sent := time.Now()
+	second := o.LinearCreated("ENG-78", "session-second", "")
+	if second.Status != 200 || second.Body != "already in progress" {
+		t.Fatalf("second trigger: %d %q", second.Status, second.Body)
+	}
+	acts := o.WaitActivities("session-second", 1, 10*time.Second)
+	if d := acts[0].At.Sub(sent); d > 10*time.Second {
+		t.Errorf("the second session was answered after %s", d)
+	}
+	if acts[0].Type != "response" || !strings.Contains(acts[0].Body, "ENG-78 is already being worked on") {
+		t.Errorf("activity on the second session = %+v", acts[0])
+	}
+
+	if run := o.WaitRun(id, 20*time.Second); run.ExitCode != 0 {
+		t.Errorf("first run: %s", run.Footer)
+	}
+	if n := len(o.Records()); n != 1 {
+		t.Errorf("the agent was started %d times, want 1", n)
+	}
+	// The first session gets its acknowledgement and the result; the second
+	// nothing more.
+	if first := o.WaitActivities("session-first", 2, 10*time.Second); first[1].Type != "response" || !strings.Contains(first[1].Body, "all done") {
+		t.Errorf("first session = %+v", first)
+	}
+	if n := len(o.Linear.Activities("session-second")); n != 1 {
+		t.Errorf("the second session got %d activities, want 1", n)
+	}
+}
+
 // spawning is a fake agent that behaves like a real one with sub-agents and
 // MCP servers: it starts children and keeps working.
 func spawning(children ...Step) []Step {

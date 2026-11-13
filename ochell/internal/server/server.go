@@ -239,27 +239,40 @@ func deliveryKey(source, delivery string) string {
 	return source + ":" + delivery
 }
 
+// submitResult is what happened to a task handed to the runner.
+type submitResult int
+
+const (
+	// submitFailed: not queued; the sender may retry the delivery.
+	submitFailed submitResult = iota
+	submitQueued
+	// submitBusy: the ticket is already queued or running. The delivery
+	// was handled and must not be retried.
+	submitBusy
+)
+
 // submit queues t and writes the HTTP response.
-func (s *Server) submit(w http.ResponseWriter, t *task.Task, log *slog.Logger) bool {
+func (s *Server) submit(w http.ResponseWriter, t *task.Task, log *slog.Logger) submitResult {
 	if !validKey.MatchString(t.Key) {
 		log.Warn("rejecting invalid ticket key", "key", t.Key)
 		reply(w, http.StatusBadRequest, "invalid ticket key")
-		return false
+		return submitFailed
 	}
 	switch err := s.runner.Submit(t); {
 	case err == nil:
 		log.Info("task queued", "task", t.ID, "key", t.Key)
 		reply(w, http.StatusOK, "queued "+t.ID)
-		return true
+		return submitQueued
 	case errors.Is(err, runner.ErrBusy):
 		log.Info("ticket already in progress", "key", t.Key)
 		reply(w, http.StatusOK, "already in progress")
+		return submitBusy
 	default:
 		// 503 makes Jira and Linear retry later.
 		log.Error("cannot queue task", "key", t.Key, "err", err)
 		reply(w, http.StatusServiceUnavailable, "cannot queue task")
+		return submitFailed
 	}
-	return false
 }
 
 func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
@@ -291,7 +304,7 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusOK, "duplicate delivery")
 		return
 	}
-	if !s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery), log) {
+	if s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery), log) == submitFailed {
 		s.seen.Remove(key)
 	}
 }
@@ -366,24 +379,37 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 	}
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, sess.Context, delivery)
 	s.attachLinearCallbacks(t, sess.SessionID, log)
-	if !s.submit(w, t, log) {
+	// Linear marks a session unresponsive unless it sees an activity within
+	// ~10s of "created", so answer now rather than when the agent starts.
+	switch s.submit(w, t, log) {
+	case submitQueued:
+		s.linearActivity(sess.SessionID, linear.ActivityThought,
+			"Picked up "+sess.Key+", the digital employee is starting work.", log)
+	case submitBusy:
+		// A second session on a ticket that is already queued or running
+		// starts no run, but it must not be left without an answer. A
+		// response closes the session.
+		s.linearActivity(sess.SessionID, linear.ActivityResponse,
+			sess.Key+" is already being worked on by the digital employee in an earlier session, so this request did not start a new run. The result will be posted in that session. Messages to a running agent are not supported yet.", log)
+	default:
 		s.seen.Remove(key)
+	}
+}
+
+// linearActivity posts an activity to a session without holding up the
+// webhook response.
+func (s *Server) linearActivity(sessionID, kind, body string, log *slog.Logger) {
+	if s.linear == nil {
+		log.Warn("linear client not configured (client_id); session will not receive activities")
 		return
 	}
-	// Linear marks a session unresponsive unless it sees an activity within
-	// ~10s of "created", so acknowledge now rather than when the agent starts.
-	if s.linear != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), linearAckBy)
-			defer cancel()
-			if err := s.linear.CreateActivity(ctx, sess.SessionID, linear.ActivityThought,
-				"Picked up "+sess.Key+", the digital employee is starting work."); err != nil {
-				log.Error("linear acknowledgement failed", "err", err)
-			}
-		}()
-	} else {
-		log.Warn("linear client not configured (client_id); session will not receive activities")
-	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), linearAckBy)
+		defer cancel()
+		if err := s.linear.CreateActivity(ctx, sessionID, kind, body); err != nil {
+			log.Error("linear activity failed", "session", sessionID, "type", kind, "err", err)
+		}
+	}()
 }
 
 func (s *Server) attachLinearCallbacks(t *task.Task, sessionID string, log *slog.Logger) {

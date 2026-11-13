@@ -266,6 +266,55 @@ func TestLinearAgentSession(t *testing.T) {
 	}
 }
 
+// A second session on a ticket that is already queued or running starts no
+// run, but gets an answer, so Linear does not show it as unresponsive.
+func TestLinearSecondSessionOnBusyTicket(t *testing.T) {
+	api := &fakeLinearAPI{got: make(chan struct{}, 4)}
+	apiSrv := httptest.NewServer(api)
+	defer apiSrv.Close()
+
+	cfg := testConfig()
+	cfg.Sources.Linear.ClientID = "cid"
+	cfg.Sources.Linear.ClientSecret = "csecret"
+	cfg.Sources.Linear.TokenFile = filepath.Join(t.TempDir(), "token.json")
+	cfg.Sources.Linear.APIURL = apiSrv.URL
+	fr := &fakeRunner{err: runner.ErrBusy}
+	s := newServer(t, cfg, fr)
+	if err := s.linear.SaveToken(&linear.Token{AccessToken: "access-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := strings.Replace(readFile(t, "linear-agent-session-created.json"), `"webhookTimestamp": 0`,
+		`"webhookTimestamp": `+strconv.FormatInt(time.Now().UnixMilli(), 10), 1)
+	hdr := map[string]string{"Linear-Signature": auth.SignHex("linear-secret", []byte(body)), "Linear-Delivery": "ld-busy"}
+	w := do(s, "/webhooks/linear", body, hdr)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "already in progress") {
+		t.Fatalf("busy ticket: %d %s", w.Code, w.Body)
+	}
+	select {
+	case <-api.got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second session got no activity")
+	}
+	api.mu.Lock()
+	in := api.calls[0]["variables"].(map[string]any)["input"].(map[string]any)
+	api.mu.Unlock()
+	content := in["content"].(map[string]any)
+	if in["agentSessionId"] != "session-0000" || content["type"] != "response" || !strings.Contains(content["body"].(string), "ENG-123 is already being worked on") {
+		t.Errorf("activity = %v", in)
+	}
+
+	// The delivery was handled: a retry of it must not post a second answer.
+	if w := do(s, "/webhooks/linear", body, hdr); !strings.Contains(w.Body.String(), "duplicate") {
+		t.Errorf("retried delivery: %d %s, want duplicate", w.Code, w.Body)
+	}
+	select {
+	case <-api.got:
+		t.Error("a retried delivery posted a second activity")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 func TestLastN(t *testing.T) {
 	if got := lastN("héllo", 4); got != "…llo" {
 		t.Errorf("lastN = %q", got)
