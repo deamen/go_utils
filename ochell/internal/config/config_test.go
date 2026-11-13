@@ -155,3 +155,60 @@ func TestPromptOnStdinByDefault(t *testing.T) {
 		t.Errorf("arg with {{.Prompt}} in args must stay valid: %v", err)
 	}
 }
+
+func TestSystemdLauncherValidation(t *testing.T) {
+	base := func() *Config {
+		cfg := Default()
+		cfg.Sources.JiraAutomation.Enabled = true
+		cfg.Sources.JiraAutomation.Token = "t"
+		cfg.Agent.Launcher = "systemd"
+		cfg.Agent.Command = "/usr/local/bin/claude"
+		return cfg
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("valid systemd configuration: %v", err)
+	}
+	cfg := base()
+	cfg.Agent.PromptVia = "arg"
+	cfg.Agent.Args = []string{"-p", "{{.Prompt}}"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "requires prompt_via: stdin") {
+		t.Errorf("prompt_via arg with the systemd launcher: got %v", err)
+	}
+	cfg = base()
+	cfg.Agent.Command = "claude"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "absolute path") {
+		t.Errorf("relative command with the systemd launcher: got %v", err)
+	}
+	cfg = base()
+	cfg.Agent.Systemd.StopCommand = nil
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "stop_command") {
+		t.Errorf("missing stop_command: got %v", err)
+	}
+	cfg = base()
+	cfg.Agent.Launcher = "docker"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "direct or systemd") {
+		t.Errorf("unknown launcher: got %v", err)
+	}
+
+	p := writeYAML(t, `
+agent:
+  launcher: systemd
+  command: /usr/local/bin/claude
+  stop_grace: 20s
+  systemd:
+    launch_command: [sudo, -n, /opt/ochell-launch]
+`)
+	cfg, err := Load("serve", []string{"--config", p}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Agent.Systemd.LaunchCommand, " "); got != "sudo -n /opt/ochell-launch" {
+		t.Errorf("launch_command = %q", got)
+	}
+	if got := strings.Join(cfg.Agent.Systemd.StopCommand, " "); got != "sudo -n /usr/local/libexec/ochell/ochell-stop" {
+		t.Errorf("default stop_command lost: %q", got)
+	}
+	if cfg.Agent.StopGrace != 20*time.Second {
+		t.Errorf("stop_grace = %s", cfg.Agent.StopGrace)
+	}
+}

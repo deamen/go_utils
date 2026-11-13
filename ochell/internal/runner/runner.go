@@ -1,8 +1,9 @@
 // Package runner queues tasks and launches the agent CLI for each of them.
 //
 // Exactly one agent process is started per task; any multi-agent work is
-// managed by that agent. The command is executed directly (no shell) so
-// ticket content can never be interpreted as shell syntax.
+// managed by that agent. The command is executed without a shell, so ticket
+// content can never be interpreted as shell syntax. A launcher (package
+// launcher) starts and stops the process.
 package runner
 
 import (
@@ -13,7 +14,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"ochell/internal/config"
+	"ochell/internal/launcher"
 	"ochell/internal/task"
 )
 
@@ -36,6 +37,7 @@ const tailSize = 4096
 type Runner struct {
 	cfg      config.Agent
 	log      *slog.Logger
+	launcher launcher.Launcher
 	prompt   *template.Template
 	args     []*template.Template
 	workdir  *template.Template
@@ -61,6 +63,19 @@ func New(cfg config.Agent, log *slog.Logger) (*Runner, error) {
 			return nil, err
 		}
 		r.args = append(r.args, t)
+	}
+	if r.launcher, err = launcher.New(cfg); err != nil {
+		return nil, err
+	}
+	if cfg.Launcher == "systemd" {
+		// Fail at start, not on the first ticket, when a template uses a
+		// field that argView does not have.
+		probe := argView{ID: "id", Source: "source", Key: "KEY-1"}
+		for _, t := range append([]*template.Template{r.workdir}, r.args...) {
+			if _, err := render(t, probe); err != nil {
+				return nil, fmt.Errorf("agent %s: with the systemd launcher only .ID, .Source and .Key may be used here, because ticket text must not reach the command line: %w", t.Name(), err)
+			}
+		}
 	}
 	size := cfg.QueueSize
 	if size < 1 {
@@ -153,7 +168,7 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	}
 	res := r.Run(ctx, t)
 	if res.Err != nil {
-		log.Error("agent failed", "exit", res.ExitCode, "err", res.Err, "duration", res.Duration, "log", res.LogFile)
+		log.Error("agent run did not succeed", "outcome", res.Outcome, "exit", res.ExitCode, "err", res.Err, "duration", res.Duration, "log", res.LogFile)
 	} else {
 		log.Info("agent finished", "duration", res.Duration, "log", res.LogFile)
 	}
@@ -166,10 +181,40 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 
 var unsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
-// Run renders the prompt and executes the agent synchronously.
+// argView is what argument and working directory templates see with the
+// systemd launcher: only fields that cannot hold ticket text. systemd
+// replaces ${VAR} in a unit's arguments from its environment, which holds
+// the agent's token, so a ticket title of "${CLAUDE_CODE_OAUTH_TOKEN}" in an
+// argument would put the real token on the command line.
+type argView struct {
+	ID     string
+	Source string
+	Key    string
+}
+
+// argData returns the template data for arguments and the working directory.
+func (r *Runner) argData(t *task.Task) any {
+	if r.cfg.Launcher == "systemd" {
+		return argView{ID: t.ID, Source: t.Source, Key: t.Key}
+	}
+	return t
+}
+
+// stopWait is how long Run waits for an agent to exit after asking the
+// launcher to stop it, beyond the grace period.
+const stopWait = 45 * time.Second
+
+type waitResult struct {
+	code int
+	err  error
+}
+
+// Run renders the prompt and executes the agent synchronously. Cancelling
+// ctx stops the agent.
 func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	start := time.Now()
 	res.ExitCode = -1
+	res.Outcome = task.OutcomeNotStarted
 	defer func() { res.Duration = time.Since(start) }()
 
 	var err error
@@ -179,20 +224,16 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	}
 	args := make([]string, 0, len(r.args))
 	for _, a := range r.args {
-		s, err := render(a, t)
+		s, err := render(a, r.argData(t))
 		if err != nil {
 			res.Err = fmt.Errorf("render args: %w", err)
 			return res
 		}
 		args = append(args, s)
 	}
-	dir, err := render(r.workdir, t)
+	dir, err := render(r.workdir, r.argData(t))
 	if err != nil {
 		res.Err = fmt.Errorf("render workdir: %w", err)
-		return res
-	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		res.Err = fmt.Errorf("create workdir: %w", err)
 		return res
 	}
 
@@ -209,55 +250,116 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	defer lf.Close()
 	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s\n# command=%s (%d args) workdir=%s\n# prompt:\n%s\n# ---- agent output ----\n",
 		t.ID, t.Source, t.Key, t.URL, r.cfg.Command, len(args), dir, t.Prompt)
+	defer func() {
+		fmt.Fprintf(lf, "\n# ---- exit=%d outcome=%s err=%v duration=%s ----\n", res.ExitCode, res.Outcome, res.Err, time.Since(start))
+	}()
 
-	if r.cfg.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, r.cfg.Timeout)
-		defer cancel()
-	}
-	cmd := exec.CommandContext(ctx, r.cfg.Command, args...)
-	cmd.Dir = dir
-	cmd.WaitDelay = 10 * time.Second
-	cmd.Env = r.environ(t)
-	if r.cfg.PromptVia == "stdin" {
-		cmd.Stdin = strings.NewReader(t.Prompt)
-	}
 	tail := &tailBuffer{max: tailSize}
-	out := io.MultiWriter(lf, tail)
-	cmd.Stdout, cmd.Stderr = out, out
-
-	err = cmd.Run()
-	res.Tail = tail.String()
-	if cmd.ProcessState != nil {
-		res.ExitCode = cmd.ProcessState.ExitCode()
+	spec := launcher.Spec{
+		TaskID:    unsafeName.ReplaceAllString(t.ID, "_"),
+		Command:   r.cfg.Command,
+		Args:      args,
+		Dir:       dir,
+		Env:       r.taskEnv(t),
+		Inherited: r.inheritedEnv(),
+		Output:    io.MultiWriter(lf, tail),
+		Timeout:   r.cfg.Timeout,
 	}
-	switch {
-	case ctx.Err() == context.DeadlineExceeded:
-		res.Err = fmt.Errorf("agent timed out after %s", r.cfg.Timeout)
-	case err != nil:
+	if r.cfg.PromptVia == "stdin" {
+		spec.Stdin = strings.NewReader(t.Prompt)
+	}
+	proc, err := r.launcher.Start(spec)
+	if err != nil {
 		res.Err = err
+		return res
 	}
-	fmt.Fprintf(lf, "\n# ---- exit=%d err=%v duration=%s ----\n", res.ExitCode, res.Err, time.Since(start))
+	waited := make(chan waitResult, 1)
+	go func() {
+		code, err := proc.Wait()
+		waited <- waitResult{code, err}
+	}()
+	var timeout <-chan time.Time
+	if r.cfg.Timeout > 0 {
+		timer := time.NewTimer(r.cfg.Timeout)
+		defer timer.Stop()
+		timeout = timer.C
+	}
+
+	// Why the run ended is decided here, from what ochell asked for. The
+	// exit code cannot tell: a unit that systemd stopped exits with 0, and
+	// one that hit its own time limit exits with 1 like a failed agent.
+	var w waitResult
+	select {
+	case w = <-waited:
+		res.Outcome = task.OutcomeFinished
+	case <-timeout:
+		res.Outcome = task.OutcomeTimedOut
+		w = r.stop(proc, waited)
+	case <-ctx.Done():
+		res.Outcome = task.OutcomeStopped
+		w = r.stop(proc, waited)
+	}
+	res.Tail = tail.String()
+	res.ExitCode = w.code
+	switch {
+	case res.Outcome == task.OutcomeTimedOut:
+		res.Err = fmt.Errorf("agent timed out after %s", r.cfg.Timeout)
+	case res.Outcome == task.OutcomeStopped:
+		res.Err = errors.New("the agent was stopped before it finished")
+	case errors.Is(w.err, launcher.ErrNotStarted):
+		res.Outcome = task.OutcomeNotStarted
+		res.Err = w.err
+	case w.err != nil:
+		res.Outcome = task.OutcomeFailed
+		res.Err = w.err
+	case w.code != 0:
+		res.Outcome = task.OutcomeFailed
+		res.Err = fmt.Errorf("exit status %d", w.code)
+	}
+	if w.err != nil && res.Outcome != task.OutcomeNotStarted && res.Outcome != task.OutcomeFailed {
+		res.Err = fmt.Errorf("%w (%v)", res.Err, w.err)
+	}
 	return res
 }
 
-// environ builds the agent's environment. The agent reads untrusted ticket
-// text, so it never inherits ochell's own environment, which holds the
-// webhook secrets and API keys: only the variables named in env_pass are
-// copied from it.
-func (r *Runner) environ(t *task.Task) []string {
+// stop asks the launcher to end the run and waits for the agent to exit.
+func (r *Runner) stop(proc launcher.Process, waited <-chan waitResult) waitResult {
+	var stopErr error
+	if err := proc.Stop(); err != nil {
+		stopErr = fmt.Errorf("stop agent: %w", err)
+	}
+	select {
+	case w := <-waited:
+		if w.err == nil {
+			w.err = stopErr
+		}
+		return w
+	case <-time.After(r.cfg.StopGrace + stopWait):
+		return waitResult{-1, errors.Join(stopErr, errors.New("the agent did not exit after the stop; it may still be running"))}
+	}
+}
+
+// The agent's environment. The agent reads untrusted ticket text, so it never
+// inherits ochell's own environment, which holds the webhook secrets and API
+// keys: only the variables named in env_pass are copied from it.
+func (r *Runner) inheritedEnv() []string {
 	env := []string{}
 	for _, name := range r.cfg.EnvPass {
 		if v, ok := os.LookupEnv(name); ok {
 			env = append(env, name+"="+v)
 		}
 	}
-	env = append(env,
-		"ORCH_TASK_ID="+t.ID,
-		"ORCH_TASK_SOURCE="+t.Source,
-		"ORCH_TASK_KEY="+t.Key,
-		"ORCH_TASK_URL="+t.URL,
-	)
+	return env
+}
+
+// taskEnv is what ochell sets for the agent: ORCH_TASK_* and agent.env.
+func (r *Runner) taskEnv(t *task.Task) []string {
+	env := []string{
+		"ORCH_TASK_ID=" + t.ID,
+		"ORCH_TASK_SOURCE=" + t.Source,
+		"ORCH_TASK_KEY=" + t.Key,
+		"ORCH_TASK_URL=" + t.URL,
+	}
 	for k, v := range r.cfg.Env {
 		env = append(env, k+"="+v)
 	}

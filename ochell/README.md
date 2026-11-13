@@ -44,7 +44,21 @@ run := o.WaitRun(id, 15*time.Second)          // exit code and log of the run
 rec := o.WaitRecords(1, 5*time.Second)[0]     // what the agent was started with
 acts := o.WaitActivities("session-1", 2, 10*time.Second)
 ```
-The harness uses the direct launcher. A test that needs the systemd launcher calls `e2e.RequireVM(t)` and is skipped unless `OCHELL_E2E_VM=1`, because CI has no systemd; run those on the VM.
+The harness uses the direct launcher by default. `e2e.UseFakeSystemd` selects the systemd launcher with the real launch and stop scripts and stand-ins for `systemd-run` and `systemctl`, which covers the path through the scripts in CI.
+
+### Tests on the VM
+CI has no systemd, so what only real systemd can show runs on the VM. Set up the systemd launcher first (see [Launchers](#launchers)).
+
+1. As root, check the scripts as ochell calls them, through `sudo`:
+   ```
+   scripts/check-launch-scripts.sh <ochell-user>
+   ```
+   Two older scripts check the mechanism itself, without the launch scripts: `scripts/check-systemd-launcher.sh` and `scripts/check-agent-token.sh`.
+2. As the ochell user, run the VM-only end-to-end tests. They are the tests that call `e2e.RequireVM(t)`, and are skipped unless `OCHELL_E2E_VM=1`. The VM needs no Go toolchain: build on a development machine with `make vmtest`, copy `vmtest/` to a directory on the VM that the agent user can read, and run
+   ```
+   OCHELL_E2E_VM=1 OCHELL_E2E_BIN_DIR=$PWD OCHELL_E2E_VM_WORKSPACE=/work ./e2e.test -test.v -test.run OnVM
+   ```
+   For these tests `launcher.conf` needs `ALLOWED_ENV='^FAKEAGENT_[A-Z_]+$'`, because the fake agent is configured through `FAKEAGENT_*` variables.
 
 ## Commands
 ```
@@ -66,6 +80,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-cmd` | Agent CLI executable (default `claude`) |
 | `--agent-arg` | Agent argument; repeatable; replaces the YAML `args` (default `-p`). Go template: `{{.Key}}`, `{{.Source}}`, `{{.ID}}`. Keep ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`, `{{.Prompt}}`) out of arguments; see [The prompt](#the-prompt) |
 | `--agent-prompt-via` | `stdin` (default) or `arg` |
+| `--agent-launcher` | `direct` (default) or `systemd`; see [Launchers](#launchers) |
 | `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
 | `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-log-dir` | Execution settings |
 | `--jira-webhook`, `--jira-webhook-secret`, `--jira-bot-account-id` | Jira system webhook source |
@@ -80,6 +95,49 @@ JIRA_SECRET=... ochell serve --http-addr 127.0.0.1 --http-port 8080 \
 ```
 
 The agent runs without a shell, with its working directory set to `workdir` (rendered per task). Output goes to `<log_dir>/<task id>.log`.
+
+### Launchers
+A launcher starts and stops the agent process. `agent.launcher` selects it.
+
+| | `direct` (default) | `systemd` |
+|---|---|---|
+| The agent runs as | ochell's own OS user | a separate OS user, in a transient unit `ochell-run-<task id>.service` |
+| The agent can read ochell's config, Linear token file and logs | yes | no |
+| A stop reaches | the agent process | every process of the unit, including children that left the process group |
+| Use for | development and tests | deployment |
+
+**Why two root-owned scripts.** ochell must not have permission to create systemd units, because that would let it run anything as root. It calls [scripts/ochell-launch](scripts/ochell-launch) and [scripts/ochell-stop](scripts/ochell-stop) through `sudo` instead. The launch script takes the agent user, the workspace root and the environment file from `/etc/ochell/launcher.conf`, never from the caller, and refuses (exit 250) anything but a valid task id, a working directory inside the workspace root, allowed environment variable names and an absolute command path. It creates the working directory as the agent user.
+
+**Setup** (as root; creating the agent user is not covered here):
+```
+install -d /usr/local/libexec/ochell /etc/ochell
+install -m 0755 scripts/ochell-launch scripts/ochell-stop /usr/local/libexec/ochell/
+install -m 0644 scripts/launcher.conf.example /etc/ochell/launcher.conf     # then edit it
+install -m 0600 /dev/null /etc/ochell/agent.env                             # then add the agent's token
+echo 'ochell ALL=(root) NOPASSWD: /usr/local/libexec/ochell/ochell-launch, /usr/local/libexec/ochell/ochell-stop' \
+  > /etc/sudoers.d/ochell && chmod 0440 /etc/sudoers.d/ochell && visudo -cf /etc/sudoers.d/ochell
+```
+Then set `agent.launcher: systemd` and check the result with `scripts/check-launch-scripts.sh <ochell-user>`.
+
+**What changes with `systemd`:**
+- **Credentials:** the agent authenticates with a token from the environment file named in `launcher.conf` (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`), never with an interactive login of the agent user. The file belongs to root, mode 0600; other users cannot see its values.
+- **Environment:** the unit has the agent user's environment, so `env_pass` is not used. ochell passes `ORCH_TASK_*` and `agent.env`. Other local users can read these values (`systemctl show`), so **no secret goes in `agent.env`**. Names other than `ORCH_*` must be allowed by `ALLOWED_ENV` in `launcher.conf`.
+- **Command:** `agent.command` must be an absolute path, because `PATH` in the unit is the system default. Install the agent CLI in a system path such as `/usr/local/bin`; that also stops the agent user from replacing its own binary.
+- **No ticket text in arguments:** systemd replaces `${VAR}` in a unit's arguments from its environment, which holds the agent's token. A ticket titled `${CLAUDE_CODE_OAUTH_TOKEN}` would put the real token on the command line. So ochell refuses to start with `prompt_via: arg`, `args` and `workdir` may only use `{{.ID}}`, `{{.Source}}` and `{{.Key}}`, and the launch script escapes every `$` in the arguments it passes.
+- **Working directory:** `workdir` must be inside `WORKSPACE_ROOT`, which belongs to the agent user.
+- **Time limit:** ochell keeps the timer and stops the unit. The unit also gets its own limit, one minute longer, in case ochell is gone.
+
+**Why a run ended** is in the last line of the run log and in ochell's log, as `outcome`:
+
+| Outcome | Meaning |
+|---|---|
+| `finished` | the agent exited by itself with status 0 |
+| `failed` | the agent exited by itself with another status |
+| `timed_out` | ochell stopped it at `agent.timeout` |
+| `stopped` | ochell stopped it for another reason |
+| `not_started` | the agent never ran: the command could not be executed, or the launch was refused. With the systemd launcher these are exit codes from 200 (250: refused by the launch script; 203: systemd could not execute the command) |
+
+ochell sets the outcome from what it asked for, never from the exit code alone: a unit that systemd stopped exits with 0.
 
 ### The prompt
 The prompt is rendered from `agent.prompt_template` and written to the agent's **stdin** (`prompt_via: stdin`, the default), which is how `claude -p` reads it when no prompt argument is given.
@@ -200,7 +258,8 @@ Notes:
   - Request bodies are limited to 1 MiB.
   - Ticket keys must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` before they are used in file names or templates.
   - Signatures and tokens are compared in constant time.
-- **Agent environment:** the agent gets an allowlisted environment, not ochell's own (see [Agent environment](#agent-environment)). It still runs as the same OS user as ochell, so it can read ochell's files.
+- **Agent environment:** the agent gets an allowlisted environment, not ochell's own (see [Agent environment](#agent-environment)).
+- **Agent OS user:** with the `direct` launcher the agent runs as the same OS user as ochell and can read ochell's files. Deploy with the `systemd` launcher (see [Launchers](#launchers)).
 - **Secrets:** never commit secrets or TLS keys. The repository's pre-commit hooks reject private keys.
 
 ## Licensing notes (checked October 2026)

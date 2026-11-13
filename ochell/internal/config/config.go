@@ -42,6 +42,13 @@ type Agent struct {
 	PromptVia      string `yaml:"prompt_via"`
 	PromptTemplate string `yaml:"prompt_template"`
 	Workdir        string `yaml:"workdir"`
+	// Launcher is "direct" (the agent is a child process of ochell) or
+	// "systemd" (a transient unit under a separate OS user).
+	Launcher string  `yaml:"launcher"`
+	Systemd  Systemd `yaml:"systemd"`
+	// StopGrace is how long an agent that is being stopped has between
+	// SIGTERM and SIGKILL.
+	StopGrace time.Duration `yaml:"stop_grace"`
 	// EnvPass names the variables the agent inherits from ochell's own
 	// environment. Everything else, including ochell's secrets, is dropped.
 	EnvPass []string `yaml:"env_pass"`
@@ -51,6 +58,14 @@ type Agent struct {
 	MaxConcurrent int               `yaml:"max_concurrent"`
 	QueueSize     int               `yaml:"queue_size"`
 	LogDir        string            `yaml:"log_dir"`
+}
+
+// Systemd configures the systemd launcher.
+type Systemd struct {
+	// LaunchCommand and StopCommand are the two root-owned scripts, with the
+	// sudo prefix ochell calls them through.
+	LaunchCommand []string `yaml:"launch_command"`
+	StopCommand   []string `yaml:"stop_command"`
 }
 
 type JiraWebhook struct {
@@ -154,11 +169,17 @@ func Default() *Config {
 			PromptVia:      "stdin",
 			PromptTemplate: DefaultPromptTemplate,
 			Workdir:        ".",
-			EnvPass:        append([]string(nil), DefaultEnvPass...),
-			Timeout:        2 * time.Hour,
-			MaxConcurrent:  1,
-			QueueSize:      100,
-			LogDir:         "logs",
+			Launcher:       "direct",
+			Systemd: Systemd{
+				LaunchCommand: []string{"sudo", "-n", "/usr/local/libexec/ochell/ochell-launch"},
+				StopCommand:   []string{"sudo", "-n", "/usr/local/libexec/ochell/ochell-stop"},
+			},
+			StopGrace:     10 * time.Second,
+			EnvPass:       append([]string(nil), DefaultEnvPass...),
+			Timeout:       2 * time.Hour,
+			MaxConcurrent: 1,
+			QueueSize:     100,
+			LogDir:        "logs",
 		},
 		Sources: Sources{
 			JiraWebhook:    JiraWebhook{Path: "/webhooks/jira"},
@@ -282,6 +303,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.Agent.Command, "agent-cmd", c.Agent.Command, "agent CLI command")
 	fs.Var(&stringList{dst: &c.Agent.Args}, "agent-arg", "agent CLI argument, repeatable, Go template (replaces config args)")
 	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: stdin or arg")
+	fs.StringVar(&c.Agent.Launcher, "agent-launcher", c.Agent.Launcher, "how the agent is run: direct or systemd")
 	fs.Var(&stringList{dst: &c.Agent.EnvPass}, "agent-env-pass", "environment variable the agent inherits from ochell, repeatable (replaces config env_pass)")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
 	fs.DurationVar(&c.Agent.Timeout, "agent-timeout", c.Agent.Timeout, "maximum agent run time")
@@ -340,6 +362,28 @@ func (c *Config) Validate() error {
 				break
 			}
 		}
+	}
+	switch c.Agent.Launcher {
+	case "direct":
+	case "systemd":
+		// systemd replaces ${VAR} in the unit's arguments from its
+		// environment, which holds the agent's token, so ticket text must
+		// never be an argument.
+		if c.Agent.PromptVia != "stdin" {
+			errs = append(errs, errors.New("agent.launcher systemd requires prompt_via: stdin"))
+		}
+		// PATH in the unit is the system default.
+		if !strings.HasPrefix(c.Agent.Command, "/") {
+			errs = append(errs, errors.New("agent.launcher systemd requires agent.command to be an absolute path"))
+		}
+		if len(c.Agent.Systemd.LaunchCommand) == 0 || len(c.Agent.Systemd.StopCommand) == 0 {
+			errs = append(errs, errors.New("agent.systemd requires launch_command and stop_command"))
+		}
+	default:
+		errs = append(errs, errors.New("agent.launcher must be direct or systemd"))
+	}
+	if c.Agent.StopGrace < 0 {
+		errs = append(errs, errors.New("agent.stop_grace must not be negative"))
 	}
 	for _, n := range c.Agent.EnvPass {
 		if !envName.MatchString(n) {
