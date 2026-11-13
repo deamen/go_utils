@@ -76,6 +76,11 @@ type JiraWebhook struct {
 	Path         string `yaml:"path"`
 	Secret       string `yaml:"secret"`
 	BotAccountID string `yaml:"bot_account_id"`
+	// MaxSkew is how far the payload's timestamp may be from now. Jira
+	// retries a failed delivery up to five times, 5 to 15 minutes apart, and
+	// a retry may carry the timestamp of the event, so this must cover those
+	// 75 minutes.
+	MaxSkew time.Duration `yaml:"max_skew"`
 }
 
 type JiraAutomation struct {
@@ -186,7 +191,7 @@ func Default() *Config {
 			LogDir:        "logs",
 		},
 		Sources: Sources{
-			JiraWebhook:    JiraWebhook{Path: "/webhooks/jira"},
+			JiraWebhook:    JiraWebhook{Path: "/webhooks/jira", MaxSkew: 2 * time.Hour},
 			JiraAutomation: JiraAutomation{Path: "/webhooks/jira-automation", Header: "Authorization"},
 			Linear: Linear{
 				Path:         "/webhooks/linear",
@@ -418,6 +423,9 @@ func (c *Config) Validate() error {
 		}
 		if s.JiraWebhook.BotAccountID == "" {
 			errs = append(errs, errors.New("sources.jira_webhook.bot_account_id is required"))
+		}
+		if s.JiraWebhook.MaxSkew <= 0 {
+			errs = append(errs, errors.New("sources.jira_webhook.max_skew must be positive"))
 		}
 	}
 	if s.JiraAutomation.Enabled && (s.JiraAutomation.Token == "" || s.JiraAutomation.Header == "") {

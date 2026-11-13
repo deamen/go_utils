@@ -7,12 +7,38 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // ErrIgnored marks a valid payload that does not represent an assignment to
 // the digital employee. Handlers answer 200 so Atlassian does not retry.
 var ErrIgnored = errors.New("event ignored")
+
+// ErrStale marks a payload whose timestamp is missing or too far from now.
+var ErrStale = errors.New("webhook timestamp outside allowed skew")
+
+// CheckTimestamp rejects a payload whose "timestamp" (milliseconds, set by
+// Jira when the event happened) is more than maxSkew away from now. A
+// captured request can then not be replayed later; within maxSkew the
+// delivery id protects against replay.
+func CheckTimestamp(body []byte, maxSkew time.Duration, now time.Time) error {
+	var ts struct {
+		Timestamp json.Number `json:"timestamp"`
+	}
+	if err := json.Unmarshal(body, &ts); err != nil {
+		return fmt.Errorf("decode timestamp: %w", err)
+	}
+	ms, err := strconv.ParseInt(ts.Timestamp.String(), 10, 64)
+	if err != nil {
+		return fmt.Errorf("%w: missing timestamp", ErrStale)
+	}
+	if d := now.Sub(time.UnixMilli(ms)); d > maxSkew || d < -maxSkew {
+		return fmt.Errorf("%w: %s", ErrStale, d.Round(time.Second))
+	}
+	return nil
+}
 
 type User struct {
 	AccountID   string `json:"accountId"`

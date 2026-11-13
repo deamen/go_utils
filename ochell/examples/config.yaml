@@ -81,6 +81,11 @@ sources:
     path: /webhooks/jira
     secret: ${JIRA_WEBHOOK_SECRET}
     bot_account_id: "712020:00000000-0000-0000-0000-000000000000"
+    # A payload whose "timestamp" is further than this from now is rejected,
+    # so a captured request cannot be replayed later. Jira retries a failed
+    # delivery up to five times, 5 to 15 minutes apart, and a retry may carry
+    # the timestamp of the event, so keep this above 75 minutes.
+    max_skew: 2h
 
   # Jira Automation "Send web request" with a hidden header.
   jira_automation:

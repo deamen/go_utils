@@ -80,10 +80,21 @@ func do(s *Server, path, body string, hdr map[string]string) *httptest.ResponseR
 	return w
 }
 
+// jiraBody returns the sample Jira webhook with its timestamp set to at.
+func jiraBody(t *testing.T, at time.Time) string {
+	t.Helper()
+	const sample = `"timestamp": 1760152365200`
+	body := readFile(t, "jira-issue-assigned.json")
+	if !strings.Contains(body, sample) {
+		t.Fatal("testdata/jira-issue-assigned.json: timestamp changed")
+	}
+	return strings.Replace(body, sample, `"timestamp": `+strconv.FormatInt(at.UnixMilli(), 10), 1)
+}
+
 func TestJiraWebhook(t *testing.T) {
 	fr := &fakeRunner{}
 	s := newServer(t, testConfig(), fr)
-	body := readFile(t, "jira-issue-assigned.json")
+	body := jiraBody(t, time.Now())
 	sig := "sha256=" + auth.SignHex("jira-secret", []byte(body))
 
 	if w := do(s, "/webhooks/jira", body, map[string]string{"X-Hub-Signature": "sha256=00"}); w.Code != 401 {
@@ -113,7 +124,7 @@ func TestJiraWebhook(t *testing.T) {
 func TestJiraWebhookQueueFullAllowsRetry(t *testing.T) {
 	fr := &fakeRunner{err: runner.ErrQueueFull}
 	s := newServer(t, testConfig(), fr)
-	body := readFile(t, "jira-issue-assigned.json")
+	body := jiraBody(t, time.Now())
 	hdr := map[string]string{
 		"X-Hub-Signature":                "sha256=" + auth.SignHex("jira-secret", []byte(body)),
 		"X-Atlassian-Webhook-Identifier": "d-2",
@@ -124,6 +135,39 @@ func TestJiraWebhookQueueFullAllowsRetry(t *testing.T) {
 	fr.err = nil
 	if w := do(s, "/webhooks/jira", body, hdr); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued") {
 		t.Fatalf("retry after 503 must be accepted: %d %s", w.Code, w.Body)
+	}
+}
+
+// A correctly signed Jira payload is refused when its timestamp is old, so a
+// captured request cannot be replayed after the delivery ids are forgotten.
+func TestJiraWebhookRejectsOldPayload(t *testing.T) {
+	fr := &fakeRunner{}
+	cfg := testConfig()
+	s := newServer(t, cfg, fr)
+	post := func(body, delivery string) *httptest.ResponseRecorder {
+		return do(s, "/webhooks/jira", body, map[string]string{
+			"X-Hub-Signature":                "sha256=" + auth.SignHex("jira-secret", []byte(body)),
+			"X-Atlassian-Webhook-Identifier": delivery,
+		})
+	}
+	skew := cfg.Sources.JiraWebhook.MaxSkew
+	for name, body := range map[string]string{
+		"the sample from October 2026": readFile(t, "jira-issue-assigned.json"),
+		"just outside the skew":        jiraBody(t, time.Now().Add(-skew-time.Minute)),
+		"from the future":              jiraBody(t, time.Now().Add(skew+time.Minute)),
+		"no timestamp":                 strings.Replace(readFile(t, "jira-issue-assigned.json"), `"timestamp": 1760152365200,`, "", 1),
+	} {
+		if w := post(body, "old-"+name); w.Code != 401 || !strings.Contains(w.Body.String(), "timestamp") {
+			t.Errorf("%s: %d %s, want 401", name, w.Code, w.Body)
+		}
+	}
+	if len(fr.tasks) != 0 {
+		t.Fatalf("an old payload started a run: %+v", fr.tasks)
+	}
+	// A delayed delivery inside the skew is accepted: a retry by Jira may
+	// carry the timestamp of the event.
+	if w := post(jiraBody(t, time.Now().Add(-skew+time.Minute)), "retry-1"); w.Code != 200 || len(fr.tasks) != 1 {
+		t.Errorf("delivery inside the skew: %d %s", w.Code, w.Body)
 	}
 }
 

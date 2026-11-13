@@ -288,6 +288,14 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusUnauthorized, "invalid signature")
 		return
 	}
+	// The signature proves who sent the payload, not when. Without this an
+	// old request could be sent again after a restart, when the delivery
+	// ids kept in memory are gone.
+	if err := jira.CheckTimestamp(body, cfg.MaxSkew, s.now()); err != nil {
+		log.Warn("timestamp check failed", "err", err, "remote", r.RemoteAddr)
+		reply(w, http.StatusUnauthorized, "stale or missing timestamp")
+		return
+	}
 	t, err := jira.ParseWebhook(body, cfg.BotAccountID)
 	if errors.Is(err, jira.ErrIgnored) {
 		log.Debug("ignored", "reason", err)
