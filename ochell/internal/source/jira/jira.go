@@ -122,9 +122,14 @@ type AutomationPayload struct {
 	Issue *Issue `json:"issue"`
 }
 
+// ErrNoAssignee marks an Automation payload that does not say who the ticket
+// is assigned to, although the bot's account id is configured. It is refused
+// rather than ignored: the rule's request body is most likely incomplete.
+var ErrNoAssignee = errors.New("jira automation payload has no assignee")
+
 // ParseAutomation accepts either the custom body or the built-in
-// "Work item data (Jira format)" body. When botAccountID is set and an
-// assignee is present in the payload, it must match.
+// "Work item data (Jira format)" body. When botAccountID is set, the payload
+// must name the bot as the assignee.
 func ParseAutomation(body []byte, botAccountID string) (*Ticket, error) {
 	var p AutomationPayload
 	if err := json.Unmarshal(body, &p); err != nil {
@@ -150,8 +155,13 @@ func ParseAutomation(body []byte, botAccountID string) (*Ticket, error) {
 	if t.Key == "" {
 		return nil, errors.New("jira automation payload has no issue key")
 	}
-	if botAccountID != "" && assignee != "" && assignee != botAccountID {
-		return nil, fmt.Errorf("%w: assignee %s is not the bot", ErrIgnored, assignee)
+	if botAccountID != "" {
+		if strings.TrimSpace(assignee) == "" {
+			return nil, ErrNoAssignee
+		}
+		if assignee != botAccountID {
+			return nil, fmt.Errorf("%w: assignee %s is not the bot", ErrIgnored, assignee)
+		}
 	}
 	return t, nil
 }

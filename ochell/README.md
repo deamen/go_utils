@@ -14,13 +14,14 @@ Linear (agent app)  ─────────┘  IP policy +   │ verify →
 | Source | Endpoint (default) | Authentication | Trigger |
 |---|---|---|---|
 | Jira system webhook | `POST /webhooks/jira` | `X-Hub-Signature: sha256=<HMAC>` with the webhook secret | `jira:issue_updated` whose changelog changes `assignee` to the bot, or `jira:issue_created` already assigned to the bot |
-| Jira Automation "Send web request" | `POST /webhooks/jira-automation` | Shared token in a header (`Authorization: Bearer …` by default). Automation cannot sign payloads. | Any authenticated request (the rule decides when to fire) |
+| Jira Automation "Send web request" | `POST /webhooks/jira-automation` | Shared token in a header (`Authorization: Bearer …` by default). Automation cannot sign payloads. | An authenticated request that names the bot as assignee. Without `bot_account_id`, any authenticated request (the rule decides when to fire) |
 | Linear agent app (`actor=app`) | `POST /webhooks/linear` | `Linear-Signature` HMAC and `webhookTimestamp` within 60s | `AgentSessionEvent` `created` (issue delegated to, or agent mentioned) |
 
 Behaviour common to all sources:
 - **Responses:**
   - 200 when a task is queued, ignored or a duplicate;
   - 401 when authentication fails;
+  - 400 when the payload is unusable, for example a Jira Automation request that names no assignee;
 - **Duplicate deliveries:** dropped using `X-Atlassian-Webhook-Identifier` / `Linear-Delivery`.
 - **One run per ticket:** a ticket that is already queued or running is not started again.
 - **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the agent exits it posts a `response` (the tail of the agent output) or an `error`.
@@ -183,7 +184,10 @@ Requires a Jira admin.
    - Method: POST
    - Header: `Authorization: Bearer <token>`, marked **Hidden**
    - Body: *Custom data*, using [examples/jira-automation-body.json](examples/jira-automation-body.json). The rule may also send *Work item data (Jira format)*.
-3. Hidden header values are lost when a rule is copied or imported, so re-enter the token afterwards.
+3. Set `sources.jira_automation.bot_account_id` to the digital employee's accountId. ochell then checks the assignee itself and does not rely on the rule's condition alone:
+   - a payload whose assignee is someone else is ignored (200);
+   - a payload that names no assignee is rejected (400), because the request body is then most likely incomplete. The rule's audit log shows the failure.
+4. Hidden header values are lost when a rule is copied or imported, so re-enter the token afterwards.
 
 ### Linear agent app
 1. In Linear go to *Settings → API → OAuth applications → New*.

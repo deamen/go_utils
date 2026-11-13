@@ -146,6 +146,33 @@ func TestJiraAutomation(t *testing.T) {
 	}
 }
 
+func TestJiraAutomationWithoutAssignee(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sources.JiraAutomation.BotAccountID = bot
+	fr := &fakeRunner{}
+	s := newServer(t, cfg, fr)
+	hdr := map[string]string{"Authorization": "Bearer auto-token"}
+	for _, body := range []string{
+		`{"issueKey":"DEV-42","summary":"s"}`,
+		`{"issueKey":"DEV-42","assigneeAccountId":""}`,
+		`{"issue":{"key":"DEV-42","fields":{"assignee":null}}}`,
+	} {
+		w := do(s, "/webhooks/jira-automation", body, hdr)
+		if w.Code != 400 || !strings.Contains(w.Body.String(), "no assignee") {
+			t.Errorf("%s: %d %s, want 400", body, w.Code, w.Body)
+		}
+	}
+	if w := do(s, "/webhooks/jira-automation", `{"issueKey":"DEV-42","assigneeAccountId":"someone-else"}`, hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "ignored") {
+		t.Errorf("other assignee: %d %s, want 200 ignored", w.Code, w.Body)
+	}
+	if len(fr.tasks) != 0 {
+		t.Fatalf("a run was started without the bot as assignee: %+v", fr.tasks)
+	}
+	if w := do(s, "/webhooks/jira-automation", readFile(t, "jira-automation.json"), hdr); w.Code != 200 || len(fr.tasks) != 1 {
+		t.Errorf("payload that names the bot: %d %s, tasks %d", w.Code, w.Body, len(fr.tasks))
+	}
+}
+
 func TestMethodAndUnknownPath(t *testing.T) {
 	s := newServer(t, testConfig(), &fakeRunner{})
 	w := httptest.NewRecorder()

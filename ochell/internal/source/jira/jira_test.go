@@ -70,3 +70,25 @@ func TestParseAutomation(t *testing.T) {
 		t.Error("missing key should fail")
 	}
 }
+
+// With the bot's account id configured, a payload that names no assignee
+// must not start a run.
+func TestParseAutomationRequiresAssignee(t *testing.T) {
+	for name, body := range map[string]string{
+		"field missing":        `{"issueKey":"DEV-1","summary":"s"}`,
+		"field empty":          `{"issueKey":"DEV-1","assigneeAccountId":""}`,
+		"field blank":          `{"issueKey":"DEV-1","assigneeAccountId":"  "}`,
+		"jira format, null":    `{"issue":{"key":"DEV-1","fields":{"summary":"s","assignee":null}}}`,
+		"jira format, missing": `{"issue":{"key":"DEV-1","fields":{"summary":"s"}}}`,
+		"jira format, empty":   `{"issue":{"key":"DEV-1","fields":{"assignee":{"accountId":""}}}}`,
+	} {
+		tk, err := ParseAutomation([]byte(body), bot)
+		if !errors.Is(err, ErrNoAssignee) || errors.Is(err, ErrIgnored) || tk != nil {
+			t.Errorf("%s: got %+v, %v; want ErrNoAssignee", name, tk, err)
+		}
+	}
+	// Without a configured bot the rule alone decides, as before.
+	if tk, err := ParseAutomation([]byte(`{"issueKey":"DEV-1"}`), ""); err != nil || tk.Key != "DEV-1" {
+		t.Errorf("no bot configured: got %+v, %v", tk, err)
+	}
+}

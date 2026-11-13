@@ -314,6 +314,11 @@ func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusOK, "ignored")
 		return
 	}
+	if errors.Is(err, jira.ErrNoAssignee) {
+		log.Warn("rejected: the payload names no assignee; check the rule's request body")
+		reply(w, http.StatusBadRequest, "no assignee in the payload: send assigneeAccountId")
+		return
+	}
 	if err != nil {
 		log.Warn("bad payload", "err", err)
 		reply(w, http.StatusBadRequest, "bad payload")
