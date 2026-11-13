@@ -33,6 +33,19 @@ make                      # cross-compile for linux/darwin/windows on amd64/arm6
 go build -o ochell .
 ```
 
+### End-to-end tests
+`go test ./e2e/` (part of `make test`) starts a real `ochell` process and sends it signed webhooks. The agent is [e2e/fakeagent](e2e/fakeagent/main.go), a scripted stand-in that records its arguments, environment, stdin and working directory, and Linear is a fake API that records the activities ochell posts. No real agent or tracker is involved.
+
+A test uses the harness in [e2e/harness.go](e2e/harness.go):
+```go
+o := e2e.Start(t, e2e.Options{Script: []e2e.Step{{Print: "done"}, e2e.Exit(0)}})
+id := o.LinearCreated("ENG-1", "session-1", "context").TaskID(t)
+run := o.WaitRun(id, 15*time.Second)          // exit code and log of the run
+rec := o.WaitRecords(1, 5*time.Second)[0]     // what the agent was started with
+acts := o.WaitActivities("session-1", 2, 10*time.Second)
+```
+The harness uses the direct launcher. A test that needs the systemd launcher calls `e2e.RequireVM(t)` and is skipped unless `OCHELL_E2E_VM=1`, because CI has no systemd; run those on the VM.
+
 ## Commands
 ```
 ochell serve --config config.yaml                 # default command
