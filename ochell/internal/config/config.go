@@ -83,6 +83,9 @@ type Linear struct {
 	OrganizationID string `yaml:"organization_id"`
 	// Optional: link shown on the agent session, templated with the task.
 	ExternalURL string `yaml:"external_url"`
+	// APIURL and TokenURL override the Linear endpoints. Only tests set them.
+	APIURL   string `yaml:"api_url"`
+	TokenURL string `yaml:"token_url"`
 }
 
 type Sources struct {

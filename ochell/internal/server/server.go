@@ -60,6 +60,12 @@ func New(cfg *config.Config, log *slog.Logger, r Submitter) (*Server, error) {
 	lc := cfg.Sources.Linear
 	if lc.Enabled && lc.ClientID != "" {
 		s.linear = linear.NewClient(lc.ClientID, lc.ClientSecret, lc.TokenFile)
+		if lc.APIURL != "" {
+			s.linear.APIURL = lc.APIURL
+		}
+		if lc.TokenURL != "" {
+			s.linear.TokenURL = lc.TokenURL
+		}
 	}
 	if lc.ExternalURL != "" {
 		t, err := template.New("external_url").Parse(lc.ExternalURL)
