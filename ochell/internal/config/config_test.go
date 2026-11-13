@@ -90,3 +90,40 @@ func TestValidate(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentEnvValidation(t *testing.T) {
+	p := writeYAML(t, `
+agent:
+  env_pass: [PATH, "BAD NAME"]
+  env: { "A=B": x, GOOD_1: y }
+sources:
+  jira_automation: { enabled: true, token: t }
+`)
+	cfg, err := Load("serve", []string{"--config", p}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation errors")
+	}
+	for _, want := range []string{`agent.env_pass: "BAD NAME"`, `agent.env: "A=B"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("missing %q in:\n%v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "GOOD_1") || strings.Contains(err.Error(), `"PATH"`) {
+		t.Errorf("valid names rejected:\n%v", err)
+	}
+
+	cfg, err = Load("serve", []string{"--agent-env-pass", "PATH", "--agent-env-pass", "ANTHROPIC_API_KEY"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Agent.EnvPass, ","); got != "PATH,ANTHROPIC_API_KEY" {
+		t.Errorf("flag should replace the default env_pass, got %q", got)
+	}
+	if got := Default().Agent.EnvPass; len(got) != len(DefaultEnvPass) {
+		t.Errorf("default env_pass changed by a flag: %v", got)
+	}
+}

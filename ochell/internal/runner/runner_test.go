@@ -33,6 +33,10 @@ func TestHelperAgent(t *testing.T) {
 		fmt.Println("key:", os.Getenv("ORCH_TASK_KEY"))
 		wd, _ := os.Getwd()
 		fmt.Println("wd:", filepath.Base(wd))
+	case "env":
+		for _, kv := range os.Environ() {
+			fmt.Println("env:", kv)
+		}
 	case "stdin":
 		b, _ := io.ReadAll(os.Stdin)
 		fmt.Print("stdin:", string(b))
@@ -46,7 +50,6 @@ func TestHelperAgent(t *testing.T) {
 }
 
 func agentCfg(t *testing.T, mode string, extraArgs ...string) config.Agent {
-	t.Setenv("ORCH_HELPER", "1")
 	dir := t.TempDir()
 	return config.Agent{
 		Command:        os.Args[0],
@@ -54,6 +57,8 @@ func agentCfg(t *testing.T, mode string, extraArgs ...string) config.Agent {
 		PromptVia:      "arg",
 		PromptTemplate: "Fix {{.Key}}: {{.Title}}",
 		Workdir:        filepath.Join(dir, "work", "{{.Key}}"),
+		EnvPass:        config.DefaultEnvPass,
+		Env:            map[string]string{"ORCH_HELPER": "1"},
 		Timeout:        5 * time.Second,
 		MaxConcurrent:  1,
 		QueueSize:      2,
@@ -94,6 +99,53 @@ func TestRunStdin(t *testing.T) {
 	res := r.Run(context.Background(), newTask())
 	if res.Err != nil || !strings.Contains(res.Tail, "stdin:Fix DEV-1") {
 		t.Fatalf("err=%v tail=%q", res.Err, res.Tail)
+	}
+}
+
+func TestRunEnvironmentIsAllowlisted(t *testing.T) {
+	// What ochell typically has in its own environment.
+	secrets := map[string]string{
+		"JIRA_WEBHOOK_SECRET":  "jira-secret-value",
+		"LINEAR_CLIENT_SECRET": "linear-secret-value",
+		"NGROK_API_KEY":        "ngrok-secret-value",
+		"ORCH_INHERITED":       "orch-secret-value",
+	}
+	for k, v := range secrets {
+		t.Setenv(k, v)
+	}
+	t.Setenv("LANG", "en_AU.UTF-8")
+	t.Setenv("OCHELL_TEST_PASSED", "passed-on")
+	cfg := agentCfg(t, "env")
+	cfg.EnvPass = append([]string{"OCHELL_TEST_PASSED", "OCHELL_TEST_UNSET"}, cfg.EnvPass...)
+	cfg.Env["AGENT_SETTING"] = "from-config"
+	r, err := New(cfg, logger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := r.Run(context.Background(), newTask())
+	if res.Err != nil {
+		t.Fatalf("run failed: %v\n%s", res.Err, res.Tail)
+	}
+	logged, err := os.ReadFile(res.LogFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(logged)
+	for k, v := range secrets {
+		if strings.Contains(out, k) || strings.Contains(out, v) {
+			t.Errorf("agent environment leaks %s", k)
+		}
+	}
+	for _, want := range []string{
+		"env: PATH=" + os.Getenv("PATH"), "env: LANG=en_AU.UTF-8", "env: OCHELL_TEST_PASSED=passed-on",
+		"env: ORCH_TASK_KEY=DEV-1", "env: ORCH_TASK_ID=t1", "env: AGENT_SETTING=from-config",
+	} {
+		if !strings.Contains(out, want+"\n") {
+			t.Errorf("agent environment missing %q", want)
+		}
+	}
+	if strings.Contains(out, "OCHELL_TEST_UNSET") {
+		t.Error("a variable that is not set must not be passed as empty")
 	}
 }
 
