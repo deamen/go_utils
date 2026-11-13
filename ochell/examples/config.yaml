@@ -51,8 +51,13 @@ agent:
   systemd:
     launch_command: [sudo, -n, /usr/local/libexec/ochell/ochell-launch]
     stop_command: [sudo, -n, /usr/local/libexec/ochell/ochell-stop]
-  # Time between SIGTERM and SIGKILL when a run is stopped.
+  # Time between SIGTERM and SIGKILL when a run is stopped, at the time limit
+  # or on shutdown. The whole agent is stopped, with its children.
   stop_grace: 10s
+  # How long a shutdown waits for running agents before it stops them. If
+  # ochell is a systemd service, keep the service's TimeoutStopSec above
+  # drain_timeout + stop_grace.
+  drain_timeout: 30s
   # The agent does not inherit ochell's environment, which holds the secrets
   # above. Only the variables named here are copied from it. This is the
   # default list; add the agent's own credential (e.g. ANTHROPIC_API_KEY) if

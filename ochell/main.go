@@ -101,8 +101,20 @@ func serve(args []string) error {
 	log := newLogger(cfg.LogLevel)
 	log.Info("starting ochell", "version", version, "build", build, "agent", cfg.Agent.Command)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// The first signal starts the shutdown; a second one ends the wait for
+	// running agents.
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hurry := make(chan struct{})
+	go func() {
+		<-sigs
+		cancel()
+		<-sigs
+		close(hurry)
+	}()
 
 	r, err := runner.New(cfg.Agent, log)
 	if err != nil {
@@ -116,11 +128,26 @@ func serve(args []string) error {
 		go ipsync.RunSync(ctx, cfg.NgrokSync, ipsync.NewFetcher(), log)
 	}
 
-	r.Start(ctx)
+	r.Start()
 	err = srv.Run(ctx)
-	// Stop accepting work and terminate running agents.
-	stop()
-	r.Stop()
+	cancel()
+
+	// Give running agents time to finish; a restart must not kill them all
+	// at once. After the wait, or on a second signal, they are stopped.
+	drain, stopDrain := context.WithTimeout(context.Background(), cfg.Agent.DrainTimeout)
+	defer stopDrain()
+	go func() {
+		select {
+		case <-hurry:
+			log.Warn("second signal: not waiting for running agents")
+			stopDrain()
+		case <-drain.Done():
+		}
+	}()
+	if n := r.Running(); n > 0 {
+		log.Info("shutting down: waiting for running agents", "tasks", n, "drain_timeout", cfg.Agent.DrainTimeout)
+	}
+	r.Shutdown(drain)
 	log.Info("stopped")
 	return err
 }
