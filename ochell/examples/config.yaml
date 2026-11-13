@@ -37,6 +37,14 @@ agent:
     {{.Context}}
     {{- end}}
   workdir: /work/{{.Source}}/{{.Key}}
+  # The agent does not inherit ochell's environment, which holds the secrets
+  # above. Only the variables named here are copied from it. This is the
+  # default list; add the agent's own credential (e.g. ANTHROPIC_API_KEY) if
+  # it comes from the environment.
+  env_pass: [PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_ALL, LC_CTYPE, TZ, TMPDIR,
+             HTTP_PROXY, HTTPS_PROXY, NO_PROXY, http_proxy, https_proxy, no_proxy,
+             SSL_CERT_FILE, SSL_CERT_DIR]
+  # Set for the agent in addition to env_pass and ORCH_TASK_*.
   env:
     CI: "true"
   timeout: 2h

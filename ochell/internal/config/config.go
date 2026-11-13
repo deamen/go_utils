@@ -37,14 +37,18 @@ type Agent struct {
 	// text/template rendered with the task (e.g. "{{.Prompt}}").
 	Args []string `yaml:"args"`
 	// PromptVia is "arg" (prompt referenced in Args) or "stdin".
-	PromptVia      string            `yaml:"prompt_via"`
-	PromptTemplate string            `yaml:"prompt_template"`
-	Workdir        string            `yaml:"workdir"`
-	Env            map[string]string `yaml:"env"`
-	Timeout        time.Duration     `yaml:"timeout"`
-	MaxConcurrent  int               `yaml:"max_concurrent"`
-	QueueSize      int               `yaml:"queue_size"`
-	LogDir         string            `yaml:"log_dir"`
+	PromptVia      string `yaml:"prompt_via"`
+	PromptTemplate string `yaml:"prompt_template"`
+	Workdir        string `yaml:"workdir"`
+	// EnvPass names the variables the agent inherits from ochell's own
+	// environment. Everything else, including ochell's secrets, is dropped.
+	EnvPass []string `yaml:"env_pass"`
+	// Env is set for the agent in addition to EnvPass and ORCH_TASK_*.
+	Env           map[string]string `yaml:"env"`
+	Timeout       time.Duration     `yaml:"timeout"`
+	MaxConcurrent int               `yaml:"max_concurrent"`
+	QueueSize     int               `yaml:"queue_size"`
+	LogDir        string            `yaml:"log_dir"`
 }
 
 type JiraWebhook struct {
@@ -126,6 +130,14 @@ Context provided by {{.Source}}:
 {{- end}}
 `
 
+// DefaultEnvPass is what an agent CLI needs to find its binaries, home
+// directory, locale, proxy and CA settings. It holds no ochell secret.
+var DefaultEnvPass = []string{
+	"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
+	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+	"SSL_CERT_FILE", "SSL_CERT_DIR",
+}
+
 func Default() *Config {
 	return &Config{
 		LogLevel: "info",
@@ -137,6 +149,7 @@ func Default() *Config {
 			PromptVia:      "arg",
 			PromptTemplate: DefaultPromptTemplate,
 			Workdir:        ".",
+			EnvPass:        append([]string(nil), DefaultEnvPass...),
 			Timeout:        2 * time.Hour,
 			MaxConcurrent:  1,
 			QueueSize:      100,
@@ -156,6 +169,8 @@ func Default() *Config {
 		NgrokSync:   NgrokSync{APIURL: "https://api.ngrok.com", Interval: 6 * time.Hour},
 	}
 }
+
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
@@ -262,6 +277,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.Agent.Command, "agent-cmd", c.Agent.Command, "agent CLI command")
 	fs.Var(&stringList{dst: &c.Agent.Args}, "agent-arg", "agent CLI argument, repeatable, Go template (replaces config args)")
 	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: arg or stdin")
+	fs.Var(&stringList{dst: &c.Agent.EnvPass}, "agent-env-pass", "environment variable the agent inherits from ochell, repeatable (replaces config env_pass)")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
 	fs.DurationVar(&c.Agent.Timeout, "agent-timeout", c.Agent.Timeout, "maximum agent run time")
 	fs.IntVar(&c.Agent.MaxConcurrent, "agent-max-concurrent", c.Agent.MaxConcurrent, "maximum concurrent agent runs")
@@ -311,6 +327,16 @@ func (c *Config) Validate() error {
 	}
 	if c.Agent.PromptVia != "arg" && c.Agent.PromptVia != "stdin" {
 		errs = append(errs, errors.New("agent.prompt_via must be arg or stdin"))
+	}
+	for _, n := range c.Agent.EnvPass {
+		if !envName.MatchString(n) {
+			errs = append(errs, fmt.Errorf("agent.env_pass: %q is not a variable name", n))
+		}
+	}
+	for n := range c.Agent.Env {
+		if !envName.MatchString(n) {
+			errs = append(errs, fmt.Errorf("agent.env: %q is not a variable name", n))
+		}
 	}
 	if c.Agent.MaxConcurrent < 1 {
 		errs = append(errs, errors.New("agent.max_concurrent must be >= 1"))

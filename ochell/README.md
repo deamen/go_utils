@@ -53,6 +53,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-cmd` | Agent CLI executable (default `claude`) |
 | `--agent-arg` | Agent argument; repeatable; replaces the YAML `args`. Go template: `{{.Prompt}}`, `{{.Key}}`, `{{.URL}}`, `{{.Source}}`, `{{.Title}}`, `{{.ID}}`, `{{.Context}}` |
 | `--agent-prompt-via` | `arg` (default) or `stdin` |
+| `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
 | `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-log-dir` | Execution settings |
 | `--jira-webhook`, `--jira-webhook-secret`, `--jira-bot-account-id` | Jira system webhook source |
 | `--jira-automation`, `--jira-automation-header`, `--jira-automation-token` | Jira Automation source |
@@ -65,7 +66,15 @@ JIRA_SECRET=... ochell serve --http-addr 127.0.0.1 --http-port 8080 \
   --agent-cmd claude --agent-arg -p --agent-arg '{{.Prompt}}'
 ```
 
-The agent runs without a shell, with its working directory set to `workdir` (rendered per task). It receives the environment variables `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY` and `ORCH_TASK_URL`. Output goes to `<log_dir>/<task id>.log`.
+The agent runs without a shell, with its working directory set to `workdir` (rendered per task). Output goes to `<log_dir>/<task id>.log`.
+
+### Agent environment
+The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:
+- the variables named in `agent.env_pass`, copied from ochell's environment when they are set. The default list is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), `SSL_CERT_FILE` and `SSL_CERT_DIR`;
+- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY` and `ORCH_TASK_URL`;
+- the variables set in `agent.env`.
+
+Setting `env_pass` (or `--agent-env-pass`) replaces the default list. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, add that name to `env_pass`. Never add a variable that holds one of ochell's own secrets.
 
 ## Setup
 ### Jira system webhook (recommended)
@@ -168,6 +177,7 @@ Notes:
   - Request bodies are limited to 1 MiB.
   - Ticket keys must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` before they are used in file names or templates.
   - Signatures and tokens are compared in constant time.
+- **Agent environment:** the agent gets an allowlisted environment, not ochell's own (see [Agent environment](#agent-environment)). It still runs as the same OS user as ochell, so it can read ochell's files.
 - **Secrets:** never commit secrets or TLS keys. The repository's pre-commit hooks reject private keys.
 
 ## Licensing notes (checked October 2026)

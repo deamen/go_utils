@@ -218,15 +218,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	cmd := exec.CommandContext(ctx, r.cfg.Command, args...)
 	cmd.Dir = dir
 	cmd.WaitDelay = 10 * time.Second
-	cmd.Env = append(os.Environ(),
-		"ORCH_TASK_ID="+t.ID,
-		"ORCH_TASK_SOURCE="+t.Source,
-		"ORCH_TASK_KEY="+t.Key,
-		"ORCH_TASK_URL="+t.URL,
-	)
-	for k, v := range r.cfg.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = r.environ(t)
 	if r.cfg.PromptVia == "stdin" {
 		cmd.Stdin = strings.NewReader(t.Prompt)
 	}
@@ -247,6 +239,29 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	}
 	fmt.Fprintf(lf, "\n# ---- exit=%d err=%v duration=%s ----\n", res.ExitCode, res.Err, time.Since(start))
 	return res
+}
+
+// environ builds the agent's environment. The agent reads untrusted ticket
+// text, so it never inherits ochell's own environment, which holds the
+// webhook secrets and API keys: only the variables named in env_pass are
+// copied from it.
+func (r *Runner) environ(t *task.Task) []string {
+	env := []string{}
+	for _, name := range r.cfg.EnvPass {
+		if v, ok := os.LookupEnv(name); ok {
+			env = append(env, name+"="+v)
+		}
+	}
+	env = append(env,
+		"ORCH_TASK_ID="+t.ID,
+		"ORCH_TASK_SOURCE="+t.Source,
+		"ORCH_TASK_KEY="+t.Key,
+		"ORCH_TASK_URL="+t.URL,
+	)
+	for k, v := range r.cfg.Env {
+		env = append(env, k+"="+v)
+	}
+	return env
 }
 
 // tailBuffer keeps the last max bytes written to it.
