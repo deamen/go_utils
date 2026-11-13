@@ -64,8 +64,8 @@ Common flags (run `ochell serve -h` for all of them):
 | `--http`, `--http-addr`, `--http-port` | Enable the HTTP listener and set its address and port separately |
 | `--https`, `--https-addr`, `--https-port`, `--tls-cert`, `--tls-key` | Same for HTTPS (TLS 1.2+) |
 | `--agent-cmd` | Agent CLI executable (default `claude`) |
-| `--agent-arg` | Agent argument; repeatable; replaces the YAML `args`. Go template: `{{.Prompt}}`, `{{.Key}}`, `{{.URL}}`, `{{.Source}}`, `{{.Title}}`, `{{.ID}}`, `{{.Context}}` |
-| `--agent-prompt-via` | `arg` (default) or `stdin` |
+| `--agent-arg` | Agent argument; repeatable; replaces the YAML `args` (default `-p`). Go template: `{{.Key}}`, `{{.Source}}`, `{{.ID}}`. Keep ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`, `{{.Prompt}}`) out of arguments; see [The prompt](#the-prompt) |
+| `--agent-prompt-via` | `stdin` (default) or `arg` |
 | `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
 | `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-log-dir` | Execution settings |
 | `--jira-webhook`, `--jira-webhook-secret`, `--jira-bot-account-id` | Jira system webhook source |
@@ -76,10 +76,19 @@ Example without a YAML file:
 ```
 JIRA_SECRET=... ochell serve --http-addr 127.0.0.1 --http-port 8080 \
   --jira-webhook --jira-webhook-secret "$JIRA_SECRET" --jira-bot-account-id 712020:... \
-  --agent-cmd claude --agent-arg -p --agent-arg '{{.Prompt}}'
+  --agent-cmd claude --agent-arg -p
 ```
 
 The agent runs without a shell, with its working directory set to `workdir` (rendered per task). Output goes to `<log_dir>/<task id>.log`.
+
+### The prompt
+The prompt is rendered from `agent.prompt_template` and written to the agent's **stdin** (`prompt_via: stdin`, the default), which is how `claude -p` reads it when no prompt argument is given.
+
+`prompt_via: arg` passes it as an argument instead: put `{{.Prompt}}` in `args`. Use this only for an agent CLI that cannot read stdin, because:
+- command-line arguments are visible to every local user in the process list, and the prompt contains ticket text;
+- the kernel limits one argument to 128 KB, and a Linear prompt context can be larger, in which case the agent cannot be started.
+
+For the same reasons, do not put other ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`) in `args`.
 
 ### Agent environment
 The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:
@@ -133,14 +142,15 @@ Requires a Jira admin.
 If the orchestrator is exposed directly instead, set `ip_allowlist.enabled: true`. Only set `trust_proxy_header` when a trusted proxy sets `X-Forwarded-For`.
 
 ## Testing with curl
-You can send the sample payloads in [testdata/](testdata/) by hand to check the endpoints and the agent command without Jira or Linear. Start a local instance with test secrets and `echo` as the agent, so that no real agent runs:
+You can send the sample payloads in [testdata/](testdata/) by hand to check the endpoints and the agent command without Jira or Linear. Start a local instance with test secrets and `cat` as the agent, so that no real agent runs:
 ```
 ochell serve --http-addr 127.0.0.1 --http-port 8080 \
   --jira-webhook --jira-webhook-secret jira-secret --jira-bot-account-id 712020:digital-employee \
   --jira-automation --jira-automation-token automation-token \
   --linear --linear-secret linear-secret \
-  --agent-cmd echo --agent-arg '{{.Prompt}}' --agent-workdir /tmp --agent-log-dir /tmp
+  --agent-cmd cat --agent-arg - --agent-workdir /tmp --agent-log-dir /tmp
 ```
+`cat -` copies its stdin, which is the prompt, to the log.
 Each request below returns `200 queued <task id>`, and the agent output goes to `<log_dir>/<task id>.log`. The signature is an HMAC-SHA256 of the **exact bytes** sent, so always use `--data-binary` (`-d` strips newlines).
 
 ### Jira system webhook
