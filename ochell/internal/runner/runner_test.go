@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,6 +43,9 @@ func TestHelperAgent(t *testing.T) {
 		fmt.Print("stdin:", string(b))
 	case "sleep":
 		time.Sleep(10 * time.Second)
+	case "nap":
+		time.Sleep(300 * time.Millisecond)
+		fmt.Println("rested")
 	case "fail":
 		fmt.Println("boom")
 		os.Exit(3)
@@ -233,8 +237,7 @@ func TestSubmitInFlightAndCallbacks(t *testing.T) {
 	if err := r.Submit(newTask()); err != ErrBusy {
 		t.Fatalf("second submit for same ticket: got %v, want ErrBusy", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	r.Start(ctx)
+	r.Start()
 	select {
 	case res := <-done:
 		if res.Err != nil {
@@ -243,10 +246,95 @@ func TestSubmitInFlightAndCallbacks(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("task did not finish")
 	}
-	cancel()
-	r.Stop()
+	r.Shutdown(context.Background())
 	if err := r.Submit(newTask()); err != ErrStopped {
-		t.Fatalf("submit after stop: got %v", err)
+		t.Fatalf("submit after shutdown: got %v", err)
+	}
+}
+
+// finished collects the result of each task by ticket key.
+type finished struct {
+	mu  sync.Mutex
+	res map[string]task.Result
+}
+
+func (f *finished) task(key string) *task.Task {
+	tk := newTask()
+	tk.ID, tk.Key = "t-"+key, key
+	tk.OnFinish = func(_ context.Context, t *task.Task, res task.Result) error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.res == nil {
+			f.res = map[string]task.Result{}
+		}
+		f.res[t.Key] = res
+		return nil
+	}
+	return tk
+}
+
+func (f *finished) outcome(key string) task.Outcome {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.res[key].Outcome
+}
+
+func waitRunning(t *testing.T, r *Runner, logDir, id string) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(filepath.Join(logDir, id+".log")); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task %s did not start", id)
+		}
+	}
+}
+
+// A shutdown waits for the running agent, and starts nothing new.
+func TestShutdownDrains(t *testing.T) {
+	cfg := agentCfg(t, "nap")
+	r, _ := New(cfg, logger())
+	var f finished
+	for _, key := range []string{"A-1", "A-2"} {
+		if err := r.Submit(f.task(key)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.Start()
+	waitRunning(t, r, cfg.LogDir, "t-A-1")
+	r.Shutdown(context.Background())
+	if got := f.outcome("A-1"); got != task.OutcomeFinished {
+		t.Errorf("running task: outcome %q, want finished: the shutdown must wait for it", got)
+	}
+	if got := f.outcome("A-2"); got != task.OutcomeNotStarted {
+		t.Errorf("queued task: outcome %q, want not_started", got)
+	}
+	if n := r.Running(); n != 0 {
+		t.Errorf("Running() = %d after shutdown, want 0", n)
+	}
+}
+
+// When the wait is over, the running agent is stopped.
+func TestShutdownStopsAfterTheWait(t *testing.T) {
+	cfg := agentCfg(t, "sleep")
+	cfg.Timeout = time.Minute
+	r, _ := New(cfg, logger())
+	var f finished
+	if err := r.Submit(f.task("B-1")); err != nil {
+		t.Fatal(err)
+	}
+	r.Start()
+	waitRunning(t, r, cfg.LogDir, "t-B-1")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	r.Shutdown(ctx)
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("shutdown took %s; the agent was not stopped", d)
+	}
+	if got := f.outcome("B-1"); got != task.OutcomeStopped {
+		t.Errorf("outcome %q, want stopped", got)
 	}
 }
 

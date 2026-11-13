@@ -46,10 +46,16 @@ type Runner struct {
 	inFlight map[string]bool
 	stopped  bool
 	wg       sync.WaitGroup
+	// quit is closed when Shutdown begins: workers start no more tasks.
+	quit chan struct{}
+	// runCtx is cancelled to stop the agents that are still running.
+	runCtx   context.Context
+	stopRuns context.CancelFunc
 }
 
 func New(cfg config.Agent, log *slog.Logger) (*Runner, error) {
-	r := &Runner{cfg: cfg, log: log, inFlight: map[string]bool{}}
+	r := &Runner{cfg: cfg, log: log, inFlight: map[string]bool{}, quit: make(chan struct{})}
+	r.runCtx, r.stopRuns = context.WithCancel(context.Background())
 	var err error
 	if r.prompt, err = parse("prompt_template", cfg.PromptTemplate); err != nil {
 		return nil, err
@@ -123,33 +129,92 @@ func (r *Runner) Submit(t *task.Task) error {
 	}
 }
 
-// Start launches the worker pool. Workers exit when ctx is cancelled;
-// cancelling ctx also terminates running agents.
-func (r *Runner) Start(ctx context.Context) {
+// Start launches the worker pool. Shutdown ends it.
+func (r *Runner) Start() {
 	n := max(r.cfg.MaxConcurrent, 1)
 	for range n {
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
 			for {
+				// A closed quit wins over a waiting task.
 				select {
-				case <-ctx.Done():
+				case <-r.quit:
+					return
+				default:
+				}
+				select {
+				case <-r.quit:
 					return
 				case t := <-r.queue:
-					r.handle(ctx, t)
+					r.handle(r.runCtx, t)
 				}
 			}
 		}()
 	}
 }
 
-// Stop rejects new tasks and waits for workers to exit (after ctx passed to
-// Start is cancelled).
-func (r *Runner) Stop() {
+// Shutdown rejects new tasks and waits for the running agents to finish.
+// When ctx is done first, it stops them and waits for that. Tasks that were
+// queued but not started are reported as not started.
+//
+// Runs that a shutdown interrupts are not resumed after a restart.
+func (r *Runner) Shutdown(ctx context.Context) {
 	r.mu.Lock()
+	already := r.stopped
 	r.stopped = true
 	r.mu.Unlock()
-	r.wg.Wait()
+	if already {
+		r.wg.Wait()
+		return
+	}
+	close(r.quit)
+
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		r.log.Warn("stopping the agents that are still running")
+		r.stopRuns()
+		<-done
+	}
+	r.stopRuns()
+
+	// No worker is left, so nothing else reads the queue.
+	for {
+		select {
+		case t := <-r.queue:
+			r.drop(t)
+		default:
+			return
+		}
+	}
+}
+
+// Running returns the number of tasks that are queued or running.
+func (r *Runner) Running() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.inFlight)
+}
+
+// drop reports a queued task that will not be started.
+func (r *Runner) drop(t *task.Task) {
+	r.mu.Lock()
+	delete(r.inFlight, ticketKey(t))
+	r.mu.Unlock()
+	r.log.Warn("task dropped: ochell shut down before it started", "task", t.ID, "source", t.Source, "key", t.Key)
+	if t.OnFinish == nil {
+		return
+	}
+	res := task.Result{Outcome: task.OutcomeNotStarted, ExitCode: -1, Err: errors.New("ochell shut down before the run started")}
+	if err := t.OnFinish(context.Background(), t, res); err != nil {
+		r.log.Warn("finish notification failed", "task", t.ID, "err", err)
+	}
 }
 
 func (r *Runner) handle(ctx context.Context, t *task.Task) {
@@ -210,7 +275,7 @@ type waitResult struct {
 }
 
 // Run renders the prompt and executes the agent synchronously. Cancelling
-// ctx stops the agent.
+// ctx stops the agent with all its processes.
 func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	start := time.Now()
 	res.ExitCode = -1
@@ -305,7 +370,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	case res.Outcome == task.OutcomeTimedOut:
 		res.Err = fmt.Errorf("agent timed out after %s", r.cfg.Timeout)
 	case res.Outcome == task.OutcomeStopped:
-		res.Err = errors.New("the agent was stopped before it finished")
+		res.Err = errors.New("the agent was stopped because ochell is shutting down")
 	case errors.Is(w.err, launcher.ErrNotStarted):
 		res.Outcome = task.OutcomeNotStarted
 		res.Err = w.err

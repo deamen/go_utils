@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -239,6 +240,167 @@ func TestSystemdLauncherRefusedLaunch(t *testing.T) {
 	}
 }
 
+// spawning is a fake agent that behaves like a real one with sub-agents and
+// MCP servers: it starts children and keeps working.
+func spawning(children ...Step) []Step {
+	return append(children, Step{Print: "working"}, Step{Sleep: "10m"})
+}
+
+func expectAllGone(t *testing.T, rec Record, wantChildren int) {
+	t.Helper()
+	if len(rec.Children) != wantChildren {
+		t.Fatalf("the agent started %d children, want %d", len(rec.Children), wantChildren)
+	}
+	// The processes are killed, not waited for; give the kernel a moment.
+	deadline := time.Now().Add(5 * time.Second)
+	for _, pid := range append([]int{rec.PID}, rec.Children...) {
+		for Alive(pid) {
+			if time.Now().After(deadline) {
+				t.Errorf("process %d is still running", pid)
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
+// waitChildren waits until the fake agent has recorded its children.
+func waitChildren(t *testing.T, o *Ochell, n int) Record {
+	t.Helper()
+	var rec Record
+	o.waitFor(10*time.Second, "the agent to start its children", func() bool {
+		recs := o.Records()
+		if len(recs) == 0 || len(recs[0].Children) < n {
+			return false
+		}
+		rec = recs[0]
+		return true
+	})
+	return rec
+}
+
+// At the time limit the whole agent is stopped, not only its top process.
+func TestTimeoutLeavesNoProcessBehind(t *testing.T) {
+	o := Start(t, Options{
+		// One child ignores SIGTERM, and so does the agent itself.
+		Script: append([]Step{{IgnoreTerm: true}}, spawning(Step{Spawn: &Spawn{Count: 2}}, Step{Spawn: &Spawn{Count: 1, IgnoreTerm: true}})...),
+		Configure: func(c *config.Config) {
+			c.Agent.Timeout = time.Second
+			c.Agent.StopGrace = time.Second
+		},
+	})
+	id := o.JiraAssigned("DEV-7", "Spawn children").TaskID(t)
+	rec := waitChildren(t, o, 3)
+	run := o.WaitRun(id, 20*time.Second)
+	if !strings.Contains(run.Footer, "outcome=timed_out") {
+		t.Errorf("run: %s", run.Footer)
+	}
+	expectAllGone(t, rec, 3)
+}
+
+// A shutdown waits for running agents up to drain_timeout, then stops them
+// with all their children.
+func TestShutdownLeavesNoProcessBehind(t *testing.T) {
+	o := Start(t, Options{
+		Script: spawning(Step{Spawn: &Spawn{Count: 2}}, Step{Spawn: &Spawn{Count: 1, IgnoreTerm: true}}),
+		Configure: func(c *config.Config) {
+			c.Agent.DrainTimeout = time.Second
+			c.Agent.StopGrace = time.Second
+		},
+	})
+	id := o.LinearCreated("ENG-27", "session-shutdown", "").TaskID(t)
+	rec := waitChildren(t, o, 3)
+	sent := time.Now()
+	o.Signal(syscall.SIGTERM)
+	if code := o.WaitExit(20 * time.Second); code != 0 {
+		t.Errorf("ochell exit code %d", code)
+	}
+	if d := time.Since(sent); d < time.Second {
+		t.Errorf("ochell exited after %s, before drain_timeout was over", d)
+	}
+	run := o.WaitRun(id, time.Second)
+	if !strings.Contains(run.Footer, "outcome=stopped") {
+		t.Errorf("run: %s", run.Footer)
+	}
+	expectAllGone(t, rec, 3)
+	// The ticket is told that the run was cut short.
+	acts := o.Linear.Activities("session-shutdown")
+	if len(acts) != 2 || acts[1].Type != "error" || !strings.Contains(acts[1].Body, "shutting down") {
+		t.Errorf("activities = %+v, want an error that names the shutdown", acts)
+	}
+}
+
+// An agent that finishes within drain_timeout is not cut short by a
+// shutdown, and no new webhook is accepted meanwhile.
+func TestShutdownWaitsForRunningAgent(t *testing.T) {
+	o := Start(t, Options{
+		Script:    []Step{{Print: "started"}, {Sleep: "1500ms"}, {Print: "all done"}},
+		Configure: func(c *config.Config) { c.Agent.DrainTimeout = 30 * time.Second },
+	})
+	id := o.LinearCreated("ENG-28", "session-drain", "").TaskID(t)
+	o.WaitRecords(1, 10*time.Second)
+	o.Signal(syscall.SIGTERM)
+	if code := o.WaitExit(20 * time.Second); code != 0 {
+		t.Errorf("ochell exit code %d", code)
+	}
+	run := o.WaitRun(id, time.Second)
+	if !strings.Contains(run.Footer, "outcome=finished") || !strings.Contains(run.Log, "all done") {
+		t.Errorf("the run was cut short: %s\n%s", run.Footer, run.Log)
+	}
+	if acts := o.Linear.Activities("session-drain"); len(acts) != 2 || acts[1].Type != "response" {
+		t.Errorf("activities = %+v, want the agent result", acts)
+	}
+}
+
+// A second signal ends the wait.
+func TestSecondSignalStopsAgentsNow(t *testing.T) {
+	o := Start(t, Options{
+		Script: spawning(Step{Spawn: &Spawn{Count: 1}}),
+		Configure: func(c *config.Config) {
+			c.Agent.DrainTimeout = 10 * time.Minute
+			c.Agent.StopGrace = time.Second
+		},
+	})
+	id := o.JiraAssigned("DEV-8", "Long run").TaskID(t)
+	rec := waitChildren(t, o, 1)
+	o.Signal(syscall.SIGTERM)
+	o.waitFor(10*time.Second, "ochell to start waiting for the agent", func() bool {
+		return strings.Contains(o.Output(), "waiting for running agents")
+	})
+	o.Signal(syscall.SIGTERM)
+	if code := o.WaitExit(20 * time.Second); code != 0 {
+		t.Errorf("ochell exit code %d", code)
+	}
+	if run := o.WaitRun(id, time.Second); !strings.Contains(run.Footer, "outcome=stopped") {
+		t.Errorf("run: %s", run.Footer)
+	}
+	expectAllGone(t, rec, 1)
+}
+
+// With the systemd launcher a shutdown stops the unit through the stop
+// script. The stand-in has no cgroup; that a stop reaches every process of
+// a unit is checked on the VM.
+func TestSystemdLauncherShutdown(t *testing.T) {
+	o := Start(t, Options{
+		Script: []Step{{Print: "working"}, {Sleep: "10m"}},
+		Configure: func(c *config.Config) {
+			UseFakeSystemd(t, c)
+			c.Agent.DrainTimeout = time.Second
+			c.Agent.StopGrace = 2 * time.Second
+		},
+	})
+	id := o.JiraAssigned("DEV-9", "Long run").TaskID(t)
+	rec := o.WaitRecords(1, 10*time.Second)[0]
+	o.Signal(syscall.SIGTERM)
+	if code := o.WaitExit(20 * time.Second); code != 0 {
+		t.Errorf("ochell exit code %d", code)
+	}
+	if run := o.WaitRun(id, time.Second); !strings.Contains(run.Footer, "outcome=stopped") {
+		t.Errorf("run: %s", run.Footer)
+	}
+	expectAllGone(t, rec, 0)
+}
+
 // The systemd launcher with real systemd: the agent runs as another OS user
 // and a stop reaches all its processes. CI has no systemd, so this runs on
 // the VM only; see "Tests on the VM" in the README for the setup.
@@ -289,12 +451,35 @@ func TestSystemdLauncherOnVM(t *testing.T) {
 	if got := rec.Writes["result.txt"]; got != "ok" {
 		t.Errorf("the agent could not write its working directory: %s", got)
 	}
-	if len(rec.Children) != 3 {
-		t.Fatalf("the agent started %d children, want 3", len(rec.Children))
+	expectAllGone(t, rec, 3)
+}
+
+// The same for a shutdown: ochell stops the unit, and systemd ends every
+// process in it, including the child that left the process group.
+func TestSystemdLauncherShutdownOnVM(t *testing.T) {
+	RequireVM(t)
+	root := os.Getenv("OCHELL_E2E_VM_WORKSPACE")
+	if root == "" {
+		root = "/work"
 	}
-	for _, pid := range append([]int{rec.PID}, rec.Children...) {
-		if Alive(pid) {
-			t.Errorf("process %d is still running after the stop", pid)
-		}
+	o := Start(t, Options{
+		OtherAgentUser: true,
+		Script:         spawning(Step{Spawn: &Spawn{Count: 2}}, Step{Spawn: &Spawn{Count: 1, Setsid: true}}),
+		Configure: func(c *config.Config) {
+			c.Agent.Launcher = "systemd"
+			c.Agent.Workdir = filepath.Join(root, "e2e-{{.Key}}-{{.ID}}")
+			c.Agent.DrainTimeout = time.Second
+			c.Agent.StopGrace = 5 * time.Second
+		},
+	})
+	id := o.LinearCreated("ENG-VM2", "session-vm-shutdown", "").TaskID(t)
+	rec := waitChildren(t, o, 3)
+	o.Signal(syscall.SIGTERM)
+	if code := o.WaitExit(60 * time.Second); code != 0 {
+		t.Errorf("ochell exit code %d", code)
 	}
+	if run := o.WaitRun(id, time.Second); !strings.Contains(run.Footer, "outcome=stopped") {
+		t.Errorf("run: %s", run.Footer)
+	}
+	expectAllGone(t, rec, 3)
 }

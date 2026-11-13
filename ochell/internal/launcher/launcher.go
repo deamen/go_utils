@@ -71,7 +71,7 @@ type Process interface {
 func New(cfg config.Agent) (Launcher, error) {
 	switch cfg.Launcher {
 	case "", "direct":
-		return Direct{}, nil
+		return Direct{StopGrace: cfg.StopGrace}, nil
 	case "systemd":
 		return &Systemd{
 			LaunchCommand: cfg.Systemd.LaunchCommand,

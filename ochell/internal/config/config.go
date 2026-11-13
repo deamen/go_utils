@@ -49,6 +49,9 @@ type Agent struct {
 	// StopGrace is how long an agent that is being stopped has between
 	// SIGTERM and SIGKILL.
 	StopGrace time.Duration `yaml:"stop_grace"`
+	// DrainTimeout is how long a shutdown waits for running agents to
+	// finish before it stops them.
+	DrainTimeout time.Duration `yaml:"drain_timeout"`
 	// EnvPass names the variables the agent inherits from ochell's own
 	// environment. Everything else, including ochell's secrets, is dropped.
 	EnvPass []string `yaml:"env_pass"`
@@ -175,6 +178,7 @@ func Default() *Config {
 				StopCommand:   []string{"sudo", "-n", "/usr/local/libexec/ochell/ochell-stop"},
 			},
 			StopGrace:     10 * time.Second,
+			DrainTimeout:  30 * time.Second,
 			EnvPass:       append([]string(nil), DefaultEnvPass...),
 			Timeout:       2 * time.Hour,
 			MaxConcurrent: 1,
@@ -307,6 +311,8 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.Var(&stringList{dst: &c.Agent.EnvPass}, "agent-env-pass", "environment variable the agent inherits from ochell, repeatable (replaces config env_pass)")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
 	fs.DurationVar(&c.Agent.Timeout, "agent-timeout", c.Agent.Timeout, "maximum agent run time")
+	fs.DurationVar(&c.Agent.StopGrace, "agent-stop-grace", c.Agent.StopGrace, "time between SIGTERM and SIGKILL when an agent is stopped")
+	fs.DurationVar(&c.Agent.DrainTimeout, "agent-drain-timeout", c.Agent.DrainTimeout, "how long a shutdown waits for running agents before it stops them")
 	fs.IntVar(&c.Agent.MaxConcurrent, "agent-max-concurrent", c.Agent.MaxConcurrent, "maximum concurrent agent runs")
 	fs.StringVar(&c.Agent.LogDir, "agent-log-dir", c.Agent.LogDir, "directory for per-task agent logs")
 
@@ -384,6 +390,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Agent.StopGrace < 0 {
 		errs = append(errs, errors.New("agent.stop_grace must not be negative"))
+	}
+	if c.Agent.DrainTimeout < 0 {
+		errs = append(errs, errors.New("agent.drain_timeout must not be negative"))
 	}
 	for _, n := range c.Agent.EnvPass {
 		if !envName.MatchString(n) {

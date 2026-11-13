@@ -26,6 +26,14 @@ Behaviour common to all sources:
 - **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the agent exits it posts a `response` (the tail of the agent output) or an `error`.
 - **Linear follow-ups:** `prompted` events are logged but not yet delivered to a running agent.
 
+### Stopping agents and shutting down
+- **A stop ends the whole agent**, not only its top process: sub-agents, MCP servers and git children too. ochell sends SIGTERM, and SIGKILL after `agent.stop_grace` (10s). This happens at `agent.timeout` and on shutdown.
+  - With the `systemd` launcher ochell stops the unit, and systemd signals every process in it.
+  - With the `direct` launcher the agent runs in its own process group and ochell signals the group. A child that leaves the group (`setsid`) is not reached; use the `systemd` launcher where that matters. When the agent exits by itself, what it left running in its group is killed as well.
+- **Shutdown** (SIGTERM or Ctrl-C): ochell stops accepting webhooks and waits up to `agent.drain_timeout` (30s) for running agents to finish. Then it stops the ones still running; their tickets get an error that says so. A second signal ends the wait at once. Tasks that were queued but not started are dropped and reported the same way.
+  - If ochell runs as a systemd service, set the service's `TimeoutStopSec` above `drain_timeout` plus `stop_grace`, or systemd kills ochell first.
+  - Interrupted runs are not resumed after a restart.
+
 ## Build
 ```
 make test                 # go vet + go test -race
@@ -83,6 +91,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-launcher` | `direct` (default) or `systemd`; see [Launchers](#launchers) |
 | `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
 | `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-log-dir` | Execution settings |
+| `--agent-stop-grace`, `--agent-drain-timeout` | Time between SIGTERM and SIGKILL when an agent is stopped; how long a shutdown waits for running agents (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down)) |
 | `--jira-webhook`, `--jira-webhook-secret`, `--jira-bot-account-id` | Jira system webhook source |
 | `--jira-automation`, `--jira-automation-header`, `--jira-automation-token` | Jira Automation source |
 | `--linear`, `--linear-secret`, `--linear-client-id`, `--linear-client-secret`, `--linear-redirect-url` | Linear agent source |
@@ -103,7 +112,7 @@ A launcher starts and stops the agent process. `agent.launcher` selects it.
 |---|---|---|
 | The agent runs as | ochell's own OS user | a separate OS user, in a transient unit `ochell-run-<task id>.service` |
 | The agent can read ochell's config, Linear token file and logs | yes | no |
-| A stop reaches | the agent process | every process of the unit, including children that left the process group |
+| A stop reaches | the agent's process group | every process of the unit, including children that left the process group |
 | Use for | development and tests | deployment |
 
 **Why two root-owned scripts.** ochell must not have permission to create systemd units, because that would let it run anything as root. It calls [scripts/ochell-launch](scripts/ochell-launch) and [scripts/ochell-stop](scripts/ochell-stop) through `sudo` instead. The launch script takes the agent user, the workspace root and the environment file from `/etc/ochell/launcher.conf`, never from the caller, and refuses (exit 250) anything but a valid task id, a working directory inside the workspace root, allowed environment variable names and an absolute command path. It creates the working directory as the agent user.
@@ -134,7 +143,7 @@ Then set `agent.launcher: systemd` and check the result with `scripts/check-laun
 | `finished` | the agent exited by itself with status 0 |
 | `failed` | the agent exited by itself with another status |
 | `timed_out` | ochell stopped it at `agent.timeout` |
-| `stopped` | ochell stopped it for another reason |
+| `stopped` | ochell stopped it because it is shutting down |
 | `not_started` | the agent never ran: the command could not be executed, or the launch was refused. With the systemd launcher these are exit codes from 200 (250: refused by the launch script; 203: systemd could not execute the command) |
 
 ochell sets the outcome from what it asked for, never from the exit code alone: a unit that systemd stopped exits with 0.
