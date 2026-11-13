@@ -1,0 +1,7 @@
+{
+  "issueKey": "DEV-42",
+  "summary": "Add retry to the payment client",
+  "url": "https://example.atlassian.net/browse/DEV-42",
+  "assigneeAccountId": "712020:digital-employee",
+  "event": "assigned"
+}

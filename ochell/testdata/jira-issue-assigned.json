@@ -1,0 +1,29 @@
+{
+  "timestamp": 1760152365200,
+  "webhookEvent": "jira:issue_updated",
+  "issue_event_type_name": "issue_assigned",
+  "user": { "accountId": "557058:human-reporter", "displayName": "Jane Reporter" },
+  "issue": {
+    "id": "10042",
+    "key": "DEV-42",
+    "self": "https://example.atlassian.net/rest/api/2/issue/10042",
+    "fields": {
+      "summary": "Add retry to the payment client",
+      "assignee": { "accountId": "712020:digital-employee", "displayName": "Digital Employee" }
+    }
+  },
+  "changelog": {
+    "id": "20001",
+    "items": [
+      {
+        "field": "assignee",
+        "fieldtype": "jira",
+        "fieldId": "assignee",
+        "from": "557058:human-reporter",
+        "fromString": "Jane Reporter",
+        "to": "712020:digital-employee",
+        "toString": "Digital Employee"
+      }
+    ]
+  }
+}

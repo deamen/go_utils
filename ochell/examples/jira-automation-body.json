@@ -1,0 +1,7 @@
+{
+  "issueKey": "{{issue.key}}",
+  "summary": "{{issue.summary.jsonEncode}}",
+  "url": "{{issue.url}}",
+  "assigneeAccountId": "{{issue.assignee.accountId}}",
+  "event": "assigned"
+}

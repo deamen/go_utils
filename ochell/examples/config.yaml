@@ -1,0 +1,94 @@
+# ochell example configuration.
+# Precedence: built-in defaults < this file < command line flags.
+# ${VAR} references are replaced with environment variables at load time;
+# keep secrets in the environment, not in this file.
+
+log_level: info
+
+http:
+  enabled: true
+  address: 127.0.0.1        # ngrok forwards to localhost
+  port: 8080
+
+https:
+  enabled: false
+  address: 0.0.0.0
+  port: 8443
+  cert_file: /etc/ochell/tls.crt
+  key_file: /etc/ochell/tls.key
+
+agent:
+  # One agent process is started per ticket; it manages any sub-agents itself.
+  command: claude
+  # Arguments are Go templates rendered per task and passed without a shell.
+  # Available fields: .ID .Source .Key .Title .URL .Context .Prompt
+  args:
+    - -p
+    - "{{.Prompt}}"
+    - --permission-mode
+    - acceptEdits
+  prompt_via: arg           # or "stdin" (then omit {{.Prompt}} from args)
+  prompt_template: |
+    You are the digital employee assigned {{.Source}} ticket {{.Key}} ({{.URL}}).
+    Use twg to retrieve the full ticket details, complete the task, and open a pull request.
+    {{- if .Context}}
+
+    Context provided by {{.Source}}:
+    {{.Context}}
+    {{- end}}
+  workdir: /work/{{.Source}}/{{.Key}}
+  env:
+    CI: "true"
+  timeout: 2h
+  max_concurrent: 1
+  queue_size: 100
+  log_dir: /var/log/ochell
+
+sources:
+  # Jira system webhook (Settings > System > WebHooks) with a secret.
+  # Suggested JQL filter: assignee = <bot accountId>
+  jira_webhook:
+    enabled: true
+    path: /webhooks/jira
+    secret: ${JIRA_WEBHOOK_SECRET}
+    bot_account_id: "712020:00000000-0000-0000-0000-000000000000"
+
+  # Jira Automation "Send web request" with a hidden header.
+  jira_automation:
+    enabled: true
+    path: /webhooks/jira-automation
+    header: Authorization   # Automation sends "Authorization: Bearer <token>"
+    token: ${JIRA_AUTOMATION_TOKEN}
+    bot_account_id: "712020:00000000-0000-0000-0000-000000000000"
+
+  # Linear agent app (OAuth app installed with actor=app).
+  linear:
+    enabled: true
+    path: /webhooks/linear
+    secret: ${LINEAR_WEBHOOK_SECRET}
+    max_skew: 60s
+    client_id: ${LINEAR_CLIENT_ID}
+    client_secret: ${LINEAR_CLIENT_SECRET}
+    redirect_url: https://example.ngrok-free.app/oauth/linear/callback
+    callback_path: /oauth/linear/callback
+    token_file: /var/lib/ochell/linear-token.json
+    organization_id: ""     # optional: only accept installs into this workspace
+    external_url: ""        # optional: e.g. https://runs.example.com/{{.ID}}
+
+# In-process source IP filtering. Use it when the orchestrator is reached
+# directly; behind ngrok prefer ngrok's restrict-ips (see ngrok-policy.yaml).
+ip_allowlist:
+  enabled: false
+  atlassian_feed: true
+  linear_feed: true
+  extra_cidrs: []
+  refresh: 1h
+  trust_proxy_header: false
+
+# Keeps ngrok IP policies in sync with the Atlassian and Linear feeds.
+ngrok_sync:
+  enabled: false
+  api_key: ${NGROK_API_KEY}
+  atlassian_policy_id: ipp_xxxxxxxxxxxxxxxxxxxxxxxxxxx
+  linear_policy_id: ipp_yyyyyyyyyyyyyyyyyyyyyyyyyyy
+  interval: 6h
