@@ -21,13 +21,16 @@ agent:
   # One agent process is started per ticket; it manages any sub-agents itself.
   command: claude
   # Arguments are Go templates rendered per task and passed without a shell.
-  # Available fields: .ID .Source .Key .Title .URL .Context .Prompt
+  # Available fields: .ID .Source .Key. Keep ticket text (.Title .URL .Context
+  # .Prompt) out of arguments: they are visible in the process list.
   args:
     - -p
-    - "{{.Prompt}}"
     - --permission-mode
     - acceptEdits
-  prompt_via: arg           # or "stdin" (then omit {{.Prompt}} from args)
+  # The prompt is written to the agent's stdin. "arg" passes it as an argument
+  # instead (add "{{.Prompt}}" to args): it is then visible in the process
+  # list and limited to 128 KB, so use it only for a CLI that cannot read stdin.
+  prompt_via: stdin
   prompt_template: |
     You are the digital employee assigned {{.Source}} ticket {{.Key}} ({{.URL}}).
     Use twg to retrieve the full ticket details, complete the task, and open a pull request.

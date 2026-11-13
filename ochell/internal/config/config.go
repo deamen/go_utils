@@ -34,9 +34,11 @@ type Agent struct {
 	// Command is the agent CLI executable, e.g. "claude".
 	Command string `yaml:"command"`
 	// Args are passed to Command without a shell. Each arg is a Go
-	// text/template rendered with the task (e.g. "{{.Prompt}}").
+	// text/template rendered with the task (e.g. "{{.Key}}").
 	Args []string `yaml:"args"`
-	// PromptVia is "arg" (prompt referenced in Args) or "stdin".
+	// PromptVia is "stdin" (the default) or "arg" (the prompt is referenced
+	// in Args as {{.Prompt}}). As an argument the prompt is visible in the
+	// process list and limited to 128 KB by the kernel.
 	PromptVia      string `yaml:"prompt_via"`
 	PromptTemplate string `yaml:"prompt_template"`
 	Workdir        string `yaml:"workdir"`
@@ -148,8 +150,8 @@ func Default() *Config {
 		HTTPS:    Listener{Enabled: false, Address: "0.0.0.0", Port: 8443},
 		Agent: Agent{
 			Command:        "claude",
-			Args:           []string{"-p", "{{.Prompt}}"},
-			PromptVia:      "arg",
+			Args:           []string{"-p"},
+			PromptVia:      "stdin",
 			PromptTemplate: DefaultPromptTemplate,
 			Workdir:        ".",
 			EnvPass:        append([]string(nil), DefaultEnvPass...),
@@ -279,7 +281,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 
 	fs.StringVar(&c.Agent.Command, "agent-cmd", c.Agent.Command, "agent CLI command")
 	fs.Var(&stringList{dst: &c.Agent.Args}, "agent-arg", "agent CLI argument, repeatable, Go template (replaces config args)")
-	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: arg or stdin")
+	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: stdin or arg")
 	fs.Var(&stringList{dst: &c.Agent.EnvPass}, "agent-env-pass", "environment variable the agent inherits from ochell, repeatable (replaces config env_pass)")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
 	fs.DurationVar(&c.Agent.Timeout, "agent-timeout", c.Agent.Timeout, "maximum agent run time")
@@ -329,7 +331,15 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("agent.command is required"))
 	}
 	if c.Agent.PromptVia != "arg" && c.Agent.PromptVia != "stdin" {
-		errs = append(errs, errors.New("agent.prompt_via must be arg or stdin"))
+		errs = append(errs, errors.New("agent.prompt_via must be stdin or arg"))
+	}
+	if c.Agent.PromptVia == "stdin" {
+		for _, a := range c.Agent.Args {
+			if strings.Contains(a, ".Prompt") {
+				errs = append(errs, errors.New("agent.args references .Prompt but prompt_via is stdin: remove it from args, or set prompt_via: arg"))
+				break
+			}
+		}
 	}
 	for _, n := range c.Agent.EnvPass {
 		if !envName.MatchString(n) {

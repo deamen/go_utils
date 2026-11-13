@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"ochell/internal/config"
 )
 
 func TestMain(m *testing.M) {
@@ -112,5 +114,32 @@ func TestAgentDoesNotSeeOchellSecrets(t *testing.T) {
 	}
 	if _, ok := rec.Getenv("PATH"); !ok {
 		t.Error("agent environment has no PATH")
+	}
+}
+
+// A prompt far above the 128 KB limit for one argument reaches the agent,
+// and is not on its command line, where the process list would show it.
+func TestLargePromptOnStdin(t *testing.T) {
+	o := Start(t, Options{Configure: func(c *config.Config) {
+		// The shipped defaults, not the harness's own choice.
+		c.Agent.PromptVia = config.Default().Agent.PromptVia
+		c.Agent.Args = config.Default().Agent.Args
+	}})
+	const marker = "MARKER-IN-TICKET-TEXT"
+	context := marker + strings.Repeat(" 0123456789abcdef", 500*1024/17) + marker
+	if len(context) < 500*1024 {
+		t.Fatalf("test context is only %d bytes", len(context))
+	}
+	id := o.LinearCreated("ENG-500", "session-large", context).TaskID(t)
+	if run := o.WaitRun(id, 20*time.Second); run.ExitCode != 0 {
+		t.Fatalf("exit code %d: %s", run.ExitCode, run.Footer)
+	}
+	rec := o.WaitRecords(1, 5*time.Second)[0]
+	if !strings.Contains(rec.Stdin, context) {
+		t.Errorf("the agent received %d bytes on stdin, without the full %d byte context", len(rec.Stdin), len(context))
+	}
+	// The arguments are what the process list shows.
+	if got := strings.Join(rec.Args, " "); got != "-p" || strings.Contains(got, marker) {
+		t.Errorf("agent arguments = %.200q, want only -p", got)
 	}
 }

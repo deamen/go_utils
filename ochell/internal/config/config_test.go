@@ -23,12 +23,12 @@ func TestPrecedence(t *testing.T) {
 http: { address: 127.0.0.1, port: 9000 }
 agent:
   command: claude
-  args: ["-p", "{{.Prompt}}"]
+  args: ["-p", "{{.Key}}"]
   timeout: 30m
 sources:
   jira_webhook: { enabled: true, secret: "${TEST_JIRA_SECRET}", bot_account_id: bot }
 `)
-	cfg, err := Load("serve", []string{"--config", p, "--http-port", "9100", "--agent-arg", "--print", "--agent-arg", "{{.Prompt}}"}, nil)
+	cfg, err := Load("serve", []string{"--config", p, "--http-port", "9100", "--agent-arg", "--print", "--agent-arg", "{{.Key}}"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ sources:
 	if cfg.Agent.Timeout != 30*time.Minute {
 		t.Errorf("yaml duration not applied: %s", cfg.Agent.Timeout)
 	}
-	if got := strings.Join(cfg.Agent.Args, " "); got != "--print {{.Prompt}}" {
+	if got := strings.Join(cfg.Agent.Args, " "); got != "--print {{.Key}}" {
 		t.Errorf("repeatable flag should replace yaml args, got %q", got)
 	}
 	if cfg.Sources.JiraWebhook.Secret != "from-env" {
@@ -125,5 +125,33 @@ sources:
 	}
 	if got := Default().Agent.EnvPass; len(got) != len(DefaultEnvPass) {
 		t.Errorf("default env_pass changed by a flag: %v", got)
+	}
+}
+
+func TestPromptOnStdinByDefault(t *testing.T) {
+	cfg := Default()
+	if cfg.Agent.PromptVia != "stdin" {
+		t.Errorf("default prompt_via = %q, want stdin", cfg.Agent.PromptVia)
+	}
+	for _, a := range cfg.Agent.Args {
+		if strings.Contains(a, "Prompt") {
+			t.Errorf("default args carry the prompt: %q", cfg.Agent.Args)
+		}
+	}
+	cfg.Sources.JiraAutomation.Enabled = true
+	cfg.Sources.JiraAutomation.Token = "t"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default agent settings must be valid: %v", err)
+	}
+
+	// A configuration written for the old default must not send the prompt
+	// both ways without anyone noticing.
+	cfg.Agent.Args = []string{"-p", "{{.Prompt}}"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "prompt_via is stdin") {
+		t.Errorf("stdin with {{.Prompt}} in args: got %v", err)
+	}
+	cfg.Agent.PromptVia = "arg"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("arg with {{.Prompt}} in args must stay valid: %v", err)
 	}
 }
