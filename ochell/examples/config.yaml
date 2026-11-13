@@ -88,6 +88,9 @@ sources:
     path: /webhooks/jira-automation
     header: Authorization   # Automation sends "Authorization: Bearer <token>"
     token: ${JIRA_AUTOMATION_TOKEN}
+    # When set, the payload must name this account as the assignee: another
+    # assignee is ignored, no assignee is rejected with 400. Leave it out
+    # only if the rule's own condition is all you want to rely on.
     bot_account_id: "712020:00000000-0000-0000-0000-000000000000"
 
   # Linear agent app (OAuth app installed with actor=app).
