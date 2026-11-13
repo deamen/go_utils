@@ -13,7 +13,7 @@ Linear (agent app)  ─────────┘  IP policy +   │ verify →
 ## Supported sources
 | Source | Endpoint (default) | Authentication | Trigger |
 |---|---|---|---|
-| Jira system webhook | `POST /webhooks/jira` | `X-Hub-Signature: sha256=<HMAC>` with the webhook secret | `jira:issue_updated` whose changelog changes `assignee` to the bot, or `jira:issue_created` already assigned to the bot |
+| Jira system webhook | `POST /webhooks/jira` | `X-Hub-Signature: sha256=<HMAC>` with the webhook secret, and `timestamp` within `max_skew` (2h) | `jira:issue_updated` whose changelog changes `assignee` to the bot, or `jira:issue_created` already assigned to the bot |
 | Jira Automation "Send web request" | `POST /webhooks/jira-automation` | Shared token in a header (`Authorization: Bearer …` by default). Automation cannot sign payloads. | An authenticated request that names the bot as assignee. Without `bot_account_id`, any authenticated request (the rule decides when to fire) |
 | Linear agent app (`actor=app`) | `POST /webhooks/linear` | `Linear-Signature` HMAC and `webhookTimestamp` within 60s | `AgentSessionEvent` `created` (issue delegated to, or agent mentioned) |
 
@@ -22,7 +22,8 @@ Behaviour common to all sources:
   - 200 when a task is queued, ignored or a duplicate;
   - 401 when authentication fails;
   - 400 when the payload is unusable, for example a Jira Automation request that names no assignee;
-- **Duplicate deliveries:** dropped using `X-Atlassian-Webhook-Identifier` / `Linear-Delivery`.
+- **Duplicate deliveries:** dropped using `X-Atlassian-Webhook-Identifier` / `Linear-Delivery`. The ids are kept in memory for 24 hours and are lost on a restart.
+- **Replay:** a signed request is rejected with 401 when its timestamp (`timestamp` for Jira, `webhookTimestamp` for Linear) is further than `max_skew` from now. The default is 60s for Linear and 2h for Jira: Jira retries a failed delivery up to five times, 5 to 15 minutes apart, and a retry may carry the timestamp of the event. Jira Automation requests carry no timestamp.
 - **One run per ticket:** a ticket that is already queued or running is not started again. The request is answered with 200 `already in progress`. A new Linear session on such a ticket gets a `response` activity that says so, which closes that session; the result is posted in the first session.
 - **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the agent exits it posts a `response` (the tail of the agent output) or an `error`.
 - **Linear follow-ups:** `prompted` events are logged but not yet delivered to a running agent.
@@ -225,16 +226,17 @@ ochell serve --http-addr 127.0.0.1 --http-port 8080 \
 Each request below returns `200 queued <task id>`, and the agent output goes to `<log_dir>/<task id>.log`. The signature is an HMAC-SHA256 of the **exact bytes** sent, so always use `--data-binary` (`-d` strips newlines).
 
 ### Jira system webhook
-The `assignee` changes to `712020:digital-employee` in the sample, so it must match `--jira-bot-account-id`.
+The `assignee` changes to `712020:digital-employee` in the sample, so it must match `--jira-bot-account-id`. Jira requests are rejected when `timestamp` (milliseconds) is more than `max_skew` (2h) from now, so set it to the current time before signing:
 ```
 URL=http://127.0.0.1:8080
-BODY=testdata/jira-issue-assigned.json
-SIG=$(openssl dgst -sha256 -hmac jira-secret < "$BODY" | sed 's/^.* //')
+BODY=$(sed "s/\"timestamp\": [0-9]*/\"timestamp\": $(($(date +%s) * 1000))/" \
+  testdata/jira-issue-assigned.json)
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac jira-secret | sed 's/^.* //')
 curl -i -X POST "$URL/webhooks/jira" \
   -H 'Content-Type: application/json' \
   -H "X-Hub-Signature: sha256=$SIG" \
   -H "X-Atlassian-Webhook-Identifier: test-$(date +%s)" \
-  --data-binary @"$BODY"
+  --data-binary "$BODY"
 ```
 
 ### Jira Automation
@@ -261,7 +263,7 @@ Without `client_id` the orchestrator logs that the session will not receive acti
 
 Notes:
 - A repeated `X-Atlassian-Webhook-Identifier` or `Linear-Delivery` value returns `duplicate delivery`, which is why the examples add `$(date +%s)`.
-- A wrong signature or token returns `401`.
+- A wrong signature or token, or a timestamp outside `max_skew`, returns `401`.
 - To test through ngrok, set `URL` to `https://<ngrok-domain>`. The policy's `restrict-ips` rules will block requests from your own IP unless you add it.
 
 ## Security notes

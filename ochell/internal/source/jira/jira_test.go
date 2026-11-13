@@ -3,8 +3,10 @@ package jira
 import (
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const bot = "712020:digital-employee"
@@ -90,5 +92,36 @@ func TestParseAutomationRequiresAssignee(t *testing.T) {
 	// Without a configured bot the rule alone decides, as before.
 	if tk, err := ParseAutomation([]byte(`{"issueKey":"DEV-1"}`), ""); err != nil || tk.Key != "DEV-1" {
 		t.Errorf("no bot configured: got %+v, %v", tk, err)
+	}
+}
+
+func TestCheckTimestamp(t *testing.T) {
+	now := time.UnixMilli(1760152365200)
+	body := func(ts string) []byte { return []byte(`{"timestamp":` + ts + `,"webhookEvent":"jira:issue_updated"}`) }
+	at := func(d time.Duration) []byte { return body(strconv.FormatInt(now.Add(d).UnixMilli(), 10)) }
+	for name, c := range map[string]struct {
+		body  []byte
+		stale bool
+	}{
+		"now":             {at(0), false},
+		"inside, past":    {at(-59 * time.Minute), false},
+		"inside, future":  {at(59 * time.Minute), false},
+		"too old":         {at(-61 * time.Minute), true},
+		"a day old":       {at(-24 * time.Hour), true},
+		"from the future": {at(61 * time.Minute), true},
+		"missing":         {[]byte(`{"webhookEvent":"jira:issue_updated"}`), true},
+		"null":            {body("null"), true},
+		"seconds, not ms": {body(strconv.FormatInt(now.Unix(), 10)), true},
+	} {
+		err := CheckTimestamp(c.body, time.Hour, now)
+		if c.stale != errors.Is(err, ErrStale) {
+			t.Errorf("%s: got %v, want stale=%v", name, err, c.stale)
+		}
+	}
+	// Anything that is not a number is refused as well.
+	for _, body := range []string{`{"timestamp":"yesterday"}`, `{"timestamp":{}}`, `not json`} {
+		if err := CheckTimestamp([]byte(body), time.Hour, now); err == nil {
+			t.Errorf("%s: accepted", body)
+		}
 	}
 }
