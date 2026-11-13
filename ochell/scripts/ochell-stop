@@ -1,0 +1,32 @@
+#!/bin/bash
+# ochell-stop: stop one agent run that ochell-launch started. ochell calls it
+# through sudo. systemd sends SIGTERM to every process of the unit, then
+# SIGKILL after the unit's stop time limit, which also reaches children that
+# left the agent's process group.
+#
+#   ochell-stop ID
+#
+# It returns when the unit has stopped. Exit status: 0 when the unit was
+# stopped or was not running, 250 when the request was refused, otherwise
+# the status of systemctl.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+IFS=$' \t\n'
+
+refuse() { echo "ochell-stop: $*" >&2; exit 250; }
+
+SYSTEMCTL=/usr/bin/systemctl
+if [ "$EUID" -ne 0 ]; then
+  # For the tests, which replace systemctl with a stub.
+  SYSTEMCTL=${OCHELL_LAUNCHER_SYSTEMCTL:-$SYSTEMCTL}
+fi
+
+[ $# -eq 1 ] || refuse "usage: ochell-stop ID"
+[[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || refuse "invalid task id"
+unit="ochell-run-$1.service"
+
+rc=0
+"$SYSTEMCTL" stop -- "$unit" || rc=$?
+# 5: the unit is not loaded, so the run has already ended.
+[ "$rc" != 5 ] || rc=0
+exit "$rc"

@@ -1,0 +1,172 @@
+#!/bin/bash
+# ochell-launch: start one agent run as a systemd transient unit under the
+# agent user. ochell calls it through sudo; it is the only way ochell can
+# start a process as another user, so it checks everything it is given.
+#
+#   ochell-launch --task ID --workdir DIR [--runtime-max SEC] [--stop-grace SEC]
+#                 [--setenv NAME=VALUE]... -- /abs/command [ARG]...
+#
+# The unit is ochell-run-<ID>.service. Stdin, stdout, stderr and the exit
+# status of the agent pass through. Stop a run with ochell-stop.
+#
+# Settings come from /etc/ochell/launcher.conf, which must belong to root
+# (see launcher.conf.example). Nothing in the caller's control selects the
+# user, the workspace root or the environment file.
+#
+# Exit status: the agent's own, or
+#   250       the request was refused or the settings are unusable
+#   200-243   systemd could not start the unit (e.g. 203: cannot execute)
+#
+# Install root-owned, mode 0755, with a sudoers entry for the ochell user:
+#   ochell ALL=(root) NOPASSWD: /usr/local/libexec/ochell/ochell-launch, /usr/local/libexec/ochell/ochell-stop
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+IFS=$' \t\n'
+umask 027
+
+refuse() { echo "ochell-launch: $*" >&2; exit 250; }
+
+CONF=/etc/ochell/launcher.conf
+SYSTEMD_RUN=/usr/bin/systemd-run
+if [ "$EUID" -ne 0 ]; then
+  # Without root this script cannot start anything as another user. The
+  # overrides exist for the tests, which replace systemd-run with a stub.
+  CONF=${OCHELL_LAUNCHER_CONF:-$CONF}
+  SYSTEMD_RUN=${OCHELL_LAUNCHER_SYSTEMD_RUN:-$SYSTEMD_RUN}
+fi
+
+AGENT_USER=
+WORKSPACE_ROOT=
+ENV_FILE=
+ALLOWED_ENV=
+DENY_LOOPBACK=0
+[ -f "$CONF" ] || refuse "missing $CONF"
+if [ "$EUID" -eq 0 ]; then
+  # A file that someone else can change would let them run anything as root.
+  owner_mode=$(stat -Lc '%u %a' -- "$CONF")
+  owner=${owner_mode% *}
+  mode=${owner_mode#* }
+  [ "$owner" = 0 ] || refuse "$CONF must belong to root"
+  [ $(( 8#$mode & 8#022 )) -eq 0 ] || refuse "$CONF must not be writable by group or others"
+fi
+# shellcheck disable=SC1090
+. "$CONF"
+
+[ -n "$AGENT_USER" ] || refuse "AGENT_USER is not set in $CONF"
+[ "$AGENT_USER" != root ] || refuse "AGENT_USER must not be root"
+id -u -- "$AGENT_USER" >/dev/null 2>&1 || refuse "no such user: $AGENT_USER"
+[ "$(id -u -- "$AGENT_USER")" != 0 ] || refuse "AGENT_USER must not be root"
+case "$WORKSPACE_ROOT" in
+  /*) ;;
+  *) refuse "WORKSPACE_ROOT must be an absolute path in $CONF" ;;
+esac
+root=$(realpath -e -- "$WORKSPACE_ROOT" 2>/dev/null) || refuse "WORKSPACE_ROOT does not exist: $WORKSPACE_ROOT"
+[ "$root" != / ] || refuse "WORKSPACE_ROOT must not be /"
+if [ -n "$ENV_FILE" ]; then
+  case "$ENV_FILE" in
+    /*) ;;
+    *) refuse "ENV_FILE must be an absolute path in $CONF" ;;
+  esac
+  [ -f "$ENV_FILE" ] || refuse "ENV_FILE does not exist: $ENV_FILE"
+fi
+
+task=
+workdir=
+runtime_max=
+stop_grace=
+setenv=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --task)        [ $# -ge 2 ] || refuse "--task needs a value"; task=$2; shift 2 ;;
+    --workdir)     [ $# -ge 2 ] || refuse "--workdir needs a value"; workdir=$2; shift 2 ;;
+    --runtime-max) [ $# -ge 2 ] || refuse "--runtime-max needs a value"; runtime_max=$2; shift 2 ;;
+    --stop-grace)  [ $# -ge 2 ] || refuse "--stop-grace needs a value"; stop_grace=$2; shift 2 ;;
+    --setenv)      [ $# -ge 2 ] || refuse "--setenv needs a value"; setenv+=("$2"); shift 2 ;;
+    --)            shift; break ;;
+    *)             refuse "unexpected argument before --: $1" ;;
+  esac
+done
+[ $# -ge 1 ] || refuse "no agent command after --"
+
+# The task id becomes part of the unit name.
+[[ "$task" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || refuse "invalid task id"
+
+for n in "$runtime_max" "$stop_grace"; do
+  [ -z "$n" ] || [[ "$n" =~ ^[1-9][0-9]{0,6}$ ]] || refuse "time limits must be whole seconds"
+done
+
+# The working directory must be inside the workspace root. Check the text
+# first, create it as the agent user, then check where it really is, so a
+# symlink in the workspace cannot lead outside.
+case "$workdir" in
+  /*) ;;
+  *) refuse "the working directory must be an absolute path" ;;
+esac
+case "$workdir/" in
+  */../*|*/./*|*//*) refuse "the working directory must not contain '..', '.' or empty components" ;;
+esac
+case "$workdir" in
+  "$root"|"$root"/*) ;;
+  *) refuse "the working directory is outside $root" ;;
+esac
+# Resolve the part that exists before creating anything, so nothing is
+# created outside the root either.
+planned=$(realpath -m -- "$workdir") || refuse "cannot resolve the working directory"
+case "$planned" in
+  "$root"|"$root"/*) ;;
+  *) refuse "the working directory resolves to a path outside $root" ;;
+esac
+if [ ! -d "$workdir" ]; then
+  if [ "$EUID" -eq 0 ]; then
+    runuser -u "$AGENT_USER" -- mkdir -p -- "$workdir" || refuse "cannot create the working directory as $AGENT_USER"
+  else
+    mkdir -p -- "$workdir" || refuse "cannot create the working directory"
+  fi
+fi
+real=$(realpath -e -- "$workdir") || refuse "cannot resolve the working directory"
+case "$real" in
+  "$root"|"$root"/*) ;;
+  *) refuse "the working directory resolves to a path outside $root" ;;
+esac
+
+# Environment for the unit. These values are visible to every local user
+# (systemctl show), so they are not for secrets; secrets go in ENV_FILE.
+allowed='^ORCH_[A-Z0-9_]+$'
+for e in ${setenv[@]+"${setenv[@]}"}; do
+  name=${e%%=*}
+  [ "$name" != "$e" ] || refuse "--setenv needs NAME=VALUE"
+  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || refuse "invalid environment variable name"
+  if ! [[ "$name" =~ $allowed ]]; then
+    { [ -n "$ALLOWED_ENV" ] && [[ "$name" =~ $ALLOWED_ENV ]]; } || refuse "environment variable $name is not allowed by $CONF"
+  fi
+  [[ "$e" != *[[:cntrl:]]* ]] || refuse "the value of $name contains a control character"
+done
+
+# The command must be an absolute path: PATH in the unit is the system
+# default, and a name starting with '-' could be read as an option.
+[[ "$1" =~ ^/[A-Za-z0-9_./+@-]+$ ]] || refuse "the agent command must be an absolute path"
+
+# systemd replaces $VAR and ${VAR} in the arguments from the unit's
+# environment, which holds the agent's token. '$$' gives a literal '$'.
+args=()
+for a in "$@"; do
+  args+=("${a//\$/\$\$}")
+done
+
+cmd=("$SYSTEMD_RUN"
+  --uid="$AGENT_USER"
+  --unit="ochell-run-$task"
+  --wait --pipe --collect --quiet --no-ask-password
+  --working-directory="$real"
+  -p KillMode=control-group)
+[ -z "$ENV_FILE" ]    || cmd+=(-p "EnvironmentFile=$ENV_FILE")
+[ -z "$runtime_max" ] || cmd+=(-p "RuntimeMaxSec=$runtime_max")
+[ -z "$stop_grace" ]  || cmd+=(-p "TimeoutStopSec=$stop_grace")
+[ "$DENY_LOOPBACK" != 1 ] || cmd+=(-p IPAddressDeny=localhost)
+for e in ${setenv[@]+"${setenv[@]}"}; do
+  cmd+=("--setenv=$e")
+done
+# '--' ends the options of systemd-run. /usr/bin/env starts the agent,
+# because SELinux does not let systemd execute a file from a home directory.
+cmd+=(-- /usr/bin/env "${args[@]}")
+exec "${cmd[@]}"

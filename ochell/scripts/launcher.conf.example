@@ -1,0 +1,25 @@
+# Settings of ochell-launch. Install as /etc/ochell/launcher.conf, owned by
+# root and not writable by anyone else (mode 0644 or 0600). The file is read
+# as a shell fragment by a script that runs as root.
+
+# The OS user the agent runs as. Not root, and not the user ochell runs as.
+AGENT_USER=ochell-agent
+
+# Every run's working directory must be inside this directory. It belongs to
+# the agent user; give ochell's group read access if ochell needs to read it.
+WORKSPACE_ROOT=/work
+
+# Optional. A file with NAME=VALUE lines that is loaded into the agent's
+# environment: the agent's token (CLAUDE_CODE_OAUTH_TOKEN or
+# ANTHROPIC_API_KEY) and other credentials. Owned by root, mode 0600. Unlike
+# variables passed by ochell, these values are not visible to other users.
+ENV_FILE=/etc/ochell/agent.env
+
+# Optional. ochell may always set ORCH_* variables. This extended regular
+# expression allows more names, for the variables in ochell's agent.env.
+#ALLOWED_ENV='^(CI|CLAUDE_CONFIG_DIR)$'
+
+# Optional. 1 denies the agent access to loopback addresses, so it cannot
+# reach ochell's local endpoints. It may break agent tools that use local
+# ports; test before enabling.
+DENY_LOOPBACK=0

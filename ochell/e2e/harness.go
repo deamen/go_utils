@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -42,6 +43,8 @@ const (
 	LinearSecret    = "e2e-linear-secret"
 	LinearToken     = "e2e-linear-access-token"
 	BotAccountID    = "712020:digital-employee"
+	// AgentToken is in the environment file of UseFakeSystemd.
+	AgentToken = "e2e-agent-token"
 )
 
 // RequireVM skips a test that needs the systemd launcher and its sudo
@@ -53,14 +56,74 @@ func RequireVM(t *testing.T) {
 	}
 }
 
+// UseFakeSystemd selects the systemd launcher with the real launch and stop
+// scripts, and stand-ins for systemd-run and systemctl, so the path through
+// the scripts is covered where there is no systemd. The agent still runs as
+// the current user. It returns the workspace root.
+func UseFakeSystemd(t *testing.T, c *config.Config) string {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("the scripts ignore the stand-ins when run as root")
+	}
+	abs := func(rel string) string {
+		p, err := filepath.Abs(rel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, state := filepath.Join(dir, "work"), filepath.Join(dir, "systemd")
+	for _, d := range []string{root, state} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	envFile := filepath.Join(dir, "agent.env")
+	if err := os.WriteFile(envFile, []byte("AGENT_TOKEN="+AgentToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	conf := filepath.Join(dir, "launcher.conf")
+	settings := "AGENT_USER=" + u.Username + "\nWORKSPACE_ROOT=" + root + "\nENV_FILE=" + envFile + "\nALLOWED_ENV='^FAKEAGENT_[A-Z_]+$'\n"
+	if err := os.WriteFile(conf, []byte(settings), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overrides := []string{
+		"/usr/bin/env",
+		"OCHELL_LAUNCHER_CONF=" + conf,
+		"OCHELL_LAUNCHER_SYSTEMD_RUN=" + abs("../internal/launcher/testdata/fake-systemd-run"),
+		"OCHELL_LAUNCHER_SYSTEMCTL=" + abs("../internal/launcher/testdata/fake-systemctl"),
+		"FAKE_SYSTEMD_DIR=" + state,
+	}
+	c.Agent.Launcher = "systemd"
+	c.Agent.Systemd.LaunchCommand = append(append([]string{}, overrides...), abs("../scripts/ochell-launch"))
+	c.Agent.Systemd.StopCommand = append(append([]string{}, overrides...), abs("../scripts/ochell-stop"))
+	c.Agent.Workdir = filepath.Join(root, "{{.Source}}-{{.Key}}")
+	return root
+}
+
 // Step and Spawn mirror the fake agent's script format (fakeagent/main.go).
 type Step struct {
 	Print      string `json:"print,omitempty"`
 	Eprint     string `json:"eprint,omitempty"`
 	Sleep      string `json:"sleep,omitempty"`
 	Spawn      *Spawn `json:"spawn,omitempty"`
+	WriteFile  *File  `json:"write_file,omitempty"`
+	TryRead    string `json:"try_read,omitempty"`
 	IgnoreTerm bool   `json:"ignore_term,omitempty"`
 	Exit       *int   `json:"exit,omitempty"`
+}
+
+type File struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
 }
 
 type Spawn struct {
@@ -75,11 +138,16 @@ func Exit(code int) Step { return Step{Exit: &code} }
 // Record is what the fake agent saw when it was started.
 type Record struct {
 	PID      int      `json:"pid"`
+	UID      int      `json:"uid"`
 	Args     []string `json:"args"`
 	Env      []string `json:"env"`
 	Stdin    string   `json:"stdin"`
 	Dir      string   `json:"dir"`
 	Children []int    `json:"children,omitempty"`
+	// Reads and Writes hold "ok" or the error of each try_read and
+	// write_file step, by path.
+	Reads  map[string]string `json:"reads,omitempty"`
+	Writes map[string]string `json:"writes,omitempty"`
 }
 
 // Getenv returns the value of name in the agent's environment.
@@ -95,12 +163,17 @@ func (r Record) Getenv(name string) (string, bool) {
 // Options configure one ochell instance.
 type Options struct {
 	// Script is played by the fake agent on every run. Empty means: print
-	// one line and exit 0.
+	// one line and exit 0. "{{dir}}" in a step is replaced with Ochell.Dir,
+	// which holds config.yaml and linear-token.json.
 	Script []Step
 	// Configure changes the configuration before ochell starts.
 	Configure func(c *config.Config)
 	// Env is added to the environment of the ochell process.
 	Env []string
+	// OtherAgentUser prepares for an agent that runs as another OS user (the
+	// systemd launcher on the VM): it must be able to read its script and
+	// write its record, but not ochell's configuration.
+	OtherAgentUser bool
 }
 
 // Ochell is a running ochell process and the fakes around it.
@@ -122,11 +195,18 @@ var (
 	buildOnce sync.Once
 	buildDir  string
 	buildErr  error
+	prebuilt  bool
 )
 
 // build compiles ochell and the fake agent once per test binary.
 func build() (ochell, agent string, err error) {
 	buildOnce.Do(func() {
+		// On the VM there may be no Go toolchain: use binaries built elsewhere.
+		if dir := os.Getenv("OCHELL_E2E_BIN_DIR"); dir != "" {
+			prebuilt = true
+			buildDir, buildErr = filepath.Abs(dir)
+			return
+		}
 		buildDir, buildErr = os.MkdirTemp("", "ochell-e2e-bin")
 		if buildErr != nil {
 			return
@@ -148,7 +228,7 @@ func build() (ochell, agent string, err error) {
 
 // RemoveBinaries deletes the compiled binaries; call it from TestMain.
 func RemoveBinaries() {
-	if buildDir != "" {
+	if buildDir != "" && !prebuilt {
 		os.RemoveAll(buildDir)
 	}
 }
@@ -166,6 +246,17 @@ func Start(t *testing.T, opts Options) *Ochell {
 	o := &Ochell{t: t, Dir: dir, recordDir: filepath.Join(dir, "records"), out: &lockedBuffer{}, exited: make(chan struct{})}
 	for _, d := range []string{o.recordDir, filepath.Join(dir, "work")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if opts.OtherAgentUser {
+		// The test's temporary directories are private to the current user.
+		for _, d := range []string{filepath.Dir(dir), dir} {
+			if err := os.Chmod(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chmod(o.recordDir, 0o777); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -188,6 +279,7 @@ func Start(t *testing.T, opts Options) *Ochell {
 			t.Fatal(err)
 		}
 		script := filepath.Join(dir, "script.json")
+		raw = bytes.ReplaceAll(raw, []byte("{{dir}}"), []byte(dir))
 		if err := os.WriteFile(script, raw, 0o644); err != nil {
 			t.Fatal(err)
 		}

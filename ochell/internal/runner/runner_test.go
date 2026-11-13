@@ -149,17 +149,73 @@ func TestRunEnvironmentIsAllowlisted(t *testing.T) {
 	}
 }
 
-func TestRunFailureAndTimeout(t *testing.T) {
-	r, _ := New(agentCfg(t, "fail"), logger())
-	if res := r.Run(context.Background(), newTask()); res.Err == nil || res.ExitCode != 3 {
-		t.Errorf("expected exit 3, got %d %v", res.ExitCode, res.Err)
+func TestRunOutcomes(t *testing.T) {
+	r, _ := New(agentCfg(t, "echo"), logger())
+	if res := r.Run(context.Background(), newTask()); res.Outcome != task.OutcomeFinished || res.Err != nil || res.ExitCode != 0 {
+		t.Errorf("finished run: %+v", res)
 	}
+
+	r, _ = New(agentCfg(t, "fail"), logger())
+	if res := r.Run(context.Background(), newTask()); res.Outcome != task.OutcomeFailed || res.Err == nil || res.ExitCode != 3 {
+		t.Errorf("failed run: outcome %s exit %d err %v", res.Outcome, res.ExitCode, res.Err)
+	}
+
 	cfg := agentCfg(t, "sleep")
 	cfg.Timeout = 200 * time.Millisecond
 	r, _ = New(cfg, logger())
 	res := r.Run(context.Background(), newTask())
-	if res.Err == nil || !strings.Contains(res.Err.Error(), "timed out") {
-		t.Errorf("expected timeout, got %v", res.Err)
+	if res.Outcome != task.OutcomeTimedOut || res.Err == nil || !strings.Contains(res.Err.Error(), "timed out") {
+		t.Errorf("timed out run: outcome %s err %v", res.Outcome, res.Err)
+	}
+	if res.Duration > 5*time.Second {
+		t.Errorf("the agent was not stopped at the time limit: %s", res.Duration)
+	}
+
+	// A run that ochell stops is reported as stopped, whatever the exit code.
+	r, _ = New(agentCfg(t, "sleep"), logger())
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	res = r.Run(ctx, newTask())
+	if res.Outcome != task.OutcomeStopped || res.Err == nil {
+		t.Errorf("stopped run: outcome %s err %v", res.Outcome, res.Err)
+	}
+	logged, _ := os.ReadFile(res.LogFile)
+	if !strings.Contains(string(logged), "outcome=stopped") {
+		t.Errorf("the log does not say why the run ended:\n%s", logged)
+	}
+
+	cfg = agentCfg(t, "echo")
+	cfg.Command = filepath.Join(t.TempDir(), "no-such-agent")
+	r, _ = New(cfg, logger())
+	if res := r.Run(context.Background(), newTask()); res.Outcome != task.OutcomeNotStarted || res.Err == nil || res.ExitCode != -1 {
+		t.Errorf("agent that cannot start: outcome %s exit %d err %v", res.Outcome, res.ExitCode, res.Err)
+	}
+}
+
+// With the systemd launcher, ticket text must not be able to reach the
+// command line.
+func TestSystemdLauncherRefusesTicketTextInArguments(t *testing.T) {
+	for _, field := range []string{".Title", ".URL", ".Context", ".Prompt", ".DeliveryID"} {
+		cfg := agentCfg(t, "echo", "--name={{"+field+"}}")
+		cfg.Launcher = "systemd"
+		if _, err := New(cfg, logger()); err == nil || !strings.Contains(err.Error(), "only .ID, .Source and .Key") {
+			t.Errorf("{{%s}} in an argument: got %v", field, err)
+		}
+	}
+	cfg := agentCfg(t, "echo", "--session={{.Source}}-{{.Key}}-{{.ID}}")
+	cfg.Launcher = "systemd"
+	if _, err := New(cfg, logger()); err != nil {
+		t.Errorf(".ID, .Source and .Key must be allowed: %v", err)
+	}
+	cfg = agentCfg(t, "echo")
+	cfg.Launcher = "systemd"
+	cfg.Workdir = "/work/{{.Title}}"
+	if _, err := New(cfg, logger()); err == nil {
+		t.Error("{{.Title}} in workdir must be refused")
+	}
+	// The direct launcher keeps the old behaviour.
+	if _, err := New(agentCfg(t, "echo", "{{.Title}}"), logger()); err != nil {
+		t.Errorf("direct launcher: %v", err)
 	}
 }
 

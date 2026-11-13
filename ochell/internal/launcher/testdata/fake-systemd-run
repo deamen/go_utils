@@ -1,0 +1,69 @@
+#!/bin/bash
+# Test stand-in for systemd-run, used where there is no systemd (CI).
+#
+# It understands the options ochell-launch passes, records its arguments in
+# $FAKE_SYSTEMD_DIR/<unit>.args (one per line), and runs the command in the
+# requested directory with a clean environment plus --setenv and
+# EnvironmentFile. Like systemd, it replaces ${VAR} in the arguments from
+# that environment and turns $$ into $.
+#
+# fake-systemctl stops a "unit" through the pid file written here.
+set -euo pipefail
+: "${FAKE_SYSTEMD_DIR:?}"
+
+unit=
+dir=
+env=()
+envfile=
+all=("$@")
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --unit=*)              unit=${1#--unit=} ;;
+    --working-directory=*) dir=${1#--working-directory=} ;;
+    --setenv=*)            env+=("${1#--setenv=}") ;;
+    -p)                    shift; case "$1" in EnvironmentFile=*) envfile=${1#EnvironmentFile=} ;; esac ;;
+    --)                    shift; break ;;
+    --*)                   ;;
+    *)                     echo "fake-systemd-run: unexpected argument $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+[ -n "$unit" ] || { echo "fake-systemd-run: no --unit" >&2; exit 1; }
+printf '%s\n' "${all[@]}" > "$FAKE_SYSTEMD_DIR/$unit.args"
+
+if [ -n "$envfile" ]; then
+  while IFS= read -r line; do
+    [ -z "$line" ] || env+=("$line")
+  done < "$envfile"
+fi
+
+lookup() {
+  local e
+  for e in ${env[@]+"${env[@]}"}; do
+    if [ "${e%%=*}" = "$1" ]; then printf '%s' "${e#*=}"; return; fi
+  done
+}
+
+# Expand ${VAR} and $$ the way systemd does for a unit's arguments.
+expand() {
+  local in=$1 out=
+  while [ -n "$in" ]; do
+    case "$in" in
+      '$$'*) out+='$'; in=${in:2} ;;
+      '${'*'}'*)
+        local name=${in:2}; name=${name%%\}*}
+        out+=$(lookup "$name"); in=${in#*\}} ;;
+      *) out+=${in:0:1}; in=${in:1} ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+cmd=()
+for a in "$@"; do
+  cmd+=("$(expand "$a")")
+done
+
+[ -z "$dir" ] || cd "$dir"
+echo $$ > "$FAKE_SYSTEMD_DIR/$unit.pid"
+exec /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin ${env[@]+"${env[@]}"} "${cmd[@]}"

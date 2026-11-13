@@ -40,6 +40,19 @@ agent:
     {{.Context}}
     {{- end}}
   workdir: /work/{{.Source}}/{{.Key}}
+  # How the agent process is run:
+  #   direct   a child process of ochell, under ochell's own OS user. For
+  #            development; the agent can read ochell's files.
+  #   systemd  a transient unit under a separate OS user, started and stopped
+  #            through two root-owned scripts (see README, "Launchers").
+  #            Requires prompt_via: stdin and an absolute command path; args
+  #            and workdir may only use .ID .Source .Key; env_pass is not used.
+  launcher: direct
+  systemd:
+    launch_command: [sudo, -n, /usr/local/libexec/ochell/ochell-launch]
+    stop_command: [sudo, -n, /usr/local/libexec/ochell/ochell-stop]
+  # Time between SIGTERM and SIGKILL when a run is stopped.
+  stop_grace: 10s
   # The agent does not inherit ochell's environment, which holds the secrets
   # above. Only the variables named here are copied from it. This is the
   # default list; add the agent's own credential (e.g. ANTHROPIC_API_KEY) if

@@ -29,8 +29,31 @@ type Task struct {
 	OnFinish func(ctx context.Context, t *Task, result Result) error
 }
 
+// Outcome says why a run ended. ochell sets it from its own record of what
+// it asked for; the exit code alone cannot tell a stopped run from a
+// finished one.
+type Outcome string
+
+const (
+	// OutcomeFinished: the agent exited by itself with status 0.
+	OutcomeFinished Outcome = "finished"
+	// OutcomeFailed: the agent exited by itself with another status.
+	OutcomeFailed Outcome = "failed"
+	// OutcomeTimedOut: ochell stopped the agent at the time limit.
+	OutcomeTimedOut Outcome = "timed_out"
+	// OutcomeStopped: ochell stopped the agent for another reason, such as
+	// its own shutdown.
+	OutcomeStopped Outcome = "stopped"
+	// OutcomeNotStarted: the agent never ran.
+	OutcomeNotStarted Outcome = "not_started"
+)
+
 type Result struct {
+	Outcome Outcome
+	// ExitCode is the agent's exit status, or -1 when there is none. Read
+	// Outcome first.
 	ExitCode int
+	// Err is nil only when Outcome is OutcomeFinished.
 	Err      error
 	LogFile  string
 	Duration time.Duration

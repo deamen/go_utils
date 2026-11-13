@@ -20,7 +20,15 @@ test:
 	go vet ./...
 	go test -race ./...
 
+# Binaries for the VM-only tests, to copy to the VM (README, "Tests on the VM").
+vmtest:
+	mkdir -p vmtest
+	GOOS=linux CGO_ENABLED=0 go build -o vmtest/ochell .
+	GOOS=linux CGO_ENABLED=0 go build -o vmtest/fakeagent ./e2e/fakeagent
+	GOOS=linux CGO_ENABLED=0 go test -c -o vmtest/e2e.test ./e2e
+
 clean:
 	find . -name 'ochell[-?][a-zA-Z0-9]*[-?][a-zA-Z0-9]*' -delete
+	rm -rf vmtest
 
-.PHONY: release $(PLATFORMS) test clean
+.PHONY: release $(PLATFORMS) test vmtest clean

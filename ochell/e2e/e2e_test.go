@@ -143,3 +143,158 @@ func TestLargePromptOnStdin(t *testing.T) {
 		t.Errorf("agent arguments = %.200q, want only -p", got)
 	}
 }
+
+// The systemd launcher and the real launch and stop scripts, with systemd
+// itself replaced by stand-ins. What only real systemd can show (another OS
+// user, the unit's cgroup) is in TestSystemdLauncherOnVM.
+func TestSystemdLauncherThroughScripts(t *testing.T) {
+	var root string
+	o := Start(t, Options{
+		Env: []string{"JIRA_WEBHOOK_SECRET=jira-env-secret"},
+		Configure: func(c *config.Config) {
+			root = UseFakeSystemd(t, c)
+			c.Agent.Args = []string{"--session", "{{.Source}}-{{.Key}}"}
+		},
+	})
+	// Ticket text that would make systemd put the token on the command line
+	// if it ever reached an argument.
+	id := o.LinearCreated("ENG-9", "session-systemd", "context with ${AGENT_TOKEN} and $$").TaskID(t)
+	run := o.WaitRun(id, 15*time.Second)
+	if run.ExitCode != 0 || !strings.Contains(run.Footer, "outcome=finished") {
+		t.Fatalf("run: %s\n%s", run.Footer, run.Log)
+	}
+	rec := o.WaitRecords(1, 5*time.Second)[0]
+	if !strings.Contains(rec.Stdin, "context with ${AGENT_TOKEN} and $$") {
+		t.Errorf("prompt on stdin was changed:\n%s", rec.Stdin)
+	}
+	if got := strings.Join(rec.Args, " "); got != "--session linear-ENG-9" {
+		t.Errorf("agent arguments = %q", got)
+	}
+	if want := filepath.Join(root, "linear-ENG-9"); rec.Dir != want {
+		t.Errorf("working directory = %q, want %q", rec.Dir, want)
+	}
+	// The unit has its own environment: the token from the root-only file
+	// and what ochell sets, but nothing inherited from ochell.
+	if got, _ := rec.Getenv("AGENT_TOKEN"); got != AgentToken {
+		t.Errorf("AGENT_TOKEN = %q, want the value from the environment file", got)
+	}
+	if got, _ := rec.Getenv("ORCH_TASK_KEY"); got != "ENG-9" {
+		t.Errorf("ORCH_TASK_KEY = %q", got)
+	}
+	for _, name := range []string{"JIRA_WEBHOOK_SECRET", "HOME", "OCHELL_LAUNCHER_CONF"} {
+		if v, ok := rec.Getenv(name); ok {
+			t.Errorf("the unit inherited %s=%q from ochell", name, v)
+		}
+	}
+	if acts := o.WaitActivities("session-systemd", 2, 10*time.Second); acts[1].Type != "response" {
+		t.Errorf("second activity = %+v, want the agent result", acts[1])
+	}
+}
+
+func TestSystemdLauncherStopsAtTimeLimit(t *testing.T) {
+	o := Start(t, Options{
+		Script: []Step{{Print: "working"}, {Sleep: "10m"}},
+		Configure: func(c *config.Config) {
+			UseFakeSystemd(t, c)
+			c.Agent.Timeout = time.Second
+			c.Agent.StopGrace = 2 * time.Second
+		},
+	})
+	id := o.LinearCreated("ENG-10", "session-timeout", "").TaskID(t)
+	run := o.WaitRun(id, 20*time.Second)
+	if !strings.Contains(run.Footer, "outcome=timed_out") {
+		t.Fatalf("run: %s", run.Footer)
+	}
+	rec := o.WaitRecords(1, 5*time.Second)[0]
+	if Alive(rec.PID) {
+		t.Errorf("the agent (pid %d) is still running after the time limit", rec.PID)
+	}
+	acts := o.WaitActivities("session-timeout", 2, 10*time.Second)
+	if acts[1].Type != "error" || !strings.Contains(acts[1].Body, "timed out") {
+		t.Errorf("second activity = %+v, want an error that names the time limit", acts[1])
+	}
+}
+
+// A launch that the script refuses is reported as "not started", with the
+// script's reason, not as an agent failure.
+func TestSystemdLauncherRefusedLaunch(t *testing.T) {
+	o := Start(t, Options{Configure: func(c *config.Config) {
+		UseFakeSystemd(t, c)
+		c.Agent.Workdir = "/outside-the-workspace/{{.Key}}"
+	}})
+	id := o.LinearCreated("ENG-11", "session-refused", "").TaskID(t)
+	run := o.WaitRun(id, 15*time.Second)
+	if run.ExitCode != 250 || !strings.Contains(run.Footer, "outcome=not_started") {
+		t.Errorf("run: %s", run.Footer)
+	}
+	if !strings.Contains(run.Log, "ochell-launch: the working directory is outside") {
+		t.Errorf("the log does not hold the reason:\n%s", run.Log)
+	}
+	if len(o.Records()) != 0 {
+		t.Error("the agent ran although the launch was refused")
+	}
+	acts := o.WaitActivities("session-refused", 2, 10*time.Second)
+	if acts[1].Type != "error" || !strings.Contains(acts[1].Body, "did not start") {
+		t.Errorf("second activity = %+v", acts[1])
+	}
+}
+
+// The systemd launcher with real systemd: the agent runs as another OS user
+// and a stop reaches all its processes. CI has no systemd, so this runs on
+// the VM only; see "Tests on the VM" in the README for the setup.
+func TestSystemdLauncherOnVM(t *testing.T) {
+	RequireVM(t)
+	root := os.Getenv("OCHELL_E2E_VM_WORKSPACE")
+	if root == "" {
+		root = "/work"
+	}
+	const arg = "A${CLAUDE_CODE_OAUTH_TOKEN}B $HOME $$ 100%h"
+	o := Start(t, Options{
+		OtherAgentUser: true,
+		Script: []Step{
+			{TryRead: "{{dir}}/config.yaml"}, {TryRead: "{{dir}}/linear-token.json"},
+			{WriteFile: &File{Path: "result.txt", Content: "done"}},
+			{Spawn: &Spawn{Count: 2}}, {Spawn: &Spawn{Count: 1, Setsid: true}},
+			{Print: "working"}, {Sleep: "10m"},
+		},
+		Configure: func(c *config.Config) {
+			c.Agent.Launcher = "systemd"
+			c.Agent.Args = []string{arg}
+			c.Agent.Workdir = filepath.Join(root, "e2e-{{.Key}}-{{.ID}}")
+			c.Agent.Timeout = 5 * time.Second
+			c.Agent.StopGrace = 5 * time.Second
+		},
+	})
+
+	id := o.LinearCreated("ENG-VM", "session-vm", "context with ${CLAUDE_CODE_OAUTH_TOKEN}").TaskID(t)
+	run := o.WaitRun(id, 60*time.Second)
+	if !strings.Contains(run.Footer, "outcome=timed_out") {
+		t.Fatalf("run: %s\n%s", run.Footer, run.Log)
+	}
+	rec := o.WaitRecords(1, 5*time.Second)[0]
+	if rec.UID == os.Getuid() {
+		t.Errorf("the agent ran as ochell's own user (uid %d)", rec.UID)
+	}
+	if len(rec.Args) != 1 || rec.Args[0] != arg {
+		t.Errorf("argument reached the agent as %q, want it unchanged: %q", rec.Args, arg)
+	}
+	if !strings.Contains(rec.Stdin, "context with ${CLAUDE_CODE_OAUTH_TOKEN}") {
+		t.Errorf("prompt on stdin was changed:\n%s", rec.Stdin)
+	}
+	for _, f := range []string{"config.yaml", "linear-token.json"} {
+		if got := rec.Reads[filepath.Join(o.Dir, f)]; got == "" || got == "ok" {
+			t.Errorf("the agent could read ochell's %s: %q", f, got)
+		}
+	}
+	if got := rec.Writes["result.txt"]; got != "ok" {
+		t.Errorf("the agent could not write its working directory: %s", got)
+	}
+	if len(rec.Children) != 3 {
+		t.Fatalf("the agent started %d children, want 3", len(rec.Children))
+	}
+	for _, pid := range append([]int{rec.PID}, rec.Children...) {
+		if Alive(pid) {
+			t.Errorf("process %d is still running after the stop", pid)
+		}
+	}
+}

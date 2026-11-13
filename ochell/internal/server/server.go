@@ -400,7 +400,7 @@ func (s *Server) attachLinearCallbacks(t *task.Task, sessionID string, log *slog
 		defer cancel()
 		if res.Err != nil {
 			return s.linear.CreateActivity(ctx, sessionID, linear.ActivityError,
-				fmt.Sprintf("The agent failed (exit %d): %v\n\n%s", res.ExitCode, res.Err, codeBlock(lastN(res.Tail, replyMax))))
+				failureText(res)+"\n\n"+codeBlock(lastN(res.Tail, replyMax)))
 		}
 		msg := strings.TrimSpace(lastN(res.Tail, replyMax))
 		if msg == "" {
@@ -408,6 +408,18 @@ func (s *Server) attachLinearCallbacks(t *task.Task, sessionID string, log *slog
 		}
 		return s.linear.CreateActivity(ctx, sessionID, linear.ActivityResponse, msg)
 	}
+}
+
+// failureText says why a run did not succeed. It goes by the outcome: the
+// exit code of a run that ochell stopped means nothing.
+func failureText(res task.Result) string {
+	switch res.Outcome {
+	case task.OutcomeTimedOut, task.OutcomeStopped:
+		return fmt.Sprintf("The run is incomplete: %v.", res.Err)
+	case task.OutcomeNotStarted:
+		return fmt.Sprintf("The run did not start: %v.", res.Err)
+	}
+	return fmt.Sprintf("The agent failed (exit %d): %v", res.ExitCode, res.Err)
 }
 
 func lastN(s string, n int) string {
