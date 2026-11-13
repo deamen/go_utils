@@ -1,0 +1,35 @@
+name: "Build ochell"
+
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - 'ochell/**'
+      - '.github/workflows/ochell_workflow.yml'
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - 'ochell/**'
+      - '.github/workflows/ochell_workflow.yml'
+
+  workflow_dispatch:
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4.1.7
+
+      - name: Setup Go
+        uses: actions/setup-go@v5.0.1
+        with:
+          go-version-file: ochell/go.mod
+
+      - name: Vet and test
+        run: make test
+        working-directory: ./ochell
+
+      - name: Build ochell binaries
+        run: make
+        working-directory: ./ochell

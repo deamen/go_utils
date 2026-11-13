@@ -1,0 +1,23 @@
+{
+  "type": "AgentSessionEvent",
+  "action": "created",
+  "createdAt": "2026-10-11T03:12:45.123Z",
+  "organizationId": "org-0000",
+  "oauthClientId": "client-0000",
+  "appUserId": "app-user-0000",
+  "agentSession": {
+    "id": "session-0000",
+    "issueId": "issue-0000",
+    "issue": {
+      "id": "issue-0000",
+      "identifier": "ENG-123",
+      "title": "Add retry to the payment client",
+      "url": "https://linear.app/example/issue/ENG-123/add-retry-to-the-payment-client"
+    }
+  },
+  "promptContext": "<issue identifier=\"ENG-123\"><title>Add retry to the payment client</title></issue>",
+  "previousComments": [],
+  "guidance": null,
+  "webhookTimestamp": 0,
+  "webhookId": "webhook-0000"
+}

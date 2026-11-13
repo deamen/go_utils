@@ -1,0 +1,51 @@
+# ngrok Traffic Policy for the orchestrator endpoint.
+#   ngrok http 8080 --url https://<your-domain>.ngrok-free.app --traffic-policy-file ngrok-policy.yaml
+#
+# Replace the placeholders; do not commit real secrets. The IP policies are
+# kept up to date with `ochell ngrok-sync`.
+# Five rules, which fits the ngrok Free plan limit of 5 rules per policy.
+on_http_request:
+  - name: Jira paths only from Atlassian egress ranges
+    expressions:
+      - "req.url.path in ['/webhooks/jira', '/webhooks/jira-automation']"
+    actions:
+      - type: restrict-ips
+        config:
+          enforce: true
+          ip_policies: ["ipp_ATLASSIAN_POLICY_ID"]
+
+  - name: Linear path only from Linear webhook IPs
+    expressions:
+      - "req.url.path == '/webhooks/linear'"
+    actions:
+      - type: restrict-ips
+        config:
+          enforce: true
+          ip_policies: ["ipp_LINEAR_POLICY_ID"]
+
+  - name: Verify Jira native webhook signature (X-Hub-Signature)
+    expressions:
+      - "req.url.path == '/webhooks/jira'"
+    actions:
+      - type: verify-webhook
+        config:
+          provider: jira
+          secret: "JIRA_WEBHOOK_SECRET"
+
+  - name: Verify Linear webhook signature (Linear-Signature)
+    expressions:
+      - "req.url.path == '/webhooks/linear'"
+    actions:
+      - type: verify-webhook
+        config:
+          provider: linear
+          secret: "LINEAR_WEBHOOK_SECRET"
+
+  - name: Jira Automation cannot sign; require the shared bearer token
+    expressions:
+      - "req.url.path == '/webhooks/jira-automation' && !('Bearer JIRA_AUTOMATION_TOKEN' in req.headers['authorization'])"
+    actions:
+      - type: custom-response
+        config:
+          status_code: 401
+          body: unauthorized
