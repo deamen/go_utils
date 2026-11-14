@@ -418,13 +418,15 @@ func TestSecondSignalStopsAgentsNow(t *testing.T) {
 // The agent signal contract: the agent says how its run ended in a result
 // file, and that decides what the ticket is told and which state it is in.
 func TestAgentSignal(t *testing.T) {
-	ticket := func(t *testing.T, o *Ochell, key string) *store.Ticket {
+	// ticket returns the stored ticket once the end of run id is stored.
+	ticket := func(t *testing.T, o *Ochell, key, id string) *store.Ticket {
 		t.Helper()
 		st, err := store.Open(o.Config.Store.Path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer st.Close()
+		o.WaitStored(st, id, 15*time.Second)
 		tk, err := st.Ticket("linear", key)
 		if err != nil || tk == nil {
 			t.Fatalf("stored ticket %s: %v, %v", key, tk, err)
@@ -443,7 +445,7 @@ func TestAgentSignal(t *testing.T) {
 		if acts[1].Type != "elicitation" || acts[1].Body != "Which of the two login pages do you mean?" {
 			t.Errorf("the ticket got %+v, want the question as an elicitation", acts[1])
 		}
-		if tk := ticket(t, o, "ENG-41"); tk.State != "waiting" || tk.Reason != "input" {
+		if tk := ticket(t, o, "ENG-41", id); tk.State != "waiting" || tk.Reason != "input" {
 			t.Errorf("ticket is %s (%s), want waiting (input)", tk.State, tk.Reason)
 		}
 
@@ -472,7 +474,7 @@ func TestAgentSignal(t *testing.T) {
 		if acts[1].Type != "elicitation" || !strings.Contains(acts[1].Body, "I think I am done.") || !strings.Contains(acts[1].Body, "without reporting a result") {
 			t.Errorf("the ticket got %+v", acts[1])
 		}
-		if tk := ticket(t, o, "ENG-42"); tk.State != "waiting" || tk.Reason != "no_result" {
+		if tk := ticket(t, o, "ENG-42", id); tk.State != "waiting" || tk.Reason != "no_result" {
 			t.Errorf("ticket is %s (%s), want waiting (no_result)", tk.State, tk.Reason)
 		}
 	})
@@ -483,7 +485,7 @@ func TestAgentSignal(t *testing.T) {
 		if run := o.WaitRun(id, 15*time.Second); !strings.Contains(run.Footer, "result=invalid") {
 			t.Errorf("run: %s", run.Footer)
 		}
-		if tk := ticket(t, o, "ENG-43"); tk.State != "waiting" || tk.Reason != "no_result" {
+		if tk := ticket(t, o, "ENG-43", id); tk.State != "waiting" || tk.Reason != "no_result" {
 			t.Errorf("ticket is %s (%s), want waiting (no_result)", tk.State, tk.Reason)
 		}
 	})
@@ -496,7 +498,7 @@ func TestAgentSignal(t *testing.T) {
 		if acts[1].Type != "response" || acts[1].Body != "Opened a pull request." {
 			t.Errorf("the ticket got %+v", acts[1])
 		}
-		tk := ticket(t, o, "ENG-44")
+		tk := ticket(t, o, "ENG-44", id)
 		if tk.State != "in_review" || tk.PRURL != "https://github.com/example/repo/pull/7" || tk.Branch != "bot/ENG-44" {
 			t.Errorf("ticket = %+v, want in_review with the pull request and the branch", tk)
 		}
@@ -509,7 +511,7 @@ func TestAgentSignal(t *testing.T) {
 		if acts := o.WaitActivities("session-failed", 2, 10*time.Second); acts[1].Type != "error" {
 			t.Errorf("the ticket got %+v, want an error", acts[1])
 		}
-		if tk := ticket(t, o, "ENG-45"); tk.State != "failed" {
+		if tk := ticket(t, o, "ENG-45", id); tk.State != "failed" {
 			t.Errorf("ticket is %s, want failed", tk.State)
 		}
 	})
@@ -618,6 +620,9 @@ func TestRunContextInThePrompt(t *testing.T) {
 		t.Errorf("the first prompt holds a run context:\n%s", first)
 	}
 
+	// The ticket is free for a new run once the first one is reported.
+	o.WaitActivities("session-first", 2, 10*time.Second)
+
 	// Someone mentions the agent in a comment: the second attempt.
 	second := prompt(o.LinearMentioned("ENG-8", "session-second", comment).TaskID(t))
 	for _, want := range []string{
@@ -677,8 +682,7 @@ func TestClaudeAdapterRecordsAndResumesTheSession(t *testing.T) {
 
 	// The ticket is delegated again: the same session goes on.
 	second := o.LinearCreated("ENG-81", "session-two", "").TaskID(t)
-	o.WaitRun(second, 15*time.Second)
-	if run, _ := st.Run(second); run == nil || !run.Result.Resumed || run.Attempt != 2 {
+	if run := o.WaitStored(st, second, 15*time.Second); !run.Result.Resumed || run.Attempt != 2 {
 		t.Errorf("second run = %+v, want a resumed second attempt", run)
 	}
 	const start = "-p --permission-mode acceptEdits --output-format stream-json --verbose"
