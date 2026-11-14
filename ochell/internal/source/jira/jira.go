@@ -22,7 +22,7 @@ var ErrStale = errors.New("webhook timestamp outside allowed skew")
 // CheckTimestamp rejects a payload whose "timestamp" (milliseconds, set by
 // Jira when the event happened) is more than maxSkew away from now. A
 // captured request can then not be replayed later; within maxSkew the
-// delivery id protects against replay.
+// server's de-duplication of the signed body protects against replay.
 func CheckTimestamp(body []byte, maxSkew time.Duration, now time.Time) error {
 	var ts struct {
 		Timestamp json.Number `json:"timestamp"`
