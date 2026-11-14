@@ -58,9 +58,12 @@ const replyHint = "Reply in a comment on this ticket, and the digital employee g
 // the activity that a Linear session gets. canReply: a comment on the
 // ticket reaches ochell, so a run that waits for a person says how to
 // answer.
-func jiraFinished(res task.Result, canReply bool) string {
+func jiraFinished(t *task.Task, res task.Result, canReply bool) string {
 	if res.Next != "" {
 		return queuedAgainText(res)
+	}
+	if res.Outcome == task.OutcomeCancelled {
+		return cancelledText(t, res)
 	}
 	if res.Err != nil {
 		return strings.TrimSpace(failureText(res) + "\n\n" + noFormat(lastN(res.Message, replyMax)))
@@ -97,7 +100,7 @@ func (s *Server) jiraRunFinished(ctx context.Context, t *task.Task, res task.Res
 	ctx, cancel := context.WithTimeout(ctx, 2*jiraCallBy)
 	defer cancel()
 	// Comments reach ochell through the system webhook only.
-	if err := s.jira.Comment(ctx, t.Key, jiraFinished(res, s.cfg.Sources.JiraWebhook.Enabled)); err != nil {
+	if err := s.jira.Comment(ctx, t.Key, jiraFinished(t, res, s.cfg.Sources.JiraWebhook.Enabled)); err != nil {
 		return err
 	}
 	// Only finished work is handed to the reviewers.

@@ -91,8 +91,9 @@ var moves = map[State][]State{
 	// From here on only a new assignment starts the ticket again.
 	Done: {Queued, Waiting},
 	// Done: the ticket was closed in the tracker as it was.
-	Failed:    {Queued, Cancelled, Waiting, Done},
-	Cancelled: {Queued, Waiting},
+	Failed: {Queued, Cancelled, Waiting, Done},
+	// Done: the ticket was closed in the tracker after it was stopped.
+	Cancelled: {Queued, Waiting, Done},
 }
 
 // Move checks a change of state. A ticket that moves to Waiting must give a
@@ -147,6 +148,8 @@ func AfterRun(o task.Outcome, signal result.Status) (State, Reason) {
 		return Waiting, ReasonInterrupted
 	case task.OutcomeStalled:
 		return Waiting, ReasonStalled
+	case task.OutcomeCancelled:
+		return Cancelled, ""
 	}
 	// failed, timed_out, not_started
 	return Failed, ""

@@ -107,9 +107,12 @@ type Event struct {
 		State      *struct {
 			Type string `json:"type"`
 		} `json:"state"`
+		DelegateID string `json:"delegateId"`
 	} `json:"data"`
-	Guidance         any   `json:"guidance"`
-	PreviousComments []any `json:"previousComments"`
+	// UpdatedFrom holds the earlier values of what an "update" changed.
+	UpdatedFrom      map[string]any `json:"updatedFrom"`
+	Guidance         any            `json:"guidance"`
+	PreviousComments []any          `json:"previousComments"`
 }
 
 // Session is the normalized result of an AgentSessionEvent.
@@ -218,6 +221,24 @@ func (e *Event) Closed() (key string, ok bool) {
 		return e.Data.Identifier, true
 	}
 	return "", false
+}
+
+// Undelegated reports whether the event says that an issue was taken away
+// from this agent, and returns its identifier: an "Issue" update that
+// changes the delegate, where the earlier delegate was this app's user.
+//
+// Without appUserId in the payload nobody can tell whose issue it was, and
+// the answer is no. Linear sends these events only when the app's webhook
+// is subscribed to issue events.
+func (e *Event) Undelegated() (key string, ok bool) {
+	if e.Type != "Issue" || e.Action != "update" || e.Data == nil || e.Data.Identifier == "" || e.AppUserID == "" {
+		return "", false
+	}
+	before, changed := e.UpdatedFrom["delegateId"].(string)
+	if !changed || before != e.AppUserID || e.Data.DelegateID == before {
+		return "", false
+	}
+	return e.Data.Identifier, true
 }
 
 // PromptText returns the user's follow-up message of a "prompted" event.

@@ -276,17 +276,33 @@ func TestClosedTicketIsKeptWhenItShouldBe(t *testing.T) {
 		t.Errorf("ticket = %s, want done", tk.State)
 	}
 
-	// A ticket whose task is queued is left alone.
+	// A ticket that is closed while its task is queued is not started.
 	st := testStore(t)
 	r, _ := New(agentCfg(t, "echo"), logger(), st)
+	f := &finished{done: make(chan string, 1)}
+	r.SetNotifier(f)
 	if err := r.Submit(newTask()); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Closed("jira", "DEV-1"); !errors.Is(err, ErrBusy) {
-		t.Errorf("closing a queued ticket: %v, want ErrBusy", err)
+	if err := r.Closed("jira", "DEV-1"); err != nil {
+		t.Errorf("closing a queued ticket: %v", err)
 	}
-	if tk, _ := st.Ticket("jira", "DEV-1"); tk.State != ticket.Queued {
-		t.Errorf("ticket = %s, want still queued", tk.State)
+	if tk, _ := st.Ticket("jira", "DEV-1"); tk.State != ticket.Done {
+		t.Errorf("ticket = %s, want done", tk.State)
+	}
+	if run, _ := st.Run("t1"); run == nil || run.Status != "ended" || run.Result.Outcome != task.OutcomeCancelled {
+		t.Errorf("the queued run = %+v, want ended as cancelled", run)
+	}
+	f.wait(t, "DEV-1")
+	if res := f.result("DEV-1"); res.Outcome != task.OutcomeCancelled || res.Err == nil || !strings.Contains(res.Err.Error(), "the ticket was closed") {
+		t.Errorf("the ticket was told %+v", res)
+	}
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	r.Shutdown(context.Background())
+	if f.attempt("DEV-1") != 0 {
+		t.Error("the run of the closed ticket was started")
 	}
 }
 

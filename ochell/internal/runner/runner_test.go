@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"ochell/internal/config"
 	"ochell/internal/store"
 	"ochell/internal/task"
+	"ochell/internal/ticket"
 )
 
 // TestHelperAgent is executed as the fake agent CLI by the tests below.
@@ -694,5 +696,141 @@ func TestStallDetection(t *testing.T) {
 	}
 	if d := time.Since(start); d < cfg.StallTimeout {
 		t.Errorf("the agent ran for %s, not longer than the limit of %s: the test shows nothing", d, cfg.StallTimeout)
+	}
+}
+
+// A stop from outside ends the running agent, and the ticket is cancelled
+// and told by whom.
+func TestStopRunningTicket(t *testing.T) {
+	cfg := agentCfg(t, "sleep")
+	cfg.Timeout = time.Minute
+	cfg.MaxAttempts = 5
+	st := testStore(t)
+	r, _ := New(cfg, logger(), st)
+	f := &finished{done: make(chan string, 1)}
+	r.SetNotifier(f)
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Shutdown(context.Background())
+	if err := r.Submit(f.task("A-1")); err != nil {
+		t.Fatal(err)
+	}
+	waitRunning(t, r, cfg.LogDir, "t-A-1")
+	start := time.Now()
+	if did, err := r.Stop("jira", "A-1", "Anna, with /stop in a comment"); err != nil || did != StoppedRun {
+		t.Fatalf("Stop = %v, %v; want StoppedRun", did, err)
+	}
+	// A second request while the first takes effect changes nothing.
+	if did, err := r.Stop("jira", "A-1", "Bob"); err != nil || did != StoppedRun {
+		t.Errorf("a second Stop = %v, %v", did, err)
+	}
+	f.wait(t, "A-1")
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("the agent was stopped after %s", d)
+	}
+	res := f.result("A-1")
+	if res.Outcome != task.OutcomeCancelled || res.Err == nil || res.Err.Error() != "the run was stopped by Anna, with /stop in a comment" || res.Next != "" {
+		t.Errorf("result = %+v, want cancelled by Anna", res)
+	}
+	if tk, _ := st.Ticket("jira", "A-1"); tk.State != ticket.Cancelled {
+		t.Errorf("ticket = %s, want cancelled", tk.State)
+	}
+	if n, _ := st.Active(); n != 0 {
+		t.Errorf("%d runs are queued or running: a stopped run must not be queued again", n)
+	}
+	// Nothing is left to stop, and an unknown ticket is one.
+	if _, err := r.Stop("jira", "A-1", "Anna"); !errors.Is(err, store.ErrReleased) {
+		t.Errorf("Stop of a stopped ticket: %v, want ErrReleased", err)
+	}
+	if _, err := r.Stop("jira", "A-404", "Anna"); !errors.Is(err, store.ErrUnknown) {
+		t.Errorf("Stop of an unknown ticket: %v, want ErrUnknown", err)
+	}
+	// Assigned again, the ticket runs again.
+	again := f.task("A-1")
+	again.ID = "t-A-1-again"
+	if err := r.Submit(again); err != nil {
+		t.Errorf("assigned again: %v", err)
+	}
+	waitRunning(t, r, cfg.LogDir, "t-A-1-again")
+	r.Stop("jira", "A-1", "the test")
+	f.wait(t, "A-1")
+}
+
+// A queued run is taken out of the queue, and a ticket that waits is
+// released. Both are told, and neither starts.
+func TestStopQueuedAndWaitingTickets(t *testing.T) {
+	cfg := agentCfg(t, "echo")
+	st := testStore(t)
+	r, _ := New(cfg, logger(), st)
+	f := &finished{done: make(chan string, 4)}
+	r.SetNotifier(f)
+	// Not started yet: the task stays queued.
+	if err := r.Submit(f.task("A-1")); err != nil {
+		t.Fatal(err)
+	}
+	if did, err := r.Stop("jira", "A-1", "Anna"); err != nil || did != StoppedQueued {
+		t.Fatalf("Stop of a queued ticket = %v, %v; want StoppedQueued", did, err)
+	}
+	f.wait(t, "A-1")
+	if res := f.result("A-1"); res.Outcome != task.OutcomeCancelled || res.Err.Error() != "the run was stopped by Anna" {
+		t.Errorf("the queued ticket was told %+v", res)
+	}
+
+	// A ticket that waits for a human.
+	if err := st.Enqueue(f.task("A-2"), store.Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	st.Claim()
+	if err := st.Finish("t-A-2", task.Result{Outcome: task.OutcomeFinished}); err != nil {
+		t.Fatal(err)
+	}
+	if did, err := r.Stop("jira", "A-2", "Anna"); err != nil || did != Released {
+		t.Fatalf("Stop of a waiting ticket = %v, %v; want Released", did, err)
+	}
+	f.wait(t, "A-2")
+	if res := f.result("A-2"); res.Outcome != task.OutcomeCancelled || res.Err.Error() != "the ticket was released by Anna" {
+		t.Errorf("the waiting ticket was told %+v", res)
+	}
+	for _, key := range []string{"A-1", "A-2"} {
+		if tk, _ := st.Ticket("jira", key); tk.State != ticket.Cancelled {
+			t.Errorf("%s = %s, want cancelled", key, tk.State)
+		}
+	}
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	r.Shutdown(context.Background())
+	if f.attempt("A-1") != 0 || f.attempt("A-2") != 0 {
+		t.Error("a stopped ticket was started")
+	}
+}
+
+// A ticket that the tracker closes while its agent runs is stopped, and is
+// done when the run has ended.
+func TestClosedWhileRunning(t *testing.T) {
+	cfg := agentCfg(t, "sleep")
+	cfg.Timeout = time.Minute
+	st := testStore(t)
+	r, _ := New(cfg, logger(), st)
+	f := &finished{done: make(chan string, 1)}
+	r.SetNotifier(f)
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Submit(f.task("A-1")); err != nil {
+		t.Fatal(err)
+	}
+	waitRunning(t, r, cfg.LogDir, "t-A-1")
+	if err := r.Closed("jira", "A-1"); err != nil {
+		t.Fatalf("Closed = %v", err)
+	}
+	f.wait(t, "A-1")
+	if res := f.result("A-1"); res.Outcome != task.OutcomeCancelled || !strings.Contains(res.Err.Error(), "the ticket was closed") {
+		t.Errorf("result = %+v, want cancelled because the ticket was closed", res)
+	}
+	r.Shutdown(context.Background())
+	if tk, _ := st.Ticket("jira", "A-1"); tk.State != ticket.Done {
+		t.Errorf("ticket = %s, want done", tk.State)
 	}
 }

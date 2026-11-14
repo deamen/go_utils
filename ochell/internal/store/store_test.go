@@ -850,3 +850,97 @@ func TestAssigner(t *testing.T) {
 		t.Errorf("assigned again by someone else: assigner = %q, want u-carl", got)
 	}
 }
+
+// Stop ends what ochell holds of a ticket that has no running agent.
+func TestStop(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	why := errors.New("the run was stopped by Anna")
+	if _, err := s.Stop("linear", "ENG-0", why); !errors.Is(err, ErrUnknown) {
+		t.Errorf("an unknown ticket: %v, want ErrUnknown", err)
+	}
+
+	// A queued run is taken out of the queue, with the messages that
+	// waited behind it.
+	if err := s.Enqueue(newTask("run-1", "ENG-1", t0), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.FollowUp(&task.Task{ID: "m1", Source: "linear", Key: "ENG-1", Comment: "also this", Received: t0}, true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := s.Stop("linear", "ENG-1", why)
+	if err != nil || queued == nil || queued.ID != "run-1" || queued.TrackerSession != "session-run-1" {
+		t.Fatalf("Stop = %+v, %v; want the queued run", queued, err)
+	}
+	if run, _ := s.Run("run-1"); run.Status != "ended" || run.Result.Outcome != task.OutcomeCancelled || run.Result.Err == nil || run.Result.Err.Error() != why.Error() {
+		t.Errorf("the queued run = %+v", run)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.Cancelled {
+		t.Errorf("ticket = %s, want cancelled", tk.State)
+	}
+	if n, _ := s.Waiting("linear", "ENG-1"); n != 0 {
+		t.Errorf("%d messages still wait for a stopped ticket", n)
+	}
+	if got, _ := s.Claim(); got != nil {
+		t.Errorf("the stopped run was claimed: %+v", got)
+	}
+	// Stopped twice, and a comment afterwards: nothing.
+	if _, err := s.Stop("linear", "ENG-1", why); !errors.Is(err, ErrReleased) {
+		t.Errorf("a second stop: %v, want ErrReleased", err)
+	}
+	if _, err := s.FollowUp(&task.Task{ID: "m2", Source: "linear", Key: "ENG-1", Comment: "hello?", Received: t0}, false, Limits{}); !errors.Is(err, ErrReleased) {
+		t.Errorf("a comment on a stopped ticket: %v, want ErrReleased", err)
+	}
+	// Assigned again, it runs again.
+	if err := s.Enqueue(newTask("run-2", "ENG-1", t0), Limits{}); err != nil {
+		t.Fatalf("assigned again: %v", err)
+	}
+
+	// A running ticket is the caller's to stop; the run then ends as
+	// cancelled, and what waited is dropped.
+	if got, _ := s.Claim(); got == nil || got.ID != "run-2" {
+		t.Fatalf("claimed %+v", got)
+	}
+	if _, err := s.Stop("linear", "ENG-1", why); !errors.Is(err, ErrBusy) {
+		t.Errorf("a running ticket: %v, want ErrBusy", err)
+	}
+	if _, err := s.FollowUp(&task.Task{ID: "m3", Source: "linear", Key: "ENG-1", Comment: "and this", Received: t0}, true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	next, err := s.FinishAndQueue("run-2", task.Result{Outcome: task.OutcomeCancelled, Err: why}, &Again{ID: "run-3", Cause: task.CauseRetry})
+	if err != nil || next != "" {
+		t.Errorf("FinishAndQueue of a cancelled run = %q, %v; want nothing queued", next, err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.Cancelled {
+		t.Errorf("ticket = %s, want cancelled", tk.State)
+	}
+	if n, _ := s.Waiting("linear", "ENG-1"); n != 0 {
+		t.Errorf("%d messages still wait", n)
+	}
+
+	// A ticket that waits is released: no run to return.
+	if err := s.Enqueue(newTask("run-4", "ENG-2", t0), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	s.Claim()
+	if err := s.Finish("run-4", task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput}); err != nil {
+		t.Fatal(err)
+	}
+	if queued, err := s.Stop("linear", "ENG-2", why); err != nil || queued != nil {
+		t.Errorf("releasing a waiting ticket = %+v, %v", queued, err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-2"); tk.State != ticket.Cancelled {
+		t.Errorf("ticket = %s, want cancelled", tk.State)
+	}
+	// Where a message about it goes: the session of its last run.
+	if last, err := s.LastTask("linear", "ENG-2"); err != nil || last == nil || last.ID != "run-4" || last.TrackerSession != "session-run-4" {
+		t.Errorf("LastTask = %+v, %v", last, err)
+	}
+	if last, err := s.LastTask("linear", "ENG-404"); err != nil || last != nil {
+		t.Errorf("LastTask of an unknown ticket = %+v, %v", last, err)
+	}
+	// A closed ticket that was stopped before can still be closed.
+	if tk, err := s.CloseTicket("linear", "ENG-2"); err != nil || tk.State != ticket.Done {
+		t.Errorf("closing a cancelled ticket = %+v, %v", tk, err)
+	}
+}

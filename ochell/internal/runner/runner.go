@@ -69,6 +69,15 @@ type Runner struct {
 	mu      sync.Mutex
 	stopped bool
 	wg      sync.WaitGroup
+	// What a stop from outside needs to know about the runs in progress,
+	// by source and key (ticketKey). All three are guarded by mu.
+	//
+	// cancels ends the run of a ticket; stops says who asked for a stop
+	// that has not taken effect yet; closing marks a ticket that the
+	// tracker closed while it ran.
+	cancels map[string]context.CancelFunc
+	stops   map[string]string
+	closing map[string]bool
 	// wake tells an idle worker to look at the queue.
 	wake chan struct{}
 	// quit is closed when Shutdown begins: workers start no more tasks.
@@ -80,7 +89,8 @@ type Runner struct {
 
 // New returns a runner that keeps its queue in st.
 func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
-	r := &Runner{cfg: cfg, log: log, store: st, wake: make(chan struct{}, 1), quit: make(chan struct{})}
+	r := &Runner{cfg: cfg, log: log, store: st, wake: make(chan struct{}, 1), quit: make(chan struct{}),
+		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}}
 	r.runCtx, r.stopRuns = context.WithCancel(context.Background())
 	var err error
 	if r.prompt, err = parse("prompt_template", cfg.PromptTemplate); err != nil {
@@ -208,6 +218,83 @@ func (r *Runner) Assigner(source, key string) (assigner string, known bool, err 
 // session, or "" when ochell knows none.
 func (r *Runner) TicketOfSession(source, session string) (string, error) {
 	return r.store.TicketOfSession(source, session)
+}
+
+func ticketKey(source, key string) string { return source + ":" + key }
+
+// What Stop did.
+type Stopped int
+
+const (
+	// StoppedRun: the agent was running, and is being stopped. The run
+	// ends as cancelled a moment later.
+	StoppedRun Stopped = iota + 1
+	// StoppedQueued: the run was still queued, and will not start.
+	StoppedQueued
+	// Released: nothing was queued or running. The ticket is no longer
+	// held: a comment on it starts nothing, until it is assigned again.
+	Released
+)
+
+// Stop ends the work on a ticket for a person, named in by: it stops the
+// running agent with all its processes, or takes the queued run out of the
+// queue, or releases a ticket that waited. The ticket becomes cancelled and
+// is not started again until it is assigned again. Messages that waited for
+// its next run are dropped.
+//
+// The ticket is told what happened and by whom, through the notifier.
+//
+// It returns store.ErrUnknown for a ticket that ochell has never seen, and
+// store.ErrReleased for one that is done or already cancelled.
+func (r *Runner) Stop(source, key, by string) (Stopped, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return 0, ErrStopped
+	}
+	return r.stopLocked(source, key, by)
+}
+
+func (r *Runner) stopLocked(source, key, by string) (Stopped, error) {
+	why := fmt.Errorf("the run was stopped by %s", by)
+	queued, err := r.store.Stop(source, key, why)
+	switch {
+	case errors.Is(err, store.ErrBusy):
+		// The agent is running. Its worker ends the run as cancelled; if
+		// the worker has not got as far as starting it, it finds the
+		// request when it does.
+		k := ticketKey(source, key)
+		if _, asked := r.stops[k]; !asked {
+			r.stops[k] = by
+		}
+		if cancel := r.cancels[k]; cancel != nil {
+			cancel()
+		}
+		r.log.Warn("stopping the run of a ticket", "source", source, "key", key, "by", by)
+		return StoppedRun, nil
+	case err != nil:
+		return 0, err
+	}
+	did := Released
+	res := task.Result{Outcome: task.OutcomeCancelled, ExitCode: -1, Err: fmt.Errorf("the ticket was released by %s", by)}
+	t := queued
+	if queued != nil {
+		did, res.Err = StoppedQueued, why
+	} else if t, err = r.store.LastTask(source, key); err != nil || t == nil {
+		// Nothing to report to: the ticket never had a run.
+		t = &task.Task{Source: source, Key: key}
+	}
+	r.log.Warn("ticket stopped", "source", source, "key", key, "by", by, "was_queued", queued != nil)
+	if r.notify != nil {
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			if err := r.notify.Finished(context.Background(), t, res); err != nil {
+				r.log.Warn("stop notification failed", "source", source, "key", key, "err", err)
+			}
+		}()
+	}
+	return did, nil
 }
 
 // Pause holds the queue: no new run starts until Resume. Running agents go
@@ -417,12 +504,36 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	}
 
 	notifyCtx := context.WithoutCancel(ctx)
-	if r.notify != nil {
+	// A stop from outside ends this run alone.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	k := ticketKey(t.Source, t.Key)
+	r.mu.Lock()
+	r.cancels[k] = cancel
+	if _, asked := r.stops[k]; asked {
+		// The stop came between the claim and now.
+		cancel()
+	}
+	r.mu.Unlock()
+
+	if r.notify != nil && ctx.Err() == nil {
 		if err := r.notify.Started(notifyCtx, t); err != nil {
 			log.Warn("start notification failed", "err", err)
 		}
 	}
 	res := r.Run(ctx, t)
+	r.mu.Lock()
+	by, stopped := r.stops[k]
+	closed := r.closing[k]
+	delete(r.cancels, k)
+	delete(r.stops, k)
+	delete(r.closing, k)
+	r.mu.Unlock()
+	if stopped {
+		// A person stopped it, which also holds when the run ended by
+		// itself in the same moment: the ticket is cancelled.
+		res.Outcome, res.Err = task.OutcomeCancelled, fmt.Errorf("the run was stopped by %s", by)
+	}
 	if res.Err != nil {
 		log.Error("agent run did not succeed", "outcome", res.Outcome, "exit", res.ExitCode, "err", res.Err, "duration", res.Duration, "log", res.LogFile)
 	} else {
@@ -453,6 +564,13 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	if r.notify != nil {
 		if err := r.notify.Finished(notifyCtx, t, res); err != nil {
 			log.Warn("finish notification failed", "err", err)
+		}
+	}
+	if closed {
+		// The tracker closed the ticket while it ran: now that the run has
+		// ended, the ticket is done and its working directory can go.
+		if err := r.Closed(t.Source, t.Key); err != nil && !errors.Is(err, ErrStopped) {
+			log.Warn("cannot record that the ticket was closed", "err", err)
 		}
 	}
 }
