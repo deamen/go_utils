@@ -92,7 +92,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-cmd` | Agent CLI executable (default `claude`) |
 | `--agent-arg` | Agent argument; repeatable; replaces the YAML `args` (default `-p`). Go template: `{{.Key}}`, `{{.Source}}`, `{{.ID}}`. Keep ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`, `{{.Prompt}}`) out of arguments; see [The prompt](#the-prompt) |
 | `--agent-prompt-via` | `stdin` (default) or `arg` |
-| `--agent-adapter` | Kind of agent CLI: `plain` (default); see [Agent adapters](#agent-adapters) |
+| `--agent-adapter` | Kind of agent CLI: `plain` (default) or `claude`; see [Agent adapters](#agent-adapters) |
 | `--agent-launcher` | `direct` (default) or `systemd`; see [Launchers](#launchers) |
 | `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
 | `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-log-dir` | Execution settings |
@@ -112,8 +112,8 @@ The agent runs without a shell, with its working directory set to `workdir` (ren
 
 ### The store
 ochell keeps its durable state in one SQLite file, `store.path` (default `ochell.db` in the working directory). It is created when missing, readable by its owner only, and updated in place when a newer ochell needs more tables. It holds:
-- the **tickets** ochell has worked on: state (see [Ticket states](#ticket-states)), number of attempts, working directory;
-- the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to;
+- the **tickets** ochell has worked on: state (see [Ticket states](#ticket-states)), number of attempts, working directory, and the agent's session id for a resume;
+- the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to, and what the agent adapter read from it (final message, session id, cost, token counts);
 - the **webhook deliveries** handled in the last 24 hours.
 
 So a restart loses no queued task, and a retried or replayed delivery from before the restart is still recognised. SQLite keeps two more files next to it while ochell runs (`-wal` and `-shm`); copy all three, or stop ochell first, when you back it up.
@@ -153,8 +153,18 @@ An adapter holds what differs between agent CLIs: how a run is started, how an e
 | Adapter | Command | Result |
 |---|---|---|
 | `plain` (default) | `agent.command` with `agent.args`; the prompt on stdin, or in the arguments with `prompt_via: arg` | the last 4 KB of the output is the message; no session, no cost, no resume |
+| `claude` | `agent.command` with `agent.args`, plus `--output-format stream-json --verbose` (and `-p` if it is missing); the prompt on stdin; `--resume <session>` to continue | the final message, the session id, the cost and the token counts, read from Claude Code's event stream |
 
 `plain` works with any CLI that takes a prompt and prints an answer.
+
+**The `claude` adapter** (checked against Claude Code 2.1.311):
+- **Settings:** `adapter: claude` needs `prompt_via: stdin`. Keep your own flags in `agent.args`, for example `--permission-mode` or `--model`. ochell refuses to start when `args` holds a flag the adapter sets itself (`--output-format`, `--resume`, `--continue`), or `--bare`, which makes Claude Code ignore the OAuth token.
+- **What the ticket gets:** the agent's final message, not the raw stream. The run log still has every event.
+- **What is stored** with each run: the message, the session id, the cost in USD and the token counts. For a resumed run, Claude Code appears to report the totals of the session so far, not of that run alone; ochell stores what it reports.
+- **Resume:** when a ticket runs again, in the same working directory as before, ochell continues the session of its last run instead of starting from zero. The run log says `session=new` or `session=resumed <id>`.
+  - Claude Code keeps its sessions under the agent user's configuration directory, so that directory must be the same for both runs.
+  - If a resumed run fails without opening a session (the session is gone), ochell forgets the session, and the ticket's next run starts a new one.
+- Tool events are not sent to the ticket while the agent runs.
 
 ### Launchers
 A launcher starts and stops the agent process. `agent.launcher` selects it.

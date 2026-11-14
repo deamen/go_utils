@@ -341,8 +341,18 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	res.Workdir = dir
 
 	// The adapter says how this agent is called and reads what it prints;
-	// the launcher runs it.
-	cmd, err := r.adapter.Start(agent.Run{Args: args, Prompt: t.Prompt})
+	// the launcher runs it. A ticket that ran before, in the same working
+	// directory, continues its session if the agent can do that.
+	run := agent.Run{Args: args, Prompt: t.Prompt}
+	var cmd agent.Command
+	err = agent.ErrNoResume
+	if t.AgentSession != "" && t.Workspace == dir {
+		cmd, err = r.adapter.Resume(run, t.AgentSession)
+		res.Resumed = err == nil
+	}
+	if errors.Is(err, agent.ErrNoResume) {
+		cmd, err = r.adapter.Start(run)
+	}
 	if err != nil {
 		res.Err = fmt.Errorf("build the agent command: %w", err)
 		return res
@@ -359,8 +369,12 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		return res
 	}
 	defer lf.Close()
-	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s\n# command=%s (%d args) workdir=%s\n# prompt:\n%s\n# ---- agent output ----\n",
-		t.ID, t.Source, t.Key, t.URL, r.cfg.Command, len(cmd.Args), dir, t.Prompt)
+	session := "new"
+	if res.Resumed {
+		session = "resumed " + t.AgentSession
+	}
+	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s\n# command=%s (%d args) workdir=%s session=%s\n# prompt:\n%s\n# ---- agent output ----\n",
+		t.ID, t.Source, t.Key, t.URL, r.cfg.Command, len(cmd.Args), dir, session, t.Prompt)
 	defer func() {
 		fmt.Fprintf(lf, "\n# ---- exit=%d outcome=%s err=%v duration=%s ----\n", res.ExitCode, res.Outcome, res.Err, time.Since(start))
 	}()
@@ -408,7 +422,8 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		res.Outcome = task.OutcomeStopped
 		w = r.stop(proc, waited)
 	}
-	res.Message = out.Report().Message
+	rep := out.Report()
+	res.Message, res.SessionID, res.CostUSD, res.Usage = rep.Message, rep.SessionID, rep.CostUSD, rep.Usage
 	res.ExitCode = w.code
 	switch {
 	case res.Outcome == task.OutcomeTimedOut:

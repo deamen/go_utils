@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"ochell/internal/agent"
 	"ochell/internal/task"
 	"ochell/internal/ticket"
 )
@@ -146,6 +147,72 @@ func TestRestart(t *testing.T) {
 	// The interrupted ticket can be started again.
 	if err := s.Enqueue(newTask("run-a2", "ENG-run-a", t0), 0); err != nil {
 		t.Errorf("new run of an interrupted ticket: %v", err)
+	}
+}
+
+// What the adapter read from a run is stored, and the ticket's next run gets
+// the session and the working directory to resume in.
+func TestAgentSession(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	run := func(id string, res task.Result) *task.Task {
+		t.Helper()
+		if err := s.Enqueue(newTask(id, "ENG-1", t0), 0); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Claim()
+		if err != nil || got == nil || got.ID != id {
+			t.Fatalf("Claim = %+v, %v", got, err)
+		}
+		if err := s.Finish(id, res); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	first := task.Result{
+		Outcome: task.OutcomeFinished, ExitCode: 0, Workdir: "/work/ENG-1", LogFile: "logs/r1.log",
+		Message: "Opened PR #7", SessionID: "sess-1", CostUSD: 0.25,
+		Usage: agent.Usage{InputTokens: 2, OutputTokens: 4, CacheReadTokens: 11852, CacheWriteTokens: 8403},
+	}
+	if got := run("r1", first); got.AgentSession != "" || got.Workspace != "" {
+		t.Errorf("first run of a ticket: session %q in %q, want none", got.AgentSession, got.Workspace)
+	}
+	stored, err := s.Run("r1")
+	if err != nil || stored == nil {
+		t.Fatalf("Run = %v, %v", stored, err)
+	}
+	if stored.Status != "ended" || stored.Attempt != 1 || stored.Key != "ENG-1" || stored.Result != first {
+		t.Errorf("stored run = %+v\nwant result %+v", stored, first)
+	}
+	if missing, err := s.Run("nope"); missing != nil || err != nil {
+		t.Errorf("Run of an unknown id = %v, %v", missing, err)
+	}
+
+	// The second run is told what to resume. It reports no session of its
+	// own (it was stopped early): the ticket keeps the one it has.
+	second := run("r2", task.Result{Outcome: task.OutcomeTimedOut, ExitCode: -1, Err: errors.New("agent timed out"), Resumed: true})
+	if second.AgentSession != "sess-1" || second.Workspace != "/work/ENG-1" || second.Attempt != 2 {
+		t.Errorf("second run = %+v, want session sess-1 in /work/ENG-1", second)
+	}
+	if stored, _ := s.Run("r2"); !stored.Result.Resumed || stored.Result.Err == nil || stored.Result.Err.Error() != "agent timed out" {
+		t.Errorf("stored second run = %+v", stored.Result)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.AgentSession != "sess-1" {
+		t.Errorf("session after a run that reported none = %q, want sess-1", tk.AgentSession)
+	}
+
+	// A resumed run that fails without opening a session: the session is
+	// gone, and the next run must start a new one.
+	run("r3", task.Result{Outcome: task.OutcomeFailed, ExitCode: 1, Err: errors.New("exit status 1"), Resumed: true})
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.AgentSession != "" {
+		t.Errorf("session after a failed resume = %q, want none", tk.AgentSession)
+	}
+	if fourth := run("r4", task.Result{Outcome: task.OutcomeFinished, SessionID: "sess-2"}); fourth.AgentSession != "" {
+		t.Errorf("run after a failed resume was told to resume %q", fourth.AgentSession)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.AgentSession != "sess-2" {
+		t.Errorf("session = %q, want sess-2", tk.AgentSession)
 	}
 }
 

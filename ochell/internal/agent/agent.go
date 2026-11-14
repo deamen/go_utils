@@ -41,6 +41,15 @@ type Report struct {
 	SessionID string
 	// CostUSD is what the run cost, 0 when the agent does not say.
 	CostUSD float64
+	Usage   Usage
+}
+
+// Usage is the token count of one run, as far as the agent reports it.
+type Usage struct {
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
 }
 
 // Output receives everything the agent writes to stdout and stderr during
@@ -67,6 +76,14 @@ func New(cfg config.Agent) (Adapter, error) {
 	switch cfg.Adapter {
 	case "", "plain":
 		return Plain{PromptOnStdin: cfg.PromptVia != "arg"}, nil
+	case "claude":
+		if cfg.PromptVia == "arg" {
+			return nil, errors.New("agent.adapter claude requires prompt_via: stdin")
+		}
+		if err := checkClaudeArgs(cfg.Args); err != nil {
+			return nil, err
+		}
+		return Claude{}, nil
 	}
 	return nil, fmt.Errorf("agent.adapter: unknown adapter %q", cfg.Adapter)
 }
