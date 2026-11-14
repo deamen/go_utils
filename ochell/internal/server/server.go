@@ -5,7 +5,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -230,13 +232,37 @@ func (s *Server) newTask(source, key, title, url, ctxText, delivery string) *tas
 	}
 }
 
-// deliveryKey returns the de-duplication key, or "" (never a duplicate) when
-// the sender did not provide a delivery id.
-func deliveryKey(source, delivery string) string {
-	if delivery == "" {
-		return ""
+// deliveryKeys returns the de-duplication keys of a signed delivery: its
+// body, and the delivery id when the sender provided one.
+//
+// The body comes first because it is what the signature covers. The delivery
+// id is a header, which anyone who replays a captured request can change or
+// leave out. It is still kept, in case a retry by the sender is signed again
+// with a new timestamp.
+func deliveryKeys(source, delivery string, body []byte) []string {
+	sum := sha256.Sum256(body)
+	keys := []string{source + ":body:" + hex.EncodeToString(sum[:])}
+	if delivery != "" {
+		keys = append(keys, source+":"+delivery)
 	}
-	return source + ":" + delivery
+	return keys
+}
+
+// firstDelivery records keys and reports whether none of them was seen before.
+func (s *Server) firstDelivery(keys []string) bool {
+	for _, k := range keys {
+		if !s.seen.Add(k) {
+			return false
+		}
+	}
+	return true
+}
+
+// forgetDelivery lets the sender retry a delivery that was not handled.
+func (s *Server) forgetDelivery(keys []string) {
+	for _, k := range keys {
+		s.seen.Remove(k)
+	}
 }
 
 // submitResult is what happened to a task handed to the runner.
@@ -289,8 +315,8 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The signature proves who sent the payload, not when. Without this an
-	// old request could be sent again after a restart, when the delivery
-	// ids kept in memory are gone.
+	// old request could be sent again after a restart, when the deliveries
+	// kept in memory are gone.
 	if err := jira.CheckTimestamp(body, cfg.MaxSkew, s.now()); err != nil {
 		log.Warn("timestamp check failed", "err", err, "remote", r.RemoteAddr)
 		reply(w, http.StatusUnauthorized, "stale or missing timestamp")
@@ -307,13 +333,13 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusBadRequest, "bad payload")
 		return
 	}
-	key := deliveryKey("jira", delivery)
-	if !s.seen.Add(key) {
+	keys := deliveryKeys("jira", delivery, body)
+	if !s.firstDelivery(keys) {
 		reply(w, http.StatusOK, "duplicate delivery")
 		return
 	}
 	if s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery), log) == submitFailed {
-		s.seen.Remove(key)
+		s.forgetDelivery(keys)
 	}
 }
 
@@ -380,8 +406,8 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusBadRequest, "bad payload")
 		return
 	}
-	key := deliveryKey("linear", delivery)
-	if !s.seen.Add(key) {
+	keys := deliveryKeys("linear", delivery, body)
+	if !s.firstDelivery(keys) {
 		reply(w, http.StatusOK, "duplicate delivery")
 		return
 	}
@@ -400,7 +426,7 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		s.linearActivity(sess.SessionID, linear.ActivityResponse,
 			sess.Key+" is already being worked on by the digital employee in an earlier session, so this request did not start a new run. The result will be posted in that session. Messages to a running agent are not supported yet.", log)
 	default:
-		s.seen.Remove(key)
+		s.forgetDelivery(keys)
 	}
 }
 

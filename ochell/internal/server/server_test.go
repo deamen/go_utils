@@ -121,6 +121,33 @@ func TestJiraWebhook(t *testing.T) {
 	}
 }
 
+// The delivery id is a header, which the signature does not cover. A captured
+// request that is sent again with another id, or with none, starts no run.
+func TestJiraWebhookReplayWithOtherDeliveryID(t *testing.T) {
+	fr := &fakeRunner{}
+	s := newServer(t, testConfig(), fr)
+	body := jiraBody(t, time.Now())
+	sig := "sha256=" + auth.SignHex("jira-secret", []byte(body))
+	post := func(hdr map[string]string) *httptest.ResponseRecorder {
+		hdr["X-Hub-Signature"] = sig
+		return do(s, "/webhooks/jira", body, hdr)
+	}
+	if w := post(map[string]string{"X-Atlassian-Webhook-Identifier": "d-1"}); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued") {
+		t.Fatalf("first delivery: %d %s", w.Code, w.Body)
+	}
+	for name, hdr := range map[string]map[string]string{
+		"another delivery id": {"X-Atlassian-Webhook-Identifier": "d-2"},
+		"no delivery id":      {},
+	} {
+		if w := post(hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "duplicate") {
+			t.Errorf("%s: %d %s, want duplicate", name, w.Code, w.Body)
+		}
+	}
+	if len(fr.tasks) != 1 {
+		t.Fatalf("a replayed request started a run: %d tasks", len(fr.tasks))
+	}
+}
+
 func TestJiraWebhookQueueFullAllowsRetry(t *testing.T) {
 	fr := &fakeRunner{err: runner.ErrQueueFull}
 	s := newServer(t, testConfig(), fr)
@@ -282,6 +309,16 @@ func TestLinearAgentSession(t *testing.T) {
 	case <-api.got:
 	case <-time.After(5 * time.Second):
 		t.Fatal("no acknowledgement activity posted")
+	}
+	// The delivery id is a header, which the signature does not cover: the
+	// same body with another id, or with none, starts no second run.
+	for name, hdr := range map[string]map[string]string{
+		"another delivery id": {"Linear-Signature": sig, "Linear-Delivery": "ld-2"},
+		"no delivery id":      {"Linear-Signature": sig},
+	} {
+		if w := do(s, "/webhooks/linear", body, hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "duplicate") {
+			t.Errorf("%s: %d %s, want duplicate", name, w.Code, w.Body)
+		}
 	}
 	if len(fr.tasks) != 1 {
 		t.Fatalf("tasks = %d", len(fr.tasks))

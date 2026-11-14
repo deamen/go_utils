@@ -22,7 +22,7 @@ Behaviour common to all sources:
   - 200 when a task is queued, ignored or a duplicate;
   - 401 when authentication fails;
   - 400 when the payload is unusable, for example a Jira Automation request that names no assignee;
-- **Duplicate deliveries:** dropped using `X-Atlassian-Webhook-Identifier` / `Linear-Delivery`. The ids are kept in memory for 24 hours and are lost on a restart.
+- **Duplicate deliveries:** a signed request is dropped when its body, or its `X-Atlassian-Webhook-Identifier` / `Linear-Delivery` id, was seen before. The body counts because the signature covers it; the id is a header that a replayed request can change. Both are kept in memory for 24 hours and are lost on a restart.
 - **Replay:** a signed request is rejected with 401 when its timestamp (`timestamp` for Jira, `webhookTimestamp` for Linear) is further than `max_skew` from now. The default is 60s for Linear and 2h for Jira: Jira retries a failed delivery up to five times, 5 to 15 minutes apart, and a retry may carry the timestamp of the event. Jira Automation requests carry no timestamp.
 - **One run per ticket:** a ticket that is already queued or running is not started again. The request is answered with 200 `already in progress`. A new Linear session on such a ticket gets a `response` activity that says so, which closes that session; the result is posted in the first session.
 - **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the agent exits it posts a `response` (the tail of the agent output) or an `error`.
@@ -262,7 +262,7 @@ curl -i -X POST "$URL/webhooks/linear" \
 Without `client_id` the orchestrator logs that the session will not receive activities. With a real Linear app configured, it will try to post activities to the sample's fake session ID and log an error.
 
 Notes:
-- A repeated `X-Atlassian-Webhook-Identifier` or `Linear-Delivery` value returns `duplicate delivery`, which is why the examples add `$(date +%s)`.
+- A repeated body, or a repeated `X-Atlassian-Webhook-Identifier` or `Linear-Delivery` value, returns `duplicate delivery`. The examples set a new timestamp in the body and add `$(date +%s)` to the id, so wait a second before sending one again.
 - A wrong signature or token, or a timestamp outside `max_skew`, returns `401`.
 - To test through ngrok, set `URL` to `https://<ngrok-domain>`. The policy's `restrict-ips` rules will block requests from your own IP unless you add it.
 
