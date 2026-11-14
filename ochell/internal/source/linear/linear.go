@@ -79,6 +79,14 @@ type AgentActivity struct {
 		Type string `json:"type"`
 		Body string `json:"body"`
 	} `json:"content"`
+	// Signal is "stop" when the user asks the agent to stop.
+	Signal string `json:"signal"`
+	// User is who wrote the prompt.
+	UserID string `json:"userId"`
+	User   *struct {
+		ID    string `json:"id"`
+		Email string `json:"email"`
+	} `json:"user"`
 }
 
 // Event is the subset of the webhook payload used by the orchestrator.
@@ -117,14 +125,25 @@ type Session struct {
 	Comment string
 	// Labels holds the labels of the issue, as far as the payload has them.
 	Labels []string
-	// Actor and ActorEmail identify the user who started the session, as
-	// far as the payload has them.
+	// Actor and ActorEmail identify the user who started the session, or
+	// who wrote the prompt, as far as the payload has them.
 	Actor      string
 	ActorEmail string
+	// Prompted says that this is a "prompted" event: a person wrote to the
+	// agent in a session that exists. Prompt is what they wrote, and Stop
+	// says that they asked the agent to stop.
+	Prompted bool
+	Prompt   string
+	Stop     bool
 }
 
-// Parse returns a Session for AgentSessionEvent "created" events. "prompted"
-// follow-ups and every other event type are returned as ErrIgnored for now.
+// Parse returns a Session for the AgentSessionEvent actions "created" (the
+// issue was delegated to the agent, or the agent was mentioned) and
+// "prompted" (a person wrote to the agent in a session that exists). Every
+// other event is returned as ErrIgnored.
+//
+// A "prompted" payload may leave out the issue; Key is then empty, and the
+// caller finds the ticket by the session.
 func Parse(body []byte) (*Event, *Session, error) {
 	var ev Event
 	if err := json.Unmarshal(body, &ev); err != nil {
@@ -136,7 +155,7 @@ func Parse(body []byte) (*Event, *Session, error) {
 	if ev.AgentSession == nil || ev.AgentSession.ID == "" {
 		return &ev, nil, errors.New("AgentSessionEvent without agentSession.id")
 	}
-	if ev.Action != "created" {
+	if ev.Action != "created" && ev.Action != "prompted" {
 		return &ev, nil, fmt.Errorf("%w: AgentSessionEvent action %q", ErrIgnored, ev.Action)
 	}
 	s := &Session{
@@ -154,6 +173,20 @@ func Parse(body []byte) (*Event, *Session, error) {
 		}
 		s.ActorEmail = c.Email
 	}
+	if ev.Action == "prompted" {
+		s.Prompted, s.Prompt = true, ev.PromptText()
+		if a := ev.AgentActivity; a != nil {
+			s.Stop = a.Signal == "stop"
+			// The author of the prompt, where the payload names one; the
+			// creator of the session otherwise.
+			if a.UserID != "" {
+				s.Actor, s.ActorEmail = a.UserID, ""
+			}
+			if u := a.User; u != nil && (u.ID != "" || u.Email != "") {
+				s.Actor, s.ActorEmail = u.ID, u.Email
+			}
+		}
+	}
 	if is := ev.AgentSession.Issue; is != nil {
 		s.Key, s.Title, s.URL = is.Identifier, is.Title, is.URL
 		for _, l := range is.Labels {
@@ -162,7 +195,7 @@ func Parse(body []byte) (*Event, *Session, error) {
 			}
 		}
 	}
-	if s.Key == "" {
+	if s.Key == "" && !s.Prompted {
 		// Sessions started outside an issue (e.g. a mention in a document)
 		// still get a stable key.
 		s.Key = "session-" + s.SessionID

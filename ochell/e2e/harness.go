@@ -646,6 +646,37 @@ func (o *Ochell) linearCreated(key, sessionID, promptContext, comment string) Re
 	})
 }
 
+// LinearPrompted sends a signed Linear AgentSessionEvent "prompted": a
+// person wrote to the agent in a session that exists.
+func (o *Ochell) LinearPrompted(key, sessionID, text string) Response {
+	o.t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"type": "AgentSessionEvent", "action": "prompted",
+		"organizationId": "org-0000",
+		"agentSession": map[string]any{
+			"id":      sessionID,
+			"creator": map[string]string{"id": o.actor(), "email": "human@example.com"},
+			"issue": map[string]string{
+				"id": "issue-" + key, "identifier": key, "title": "Title of " + key,
+				"url": "https://linear.app/example/issue/" + key,
+			},
+		},
+		"agentActivity": map[string]any{
+			"id":      "activity-" + nextDelivery(),
+			"content": map[string]string{"type": "prompt", "body": text},
+			"user":    map[string]string{"id": o.actor(), "email": "human@example.com"},
+		},
+		"webhookTimestamp": time.Now().UnixMilli(),
+	})
+	if err != nil {
+		o.t.Fatal(err)
+	}
+	return o.Post(o.Config.Sources.Linear.Path, body, map[string]string{
+		"Linear-Signature": auth.SignHex(LinearSecret, body),
+		"Linear-Delivery":  nextDelivery(),
+	})
+}
+
 // Records returns what the fake agent recorded, one entry per run so far.
 func (o *Ochell) Records() []Record {
 	o.t.Helper()
