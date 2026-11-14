@@ -1,7 +1,8 @@
 //go:build unix
 
 // Package e2e is the end-to-end test harness. It starts a real ochell
-// process with a scripted fake agent (see fakeagent) and a fake Linear API,
+// process with a scripted fake agent (see fakeagent), a fake Linear API and
+// a fake Jira site,
 // and sends it signed webhooks, so the full loop can be tested without a
 // real agent or tracker.
 //
@@ -35,6 +36,7 @@ import (
 	"ochell/internal/auth"
 	"ochell/internal/config"
 	"ochell/internal/store"
+	"ochell/internal/tracker/jiraapi/jiratest"
 )
 
 // Secrets and ids the harness configures ochell with.
@@ -198,6 +200,8 @@ type Ochell struct {
 	Dir    string
 	Config *config.Config
 	Linear *FakeLinear
+	// Jira is the fake Jira site that the Jira API client talks to.
+	Jira *jiratest.Server
 	// Actor is the user who assigns the tickets in the payloads that are
 	// sent from now on. Empty: HumanAccountID.
 	Actor string
@@ -284,6 +288,7 @@ func Start(t *testing.T, opts Options) *Ochell {
 		}
 	}
 	o.Linear = newFakeLinear(t)
+	o.Jira = jiratest.New(t)
 
 	port := freePort(t)
 	cfg := config.Default()
@@ -316,6 +321,7 @@ func Start(t *testing.T, opts Options) *Ochell {
 	cfg.Sources.JiraAutomation.Enabled = true
 	cfg.Sources.JiraAutomation.Token = AutomationToken
 	cfg.Sources.JiraAutomation.BotAccountID = BotAccountID
+	cfg.Sources.JiraAPI = config.JiraAPI{BaseURL: o.Jira.URL, Email: jiratest.Email, Token: jiratest.Token}
 	cfg.Sources.Linear.Enabled = true
 	cfg.Sources.Linear.Secret = LinearSecret
 	cfg.Sources.Linear.ClientID = "e2e-client-id"
@@ -364,9 +370,10 @@ func (o *Ochell) actor() string {
 	return HumanAccountID
 }
 
-// Admin runs an admin subcommand of ochell (pause, resume, status, reset)
-// against the running process, as an operator would, and returns what it
-// printed and its exit code.
+// Admin runs a subcommand of ochell with the configuration of the running
+// process, as an operator would: an admin command (pause, resume, status,
+// reset) or jira-check. It returns what the command printed and its exit
+// code.
 func (o *Ochell) Admin(args ...string) (string, int) {
 	o.t.Helper()
 	cmd := exec.Command(o.bin, append(args, "--config", o.cfgFile)...)

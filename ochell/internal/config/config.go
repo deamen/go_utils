@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"regexp"
 	"slices"
@@ -112,6 +113,23 @@ type JiraAutomation struct {
 	AllowedAssigners []string `yaml:"allowed_assigners"`
 }
 
+// JiraAPI is ochell's own access to the Jira REST API, as the bot account.
+// The poller and the comments that ochell writes on a ticket need it; the
+// webhook sources work without it. It is used when BaseURL is set.
+type JiraAPI struct {
+	// BaseURL is the Jira site, e.g. https://example.atlassian.net.
+	BaseURL string `yaml:"base_url"`
+	// Email and Token are the bot account's email address and API token.
+	Email string `yaml:"email"`
+	Token string `yaml:"token"`
+	// JQL selects the open tickets of the bot. Empty: the open tickets
+	// assigned to the account that owns the token.
+	JQL string `yaml:"jql"`
+}
+
+// Enabled reports whether the Jira API is configured.
+func (j JiraAPI) Enabled() bool { return j.BaseURL != "" }
+
 type Linear struct {
 	Enabled bool          `yaml:"enabled"`
 	Path    string        `yaml:"path"`
@@ -138,6 +156,7 @@ type Linear struct {
 type Sources struct {
 	JiraWebhook    JiraWebhook    `yaml:"jira_webhook"`
 	JiraAutomation JiraAutomation `yaml:"jira_automation"`
+	JiraAPI        JiraAPI        `yaml:"jira_api"`
 	Linear         Linear         `yaml:"linear"`
 }
 
@@ -507,6 +526,25 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.NgrokSync.LinearPolicyID, "ngrok-linear-policy", c.NgrokSync.LinearPolicyID, "ngrok IP policy id for Linear ranges")
 }
 
+// Validate checks the settings of the Jira API, when it is configured.
+func (j JiraAPI) Validate() error {
+	if !j.Enabled() {
+		if j.Email != "" || j.Token != "" {
+			return errors.New("sources.jira_api: email and token are set but base_url is not")
+		}
+		return nil
+	}
+	var errs []error
+	u, err := url.Parse(j.BaseURL)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" {
+		errs = append(errs, errors.New("sources.jira_api.base_url must be the address of the Jira site, such as https://example.atlassian.net"))
+	}
+	if j.Email == "" || j.Token == "" {
+		errs = append(errs, errors.New("sources.jira_api requires email and token: the bot account's email address and API token"))
+	}
+	return errors.Join(errs...)
+}
+
 // Validate checks the configuration needed to serve webhooks.
 func (c *Config) Validate() error {
 	var errs []error
@@ -671,6 +709,9 @@ func (c *Config) Validate() error {
 	}
 	if s.JiraAutomation.Enabled && (s.JiraAutomation.Token == "" || s.JiraAutomation.Header == "") {
 		errs = append(errs, errors.New("sources.jira_automation requires header and token"))
+	}
+	if err := s.JiraAPI.Validate(); err != nil {
+		errs = append(errs, err)
 	}
 	if s.Linear.Enabled && s.Linear.Secret == "" {
 		errs = append(errs, errors.New("sources.linear.secret is required"))

@@ -381,3 +381,32 @@ agent:
 		t.Errorf("stop_grace = %s", cfg.Agent.StopGrace)
 	}
 }
+
+func TestJiraAPI(t *testing.T) {
+	ok := JiraAPI{BaseURL: "https://example.atlassian.net", Email: "bot@example.com", Token: "t"}
+	for name, tc := range map[string]struct {
+		change func(*JiraAPI)
+		want   string
+	}{
+		"complete":        {func(*JiraAPI) {}, ""},
+		"not configured":  {func(j *JiraAPI) { *j = JiraAPI{} }, ""},
+		"no token":        {func(j *JiraAPI) { j.Token = "" }, "requires email and token"},
+		"no email":        {func(j *JiraAPI) { j.Email = "" }, "requires email and token"},
+		"not an address":  {func(j *JiraAPI) { j.BaseURL = "example.atlassian.net" }, "base_url must be"},
+		"with a password": {func(j *JiraAPI) { j.BaseURL = "https://bot:secret@example.atlassian.net" }, "base_url must be"},
+		"only a token":    {func(j *JiraAPI) { j.BaseURL = "" }, "base_url is not"},
+	} {
+		j := ok
+		tc.change(&j)
+		err := j.Validate()
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("%s: unexpected error: %v", name, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+			t.Errorf("%s: error = %v, want %q", name, err, tc.want)
+		}
+	}
+	if (JiraAPI{}).Enabled() || !ok.Enabled() {
+		t.Error("Enabled must follow base_url")
+	}
+}
