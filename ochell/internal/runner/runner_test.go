@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"ochell/internal/agent"
 	"ochell/internal/config"
 	"ochell/internal/store"
 	"ochell/internal/task"
@@ -99,11 +100,11 @@ func TestRunArgsAreNotShellInterpreted(t *testing.T) {
 	}
 	res := r.Run(context.Background(), newTask())
 	if res.Err != nil {
-		t.Fatalf("run failed: %v\n%s", res.Err, res.Tail)
+		t.Fatalf("run failed: %v\n%s", res.Err, res.Message)
 	}
 	for _, want := range []string{`args: Fix DEV-1: it's "quoted"; rm -rf /`, "key: DEV-1", "wd: DEV-1"} {
-		if !strings.Contains(res.Tail, want) {
-			t.Errorf("output missing %q:\n%s", want, res.Tail)
+		if !strings.Contains(res.Message, want) {
+			t.Errorf("output missing %q:\n%s", want, res.Message)
 		}
 	}
 	logged, _ := os.ReadFile(res.LogFile)
@@ -117,8 +118,8 @@ func TestRunStdin(t *testing.T) {
 	cfg.PromptVia = "stdin"
 	r, _ := New(cfg, logger(), testStore(t))
 	res := r.Run(context.Background(), newTask())
-	if res.Err != nil || !strings.Contains(res.Tail, "stdin:Fix DEV-1") {
-		t.Fatalf("err=%v tail=%q", res.Err, res.Tail)
+	if res.Err != nil || !strings.Contains(res.Message, "stdin:Fix DEV-1") {
+		t.Fatalf("err=%v message=%q", res.Err, res.Message)
 	}
 }
 
@@ -144,7 +145,7 @@ func TestRunEnvironmentIsAllowlisted(t *testing.T) {
 	}
 	res := r.Run(context.Background(), newTask())
 	if res.Err != nil {
-		t.Fatalf("run failed: %v\n%s", res.Err, res.Tail)
+		t.Fatalf("run failed: %v\n%s", res.Err, res.Message)
 	}
 	logged, err := os.ReadFile(res.LogFile)
 	if err != nil {
@@ -166,6 +167,52 @@ func TestRunEnvironmentIsAllowlisted(t *testing.T) {
 	}
 	if strings.Contains(out, "OCHELL_TEST_UNSET") {
 		t.Error("a variable that is not set must not be passed as empty")
+	}
+}
+
+// fakeAdapter changes the command and the result, to show that the runner
+// takes both from the adapter.
+type fakeAdapter struct{}
+
+func (fakeAdapter) Start(run agent.Run) (agent.Command, error) {
+	return agent.Command{Args: append(run.Args, "--from-adapter"), Stdin: strings.NewReader("adapter stdin: " + run.Prompt)}, nil
+}
+func (fakeAdapter) Resume(agent.Run, string) (agent.Command, error) {
+	return agent.Command{}, agent.ErrNoResume
+}
+func (fakeAdapter) Output() agent.Output { return &fakeOutput{} }
+
+type fakeOutput struct{ n int }
+
+func (o *fakeOutput) Write(p []byte) (int, error) { o.n += len(p); return len(p), nil }
+func (o *fakeOutput) Report() agent.Report {
+	return agent.Report{Message: fmt.Sprintf("the adapter read %d bytes", o.n)}
+}
+
+func TestRunGoesThroughTheAdapter(t *testing.T) {
+	r, err := New(agentCfg(t, "stdin"), logger(), testStore(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.adapter = fakeAdapter{}
+	res := r.Run(context.Background(), newTask())
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	logged, _ := os.ReadFile(res.LogFile)
+	if !strings.Contains(string(logged), "stdin:adapter stdin: Fix DEV-1") {
+		t.Errorf("the agent did not get the stdin the adapter built:\n%s", logged)
+	}
+	if !strings.HasPrefix(res.Message, "the adapter read ") || res.Message == "the adapter read 0 bytes" {
+		t.Errorf("message = %q, want what the adapter reported", res.Message)
+	}
+
+	r, _ = New(agentCfg(t, "echo"), logger(), testStore(t))
+	r.adapter = fakeAdapter{}
+	res = r.Run(context.Background(), newTask())
+	logged, _ = os.ReadFile(res.LogFile)
+	if !strings.Contains(string(logged), "args: --from-adapter") {
+		t.Errorf("the agent did not get the arguments the adapter built:\n%s", logged)
 	}
 }
 

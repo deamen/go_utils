@@ -91,6 +91,19 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestAdapterValidation(t *testing.T) {
+	cfg := Default()
+	cfg.Sources.JiraAutomation.Enabled = true
+	cfg.Sources.JiraAutomation.Token = "t"
+	if cfg.Agent.Adapter != "plain" {
+		t.Errorf("default adapter = %q, want plain", cfg.Agent.Adapter)
+	}
+	cfg.Agent.Adapter = "telepathy"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.adapter") {
+		t.Errorf("unknown adapter: got %v", err)
+	}
+}
+
 func TestAgentEnvValidation(t *testing.T) {
 	p := writeYAML(t, `
 agent:

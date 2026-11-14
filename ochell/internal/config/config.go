@@ -42,6 +42,9 @@ type Agent struct {
 	PromptVia      string `yaml:"prompt_via"`
 	PromptTemplate string `yaml:"prompt_template"`
 	Workdir        string `yaml:"workdir"`
+	// Adapter names the kind of agent CLI: how it is called and how its
+	// output is read. "plain" works with any CLI.
+	Adapter string `yaml:"adapter"`
 	// Launcher is "direct" (the agent is a child process of ochell) or
 	// "systemd" (a transient unit under a separate OS user).
 	Launcher string  `yaml:"launcher"`
@@ -186,6 +189,7 @@ func Default() *Config {
 			PromptVia:      "stdin",
 			PromptTemplate: DefaultPromptTemplate,
 			Workdir:        ".",
+			Adapter:        "plain",
 			Launcher:       "direct",
 			Systemd: Systemd{
 				LaunchCommand: []string{"sudo", "-n", "/usr/local/libexec/ochell/ochell-launch"},
@@ -323,6 +327,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.Agent.Command, "agent-cmd", c.Agent.Command, "agent CLI command")
 	fs.Var(&stringList{dst: &c.Agent.Args}, "agent-arg", "agent CLI argument, repeatable, Go template (replaces config args)")
 	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: stdin or arg")
+	fs.StringVar(&c.Agent.Adapter, "agent-adapter", c.Agent.Adapter, "kind of agent CLI: plain")
 	fs.StringVar(&c.Agent.Launcher, "agent-launcher", c.Agent.Launcher, "how the agent is run: direct or systemd")
 	fs.Var(&stringList{dst: &c.Agent.EnvPass}, "agent-env-pass", "environment variable the agent inherits from ochell, repeatable (replaces config env_pass)")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
@@ -387,6 +392,9 @@ func (c *Config) Validate() error {
 				break
 			}
 		}
+	}
+	if c.Agent.Adapter != "plain" {
+		errs = append(errs, errors.New("agent.adapter must be plain"))
 	}
 	switch c.Agent.Launcher {
 	case "direct":

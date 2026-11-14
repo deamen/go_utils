@@ -10,7 +10,6 @@
 package runner
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,6 +23,7 @@ import (
 	"text/template"
 	"time"
 
+	"ochell/internal/agent"
 	"ochell/internal/config"
 	"ochell/internal/launcher"
 	"ochell/internal/store"
@@ -35,8 +35,6 @@ var (
 	ErrQueueFull = store.ErrQueueFull
 	ErrStopped   = errors.New("runner is stopped")
 )
-
-const tailSize = 4096
 
 // Notifier tells the source of a task how its run went. The server
 // implements it.
@@ -52,6 +50,7 @@ type Runner struct {
 	log      *slog.Logger
 	store    *store.Store
 	notify   Notifier
+	adapter  agent.Adapter
 	launcher launcher.Launcher
 	prompt   *template.Template
 	args     []*template.Template
@@ -85,6 +84,9 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 			return nil, err
 		}
 		r.args = append(r.args, t)
+	}
+	if r.adapter, err = agent.New(cfg); err != nil {
+		return nil, err
 	}
 	if r.launcher, err = launcher.New(cfg); err != nil {
 		return nil, err
@@ -338,6 +340,14 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	}
 	res.Workdir = dir
 
+	// The adapter says how this agent is called and reads what it prints;
+	// the launcher runs it.
+	cmd, err := r.adapter.Start(agent.Run{Args: args, Prompt: t.Prompt})
+	if err != nil {
+		res.Err = fmt.Errorf("build the agent command: %w", err)
+		return res
+	}
+
 	if err := os.MkdirAll(r.cfg.LogDir, 0o750); err != nil {
 		res.Err = fmt.Errorf("create log dir: %w", err)
 		return res
@@ -350,24 +360,22 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	}
 	defer lf.Close()
 	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s\n# command=%s (%d args) workdir=%s\n# prompt:\n%s\n# ---- agent output ----\n",
-		t.ID, t.Source, t.Key, t.URL, r.cfg.Command, len(args), dir, t.Prompt)
+		t.ID, t.Source, t.Key, t.URL, r.cfg.Command, len(cmd.Args), dir, t.Prompt)
 	defer func() {
 		fmt.Fprintf(lf, "\n# ---- exit=%d outcome=%s err=%v duration=%s ----\n", res.ExitCode, res.Outcome, res.Err, time.Since(start))
 	}()
 
-	tail := &tailBuffer{max: tailSize}
+	out := r.adapter.Output()
 	spec := launcher.Spec{
 		TaskID:    unsafeName.ReplaceAllString(t.ID, "_"),
 		Command:   r.cfg.Command,
-		Args:      args,
+		Args:      cmd.Args,
+		Stdin:     cmd.Stdin,
 		Dir:       dir,
 		Env:       r.taskEnv(t),
 		Inherited: r.inheritedEnv(),
-		Output:    io.MultiWriter(lf, tail),
+		Output:    io.MultiWriter(lf, out),
 		Timeout:   r.cfg.Timeout,
-	}
-	if r.cfg.PromptVia == "stdin" {
-		spec.Stdin = strings.NewReader(t.Prompt)
 	}
 	proc, err := r.launcher.Start(spec)
 	if err != nil {
@@ -400,7 +408,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		res.Outcome = task.OutcomeStopped
 		w = r.stop(proc, waited)
 	}
-	res.Tail = tail.String()
+	res.Message = out.Report().Message
 	res.ExitCode = w.code
 	switch {
 	case res.Outcome == task.OutcomeTimedOut:
@@ -465,27 +473,4 @@ func (r *Runner) taskEnv(t *task.Task) []string {
 		env = append(env, k+"="+v)
 	}
 	return env
-}
-
-// tailBuffer keeps the last max bytes written to it.
-type tailBuffer struct {
-	mu  sync.Mutex
-	max int
-	buf bytes.Buffer
-}
-
-func (b *tailBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.buf.Write(p)
-	if over := b.buf.Len() - b.max; over > 0 {
-		b.buf.Next(over)
-	}
-	return len(p), nil
-}
-
-func (b *tailBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
 }

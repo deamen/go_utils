@@ -92,6 +92,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-cmd` | Agent CLI executable (default `claude`) |
 | `--agent-arg` | Agent argument; repeatable; replaces the YAML `args` (default `-p`). Go template: `{{.Key}}`, `{{.Source}}`, `{{.ID}}`. Keep ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`, `{{.Prompt}}`) out of arguments; see [The prompt](#the-prompt) |
 | `--agent-prompt-via` | `stdin` (default) or `arg` |
+| `--agent-adapter` | Kind of agent CLI: `plain` (default); see [Agent adapters](#agent-adapters) |
 | `--agent-launcher` | `direct` (default) or `systemd`; see [Launchers](#launchers) |
 | `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
 | `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-log-dir` | Execution settings |
@@ -145,6 +146,15 @@ What a run leads to today:
 | `stopped`, `interrupted` | `waiting`, reason `interrupted` |
 
 Several states and reasons are not reached yet: they belong to features that come later (the agent's own result, the plan gate, stop from the ticket, handoff). Pausing will not be a state: it holds the queue, and queued tickets stay queued.
+
+### Agent adapters
+An adapter holds what differs between agent CLIs: how a run is started, how an earlier session is resumed, and how the output is read (final message, session id, cost). It only builds commands and parses output. Running and stopping the process is the launcher's job, so every adapter works with every launcher. `agent.adapter` selects it.
+
+| Adapter | Command | Result |
+|---|---|---|
+| `plain` (default) | `agent.command` with `agent.args`; the prompt on stdin, or in the arguments with `prompt_via: arg` | the last 4 KB of the output is the message; no session, no cost, no resume |
+
+`plain` works with any CLI that takes a prompt and prints an answer.
 
 ### Launchers
 A launcher starts and stops the agent process. `agent.launcher` selects it.

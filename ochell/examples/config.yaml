@@ -46,6 +46,10 @@ agent:
     {{.Context}}
     {{- end}}
   workdir: /work/{{.Source}}/{{.Key}}
+  # The kind of agent CLI: how it is called and how its output is read.
+  #   plain    any CLI: the prompt goes in, the last part of the output is
+  #            the result.
+  adapter: plain
   # How the agent process is run:
   #   direct   a child process of ochell, under ochell's own OS user. For
   #            development; the agent can read ochell's files.
