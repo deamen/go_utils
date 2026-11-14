@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"ochell/internal/admin"
 	"ochell/internal/config"
 	"ochell/internal/ipsync"
 	"ochell/internal/runner"
@@ -36,6 +38,10 @@ var availCmds = [][2]string{
 	{"serve", "run the webhook server (default)"},
 	{"ngrok-sync", "sync Atlassian/Linear IP ranges into ngrok IP policies"},
 	{"linear-install", "print the Linear agent app install URL"},
+	{"pause", "hold the queue of the running ochell: no new run starts"},
+	{"resume", "end a pause"},
+	{"status", "say whether the running ochell is paused, and what is queued and running"},
+	{"reset", "reset the attempts of a ticket: ochell reset <jira|linear> <KEY>"},
 	{"version", "print the version"},
 }
 
@@ -74,6 +80,8 @@ func main() {
 		err = ngrokSync(args)
 	case "linear-install":
 		err = linearInstall(args)
+	case "pause", "resume", "status", "reset":
+		err = adminCommand(cmd, args)
 	case "version":
 		fmt.Printf("%s-%s\n", version, build)
 	case "help":
@@ -138,6 +146,15 @@ func serve(args []string) error {
 		go ipsync.RunSync(ctx, cfg.NgrokSync, ipsync.NewFetcher(), log)
 	}
 
+	if cfg.Admin.Socket != "" {
+		adm, err := admin.Listen(cfg.Admin.Socket, r, log)
+		if err != nil {
+			return err
+		}
+		defer adm.Close()
+		log.Info("admin channel", "socket", cfg.Admin.Socket)
+	}
+
 	if err := r.Start(); err != nil {
 		return err
 	}
@@ -162,6 +179,41 @@ func serve(args []string) error {
 	r.Shutdown(drain)
 	log.Info("stopped")
 	return err
+}
+
+// adminCommand sends a command to the running ochell over its admin socket.
+// The socket is found in the same configuration that the server uses.
+func adminCommand(cmd string, args []string) error {
+	var rest []string
+	// The ticket of "reset" comes before the flags: ochell reset jira DEV-1 --config …
+	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		rest, args = append(rest, args[0]), args[1:]
+	}
+	cfg, err := config.Load(cmd, args, nil)
+	if err != nil {
+		return err
+	}
+	method, query := "POST", url.Values{}
+	switch cmd {
+	case "status":
+		method = "GET"
+	case "reset":
+		if len(rest) != 2 || (rest[0] != "jira" && rest[0] != "linear") {
+			return errors.New("usage: ochell reset <jira|linear> <KEY> [flags]")
+		}
+		query.Set("source", rest[0])
+		query.Set("key", rest[1])
+		rest = nil
+	}
+	if len(rest) > 0 {
+		return fmt.Errorf("unexpected arguments: %v", rest)
+	}
+	answer, err := admin.Call(cfg.Admin.Socket, method, cmd, query)
+	if err != nil {
+		return err
+	}
+	fmt.Println(answer)
+	return nil
 }
 
 func ngrokSync(args []string) error {

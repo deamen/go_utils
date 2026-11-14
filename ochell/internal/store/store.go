@@ -26,6 +26,8 @@ import (
 var (
 	ErrBusy      = errors.New("a task for this ticket is already queued or running")
 	ErrQueueFull = errors.New("task queue is full")
+	// ErrAttempts: the ticket has used up its attempts.
+	ErrAttempts = errors.New("the ticket has reached its maximum number of attempts")
 )
 
 // Run statuses.
@@ -115,6 +117,12 @@ var migrations = []string{
 
 	// Version 7: the working directory that the after_create hook prepared.
 	`ALTER TABLE tickets ADD COLUMN prepared_workspace TEXT NOT NULL DEFAULT '';`,
+
+	// Version 8: settings that are changed while ochell runs (the pause flag).
+	`CREATE TABLE settings (
+		key   TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);`,
 }
 
 // Store is safe for concurrent use.
@@ -228,10 +236,19 @@ func (s *Store) move(tx *sql.Tx, source, key string, to ticket.State, reason tic
 	return err
 }
 
+// Limits bound what Enqueue accepts. A zero value means no limit.
+type Limits struct {
+	// MaxQueued is how many runs may wait in the queue.
+	MaxQueued int
+	// MaxAttempts is how many runs one ticket may have had.
+	MaxAttempts int
+}
+
 // Enqueue records t as a queued run of its ticket. It returns ErrBusy when
-// the ticket already has a queued or running run, and ErrQueueFull when
-// maxQueued runs are waiting (0 means no limit).
-func (s *Store) Enqueue(t *task.Task, maxQueued int) error {
+// the ticket already has a queued or running run, ErrAttempts when the
+// ticket has had lim.MaxAttempts runs, and ErrQueueFull when lim.MaxQueued
+// runs are waiting.
+func (s *Store) Enqueue(t *task.Task, lim Limits) error {
 	now := ms(s.now())
 	return s.tx(func(tx *sql.Tx) error {
 		from, err := state(tx, t.Source, t.Key)
@@ -241,12 +258,21 @@ func (s *Store) Enqueue(t *task.Task, maxQueued int) error {
 		if from.Active() {
 			return ErrBusy
 		}
-		if maxQueued > 0 {
+		if lim.MaxAttempts > 0 && from != ticket.None {
+			var attempts int
+			if err := tx.QueryRow(`SELECT attempts FROM tickets WHERE source = ? AND key = ?`, t.Source, t.Key).Scan(&attempts); err != nil {
+				return err
+			}
+			if attempts >= lim.MaxAttempts {
+				return ErrAttempts
+			}
+		}
+		if lim.MaxQueued > 0 {
 			var n int
 			if err := tx.QueryRow(`SELECT COUNT(*) FROM runs WHERE status = ?`, runQueued).Scan(&n); err != nil {
 				return err
 			}
-			if n >= maxQueued {
+			if n >= lim.MaxQueued {
 				return ErrQueueFull
 			}
 		}
@@ -307,14 +333,66 @@ func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 	return &t, nil
 }
 
+const settingPaused = "paused"
+
+// SetPaused sets the pause flag. While it is set, Claim hands out no run:
+// queued runs stay queued, and running ones go on. The flag is kept across
+// a restart.
+func (s *Store) SetPaused(paused bool) error {
+	if !paused {
+		_, err := s.db.Exec(`DELETE FROM settings WHERE key = ?`, settingPaused)
+		return err
+	}
+	_, err := s.db.Exec(`INSERT INTO settings (key, value) VALUES (?, '1') ON CONFLICT (key) DO NOTHING`, settingPaused)
+	return err
+}
+
+// Paused reports whether the pause flag is set.
+func (s *Store) Paused() (bool, error) {
+	return paused(s.db)
+}
+
+func paused(q interface {
+	QueryRow(string, ...any) *sql.Row
+}) (bool, error) {
+	var n int
+	err := q.QueryRow(`SELECT COUNT(*) FROM settings WHERE key = ?`, settingPaused).Scan(&n)
+	return n > 0, err
+}
+
+// Counts returns the number of queued and of running runs.
+func (s *Store) Counts() (queued, running int, err error) {
+	err = s.db.QueryRow(`SELECT COUNT(*) FILTER (WHERE status = ?), COUNT(*) FILTER (WHERE status = ?) FROM runs`,
+		runQueued, runRunning).Scan(&queued, &running)
+	return queued, running, err
+}
+
+// ResetAttempts sets the attempt count of a ticket back to zero, so that a
+// ticket that reached its limit can be started again. It returns ErrUnknown
+// for a ticket that ochell has never seen.
+func (s *Store) ResetAttempts(source, key string) error {
+	r, err := s.db.Exec(`UPDATE tickets SET attempts = 0 WHERE source = ? AND key = ?`, source, key)
+	if err != nil {
+		return err
+	}
+	if n, _ := r.RowsAffected(); n == 0 {
+		return ErrUnknown
+	}
+	return nil
+}
+
 // Claim takes the oldest queued run and marks it, and its ticket, as
-// running. It returns nil when nothing is queued. The task's Attempt says
+// running. It returns nil when nothing is queued, and while the pause flag
+// is set. The task's Attempt says
 // which run of the ticket this is, counting from 1; AgentSession, Workspace,
 // PRURL and Branch come from the ticket's earlier runs.
 func (s *Store) Claim() (*task.Task, error) {
 	now := ms(s.now())
 	var t *task.Task
 	err := s.tx(func(tx *sql.Tx) error {
+		if held, err := paused(tx); err != nil || held {
+			return err
+		}
 		var id string
 		err := tx.QueryRow(`SELECT id FROM runs WHERE status = ? ORDER BY received_at, rowid LIMIT 1`, runQueued).Scan(&id)
 		if errors.Is(err, sql.ErrNoRows) {

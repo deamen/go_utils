@@ -518,6 +518,138 @@ func TestAgentSignal(t *testing.T) {
 	})
 }
 
+// The attempt cap: a ticket stops after max_attempts runs, until someone
+// resets it.
+func TestAttemptCap(t *testing.T) {
+	o := Start(t, Options{Configure: func(c *config.Config) { c.Agent.MaxAttempts = 2 }})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for i, session := range []string{"session-1", "session-2"} {
+		id := o.LinearCreated("ENG-45", session, "").TaskID(t)
+		if run := o.WaitStored(st, id, 15*time.Second); run.Attempt != i+1 {
+			t.Fatalf("run %d was attempt %d", i+1, run.Attempt)
+		}
+		o.WaitActivities(session, 2, 10*time.Second)
+	}
+
+	// The third assignment starts nothing.
+	third := o.LinearCreated("ENG-45", "session-3", "")
+	if third.Status != 200 || third.Body != "not started: ENG-45 has used its 2 attempts" {
+		t.Fatalf("third assignment: %d %q", third.Status, third.Body)
+	}
+	acts := o.WaitActivities("session-3", 1, 10*time.Second)
+	if acts[0].Type != "elicitation" || !strings.Contains(acts[0].Body, "has used its 2 attempts") || !strings.Contains(acts[0].Body, "ochell reset linear ENG-45") {
+		t.Errorf("the session got %+v", acts[0])
+	}
+	if tk, _ := st.Ticket("linear", "ENG-45"); tk.State != "waiting" || tk.Reason != "escalation" || tk.Attempts != 2 {
+		t.Errorf("ticket = %s (%s) with %d attempts, want waiting (escalation) with 2", tk.State, tk.Reason, tk.Attempts)
+	}
+	if n := len(o.Records()); n != 2 {
+		t.Errorf("the agent was started %d times, want 2", n)
+	}
+	if !strings.Contains(o.Output(), "ticket not started: it has used up its attempts") {
+		t.Error("the refusal is not in ochell's log")
+	}
+
+	// An operator looks at it and resets it; then it can be assigned again.
+	if out, code := o.Admin("reset", "linear", "ENG-45"); code != 0 || !strings.Contains(out, "attempts of linear ENG-45 are reset") {
+		t.Fatalf("ochell reset: exit %d, %q", code, out)
+	}
+	if out, code := o.Admin("reset", "linear", "ENG-404"); code == 0 || !strings.Contains(out, "knows no linear ticket ENG-404") {
+		t.Errorf("ochell reset of an unknown ticket: exit %d, %q", code, out)
+	}
+	id := o.LinearCreated("ENG-45", "session-4", "").TaskID(t)
+	if run := o.WaitStored(st, id, 15*time.Second); run.Attempt != 1 {
+		t.Errorf("the run after the reset was attempt %d, want 1", run.Attempt)
+	}
+}
+
+// The pause flag: ochell pause and ochell resume take effect on the running
+// server, and no run starts while it is paused.
+func TestPauseAndResume(t *testing.T) {
+	o := Start(t, Options{})
+	if out, code := o.Admin("status"); code != 0 || out != "running; 0 queued, 0 running" {
+		t.Fatalf("ochell status: exit %d, %q", code, out)
+	}
+	if out, code := o.Admin("pause"); code != 0 || out != "paused: no new run starts; 0 queued, 0 running" {
+		t.Fatalf("ochell pause: exit %d, %q", code, out)
+	}
+
+	// Webhooks are still accepted, and queued.
+	id := o.JiraAssigned("DEV-45", "Arrives during the pause").TaskID(t)
+	time.Sleep(500 * time.Millisecond)
+	if n := len(o.Records()); n != 0 {
+		t.Fatalf("a run started while ochell was paused (%d)", n)
+	}
+	if _, err := os.Stat(o.LogFile(id)); err == nil {
+		t.Error("the queued task has a run log while ochell is paused")
+	}
+	if out, _ := o.Admin("status"); out != "paused: no new run starts; 1 queued, 0 running" {
+		t.Errorf("ochell status during the pause: %q", out)
+	}
+
+	// The pause is kept across a restart.
+	o.Signal(syscall.SIGTERM)
+	o.WaitExit(20 * time.Second)
+	o.Restart()
+	time.Sleep(300 * time.Millisecond)
+	if out, _ := o.Admin("status"); out != "paused: no new run starts; 1 queued, 0 running" || len(o.Records()) != 0 {
+		t.Errorf("after a restart: %q, %d runs; want still paused with the task queued", out, len(o.Records()))
+	}
+
+	// Resume, without a restart: the queued task runs.
+	if out, code := o.Admin("resume"); code != 0 || !strings.HasPrefix(out, "running; ") {
+		t.Fatalf("ochell resume: exit %d, %q", code, out)
+	}
+	if run := o.WaitRun(id, 15*time.Second); !strings.Contains(run.Footer, "outcome=finished") {
+		t.Errorf("the queued task after the resume: %s", run.Footer)
+	}
+}
+
+// The assigner allowlist: an assignment from someone who is not on it is
+// rejected and logged, for each source.
+func TestAssignerAllowlist(t *testing.T) {
+	o := Start(t, Options{Configure: func(c *config.Config) {
+		c.Sources.JiraWebhook.AllowedAssigners = []string{HumanAccountID}
+		c.Sources.JiraAutomation.AllowedAssigners = []string{HumanAccountID}
+		c.Sources.Linear.AllowedAssigners = []string{"Human@Example.com"}
+	}})
+
+	// Someone on the list.
+	o.WaitRun(o.JiraAssigned("DEV-50", "Allowed").TaskID(t), 15*time.Second)
+	o.WaitRun(o.JiraAutomation("DEV-51", "Allowed").TaskID(t), 15*time.Second)
+	o.WaitRun(o.LinearCreated("ENG-50", "session-allowed", "").TaskID(t), 15*time.Second)
+	runs := len(o.Records())
+
+	// Someone else.
+	o.Actor = "557058:stranger"
+	if r := o.JiraAssigned("DEV-52", "Not allowed"); r.Status != 403 || r.Body != "the assigner is not allowed to assign work" {
+		t.Errorf("Jira webhook from a stranger: %d %q", r.Status, r.Body)
+	}
+	if r := o.JiraAutomation("DEV-53", "Not allowed"); r.Status != 403 {
+		t.Errorf("Jira Automation from a stranger: %d %q", r.Status, r.Body)
+	}
+	if !strings.Contains(o.Output(), `msg="rejected: the assigner is not on the allowlist" source=jira_webhook`) ||
+		!strings.Contains(o.Output(), "key=DEV-52 assigner=557058:stranger") {
+		t.Error("the rejected Jira assignment is not in ochell's log")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := len(o.Records()); n != runs {
+		t.Errorf("a run started for a rejected assignment: %d runs, want %d", n, runs)
+	}
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if tk, _ := st.Ticket("jira", "DEV-52"); tk != nil {
+		t.Errorf("a rejected assignment left a ticket behind: %+v", tk)
+	}
+}
+
 // git runs git with a fixed identity, and fails the test when it fails.
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()

@@ -40,16 +40,16 @@ func TestQueue(t *testing.T) {
 		t.Fatalf("Claim on an empty store = %v, %v", got, err)
 	}
 	// Queued out of order: the oldest is claimed first.
-	if err := s.Enqueue(newTask("r2", "ENG-2", t0.Add(time.Second)), 2); err != nil {
+	if err := s.Enqueue(newTask("r2", "ENG-2", t0.Add(time.Second)), Limits{MaxQueued: 2}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Enqueue(newTask("r1", "ENG-1", t0), 2); err != nil {
+	if err := s.Enqueue(newTask("r1", "ENG-1", t0), Limits{MaxQueued: 2}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Enqueue(newTask("r1b", "ENG-1", t0), 0); !errors.Is(err, ErrBusy) {
+	if err := s.Enqueue(newTask("r1b", "ENG-1", t0), Limits{}); !errors.Is(err, ErrBusy) {
 		t.Errorf("second run of a queued ticket: %v, want ErrBusy", err)
 	}
-	if err := s.Enqueue(newTask("r3", "ENG-3", t0), 2); !errors.Is(err, ErrQueueFull) {
+	if err := s.Enqueue(newTask("r3", "ENG-3", t0), Limits{MaxQueued: 2}); !errors.Is(err, ErrQueueFull) {
 		t.Errorf("third queued run with a limit of 2: %v, want ErrQueueFull", err)
 	}
 	if n, _ := s.Active(); n != 2 {
@@ -65,11 +65,11 @@ func TestQueue(t *testing.T) {
 	if *got != *want {
 		t.Errorf("claimed %+v\nwant    %+v", got, want)
 	}
-	if err := s.Enqueue(newTask("r1c", "ENG-1", t0), 0); !errors.Is(err, ErrBusy) {
+	if err := s.Enqueue(newTask("r1c", "ENG-1", t0), Limits{}); !errors.Is(err, ErrBusy) {
 		t.Errorf("second run of a running ticket: %v, want ErrBusy", err)
 	}
 	// A running run no longer counts against the queue limit.
-	if err := s.Enqueue(newTask("r3", "ENG-3", t0.Add(2*time.Second)), 2); err != nil {
+	if err := s.Enqueue(newTask("r3", "ENG-3", t0.Add(2*time.Second)), Limits{MaxQueued: 2}); err != nil {
 		t.Errorf("queue with one waiting run and a limit of 2: %v", err)
 	}
 
@@ -89,7 +89,7 @@ func TestQueue(t *testing.T) {
 	}
 
 	// The ticket is free again; its next run is attempt 2.
-	if err := s.Enqueue(newTask("r4", "ENG-1", t0.Add(-time.Hour)), 0); err != nil {
+	if err := s.Enqueue(newTask("r4", "ENG-1", t0.Add(-time.Hour)), Limits{}); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := s.Claim(); got == nil || got.ID != "r4" || got.Attempt != 2 {
@@ -109,7 +109,7 @@ func TestRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, id := range []string{"run-a", "run-b", "run-c"} {
-		if err := s.Enqueue(newTask(id, "ENG-"+id, t0.Add(time.Duration(i)*time.Second)), 0); err != nil {
+		if err := s.Enqueue(newTask(id, "ENG-"+id, t0.Add(time.Duration(i)*time.Second)), Limits{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -146,7 +146,7 @@ func TestRestart(t *testing.T) {
 		}
 	}
 	// The interrupted ticket can be started again.
-	if err := s.Enqueue(newTask("run-a2", "ENG-run-a", t0), 0); err != nil {
+	if err := s.Enqueue(newTask("run-a2", "ENG-run-a", t0), Limits{}); err != nil {
 		t.Errorf("new run of an interrupted ticket: %v", err)
 	}
 }
@@ -158,7 +158,7 @@ func TestAgentSession(t *testing.T) {
 	t0 := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
 	run := func(id string, res task.Result) *task.Task {
 		t.Helper()
-		if err := s.Enqueue(newTask(id, "ENG-1", t0), 0); err != nil {
+		if err := s.Enqueue(newTask(id, "ENG-1", t0), Limits{}); err != nil {
 			t.Fatal(err)
 		}
 		got, err := s.Claim()
@@ -226,6 +226,66 @@ func TestAgentSession(t *testing.T) {
 	}
 }
 
+// The guards: a ticket's attempts are limited, and a pause holds the queue.
+func TestGuards(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ochell.db")
+	s := open(t, path)
+	t0 := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	lim := Limits{MaxAttempts: 2}
+	for _, id := range []string{"r1", "r2"} {
+		if err := s.Enqueue(newTask(id, "ENG-1", t0), lim); err != nil {
+			t.Fatal(err)
+		}
+		s.Claim()
+		if err := s.Finish(id, task.Result{Outcome: task.OutcomeFailed}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Enqueue(newTask("r3", "ENG-1", t0), lim); !errors.Is(err, ErrAttempts) {
+		t.Errorf("third run with a limit of 2: %v, want ErrAttempts", err)
+	}
+	if err := s.Enqueue(newTask("other", "ENG-2", t0), lim); err != nil {
+		t.Errorf("the limit is per ticket: %v", err)
+	}
+	if err := s.ResetAttempts("linear", "ENG-0"); !errors.Is(err, ErrUnknown) {
+		t.Errorf("reset of an unknown ticket: %v", err)
+	}
+	if err := s.ResetAttempts("linear", "ENG-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(newTask("r3", "ENG-1", t0.Add(time.Second)), lim); err != nil {
+		t.Errorf("after the reset: %v", err)
+	}
+
+	// Paused: nothing is handed out, and nothing is lost.
+	if err := s.SetPaused(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPaused(true); err != nil {
+		t.Errorf("pausing twice: %v", err)
+	}
+	if got, err := s.Claim(); got != nil || err != nil {
+		t.Errorf("Claim while paused = %v, %v", got, err)
+	}
+	if queued, running, _ := s.Counts(); queued != 2 || running != 0 {
+		t.Errorf("Counts = %d queued, %d running; want 2, 0", queued, running)
+	}
+	// The flag is kept across a restart.
+	s2 := open(t, path)
+	if held, _ := s2.Paused(); !held {
+		t.Error("the pause was forgotten by a restart")
+	}
+	if err := s2.SetPaused(false); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s2.Claim(); got == nil || got.ID != "other" {
+		t.Errorf("Claim after the resume = %+v, want the oldest queued run", got)
+	}
+	if queued, running, _ := s2.Counts(); queued != 1 || running != 1 {
+		t.Errorf("Counts = %d queued, %d running; want 1, 1", queued, running)
+	}
+}
+
 // What the tracker's report of a closed ticket does, by the ticket's state.
 func TestCloseTicket(t *testing.T) {
 	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
@@ -235,7 +295,7 @@ func TestCloseTicket(t *testing.T) {
 	}
 	ended := func(key string, res task.Result) {
 		t.Helper()
-		if err := s.Enqueue(newTask("run-"+key, key, t0), 0); err != nil {
+		if err := s.Enqueue(newTask("run-"+key, key, t0), Limits{}); err != nil {
 			t.Fatal(err)
 		}
 		if got, err := s.Claim(); err != nil || got == nil {
@@ -260,7 +320,7 @@ func TestCloseTicket(t *testing.T) {
 	}
 
 	// A queued and a running ticket are left as they are.
-	if err := s.Enqueue(newTask("run-q", "ENG-4", t0), 0); err != nil {
+	if err := s.Enqueue(newTask("run-q", "ENG-4", t0), Limits{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CloseTicket("linear", "ENG-4"); !errors.Is(err, ErrBusy) {
@@ -311,7 +371,7 @@ func TestHold(t *testing.T) {
 	// task carries the repository.
 	mapped := newTask("r2", "OPS-7", t0)
 	mapped.Repo = "git@example.com:org/ops.git"
-	if err := s.Enqueue(mapped, 0); err != nil {
+	if err := s.Enqueue(mapped, Limits{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Hold(newTask("r3", "OPS-7", t0), ticket.ReasonNoRepoMapping); !errors.Is(err, ErrBusy) {
@@ -330,7 +390,7 @@ func TestHold(t *testing.T) {
 // and changes nothing then.
 func TestStateIsEnforced(t *testing.T) {
 	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
-	if err := s.Enqueue(newTask("r1", "ENG-1", time.Now()), 0); err != nil {
+	if err := s.Enqueue(newTask("r1", "ENG-1", time.Now()), Limits{}); err != nil {
 		t.Fatal(err)
 	}
 	// A queued ticket cannot go straight to review.

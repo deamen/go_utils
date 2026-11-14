@@ -77,6 +77,12 @@ ochell serve --config config.yaml                 # default command
 ochell ngrok-sync --config config.yaml [--dry-run] [--loop]
 ochell linear-install --config config.yaml        # prints the agent install URL
 ochell version
+
+# commands to the running ochell, over its admin socket (see "Guards and the admin channel")
+ochell status --config config.yaml                # paused or running; what is queued and running
+ochell pause  --config config.yaml                # hold the queue: no new run starts
+ochell resume --config config.yaml
+ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts of a ticket
 ```
 
 ## Configuration
@@ -88,6 +94,7 @@ Common flags (run `ochell serve -h` for all of them):
 |---|---|
 | `--http`, `--http-addr`, `--http-port` | Enable the HTTP listener and set its address and port separately |
 | `--https`, `--https-addr`, `--https-port`, `--tls-cert`, `--tls-key` | Same for HTTPS (TLS 1.2+) |
+| `--admin-socket` | Unix socket of the admin channel (default `ochell.sock`); see [Guards and the admin channel](#guards-and-the-admin-channel) |
 | `--store-path` | File that holds the tickets, the task queue and the handled deliveries (default `ochell.db`); see [The store](#the-store) |
 | `--agent-cmd` | Agent CLI executable (default `claude`) |
 | `--agent-arg` | Agent argument; repeatable; replaces the YAML `args` (default `-p`). Go template: `{{.Key}}`, `{{.Source}}`, `{{.ID}}`. Keep ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`, `{{.Prompt}}`) out of arguments; see [The prompt](#the-prompt) |
@@ -95,7 +102,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-adapter` | Kind of agent CLI: `plain` (default) or `claude`; see [Agent adapters](#agent-adapters) |
 | `--agent-launcher` | `direct` (default) or `systemd`; see [Launchers](#launchers) |
 | `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
-| `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-log-dir`, `--agent-run-dir` | Execution settings |
+| `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-max-attempts`, `--agent-log-dir`, `--agent-run-dir` | Execution settings |
 | `--agent-stop-grace`, `--agent-drain-timeout` | Time between SIGTERM and SIGKILL when an agent is stopped; how long a shutdown waits for running agents (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down)) |
 | `--jira-webhook`, `--jira-webhook-secret`, `--jira-bot-account-id` | Jira system webhook source |
 | `--jira-automation`, `--jira-automation-header`, `--jira-automation-token` | Jira Automation source |
@@ -136,6 +143,23 @@ repos:
 - **The first entry that matches wins**, so put the narrower entries first.
 - **A ticket that no entry matches is not started.** It is recorded as `waiting` with the reason `no_repo_mapping`, the request is answered with 200 `not started: …`, ochell logs a warning, and a Linear session is told why. After the mapping is added, assign the ticket again.
 - With no `repos` at all, every ticket runs, without a repository.
+
+### Guards and the admin channel
+Three limits on what starts a run, and one way to talk to the running ochell.
+
+- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear> <KEY>` sets the count back to zero; then assign the ticket again.
+- **Pause:** `ochell pause` holds the queue. No new run starts; running agents go on; webhooks are still accepted and queued. `ochell resume` ends it, and the queued tasks run. Both take effect at once, without a restart, and a pause is kept across a restart. `ochell status` says which it is, and how many tasks are queued and running.
+- **Assigner allowlist:** `allowed_assigners` of a source, when it is not empty, lists who may assign work. Anyone else is rejected, and the rejection is logged with the ticket and the assigner. Nothing is stored for a rejected assignment.
+
+  | Source | Who is checked | A rejected assignment |
+  |---|---|---|
+  | Jira system webhook | `user.accountId` of the event: the user who made the change | 403 |
+  | Jira Automation | `initiatorAccountId` in the request body: add `"initiatorAccountId": "{{initiator.accountId}}"` to the rule's body. A request without it is rejected with 400 | 403 |
+  | Linear | the id or the email address of `agentSession.creator` (or `creatorId`). If the payload has neither, the assignment is rejected. Those fields were not checked against Linear | 200, and an `error` activity in the session |
+
+**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The four commands above find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
+- Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port: the agent runs on the same host and can reach any local port. With the `systemd` launcher the agent is another user and cannot open the socket; with the `direct` launcher it is the same user and can.
+- Keep the socket in a directory that the agent user cannot write to.
 
 ### Workspaces
 The working directory of a ticket is `agent.workdir`, rendered per ticket, for example `/work/{{.Source}}/{{.Key}}`. `workspace` says where it may be, how it is prepared and when it goes.
@@ -187,7 +211,7 @@ Every ticket ochell has seen is in one of these states. They are defined, with t
 
 A ticket that is `queued` or `running` takes no second run. From every other state a new assignment queues it again.
 
-Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation`, and `interrupted` (ochell itself stopped during the run).
+Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation` (the agent was not sure or out of scope, or the ticket used up its attempts), and `interrupted` (ochell itself stopped during the run).
 
 What a run leads to:
 
@@ -201,7 +225,7 @@ What a run leads to:
 | `failed`, `timed_out`, `not_started` | not looked at | `failed` |
 | `stopped`, `interrupted` | not looked at | `waiting`, reason `interrupted` |
 
-Several states and reasons are not reached yet: they belong to features that come later (the plan gate, stop from the ticket, handoff). Pausing will not be a state: it holds the queue, and queued tickets stay queued.
+Several states and reasons are not reached yet: they belong to features that come later (the plan gate, stop from the ticket, handoff). Pausing is not a state: it holds the queue, and queued tickets stay queued.
 
 ### Agent adapters
 An adapter holds what differs between agent CLIs: how a run is started, how an earlier session is resumed, and how the output is read (final message, session id, cost). It only builds commands and parses output. Running and stopping the process is the launcher's job, so every adapter works with every launcher. `agent.adapter` selects it.
@@ -341,7 +365,7 @@ Requires a Jira admin.
    - URL: `https://<ngrok-domain>/webhooks/jira-automation`
    - Method: POST
    - Header: `Authorization: Bearer <token>`, marked **Hidden**
-   - Body: *Custom data*, using [examples/jira-automation-body.json](examples/jira-automation-body.json). The rule may also send *Work item data (Jira format)*.
+   - Body: *Custom data*, using [examples/jira-automation-body.json](examples/jira-automation-body.json). The rule may also send *Work item data (Jira format)*, but that body does not say who triggered the rule, so it cannot be used with `allowed_assigners`.
 3. Set `sources.jira_automation.bot_account_id` to the digital employee's accountId. ochell then checks the assignee itself and does not rely on the rule's condition alone:
    - a payload whose assignee is someone else is ignored (200);
    - a payload that names no assignee is rejected (400), because the request body is then most likely incomplete. The rule's audit log shows the failure.

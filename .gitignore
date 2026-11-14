@@ -21,3 +21,5 @@ ochell/logs/
 ochell/vmtest/
 ochell/linear-token.json
 ochell/ochell.db*
+ochell/ochell.sock
+ochell/runs/
