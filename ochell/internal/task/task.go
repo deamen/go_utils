@@ -56,6 +56,10 @@ type Task struct {
 	// a plain assignment. Several messages that waited for the same run
 	// are joined with CommentSeparator, oldest first.
 	Comment string
+	// Actor identifies the person who assigned the ticket, as the source
+	// names them (a Jira accountId, a Linear user id). Empty when the
+	// source does not say, and for a run that is no assignment.
+	Actor string
 	// Cause says why the run was queued; empty for a plain assignment.
 	Cause Cause
 	// TrackerSession is where the source wants progress reported: the id of

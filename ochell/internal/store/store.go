@@ -147,6 +147,9 @@ var migrations = []string{
 		received_at     INTEGER NOT NULL
 	);
 	CREATE INDEX followups_by_ticket ON followups (source, key, id);`,
+
+	// Version 13: who assigned a ticket to the bot.
+	`ALTER TABLE tickets ADD COLUMN assigner TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is safe for concurrent use.
@@ -450,13 +453,14 @@ func (s *Store) TicketOfSession(source, session string) (string, error) {
 }
 
 // upsert records the ticket of t, or brings its title, URL and repository
-// up to date. A new ticket is created in the state "none", and then moved
+// up to date, and who assigned it when t says so. A new ticket is created in the state "none", and then moved
 // like any other.
 func (s *Store) upsert(tx *sql.Tx, t *task.Task, now int64) error {
-	_, err := tx.Exec(`INSERT INTO tickets (source, key, title, url, repo, state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (source, key) DO UPDATE SET title = excluded.title, url = excluded.url, repo = excluded.repo`,
-		t.Source, t.Key, t.Title, t.URL, t.Repo, ticket.None, now, now)
+	_, err := tx.Exec(`INSERT INTO tickets (source, key, title, url, repo, assigner, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (source, key) DO UPDATE SET title = excluded.title, url = excluded.url, repo = excluded.repo,
+			assigner = CASE WHEN excluded.assigner != '' THEN excluded.assigner ELSE assigner END`,
+		t.Source, t.Key, t.Title, t.URL, t.Repo, t.Actor, ticket.None, now, now)
 	return err
 }
 
@@ -840,6 +844,9 @@ type Ticket struct {
 	State ticket.State
 	// Reason is set when State is ticket.Waiting.
 	Reason ticket.Reason
+	// Assigner is who last assigned the ticket to the bot, as the source
+	// named them; empty when it did not.
+	Assigner string
 	// Attempts is the number of runs that were started.
 	Attempts  int
 	Workspace string
@@ -861,9 +868,9 @@ type Ticket struct {
 func (s *Store) Ticket(source, key string) (*Ticket, error) {
 	t := Ticket{Source: source, Key: key}
 	var created, updated int64
-	err := s.db.QueryRow(`SELECT title, url, repo, state, reason, attempts, workspace, prepared_workspace, agent_session, pr_url, branch, created_at, updated_at
+	err := s.db.QueryRow(`SELECT title, url, repo, assigner, state, reason, attempts, workspace, prepared_workspace, agent_session, pr_url, branch, created_at, updated_at
 		FROM tickets WHERE source = ? AND key = ?`, source, key).
-		Scan(&t.Title, &t.URL, &t.Repo, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
+		Scan(&t.Title, &t.URL, &t.Repo, &t.Assigner, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

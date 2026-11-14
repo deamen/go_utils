@@ -123,6 +123,11 @@ type JiraWebhook struct {
 	// AllowedAssigners, when not empty, are the Jira accountIds of the
 	// people who may assign work: the user who made the change.
 	AllowedAssigners []string `yaml:"allowed_assigners"`
+	// AllowedFollowUps, when not empty, says who may send follow-ups and
+	// stops in comments: Jira accountIds, and the words "assigner" (who
+	// assigned the ticket to the bot) and "reporter" (the ticket's
+	// reporter). Empty: the same people as AllowedAssigners.
+	AllowedFollowUps []string `yaml:"allowed_follow_ups"`
 	// MaxSkew is how far the payload's timestamp may be from now. Jira
 	// retries a failed delivery up to five times, 5 to 15 minutes apart, and
 	// a retry may carry the timestamp of the event, so this must cover those
@@ -178,6 +183,11 @@ type Linear struct {
 	// AllowedAssigners, when not empty, are the Linear user ids or email
 	// addresses of the people who may delegate work.
 	AllowedAssigners []string `yaml:"allowed_assigners"`
+	// AllowedFollowUps, when not empty, says who may send follow-ups and
+	// stops in an agent session: Linear user ids or email addresses, and
+	// the word "assigner" (who delegated the issue). Empty: the same
+	// people as AllowedAssigners.
+	AllowedFollowUps []string `yaml:"allowed_follow_ups"`
 	// Optional: only accept an OAuth install for this workspace.
 	OrganizationID string `yaml:"organization_id"`
 	// Optional: link shown on the agent session, templated with the task.

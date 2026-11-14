@@ -801,3 +801,52 @@ func TestFollowUpsDuringARun(t *testing.T) {
 		}
 	}
 }
+
+// The ticket remembers who assigned it; a run that names nobody (a retry, a
+// follow-up) does not erase that.
+func TestAssigner(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	assign := func(id, actor string) {
+		t.Helper()
+		tk := newTask(id, "ENG-1", t0)
+		tk.Actor = actor
+		if err := s.Enqueue(tk, Limits{}); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := s.Claim(); got == nil {
+			t.Fatal("nothing claimed")
+		}
+		if err := s.Finish(id, task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assigner := func() string {
+		tk, err := s.Ticket("linear", "ENG-1")
+		if err != nil || tk == nil {
+			t.Fatalf("Ticket = %v, %v", tk, err)
+		}
+		return tk.Assigner
+	}
+	assign("run-1", "u-anna")
+	if got := assigner(); got != "u-anna" {
+		t.Errorf("assigner = %q, want u-anna", got)
+	}
+	assign("run-2", "")
+	if got := assigner(); got != "u-anna" {
+		t.Errorf("an assignment that names nobody: assigner = %q, want u-anna still", got)
+	}
+	if _, err := s.FollowUp(&task.Task{ID: "f1", Source: "linear", Key: "ENG-1", Comment: "go on", Actor: "u-bob", Received: t0}, true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := assigner(); got != "u-anna" {
+		t.Errorf("after a follow-up: assigner = %q, want u-anna", got)
+	}
+	if got, _ := s.Claim(); got != nil {
+		s.Finish(got.ID, task.Result{Outcome: task.OutcomeFinished, Signal: result.Done})
+	}
+	assign("run-3", "u-carl")
+	if got := assigner(); got != "u-carl" {
+		t.Errorf("assigned again by someone else: assigner = %q, want u-carl", got)
+	}
+}
