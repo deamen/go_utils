@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"ochell/internal/store"
 	"ochell/internal/task"
 	"ochell/internal/ticket"
+	"ochell/internal/tracker"
 )
 
 const bot = "712020:digital-employee"
@@ -633,5 +635,101 @@ func TestLastN(t *testing.T) {
 	}
 	if got := lastN("abc", 10); got != "abc" {
 		t.Errorf("lastN = %q", got)
+	}
+}
+
+// The Jira back-channel: a Jira ticket gets a comment when its run starts
+// and one with the result when it ends.
+func TestJiraBackChannel(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sources.JiraAPI.ReviewStatus = "In Review"
+	s := newServer(t, cfg, &fakeRunner{})
+	jira := &tracker.Fake{}
+	s.UseJira(jira)
+	ctx := context.Background()
+	run := func(key string, attempt int, res task.Result) []string {
+		t.Helper()
+		tk := &task.Task{Source: "jira", Key: key, Attempt: attempt}
+		if err := s.Started(ctx, tk); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Finished(ctx, tk, res); err != nil {
+			t.Fatal(err)
+		}
+		got := jira.Comments(key)
+		if len(got) != 2 {
+			t.Fatalf("%s has %d comments, want 2: %q", key, len(got), got)
+		}
+		return got
+	}
+
+	got := run("DEV-1", 1, task.Result{Outcome: task.OutcomeFinished, Signal: result.Done, SignalMessage: "Opened a pull request.", PRURL: "https://github.com/example/repo/pull/7"})
+	if got[0] != "The digital employee started work on this ticket." {
+		t.Errorf("start comment = %q", got[0])
+	}
+	for _, want := range []string{"ready for review", "Opened a pull request.", "Pull request: https://github.com/example/repo/pull/7"} {
+		if !strings.Contains(got[1], want) {
+			t.Errorf("finish comment missing %q: %q", want, got[1])
+		}
+	}
+	if st := jira.Status("DEV-1"); st != "In Review" {
+		t.Errorf("status = %q, want In Review", st)
+	}
+
+	// A question is asked on the ticket, and the ticket is not moved.
+	got = run("DEV-2", 2, task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput, SignalMessage: "Which login page?"})
+	if got[0] != "The digital employee is working on this ticket again (attempt 2)." || got[1] != "Which login page?" {
+		t.Errorf("comments = %q", got)
+	}
+	if st := jira.Status("DEV-2"); st != "" {
+		t.Errorf("a ticket that waits for an answer was moved to %q", st)
+	}
+
+	// A failed run says so, with the end of the agent's output. A result
+	// file of such a run is not believed, and the ticket is not moved.
+	got = run("DEV-3", 1, task.Result{Outcome: task.OutcomeFailed, ExitCode: 3, Err: errors.New("exit status 3"), Signal: result.Done, Message: "panic: {noformat} boom"})
+	if !strings.Contains(got[1], "The agent failed (exit 3)") || !strings.Contains(got[1], "{noformat}\npanic: { noformat } boom\n{noformat}") {
+		t.Errorf("failure comment = %q", got[1])
+	}
+	if st := jira.Status("DEV-3"); st != "" {
+		t.Errorf("a failed ticket was moved to %q", st)
+	}
+
+	// Linear tickets are not commented on in Jira, and without the API
+	// nothing is attempted.
+	if err := s.Started(ctx, &task.Task{Source: "linear", Key: "ENG-1"}); err != nil || len(jira.Comments("ENG-1")) != 0 {
+		t.Errorf("a Linear ticket got Jira comments: %v %q", err, jira.Comments("ENG-1"))
+	}
+	s.UseJira(nil)
+	if err := s.Finished(ctx, &task.Task{Source: "jira", Key: "DEV-4"}, task.Result{Outcome: task.OutcomeFinished}); err != nil {
+		t.Errorf("Finished without the Jira API: %v", err)
+	}
+
+	// An error of the API reaches the caller, which logs it.
+	s.UseJira(&tracker.Fake{Err: errors.New("HTTP 503")})
+	if err := s.Started(ctx, &task.Task{Source: "jira", Key: "DEV-5"}); err == nil {
+		t.Error("Started hid the error of the Jira API")
+	}
+}
+
+// A Jira ticket that is accepted but not started is told why.
+func TestJiraNotStartedIsCommented(t *testing.T) {
+	cfg := testConfig()
+	cfg.Repos = []config.Repo{{Source: "jira", Project: "OPS", Repo: "git@example.com:ops.git"}}
+	s := newServer(t, cfg, &fakeRunner{})
+	jira := &tracker.Fake{}
+	s.UseJira(jira)
+	body := jiraBody(t, time.Now())
+	w := do(s, "/webhooks/jira", body, map[string]string{"X-Hub-Signature": "sha256=" + auth.SignHex("jira-secret", []byte(body))})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "not started") {
+		t.Fatalf("answer = %d %q", w.Code, w.Body.String())
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(jira.Comments("DEV-42")) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := jira.Comments("DEV-42")
+	if len(got) != 1 || !strings.Contains(got[0], "no repository is configured") {
+		t.Errorf("comments = %q", got)
 	}
 }

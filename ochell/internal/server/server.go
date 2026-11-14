@@ -31,6 +31,8 @@ import (
 	"ochell/internal/store"
 	"ochell/internal/task"
 	"ochell/internal/ticket"
+	"ochell/internal/tracker"
+	"ochell/internal/tracker/jiraapi"
 )
 
 const (
@@ -59,11 +61,13 @@ type Deliveries interface {
 }
 
 type Server struct {
-	cfg     *config.Config
-	log     *slog.Logger
-	runner  Submitter
-	seen    Deliveries
-	linear  *linear.Client
+	cfg    *config.Config
+	log    *slog.Logger
+	runner Submitter
+	seen   Deliveries
+	linear *linear.Client
+	// jira is ochell's access to the Jira API; nil without sources.jira_api.
+	jira    tracker.Client
 	extURL  *template.Template
 	handler http.Handler
 	now     func() time.Time
@@ -84,6 +88,9 @@ func New(cfg *config.Config, log *slog.Logger, r Submitter, seen Deliveries) (*S
 		if lc.TokenURL != "" {
 			s.linear.TokenURL = lc.TokenURL
 		}
+	}
+	if api := cfg.Sources.JiraAPI; api.Enabled() {
+		s.jira = jiraapi.New(api)
 	}
 	if lc.ExternalURL != "" {
 		t, err := template.New("external_url").Parse(lc.ExternalURL)
@@ -455,8 +462,21 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	if s.firstDelivery(w, keys, log) != deliveryNew {
 		return
 	}
-	if s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery), t.Labels, log) == submitFailed {
+	res := s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery), t.Labels, log)
+	if res == submitFailed {
 		s.forgetDelivery(keys, log)
+	}
+	s.jiraNotStarted(res, t.Key, log)
+}
+
+// jiraNotStarted tells a Jira ticket that it was accepted but is not
+// started, and what has to happen first.
+func (s *Server) jiraNotStarted(res submitResult, key string, log *slog.Logger) {
+	switch res {
+	case submitCapped:
+		s.jiraComment(key, fmt.Sprintf("The digital employee did not start work on this ticket: it has used its %d attempts. Someone who looks after the orchestrator has to look at it and reset it (ochell reset jira %s); then assign the ticket again.", s.cfg.Agent.MaxAttempts, key), log)
+	case submitHeld:
+		s.jiraComment(key, "The digital employee did not start work on this ticket: no repository is configured for it. Someone who looks after the orchestrator has to add one; then assign the ticket again.", log)
 	}
 }
 
@@ -500,7 +520,7 @@ func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 	}
 	// Automation has no delivery id; the runner's per-ticket in-flight guard
 	// prevents duplicate concurrent runs.
-	s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", ""), t.Labels, log)
+	s.jiraNotStarted(s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", ""), t.Labels, log), t.Key, log)
 }
 
 func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
@@ -602,6 +622,9 @@ func (s *Server) reportsToLinear(t *task.Task) bool {
 // Started tells the source of t that its run begins. It implements
 // runner.Notifier.
 func (s *Server) Started(ctx context.Context, t *task.Task) error {
+	if s.reportsToJira(t) {
+		return s.jiraRunStarted(ctx, t)
+	}
 	if !s.reportsToLinear(t) || s.extURL == nil {
 		return nil
 	}
@@ -617,6 +640,9 @@ func (s *Server) Started(ctx context.Context, t *task.Task) error {
 // Finished tells the source of t how its run ended. It implements
 // runner.Notifier.
 func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) error {
+	if s.reportsToJira(t) {
+		return s.jiraRunFinished(ctx, t, res)
+	}
 	if !s.reportsToLinear(t) {
 		return nil
 	}
