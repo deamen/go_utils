@@ -21,7 +21,7 @@ func TestMoves(t *testing.T) {
 		InReview:  "  -     yes    -       yes     -         yes  -      yes",
 		Done:      "  -     yes    -       yes     -         -    -      -",
 		Failed:    "  -     yes    -       yes     -         yes  -      yes",
-		Cancelled: "  -     yes    -       yes     -         -    -      -",
+		Cancelled: "  -     yes    -       yes     -         yes  -      -",
 	}
 	for _, from := range all {
 		cells := strings.Fields(want[from])

@@ -586,6 +586,28 @@ func (o *Ochell) JiraResolved(key string) Response {
 	})
 }
 
+// JiraUnassigned sends a signed Jira system webhook: someone took the
+// ticket away from the digital employee.
+func (o *Ochell) JiraUnassigned(key string) Response {
+	o.t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"timestamp":    time.Now().UnixMilli(),
+		"webhookEvent": "jira:issue_updated",
+		"user":         map[string]string{"accountId": o.actor(), "displayName": "Someone"},
+		"issue":        map[string]any{"id": "10042", "key": key},
+		"changelog": map[string]any{"items": []map[string]any{
+			{"field": "assignee", "fieldId": "assignee", "from": BotAccountID, "to": nil},
+		}},
+	})
+	if err != nil {
+		o.t.Fatal(err)
+	}
+	return o.Post(o.Config.Sources.JiraWebhook.Path, body, map[string]string{
+		"X-Hub-Signature":                "sha256=" + auth.SignHex(JiraSecret, body),
+		"X-Atlassian-Webhook-Identifier": nextDelivery(),
+	})
+}
+
 // JiraCommented sends a signed Jira system webhook: someone added a comment
 // to a ticket that is assigned to the digital employee. An empty author is
 // the person who assigns the tickets; BotAccountID is the bot itself.
@@ -683,6 +705,26 @@ func (o *Ochell) linearCreated(key, sessionID, promptContext, comment string) Re
 // person wrote to the agent in a session that exists.
 func (o *Ochell) LinearPrompted(key, sessionID, text string) Response {
 	o.t.Helper()
+	return o.linearPrompted(key, sessionID, text, "")
+}
+
+// LinearStop sends the same event with the stop signal: the person asks
+// the agent to stop.
+func (o *Ochell) LinearStop(key, sessionID string) Response {
+	o.t.Helper()
+	return o.linearPrompted(key, sessionID, "", "stop")
+}
+
+func (o *Ochell) linearPrompted(key, sessionID, text, signal string) Response {
+	o.t.Helper()
+	activity := map[string]any{
+		"id":      "activity-" + nextDelivery(),
+		"content": map[string]string{"type": "prompt", "body": text},
+		"user":    map[string]string{"id": o.actor(), "email": "human@example.com"},
+	}
+	if signal != "" {
+		activity["signal"] = signal
+	}
 	body, err := json.Marshal(map[string]any{
 		"type": "AgentSessionEvent", "action": "prompted",
 		"organizationId": "org-0000",
@@ -694,11 +736,7 @@ func (o *Ochell) LinearPrompted(key, sessionID, text string) Response {
 				"url": "https://linear.app/example/issue/" + key,
 			},
 		},
-		"agentActivity": map[string]any{
-			"id":      "activity-" + nextDelivery(),
-			"content": map[string]string{"type": "prompt", "body": text},
-			"user":    map[string]string{"id": o.actor(), "email": "human@example.com"},
-		},
+		"agentActivity":    activity,
 		"webhookTimestamp": time.Now().UnixMilli(),
 	})
 	if err != nil {

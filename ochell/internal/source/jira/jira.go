@@ -238,6 +238,31 @@ func ParseComment(body []byte) (*Comment, error) {
 	return c, nil
 }
 
+// ParseUnassigned reports whether a webhook payload says that an issue was
+// taken away from the bot: its changelog changes the assignee from the bot
+// to someone else, or to nobody. It returns the issue key and the display
+// name (or else the accountId) of who did it.
+//
+// Jira may not send this event at all when the webhook's JQL filter is
+// "assignee = <bot>": the issue no longer matches after the change.
+func ParseUnassigned(body []byte, botAccountID string) (key, by string, ok bool) {
+	var ev WebhookEvent
+	if json.Unmarshal(body, &ev) != nil || ev.Issue == nil || ev.Issue.Key == "" || ev.Changelog == nil || ev.WebhookEvent != "jira:issue_updated" {
+		return "", "", false
+	}
+	for _, it := range ev.Changelog.Items {
+		if (it.FieldID == "assignee" || it.Field == "assignee") && it.From == botAccountID && it.To != botAccountID {
+			if ev.User != nil {
+				if by = ev.User.DisplayName; by == "" {
+					by = ev.User.AccountID
+				}
+			}
+			return ev.Issue.Key, by, true
+		}
+	}
+	return "", "", false
+}
+
 func assignedTo(ev WebhookEvent, bot string) bool {
 	if ev.Changelog == nil {
 		return false

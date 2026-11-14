@@ -211,3 +211,35 @@ func TestParseComment(t *testing.T) {
 		t.Errorf("comment = %+v, %v", c, err)
 	}
 }
+
+func TestParseUnassigned(t *testing.T) {
+	const bot = "712020:bot"
+	event := func(from, to string) string {
+		return `{"webhookEvent":"jira:issue_updated","user":{"accountId":"557058:anna","displayName":"Anna"},"issue":{"key":"DEV-42"},
+			"changelog":{"items":[{"field":"status","from":"1","to":"3"},{"field":"assignee","fieldId":"assignee","from":` + from + `,"to":` + to + `}]}}`
+	}
+	for name, c := range map[string]struct {
+		body string
+		want bool
+	}{
+		"to someone else":       {event(`"712020:bot"`, `"557058:carl"`), true},
+		"to nobody":             {event(`"712020:bot"`, `null`), true},
+		"to the bot":            {event(`"557058:carl"`, `"712020:bot"`), false},
+		"between two others":    {event(`"557058:carl"`, `"557058:dora"`), false},
+		"no change of assignee": {`{"webhookEvent":"jira:issue_updated","issue":{"key":"DEV-42"},"changelog":{"items":[{"field":"status","from":"1","to":"3"}]}}`, false},
+		"another event":         {strings.Replace(event(`"712020:bot"`, `null`), "jira:issue_updated", "jira:issue_created", 1), false},
+		"not JSON":              {`{`, false},
+	} {
+		key, by, ok := ParseUnassigned([]byte(c.body), bot)
+		if ok != c.want {
+			t.Errorf("%s: ok = %v, want %v", name, ok, c.want)
+		}
+		if ok && (key != "DEV-42" || by != "Anna") {
+			t.Errorf("%s: key %q by %q", name, key, by)
+		}
+	}
+	// An unassignment is no assignment.
+	if _, err := ParseWebhook([]byte(event(`"712020:bot"`, `"557058:carl"`)), bot); !errors.Is(err, ErrIgnored) {
+		t.Errorf("ParseWebhook of an unassignment: %v", err)
+	}
+}

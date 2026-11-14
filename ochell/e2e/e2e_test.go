@@ -1687,3 +1687,148 @@ func TestFollowUpAllowlist(t *testing.T) {
 		t.Errorf("the agent was started %d times in all, want 5", n)
 	}
 }
+
+// The done-when of stopping from the ticket: the Linear signal, the Jira
+// command and an unassign event each stop the agent with its children, and
+// the ticket shows that it was stopped and by whom.
+func TestStopFromTheTicket(t *testing.T) {
+	start := func(t *testing.T, allow ...string) (*Ochell, *store.Store) {
+		o := Start(t, Options{
+			Script: spawning(Step{Spawn: &Spawn{Count: 2}}),
+			Configure: func(c *config.Config) {
+				c.Agent.StopGrace = time.Second
+				c.Sources.JiraWebhook.AllowedFollowUps = allow
+			},
+		})
+		st, err := store.Open(o.Config.Store.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		return o, st
+	}
+	// stopped checks what every stop must leave behind.
+	stopped := func(t *testing.T, o *Ochell, st *store.Store, source, key, id string, rec Record) {
+		t.Helper()
+		run := o.WaitStored(st, id, 15*time.Second)
+		if run.Result.Outcome != "cancelled" {
+			t.Errorf("run = %+v, want cancelled", run.Result)
+		}
+		expectAllGone(t, rec, 2)
+		if tk, _ := st.Ticket(source, key); tk == nil || tk.State != "cancelled" {
+			t.Errorf("ticket = %+v, want cancelled", tk)
+		}
+		time.Sleep(300 * time.Millisecond)
+		if n := len(o.Records()); n != 1 {
+			t.Errorf("the agent was started %d times, want 1: a stopped run is not started again", n)
+		}
+	}
+
+	t.Run("the Linear stop signal", func(t *testing.T) {
+		o, st := start(t)
+		id := o.LinearCreated("ENG-85", "session-stop", "").TaskID(t)
+		rec := waitChildren(t, o, 2)
+		if r := o.LinearStop("ENG-85", "session-stop"); r.Status != 200 || r.Body != "stopped ENG-85" {
+			t.Fatalf("stop signal: %d %q", r.Status, r.Body)
+		}
+		stopped(t, o, st, "linear", "ENG-85", id, rec)
+		acts := o.WaitActivities("session-stop", 2, 10*time.Second)
+		if acts[1].Type != "response" || !strings.Contains(acts[1].Body, "stopped by human@example.com, with the stop signal in Linear") {
+			t.Errorf("the session got %+v, want that it was stopped and by whom", acts[1])
+		}
+		// There is nothing left to stop.
+		if r := o.LinearStop("ENG-85", "session-stop"); r.Status != 200 || r.Body != "nothing to stop" {
+			t.Errorf("a second stop: %d %q", r.Status, r.Body)
+		}
+	})
+
+	t.Run("the Jira command", func(t *testing.T) {
+		o, st := start(t, "assigner")
+		o.Jira.Add(jiratest.Issue{Key: "DEV-85"})
+		id := o.JiraAssigned("DEV-85", "Rework the page").TaskID(t)
+		rec := waitChildren(t, o, 2)
+		// Someone outside the allowlist cannot stop the run.
+		if r := o.JiraCommented("DEV-85", "557058:outsider", "/stop"); r.Status != 200 || !strings.Contains(r.Body, "not allowed") {
+			t.Fatalf("/stop by an outsider: %d %q", r.Status, r.Body)
+		}
+		time.Sleep(300 * time.Millisecond)
+		if !Alive(rec.PID) {
+			t.Fatal("an outsider stopped the agent")
+		}
+		if r := o.JiraCommented("DEV-85", "", "/stop\nWrong ticket, sorry."); r.Status != 200 || r.Body != "stopped DEV-85" {
+			t.Fatalf("/stop: %d %q", r.Status, r.Body)
+		}
+		stopped(t, o, st, "jira", "DEV-85", id, rec)
+		// start comment, the refusal for the outsider, the stop.
+		comments := o.WaitJiraComments("DEV-85", 3, 10*time.Second)
+		if last := comments[len(comments)-1]; !strings.Contains(last, "The run was stopped by Someone, with /stop in a comment") || !strings.Contains(last, "Assign it again") {
+			t.Errorf("the ticket got %q, want that it was stopped and by whom", last)
+		}
+		// A comment on the stopped ticket starts nothing.
+		if r := o.JiraCommented("DEV-85", "", "Actually, one more thing."); r.Status != 200 || r.Body != "ignored" {
+			t.Errorf("a comment on a stopped ticket: %d %q", r.Status, r.Body)
+		}
+		// Assigned again, it runs again.
+		again := o.JiraAssigned("DEV-85", "Rework the page").TaskID(t)
+		o.WaitRecords(2, 10*time.Second)
+		o.JiraCommented("DEV-85", "", "/stop")
+		o.WaitStored(st, again, 15*time.Second)
+	})
+
+	t.Run("an unassign event", func(t *testing.T) {
+		o, st := start(t)
+		o.Jira.Add(jiratest.Issue{Key: "DEV-86"})
+		id := o.JiraAssigned("DEV-86", "Rework the page").TaskID(t)
+		rec := waitChildren(t, o, 2)
+		if r := o.JiraUnassigned("DEV-86"); r.Status != 200 || r.Body != "stopped DEV-86" {
+			t.Fatalf("unassigned: %d %q", r.Status, r.Body)
+		}
+		stopped(t, o, st, "jira", "DEV-86", id, rec)
+		comments := o.WaitJiraComments("DEV-86", 2, 10*time.Second)
+		if !strings.Contains(comments[1], "stopped by Someone, who took the ticket away from the digital employee") {
+			t.Errorf("the ticket got %q", comments[1])
+		}
+	})
+
+	t.Run("a ticket that is closed while it runs", func(t *testing.T) {
+		o, st := start(t)
+		id := o.JiraAssigned("DEV-87", "Rework the page").TaskID(t)
+		rec := waitChildren(t, o, 2)
+		if r := o.JiraResolved("DEV-87"); r.Status != 200 || r.Body != "closed DEV-87" {
+			t.Fatalf("resolved: %d %q", r.Status, r.Body)
+		}
+		if run := o.WaitStored(st, id, 15*time.Second); run.Result.Outcome != "cancelled" {
+			t.Errorf("run = %+v, want cancelled", run.Result)
+		}
+		expectAllGone(t, rec, 2)
+		o.waitFor(5*time.Second, "the closed ticket to be done", func() bool {
+			tk, _ := st.Ticket("jira", "DEV-87")
+			return tk != nil && tk.State == "done"
+		})
+	})
+
+	t.Run("a queued run and its waiting messages", func(t *testing.T) {
+		o, st := start(t)
+		o.LinearCreated("ENG-1", "session-busy", "").TaskID(t)
+		waitChildren(t, o, 2)
+		// The only worker is busy: this one stays queued.
+		queued := o.LinearCreated("ENG-2", "session-queued", "").TaskID(t)
+		if r := o.LinearPrompted("ENG-2", "session-queued", "and one more thing"); r.Body != "queued for the next run" {
+			t.Fatalf("a message for the queued ticket: %d %q", r.Status, r.Body)
+		}
+		if r := o.LinearStop("ENG-2", "session-queued"); r.Status != 200 || r.Body != "stopped ENG-2" {
+			t.Fatalf("stop of a queued ticket: %d %q", r.Status, r.Body)
+		}
+		if run := o.WaitStored(st, queued, 5*time.Second); run.Result.Outcome != "cancelled" {
+			t.Errorf("the queued run = %+v", run.Result)
+		}
+		if n, _ := st.Waiting("linear", "ENG-2"); n != 0 {
+			t.Errorf("%d messages still wait for the stopped ticket", n)
+		}
+		o.LinearStop("ENG-1", "session-busy")
+		time.Sleep(time.Second)
+		if n := len(o.Records()); n != 1 {
+			t.Errorf("the agent was started %d times, want 1: the stopped queued run must not start", n)
+		}
+	})
+}

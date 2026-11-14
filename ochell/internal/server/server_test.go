@@ -47,6 +47,10 @@ type fakeRunner struct {
 	// submitErr is returned by Submit only, followErr by FollowUp only.
 	submitErr error
 	followErr error
+	// stopped are the stops that were asked for, as "source:key by who".
+	stopped    []string
+	stopResult runner.Stopped
+	stopErr    error
 	// assigners maps a ticket key to who assigned it.
 	assigners map[string]string
 	// sessions maps a tracker session to its ticket key.
@@ -72,6 +76,20 @@ func (f *fakeRunner) FollowUp(t *task.Task, addressed bool) (bool, error) {
 	}
 	f.tasks = append(f.tasks, t)
 	return false, nil
+}
+
+// Stop records the request, and answers with stopResult or stopErr.
+func (f *fakeRunner) Stop(source, key, by string) (runner.Stopped, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopErr != nil {
+		return 0, f.stopErr
+	}
+	f.stopped = append(f.stopped, source+":"+key+" by "+by)
+	if f.stopResult == 0 {
+		return runner.StoppedRun, nil
+	}
+	return f.stopResult, nil
 }
 
 func (f *fakeRunner) Assigner(source, key string) (string, bool, error) {
@@ -643,7 +661,7 @@ func TestClosedTickets(t *testing.T) {
 		t.Errorf("unsigned close: %d, closed %v", w.Code, fr.closed)
 	}
 	// What the runner answers decides the response.
-	for err, want := range map[error]string{store.ErrUnknown: "ignored", runner.ErrBusy: "closed while in progress"} {
+	for err, want := range map[error]string{store.ErrUnknown: "ignored"} {
 		fr.err = err
 		if w := do(s, "/webhooks/linear", completed, map[string]string{"Linear-Signature": auth.SignHex("linear-secret", []byte(completed))}); w.Code != 200 || strings.TrimSpace(w.Body.String()) != want {
 			t.Errorf("runner says %v: %d %s, want 200 %s", err, w.Code, w.Body, want)
@@ -931,7 +949,6 @@ func TestJiraCommentFollowUp(t *testing.T) {
 		"no author":                  {"", bot, "hello", "ignored"},
 		"ticket of someone else":     {"557058:human", "557058:other", "hello", "ignored"},
 		"no text":                    {"557058:human", bot, "  \n ", "ignored"},
-		"the stop command, not yet":  {"557058:human", bot, "/stop\nplease", "ignored"},
 		"without the assignee field": {"557058:human", "", "and add a test", "queued "},
 	} {
 		before := len(fr.tasks)
@@ -1117,5 +1134,116 @@ func TestLinearFollowUpFromOutsideTheAllowlist(t *testing.T) {
 	}
 	if fr2.tasks[1].Actor == "" {
 		t.Errorf("the Jira assignment did not record its actor: %+v", fr2.tasks[1])
+	}
+}
+
+// The ways to stop a ticket from the tracker: the Linear stop signal, a
+// Jira comment that begins with /stop, and taking the ticket away from the
+// bot.
+func TestStopFromTheTicket(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sources.JiraWebhook.AllowedFollowUps = []string{"557058:human"}
+	cfg.Sources.Linear.AllowedFollowUps = []string{"human@example.com"}
+	fr := &fakeRunner{sessions: map[string]string{"session-known": "ENG-9"}, assigners: map[string]string{"DEV-42": "557058:human"}}
+	s := newServer(t, cfg, fr)
+	last := func() string {
+		fr.mu.Lock()
+		defer fr.mu.Unlock()
+		if len(fr.stopped) == 0 {
+			return ""
+		}
+		return fr.stopped[len(fr.stopped)-1]
+	}
+
+	// Jira: /stop as the first line of a comment.
+	body, hdr := jiraComment("DEV-42", "557058:human", bot, " /stop \nwrong ticket, sorry")
+	if w := do(s, "/webhooks/jira", body, hdr); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "stopped DEV-42" {
+		t.Errorf("/stop: %d %s", w.Code, w.Body)
+	}
+	if got := last(); got != "jira:DEV-42 by A Person, with /stop in a comment" {
+		t.Errorf("stop = %q", got)
+	}
+	// Not the first line, or more than the command: an ordinary comment.
+	for _, text := range []string{"please do not /stop", "/stop it now", "/stopping\nhere"} {
+		body, hdr = jiraComment("DEV-42", "557058:human", bot, text)
+		if w := do(s, "/webhooks/jira", body, hdr); !strings.HasPrefix(w.Body.String(), "queued ") {
+			t.Errorf("%q: %d %s, want a follow-up", text, w.Code, w.Body)
+		}
+	}
+	// Someone who may not send follow-ups may not stop either.
+	before := len(fr.stopped)
+	body, hdr = jiraComment("DEV-42", "557058:outsider", bot, "/stop")
+	if w := do(s, "/webhooks/jira", body, hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "not allowed") || len(fr.stopped) != before {
+		t.Errorf("/stop by an outsider: %d %s", w.Code, w.Body)
+	}
+	// The bot's own comments never stop anything.
+	body, hdr = jiraComment("DEV-42", bot, bot, "/stop")
+	if w := do(s, "/webhooks/jira", body, hdr); len(fr.stopped) != before {
+		t.Errorf("/stop by the bot: %d %s", w.Code, w.Body)
+	}
+
+	// Jira: the ticket is taken away from the bot. Jira decides who may.
+	unassigned := `{"timestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `,"webhookEvent":"jira:issue_updated","user":{"accountId":"557058:outsider","displayName":"Olga"},"issue":{"key":"DEV-42"},"changelog":{"items":[{"field":"assignee","fieldId":"assignee","from":"` + bot + `","to":"557058:carl"}]}}`
+	if w := do(s, "/webhooks/jira", unassigned, map[string]string{"X-Hub-Signature": "sha256=" + auth.SignHex("jira-secret", []byte(unassigned))}); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "stopped DEV-42" {
+		t.Errorf("unassigned: %d %s", w.Code, w.Body)
+	}
+	if got := last(); got != "jira:DEV-42 by Olga, who took the ticket away from the digital employee" {
+		t.Errorf("stop = %q", got)
+	}
+
+	// Linear: the stop signal, with or without the issue in the payload.
+	sent := 0
+	stop := func(session, issue string) *httptest.ResponseRecorder {
+		sent++
+		sess := map[string]any{"id": session, "creator": map[string]string{"id": "u-1", "email": "human@example.com"}}
+		if issue != "" {
+			sess["issue"] = map[string]string{"identifier": issue}
+		}
+		raw, _ := json.Marshal(map[string]any{
+			"type": "AgentSessionEvent", "action": "prompted", "agentSession": sess,
+			"agentActivity":    map[string]any{"signal": "stop", "content": map[string]string{"type": "prompt", "body": ""}},
+			"webhookTimestamp": time.Now().UnixMilli(), "nonce": sent,
+		})
+		return do(s, "/webhooks/linear", string(raw), map[string]string{"Linear-Signature": auth.SignHex("linear-secret", raw)})
+	}
+	if w := stop("session-1", "ENG-7"); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "stopped ENG-7" {
+		t.Errorf("stop signal: %d %s", w.Code, w.Body)
+	}
+	if got := last(); got != "linear:ENG-7 by human@example.com, with the stop signal in Linear" {
+		t.Errorf("stop = %q", got)
+	}
+	if w := stop("session-known", ""); strings.TrimSpace(w.Body.String()) != "stopped ENG-9" {
+		t.Errorf("stop signal by session: %d %s", w.Code, w.Body)
+	}
+	// Linear: the issue is taken away from the agent.
+	undelegated := `{"type":"Issue","action":"update","appUserId":"app-1","webhookTimestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `,"data":{"identifier":"ENG-7"},"updatedFrom":{"delegateId":"app-1"}}`
+	if w := do(s, "/webhooks/linear", undelegated, map[string]string{"Linear-Signature": auth.SignHex("linear-secret", []byte(undelegated))}); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "stopped ENG-7" {
+		t.Errorf("undelegated: %d %s", w.Code, w.Body)
+	}
+
+	// What the runner says decides the answer.
+	fr.stopResult = runner.Released
+	if w := stop("session-1", "ENG-7"); strings.TrimSpace(w.Body.String()) != "released ENG-7" {
+		t.Errorf("a ticket that waited: %d %s", w.Code, w.Body)
+	}
+	for err, want := range map[error]string{store.ErrUnknown: "200 nothing to stop", store.ErrReleased: "200 nothing to stop", errors.New("disk full"): "503 cannot stop the ticket"} {
+		fr.stopErr = err
+		w := stop("session-1", "ENG-7")
+		if got := strconv.Itoa(w.Code) + " " + strings.TrimSpace(w.Body.String()); got != want {
+			t.Errorf("runner says %v: %s, want %s", err, got, want)
+		}
+	}
+}
+
+// What a ticket is told when a person stopped it.
+func TestCancelledText(t *testing.T) {
+	res := task.Result{Outcome: task.OutcomeCancelled, Err: errors.New("the run was stopped by Anna, with /stop in a comment")}
+	got := jiraFinished(&task.Task{Source: "jira", Key: "DEV-1"}, res, true)
+	want := "The run was stopped by Anna, with /stop in a comment. The digital employee no longer works on DEV-1, and messages on it start nothing. Assign it again to start it again."
+	if got != want {
+		t.Errorf("Jira:\n%s\nwant\n%s", got, want)
+	}
+	if got := cancelledText(&task.Task{Source: "linear", Key: "ENG-1"}, res); !strings.Contains(got, "Delegate it again") {
+		t.Errorf("Linear: %s", got)
 	}
 }

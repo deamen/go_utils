@@ -152,3 +152,26 @@ func TestAuthorizeURL(t *testing.T) {
 		}
 	}
 }
+
+func TestUndelegated(t *testing.T) {
+	for name, c := range map[string]struct {
+		body string
+		want bool
+	}{
+		"taken away":               {`{"type":"Issue","action":"update","appUserId":"app-1","data":{"identifier":"ENG-1"},"updatedFrom":{"delegateId":"app-1"}}`, true},
+		"given to another agent":   {`{"type":"Issue","action":"update","appUserId":"app-1","data":{"identifier":"ENG-1","delegateId":"app-2"},"updatedFrom":{"delegateId":"app-1"}}`, true},
+		"given to this agent":      {`{"type":"Issue","action":"update","appUserId":"app-1","data":{"identifier":"ENG-1","delegateId":"app-1"},"updatedFrom":{"delegateId":null}}`, false},
+		"another agent lost it":    {`{"type":"Issue","action":"update","appUserId":"app-1","data":{"identifier":"ENG-1"},"updatedFrom":{"delegateId":"app-2"}}`, false},
+		"another change":           {`{"type":"Issue","action":"update","appUserId":"app-1","data":{"identifier":"ENG-1","delegateId":"app-1"},"updatedFrom":{"title":"old"}}`, false},
+		"nobody says whose it was": {`{"type":"Issue","action":"update","data":{"identifier":"ENG-1"},"updatedFrom":{"delegateId":"app-1"}}`, false},
+		"a comment":                {`{"type":"Comment","action":"update","appUserId":"app-1","data":{"identifier":"ENG-1"},"updatedFrom":{"delegateId":"app-1"}}`, false},
+	} {
+		ev, _, err := Parse([]byte(c.body))
+		if !errors.Is(err, ErrIgnored) || ev == nil {
+			t.Fatalf("%s: Parse = %v, %v", name, ev, err)
+		}
+		if key, ok := ev.Undelegated(); ok != c.want || (ok && key != "ENG-1") {
+			t.Errorf("%s: %q, %v; want %v", name, key, ok, c.want)
+		}
+	}
+}

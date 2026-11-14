@@ -51,6 +51,11 @@ type Submitter interface {
 	// person wrote to the agent itself, not only on the ticket. later: the
 	// ticket is in progress, and the message is kept for its next run.
 	FollowUp(t *task.Task, addressed bool) (later bool, err error)
+	// Stop ends the work on a ticket for a person, named in by: it stops
+	// the agent, takes the queued run out of the queue, or releases a
+	// ticket that waited. store.ErrUnknown and store.ErrReleased say that
+	// there was nothing to stop.
+	Stop(source, key, by string) (runner.Stopped, error)
 	// Assigner returns who last assigned a ticket to the bot, as the
 	// source named them, or "". known: ochell has seen the ticket.
 	Assigner(source, key string) (assigner string, known bool, err error)
@@ -454,6 +459,34 @@ func (s *Server) submit(w http.ResponseWriter, t *task.Task, labels []string, lo
 	}
 }
 
+// stop ends the work on a ticket for a person and writes the HTTP response.
+// It reports whether there was something to stop; the ticket is then told
+// by the runner, through Finished. keys are the de-duplication keys of the
+// delivery, if it has any: they are forgotten when the stop fails, so that
+// the tracker can send it again.
+func (s *Server) stop(w http.ResponseWriter, source, key, by string, keys []string, log *slog.Logger) bool {
+	switch did, err := s.runner.Stop(source, key, by); {
+	case err == nil && did == runner.Released:
+		log.Info("ticket released", "key", key, "by", by)
+		reply(w, http.StatusOK, "released "+key)
+		return true
+	case err == nil:
+		log.Info("ticket stopped", "key", key, "by", by)
+		reply(w, http.StatusOK, "stopped "+key)
+		return true
+	case errors.Is(err, store.ErrUnknown), errors.Is(err, store.ErrReleased):
+		log.Debug("a stop for a ticket that ochell does not hold", "key", key, "by", by, "reason", err)
+		reply(w, http.StatusOK, "nothing to stop")
+		return false
+	default:
+		// 503 makes the tracker send the request again.
+		log.Error("cannot stop the ticket", "key", key, "err", err)
+		s.forgetDelivery(keys, log)
+		reply(w, http.StatusServiceUnavailable, "cannot stop the ticket")
+		return false
+	}
+}
+
 // closed handles the tracker's report that a ticket was closed, and writes
 // the HTTP response. It is safe to receive the same report twice.
 func (s *Server) closed(w http.ResponseWriter, source, key string, log *slog.Logger) {
@@ -467,10 +500,6 @@ func (s *Server) closed(w http.ResponseWriter, source, key string, log *slog.Log
 	case errors.Is(err, store.ErrUnknown):
 		log.Debug("ignored: a ticket that ochell never worked on was closed", "key", key)
 		reply(w, http.StatusOK, "ignored")
-	case errors.Is(err, runner.ErrBusy):
-		// Stopping a run from the tracker is not supported yet.
-		log.Warn("ticket was closed while its run is queued or running; the run goes on", "key", key)
-		reply(w, http.StatusOK, "closed while in progress")
 	default:
 		log.Error("cannot record that the ticket was closed", "key", key, "err", err)
 		reply(w, http.StatusServiceUnavailable, "cannot record the close")
@@ -504,6 +533,19 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 			s.closed(w, "jira", key, log)
 			return
 		}
+		if key, by, ok := jira.ParseUnassigned(body, cfg.BotAccountID); ok {
+			// Taking the ticket away from the bot stops its work. Who may
+			// do that is Jira's matter, like who may close a ticket.
+			if !validKey.MatchString(key) {
+				reply(w, http.StatusOK, "ignored")
+				return
+			}
+			if by == "" {
+				by = "someone"
+			}
+			s.stop(w, "jira", key, by+", who took the ticket away from the digital employee", nil, log)
+			return
+		}
 		if c, cerr := jira.ParseComment(body); !errors.Is(cerr, jira.ErrIgnored) {
 			s.jiraCommented(w, c, cerr, deliveryKeys("jira", delivery, body), delivery, log)
 			return
@@ -535,6 +577,10 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	s.jiraNotStarted(res, t.Key, log)
 }
 
+// stopCommand, as the first line of a comment on a Jira ticket, stops the
+// work on the ticket.
+const stopCommand = "/stop"
+
 // jiraCommented handles a comment that someone added to a Jira ticket. A
 // comment of a person on a ticket that ochell holds starts a run of the
 // ticket with the comment; the run continues the agent session of the
@@ -548,6 +594,8 @@ func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error
 	}
 	text := strings.TrimSpace(c.Body)
 	first, _, _ := strings.Cut(text, "\n")
+	// A comment whose first line is the command stops the ticket.
+	isStop := strings.TrimSpace(first) == stopCommand
 	switch {
 	case c.Author == cfg.BotAccountID:
 		// The loop guard: what the bot account writes (ochell's own
@@ -566,11 +614,6 @@ func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error
 		return
 	case text == "":
 		log.Debug("ignored: a comment without text", "key", c.Key)
-		reply(w, http.StatusOK, "ignored")
-		return
-	case strings.TrimSpace(first) == "/stop":
-		// Stopping a run from the ticket is not supported yet.
-		log.Info("stop command received but not supported yet", "key", c.Key, "author", c.Author)
 		reply(w, http.StatusOK, "ignored")
 		return
 	case !validKey.MatchString(c.Key):
@@ -593,6 +636,14 @@ func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error
 			s.jiraComment(c.Key, "The last comment was not passed on to the digital employee: "+who+" is not on the list of people who may send it messages on this ticket.", log)
 		}
 		reply(w, http.StatusOK, "ignored: the author is not allowed")
+		return
+	}
+	if isStop {
+		who := c.AuthorName
+		if who == "" {
+			who = c.Author
+		}
+		s.stop(w, "jira", c.Key, who+", with "+stopCommand+" in a comment", keys, log)
 		return
 	}
 	t := s.newTask("jira", c.Key, c.Summary, c.URL, "", delivery)
@@ -691,6 +742,10 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 			s.closed(w, "linear", key, log)
 			return
 		}
+		if key, ok := ev.Undelegated(); ok && validKey.MatchString(key) {
+			s.stop(w, "linear", key, "someone who took the issue away from the digital employee", nil, log)
+			return
+		}
 		log.Debug("ignored", "reason", err)
 		reply(w, http.StatusOK, "ignored")
 		return
@@ -751,18 +806,13 @@ func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, key
 	}
 	text := strings.TrimSpace(sess.Prompt)
 	switch {
-	case sess.Stop:
-		// Stopping a run from the ticket is not supported yet.
-		log.Info("stop signal received but not supported yet", "session", sess.SessionID, "key", sess.Key)
-		reply(w, http.StatusOK, "ignored")
-		return
 	case sess.Key == "":
 		log.Warn("a message in a session that ochell does not know", "session", sess.SessionID)
 		s.linearActivity(sess.SessionID, linear.ActivityError,
 			"The digital employee does not know this session, so it cannot continue it. Delegate the issue again.", log)
 		reply(w, http.StatusOK, "unknown session")
 		return
-	case text == "":
+	case text == "" && !sess.Stop:
 		log.Debug("ignored: a prompt without text", "session", sess.SessionID)
 		reply(w, http.StatusOK, "ignored")
 		return
@@ -782,6 +832,21 @@ func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, key
 				"This message was not passed on to the digital employee: you are not on the list of people who may send it messages on "+sess.Key+".", log)
 		}
 		reply(w, http.StatusOK, "ignored: the author is not allowed")
+		return
+	}
+	if sess.Stop {
+		who := sess.ActorEmail
+		if who == "" {
+			who = sess.Actor
+		}
+		if who == "" {
+			who = "a person"
+		}
+		if !s.stop(w, "linear", sess.Key, who+", with the stop signal in Linear", keys, log) {
+			// The signal still gets an answer.
+			s.linearActivity(sess.SessionID, linear.ActivityResponse,
+				"The digital employee is not working on "+sess.Key+", so there was nothing to stop.", log)
+		}
 		return
 	}
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, "", delivery)
@@ -917,6 +982,11 @@ func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) er
 		// Not the end for the ticket: a thought keeps the session open.
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityThought, queuedAgainText(res))
 	}
+	if res.Outcome == task.OutcomeCancelled {
+		// A person asked for it: an answer, not an error. It closes the
+		// session.
+		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityResponse, cancelledText(t, res))
+	}
 	if res.Err != nil {
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityError,
 			strings.TrimSpace(failureText(res)+"\n\n"+codeBlock(lastN(res.Message, replyMax))))
@@ -971,6 +1041,20 @@ func queuedAgainText(res task.Result) string {
 		return fmt.Sprintf("The run was stopped: %v. %s; the agent checks first what it has already done.", res.Err, when)
 	}
 	return "The run was cut off because the orchestrator was restarted. " + when + "; the agent goes on where it stopped and checks first what it has already done."
+}
+
+// cancelledText is what a ticket is told when a person stopped its run or
+// released it: what happened and by whom (res.Err), and what follows.
+func cancelledText(t *task.Task, res task.Result) string {
+	what := "The ticket was stopped"
+	if res.Err != nil {
+		what = strings.ToUpper(res.Err.Error()[:1]) + res.Err.Error()[1:]
+	}
+	again := "Assign it again to start it again."
+	if t.Source == "linear" {
+		again = "Delegate it again to start it again."
+	}
+	return what + ". The digital employee no longer works on " + t.Key + ", and messages on it start nothing. " + again
 }
 
 // failureText says why a run did not succeed. It goes by the outcome: the

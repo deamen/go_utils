@@ -193,9 +193,11 @@ func (l *ticketLocks) lock(source, key string) (unlock func()) {
 // becomes done where its state allows, and with workspace.cleanup its
 // working directory is removed, in the background.
 //
-// It returns ErrBusy for a ticket with a queued or running task: stopping a
-// run is not supported yet, so such a ticket is left as it is. It returns
-// store.ErrUnknown for a ticket ochell has never seen.
+// A ticket with a queued or running task is stopped first (Stop): nobody
+// wants the work of a closed ticket. For a running agent the rest happens
+// when its run has ended.
+//
+// It returns store.ErrUnknown for a ticket ochell has never seen.
 func (r *Runner) Closed(source, key string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -203,6 +205,18 @@ func (r *Runner) Closed(source, key string) error {
 		return ErrStopped
 	}
 	tk, err := r.store.CloseTicket(source, key)
+	if errors.Is(err, ErrBusy) {
+		did, serr := r.stopLocked(source, key, "the tracker: the ticket was closed")
+		if serr != nil {
+			return serr
+		}
+		if did == StoppedRun {
+			// handle calls Closed again when the run has ended.
+			r.closing[ticketKey(source, key)] = true
+			return nil
+		}
+		tk, err = r.store.CloseTicket(source, key)
+	}
 	if err != nil {
 		return err
 	}

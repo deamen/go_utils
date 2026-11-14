@@ -650,6 +650,11 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result, again *Again) (ne
 	if err != nil {
 		return "", err
 	}
+	if res.Outcome == task.OutcomeCancelled {
+		// A person stopped the ticket: nothing follows, and what waited
+		// for its next run is dropped.
+		again, waiting, waitingSession = nil, nil, ""
+	}
 	fromPeople := len(waiting) > 0
 	var newID string
 	var notBefore int64
@@ -762,6 +767,64 @@ func (s *Store) end(tx *sql.Tx, id string, res task.Result) error {
 		_, err = tx.Exec(`UPDATE tickets SET agent_session = '' WHERE source = ? AND key = ?`, source, key)
 	}
 	return err
+}
+
+// Stop ends what ochell holds of a ticket without a running agent, for a
+// person who stopped or released it:
+//   - a ticket whose run is still queued: the run is closed as cancelled,
+//     with why as its error, and returned;
+//   - a ticket that waits for a human, is in review or failed: it is
+//     released, and nothing is returned.
+//
+// In both cases the ticket becomes cancelled, the messages that waited for
+// its next run are dropped, and it is not started again until it is
+// assigned again.
+//
+// It returns ErrBusy for a ticket whose run is running (the caller stops
+// the agent, and the run then ends as cancelled), ErrReleased for a ticket
+// that is done or already cancelled, and ErrUnknown.
+func (s *Store) Stop(source, key string, why error) (queued *task.Task, err error) {
+	err = s.tx(func(tx *sql.Tx) error {
+		from, err := state(tx, source, key)
+		if err != nil {
+			return err
+		}
+		switch from {
+		case ticket.None:
+			return ErrUnknown
+		case ticket.Running:
+			return ErrBusy
+		case ticket.Done, ticket.Cancelled:
+			return ErrReleased
+		case ticket.Queued:
+			queued, err = scanTask(tx.QueryRow(`SELECT `+taskColumns+` FROM runs r JOIN tickets t USING (source, key)
+				WHERE r.source = ? AND r.key = ? AND r.status = ? ORDER BY r.rowid DESC LIMIT 1`, source, key, runQueued))
+			if err != nil {
+				return err
+			}
+			res := task.Result{Outcome: task.OutcomeCancelled, ExitCode: -1, Err: why}
+			if err := s.end(tx, queued.ID, res); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`DELETE FROM followups WHERE source = ? AND key = ?`, source, key); err != nil {
+			return err
+		}
+		return s.move(tx, source, key, ticket.Cancelled, "")
+	})
+	return queued, err
+}
+
+// LastTask returns the task of the most recent run of a ticket, with what
+// the ticket has now, or nil when the ticket never had a run. It says
+// where a message about the ticket goes (the tracker session).
+func (s *Store) LastTask(source, key string) (*task.Task, error) {
+	t, err := scanTask(s.db.QueryRow(`SELECT `+taskColumns+` FROM runs r JOIN tickets t USING (source, key)
+		WHERE r.source = ? AND r.key = ? ORDER BY r.received_at DESC, r.rowid DESC LIMIT 1`, source, key))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return t, err
 }
 
 // ErrInterrupted is the error recorded for a run that Recover closes.

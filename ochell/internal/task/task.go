@@ -107,6 +107,9 @@ const (
 	// OutcomeStopped: ochell stopped the agent for another reason, such as
 	// its own shutdown.
 	OutcomeStopped Outcome = "stopped"
+	// OutcomeCancelled: a person stopped the run, or released the ticket:
+	// from the ticket, by unassigning it, or from ochell itself.
+	OutcomeCancelled Outcome = "cancelled"
 	// OutcomeNotStarted: the agent never ran.
 	OutcomeNotStarted Outcome = "not_started"
 	// OutcomeInterrupted: ochell itself stopped while the agent was running,

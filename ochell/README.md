@@ -35,7 +35,23 @@ Behaviour common to all sources:
   - A comment that arrives while the ticket has a run is kept (see below).
   - Who wrote the comment is checked against `allowed_follow_ups` (see [Guards and the admin channel](#guards-and-the-admin-channel)).
   - **Jira Automation stays a start-only trigger.** It cannot sign requests and has no delivery id, so follow-ups work with the system webhook only.
-  - A comment whose first line is `/stop` starts nothing; stopping a run from the ticket is not handled yet.
+  - A comment whose first line is `/stop` stops the ticket (see *Stopping from the ticket* below).
+- **Stopping from the ticket:** a person can stop the work on a ticket without touching ochell.
+
+  | How | Who may |
+  |---|---|
+  | Linear: the **stop** control of the agent session (the `stop` signal of a `prompted` event) | the people of `allowed_follow_ups` |
+  | Jira: a comment whose **first line is `/stop`**, and nothing else on that line. More lines may follow | the people of `allowed_follow_ups` |
+  | Jira: the ticket is **taken away from the bot** (assigned to someone else, or to nobody) | whoever Jira lets do that |
+  | Linear: the issue is taken away from the agent (an `Issue` update that changes the delegate) | whoever Linear lets do that |
+  | The ticket is **closed** in the tracker while it is queued or running | whoever the tracker lets do that |
+
+  - **What is stopped:** a running agent with all its processes (as at the time limit); a run that is still queued, which then never starts; and a ticket that only waited, which is released.
+  - **The ticket becomes `cancelled`.** It is not started again, and comments on a Jira ticket start nothing, until it is assigned again. Messages that waited for its next run are dropped. The run has the outcome `cancelled`.
+  - **The ticket shows it:** a `response` in the Linear session, a comment on the Jira ticket, that says who stopped it and how, and that it has to be assigned again to go on.
+  - A closed ticket becomes `done` once its run has ended, and its working directory is removed as for any closed ticket.
+  - **Jira may not send the unassign event** when the webhook's filter is `assignee = <bot>`: the ticket no longer matches after the change. ochell handles the event when it arrives. That was not tested against a real Jira (MMZ-94).
+  - The Linear events were not checked against Linear: where the payload carries the stop signal, and what an issue update looks like when the delegate changes. The second also needs the app's webhook to subscribe to **Issues**, and is only acted on when the payload names this app's user as the earlier delegate.
 - **Messages during a run:** a comment or reply that arrives while a ticket has a queued or running run is kept in the store, and **delivered with the ticket's next run**, which ochell queues itself as soon as the current one has ended. Several messages are delivered together, oldest first, each in its own `<comment>` block of the run context.
   - The run that was going ends as it would have: its result is posted, and then the next run starts.
   - A Linear session is told that the message is queued. A Jira ticket is not, so that ochell does not answer every comment; the webhook is answered with `queued for the next run`.
@@ -49,7 +65,7 @@ Behaviour common to all sources:
   - A message that arrives while the ticket has a run is kept (see below), and the session is told so.
   - A reply in a session of a ticket that ochell has never worked on is taken as a new assignment.
   - Who wrote the reply is checked against `allowed_follow_ups` (see [Guards and the admin channel](#guards-and-the-admin-channel)). Whether the payload names the author of a prompt was not checked against Linear; without one, the creator of the session counts.
-  - The `stop` signal is not handled yet.
+  - The `stop` signal stops the ticket (see *Stopping from the ticket* above).
 
 ### Retry and stall detection
 ochell starts a ticket again by itself in two cases. Both count as an attempt, so `agent.max_attempts` bounds them.
@@ -269,7 +285,7 @@ workspace:
 - **`cleanup: true`** removes a ticket's working directory when the tracker reports the ticket as closed. It needs `root`, and `{{.Key}}` in `agent.workdir`, so that a directory can only be that of one ticket. The root itself is never removed.
   - **Jira:** the system webhook reports it: an issue that was resolved (its resolution was set) or deleted. A workflow that closes issues without a resolution is not recognised.
   - **Linear:** an `Issue` event whose issue is completed, cancelled or removed. Linear sends these only when the app's webhook also subscribes to **Issues**. The shape of that payload was not checked against Linear.
-  - The closed ticket becomes `done` if it was waiting, in review or failed. **A ticket whose run is queued or running is left alone**: stopping a run from the tracker is not supported yet.
+  - The closed ticket becomes `done`. A ticket whose run is queued or running is stopped first (see *Stopping from the ticket*), and its directory goes when the run has ended.
   - With the `systemd` launcher the directory is removed as the agent user (`/bin/rm -rf`, through the launch script). What was done is in `<log_dir>/<time>-<source>-<key>.remove.log`.
   - The agent session is forgotten with the directory. A ticket that is assigned again gets a new directory and a new session.
 
@@ -284,7 +300,7 @@ Every ticket ochell has seen is in one of these states. They are defined, with t
 | `in_review` | the agent handed its work over and a human reviews it | `queued`, `done`, `waiting`, `cancelled` |
 | `done` | the work was accepted, or the ticket was closed in the tracker | `queued` |
 | `failed` | the last run did not succeed and nothing retries it | `queued`, `waiting`, `done`, `cancelled` |
-| `cancelled` | stopped or released by a human; not started again until it is assigned again | `queued` |
+| `cancelled` | stopped or released by a human; not started again until it is assigned again | `queued`, `done` |
 
 A ticket that is `queued` or `running` takes no second run. From every other state a new assignment queues it again.
 
@@ -301,9 +317,10 @@ What a run leads to:
 | `finished` | missing or invalid | `waiting`, reason `no_result` |
 | `failed`, `timed_out`, `not_started` | not looked at | `failed`. A `failed` run that matches a retry pattern: `queued` again while the ticket has an attempt left |
 | `stalled` | not looked at | `queued` again; `waiting`, reason `stalled`, when the attempts are used up |
+| `cancelled` | not looked at | `cancelled` |
 | `stopped`, `interrupted` | not looked at | `queued` again, for a new attempt with the recovery note; `waiting`, reason `interrupted`, when the attempts are used up |
 
-Several states and reasons are not reached yet: they belong to features that come later (the plan gate, stop from the ticket, handoff). Pausing is not a state: it holds the queue, and queued tickets stay queued.
+Some reasons are not reached yet: they belong to features that come later (the plan gate). Pausing is not a state: it holds the queue, and queued tickets stay queued.
 
 ### Agent adapters
 An adapter holds what differs between agent CLIs: how a run is started, how an earlier session is resumed, and how the output is read (final message, session id, cost). It only builds commands and parses output. Running and stopping the process is the launcher's job, so every adapter works with every launcher. `agent.adapter` selects it.
@@ -365,6 +382,7 @@ Then set `agent.launcher: systemd` and check the result with `scripts/check-laun
 | `timed_out` | ochell stopped it at `agent.timeout` |
 | `stalled` | ochell stopped it because it wrote no output for `agent.stall_timeout` |
 | `stopped` | ochell stopped it because it is shutting down. The ticket is queued again |
+| `cancelled` | a person stopped the run, from the ticket or by closing or unassigning it |
 | `not_started` | the agent never ran: the command could not be executed, or the launch was refused. With the systemd launcher these are exit codes from 200 (250: refused by the launch script; 203: systemd could not execute the command) |
 | `interrupted` | ochell itself was killed during the run, and found it unfinished at the next start. The ticket is queued again. This one is only in the store and in ochell's log, not in the run log |
 
