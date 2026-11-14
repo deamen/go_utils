@@ -69,6 +69,7 @@ func agentCfg(t *testing.T, mode string, extraArgs ...string) config.Agent {
 		MaxConcurrent:  1,
 		QueueSize:      2,
 		LogDir:         filepath.Join(dir, "logs"),
+		RunDir:         filepath.Join(dir, "runs"),
 	}
 }
 

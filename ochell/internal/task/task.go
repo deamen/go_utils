@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"ochell/internal/agent"
+	"ochell/internal/result"
 )
 
 type Task struct {
@@ -79,6 +80,14 @@ type Result struct {
 	SessionID string
 	CostUSD   float64
 	Usage     agent.Usage
+	// Signal is what the agent's result file says about the run, and
+	// SignalMessage its text for the people on the ticket. Signal is
+	// result.None when the run left no valid file. PRURL and Branch are
+	// the pull request and the branch the file names, if any.
+	Signal        result.Status
+	SignalMessage string
+	PRURL         string
+	Branch        string
 	// Message is the agent's final message, as its adapter read it: for
 	// the plain adapter, the last part of the output.
 	Message string

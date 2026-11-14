@@ -23,6 +23,7 @@ import (
 	"ochell/internal/auth"
 	"ochell/internal/config"
 	"ochell/internal/ipsync"
+	"ochell/internal/result"
 	"ochell/internal/runner"
 	"ochell/internal/source/jira"
 	"ochell/internal/source/linear"
@@ -507,11 +508,40 @@ func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) er
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityError,
 			strings.TrimSpace(failureText(res)+"\n\n"+codeBlock(lastN(res.Message, replyMax))))
 	}
-	msg := strings.TrimSpace(lastN(res.Message, replyMax))
-	if msg == "" {
-		msg = "The agent finished."
+	kind, msg := signalActivity(res)
+	return s.linear.CreateActivity(ctx, t.TrackerSession, kind, msg)
+}
+
+// signalActivity turns the result of a run that ended by itself into what
+// the Linear session is told. The agent's signal decides: a finished piece
+// of work is a response, which closes the session; anything that needs a
+// human is an elicitation, which leaves the session waiting for a reply.
+func signalActivity(res task.Result) (kind, msg string) {
+	said := strings.TrimSpace(lastN(res.SignalMessage, replyMax))
+	if said == "" {
+		// The agent's last words stand in for a message it did not write.
+		said = strings.TrimSpace(lastN(res.Message, replyMax))
 	}
-	return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityResponse, msg)
+	switch res.Signal {
+	case result.Done:
+		if said == "" {
+			said = "The agent finished."
+		}
+		return linear.ActivityResponse, said
+	case result.NeedsInput:
+		return linear.ActivityElicitation, said
+	case result.Blocked:
+		return linear.ActivityElicitation, "The agent is blocked: " + said
+	case result.LowConfidence:
+		return linear.ActivityElicitation, "The agent finished, but is not sure of the result: " + said
+	case result.OutOfScope:
+		return linear.ActivityElicitation, "The agent did not do this, because it is out of its scope: " + said
+	}
+	note := "The agent stopped without reporting a result, so this ticket now waits for a human."
+	if said == "" {
+		return linear.ActivityElicitation, note
+	}
+	return linear.ActivityElicitation, said + "\n\n" + note
 }
 
 // failureText says why a run did not succeed. It goes by the outcome: the

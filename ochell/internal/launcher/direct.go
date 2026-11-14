@@ -29,6 +29,11 @@ func (d Direct) Start(spec Spec) (Process, error) {
 	if err := os.MkdirAll(spec.Dir, 0o750); err != nil {
 		return nil, fmt.Errorf("create workdir: %w", err)
 	}
+	if spec.RunDir != "" {
+		if err := os.MkdirAll(spec.RunDir, 0o750); err != nil {
+			return nil, fmt.Errorf("create run directory: %w", err)
+		}
+	}
 	cmd := exec.Command(spec.Command, spec.Args...)
 	cmd.Dir = spec.Dir
 	// Never ochell's own environment: it holds the webhook secrets.

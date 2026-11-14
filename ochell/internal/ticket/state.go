@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"slices"
 
+	"ochell/internal/result"
 	"ochell/internal/task"
 )
 
@@ -123,13 +124,24 @@ func name(s State) string {
 
 // AfterRun returns the state a running ticket moves to when its run ends.
 //
-// A run that ended by itself with status 0 handed its work over. Until the
-// agent can say more (the result file of the signal contract), that is all
-// ochell knows.
-func AfterRun(o task.Outcome) (State, Reason) {
+// For a run that ended by itself with status 0, the agent's own signal (its
+// result file) decides. Without a signal nobody knows how the run went, so
+// the ticket waits for a human. For every other run the outcome decides;
+// what such a run wrote is not believed.
+func AfterRun(o task.Outcome, signal result.Status) (State, Reason) {
 	switch o {
 	case task.OutcomeFinished:
-		return InReview, ""
+		switch signal {
+		case result.Done:
+			return InReview, ""
+		case result.NeedsInput:
+			return Waiting, ReasonInput
+		case result.Blocked:
+			return Waiting, ReasonBlocked
+		case result.LowConfidence, result.OutOfScope:
+			return Waiting, ReasonEscalation
+		}
+		return Waiting, ReasonNoResult
 	case task.OutcomeStopped, task.OutcomeInterrupted:
 		return Waiting, ReasonInterrupted
 	}

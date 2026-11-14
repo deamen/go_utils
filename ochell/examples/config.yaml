@@ -45,7 +45,14 @@ agent:
     Context provided by {{.Source}}:
     {{.Context}}
     {{- end}}
+
+    {{.ResultInstructions}}
   workdir: /work/{{.Source}}/{{.Key}}
+  # One directory per run, where the agent leaves its result file for ochell
+  # (the path is in its environment as ORCH_RESULT_FILE). Keep it outside
+  # the working directories. The prompt template must include
+  # {{.ResultInstructions}}, which tells the agent what to write.
+  run_dir: /work/runs
   # The kind of agent CLI: how it is called and how its output is read.
   #   plain    any CLI: the prompt goes in, the last part of the output is
   #            the result.
@@ -59,8 +66,10 @@ agent:
   #            development; the agent can read ochell's files.
   #   systemd  a transient unit under a separate OS user, started and stopped
   #            through two root-owned scripts (see README, "Launchers").
-  #            Requires prompt_via: stdin and an absolute command and workdir; args
-  #            and workdir may only use .ID .Source .Key; env_pass is not used.
+  #            Requires prompt_via: stdin and an absolute command, workdir and
+  #            run_dir; args and workdir may only use .ID .Source .Key;
+  #            env_pass is not used. ochell must be in the agent user's group
+  #            to read the result files.
   launcher: direct
   systemd:
     launch_command: [sudo, -n, /usr/local/libexec/ochell/ochell-launch]

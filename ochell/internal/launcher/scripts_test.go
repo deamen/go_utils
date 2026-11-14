@@ -114,8 +114,9 @@ func (e *scriptEnv) started() bool {
 func TestLaunchScriptStartsUnit(t *testing.T) {
 	e := newScriptEnv(t)
 	dir := filepath.Join(e.root, "jira", "DEV-1")
+	rundir := filepath.Join(e.root, "runs", "T-1.jira_DEV-1")
 	res := run(t, "prompt on stdin", e.launch,
-		"--task", "T-1.jira_DEV-1", "--workdir", dir, "--runtime-max", "7260", "--stop-grace", "10",
+		"--task", "T-1.jira_DEV-1", "--workdir", dir, "--rundir", rundir, "--runtime-max", "7260", "--stop-grace", "10",
 		"--setenv", "ORCH_TASK_KEY=DEV-1", "--setenv", "ORCH_TASK_URL=https://x/${AGENT_TOKEN}",
 		"--", "/bin/sh", "-c", `pwd; cat; echo; echo "key=$ORCH_TASK_KEY url=$ORCH_TASK_URL token=$AGENT_TOKEN leak=${OCHELL_LAUNCHER_CONF:-none}"; exit 7`)
 	if res.code != 7 {
@@ -128,6 +129,11 @@ func TestLaunchScriptStartsUnit(t *testing.T) {
 		t.Errorf("agent output:\n%s\nwant:\n%s", res.stdout, want)
 	}
 
+	// The run directory is created, for the agent to write its result in.
+	if info, err := os.Stat(rundir); err != nil || !info.IsDir() {
+		t.Errorf("run directory: %v", err)
+	}
+
 	got := e.unitArgs("T-1.jira_DEV-1")
 	i := 0
 	for ; i < len(got) && got[i] != "--"; i++ {
@@ -135,7 +141,7 @@ func TestLaunchScriptStartsUnit(t *testing.T) {
 	opts, cmd := strings.Join(got[:i], "\n")+"\n", got[i:]
 	for _, w := range []string{
 		"--uid=" + e.agentUser + "\n", "--unit=ochell-run-T-1.jira_DEV-1\n", "--wait\n", "--pipe\n", "--collect\n",
-		"--no-ask-password\n", "--working-directory=" + dir + "\n", "KillMode=control-group\n",
+		"--no-ask-password\n", "--working-directory=" + dir + "\n", "KillMode=control-group\n", "UMask=0027\n",
 		"EnvironmentFile=" + filepath.Join(filepath.Dir(e.root), "agent.env") + "\n",
 		"RuntimeMaxSec=7260\n", "TimeoutStopSec=10\n", "--setenv=ORCH_TASK_KEY=DEV-1\n",
 	} {
@@ -201,6 +207,11 @@ func TestLaunchScriptRefuses(t *testing.T) {
 		"workdir sibling prefix":   with(3, e.root+"-other"),
 		"workdir through symlink":  with(3, filepath.Join(e.root, "link", "x")),
 		"workdir like an option":   with(3, "--uid=root"),
+		"rundir outside the root":  append([]string{"--rundir", filepath.Join(outside, "run")}, ok...),
+		"rundir relative":          append([]string{"--rundir", "runs/T-1"}, ok...),
+		"rundir with ..":           append([]string{"--rundir", e.root + "/runs/../../x"}, ok...),
+		"rundir through symlink":   append([]string{"--rundir", filepath.Join(e.root, "link", "run")}, ok...),
+		"rundir without a value":   append(append([]string{}, ok[:4]...), "--rundir"),
 		"relative command":         with(5, "claude"),
 		"option as the command":    with(5, "--uid=root"),
 		"command with a space":     with(5, "/bin/true --uid=root"),
@@ -231,8 +242,10 @@ func TestLaunchScriptRefuses(t *testing.T) {
 	if e.started() {
 		t.Error("systemd-run was called for a refused request")
 	}
-	if _, err := os.Stat(filepath.Join(outside, "x")); err == nil {
-		t.Error("a directory was created outside the workspace root")
+	for _, name := range []string{"x", "run"} {
+		if _, err := os.Stat(filepath.Join(outside, name)); err == nil {
+			t.Errorf("%s was created outside the workspace root", name)
+		}
 	}
 	// The request the cases are derived from is itself accepted.
 	if res := run(t, "", e.launch, ok...); res.code != 0 {

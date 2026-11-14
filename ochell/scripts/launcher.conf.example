@@ -5,8 +5,9 @@
 # The OS user the agent runs as. Not root, and not the user ochell runs as.
 AGENT_USER=ochell-agent
 
-# Every run's working directory must be inside this directory. It belongs to
-# the agent user; give ochell's group read access if ochell needs to read it.
+# Every run's working directory and run directory must be inside this
+# directory. It belongs to the agent user. ochell reads each run's result
+# file from the run directory: add the ochell user to the agent user's group.
 WORKSPACE_ROOT=/work
 
 # Optional. A file with NAME=VALUE lines that is loaded into the agent's

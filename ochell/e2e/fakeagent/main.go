@@ -35,7 +35,9 @@ type Step struct {
 	// Spawn starts long-running child processes, as sub-agents and MCP
 	// servers are in a real run.
 	Spawn *Spawn `json:"spawn,omitempty"`
-	// WriteFile creates a file; a relative path is in the working directory.
+	// WriteFile creates a file; a relative path is in the working
+	// directory, and $NAME in the path is replaced from the environment
+	// (e.g. $ORCH_RESULT_FILE).
 	WriteFile *File `json:"write_file,omitempty"`
 	// TryRead reads a file and notes in the record whether that worked.
 	TryRead string `json:"try_read,omitempty"`
@@ -97,7 +99,10 @@ func main() {
 			os.Exit(64)
 		}
 	} else {
-		script.Steps = []Step{{Print: "fake agent finished " + os.Getenv("ORCH_TASK_KEY")}}
+		// A well-behaved agent: it says what it did and reports its result.
+		done := "fake agent finished " + os.Getenv("ORCH_TASK_KEY")
+		report, _ := json.Marshal(map[string]string{"status": "done", "message": done})
+		script.Steps = []Step{{Print: done}, {WriteFile: &File{Path: "$ORCH_RESULT_FILE", Content: string(report)}}}
 	}
 
 	for _, st := range script.Steps {
@@ -119,7 +124,7 @@ func main() {
 			}
 			writeRecord(rec)
 		case st.WriteFile != nil:
-			rec.Writes[st.WriteFile.Path] = result(os.WriteFile(st.WriteFile.Path, []byte(st.WriteFile.Content), 0o644))
+			rec.Writes[st.WriteFile.Path] = result(os.WriteFile(os.ExpandEnv(st.WriteFile.Path), []byte(st.WriteFile.Content), 0o644))
 			writeRecord(rec)
 		case st.TryRead != "":
 			_, err := os.ReadFile(st.TryRead)

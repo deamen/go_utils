@@ -97,6 +97,15 @@ var migrations = []string{
 	ALTER TABLE runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE runs ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE runs ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;`,
+
+	// Version 4: the agent's own signal (its result file), and the pull
+	// request and branch it names.
+	`ALTER TABLE runs ADD COLUMN signal TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN signal_message TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN pr_url TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN branch TEXT NOT NULL DEFAULT '';
+	ALTER TABLE tickets ADD COLUMN pr_url TEXT NOT NULL DEFAULT '';
+	ALTER TABLE tickets ADD COLUMN branch TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is safe for concurrent use.
@@ -318,10 +327,12 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result) error {
 	}
 	r, err := tx.Exec(`UPDATE runs SET status = ?, ended_at = ?, outcome = ?, exit_code = ?, error = ?, log_file = ?,
 			workdir = ?, resumed = ?, agent_session = ?, message = ?, cost_usd = ?,
-			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?
+			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
+			signal = ?, signal_message = ?, pr_url = ?, branch = ?
 		WHERE id = ? AND status != ?`, runEnded, now, string(res.Outcome), exit, msg, res.LogFile,
 		res.Workdir, res.Resumed, res.SessionID, res.Message, res.CostUSD,
 		res.Usage.InputTokens, res.Usage.OutputTokens, res.Usage.CacheReadTokens, res.Usage.CacheWriteTokens,
+		res.Signal, res.SignalMessage, res.PRURL, res.Branch,
 		id, runEnded)
 	if err != nil {
 		return err
@@ -333,12 +344,21 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result) error {
 	if err := tx.QueryRow(`SELECT source, key FROM runs WHERE id = ?`, id).Scan(&source, &key); err != nil {
 		return err
 	}
-	to, reason := ticket.AfterRun(res.Outcome)
+	to, reason := ticket.AfterRun(res.Outcome, res.Signal)
 	if err := s.move(tx, source, key, to, reason); err != nil {
 		return err
 	}
 	if res.Workdir != "" {
 		if _, err := tx.Exec(`UPDATE tickets SET workspace = ? WHERE source = ? AND key = ?`, res.Workdir, source, key); err != nil {
+			return err
+		}
+	}
+	// The ticket keeps the last pull request and branch a run named.
+	if res.PRURL != "" || res.Branch != "" {
+		if _, err := tx.Exec(`UPDATE tickets SET
+				pr_url = CASE WHEN ? != '' THEN ? ELSE pr_url END,
+				branch = CASE WHEN ? != '' THEN ? ELSE branch END
+			WHERE source = ? AND key = ?`, res.PRURL, res.PRURL, res.Branch, res.Branch, source, key); err != nil {
 			return err
 		}
 	}
@@ -410,17 +430,21 @@ type Ticket struct {
 	// AgentSession is the agent's session id from the last run that
 	// reported one.
 	AgentSession string
-	Created      time.Time
-	Updated      time.Time
+	// PRURL and Branch are the last pull request and branch that a run
+	// of the ticket named in its result file.
+	PRURL   string
+	Branch  string
+	Created time.Time
+	Updated time.Time
 }
 
 // Ticket returns the stored ticket, or nil when ochell has never seen it.
 func (s *Store) Ticket(source, key string) (*Ticket, error) {
 	t := Ticket{Source: source, Key: key}
 	var created, updated int64
-	err := s.db.QueryRow(`SELECT title, url, state, reason, attempts, workspace, agent_session, created_at, updated_at
+	err := s.db.QueryRow(`SELECT title, url, state, reason, attempts, workspace, agent_session, pr_url, branch, created_at, updated_at
 		FROM tickets WHERE source = ? AND key = ?`, source, key).
-		Scan(&t.Title, &t.URL, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.AgentSession, &created, &updated)
+		Scan(&t.Title, &t.URL, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -450,11 +474,13 @@ func (s *Store) Run(id string) (*Run, error) {
 	var outcome, msg string
 	res := &r.Result
 	err := s.db.QueryRow(`SELECT source, key, status, attempt, outcome, exit_code, error, log_file,
-			workdir, resumed, agent_session, message, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+			workdir, resumed, agent_session, message, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			signal, signal_message, pr_url, branch
 		FROM runs WHERE id = ?`, id).
 		Scan(&r.Source, &r.Key, &r.Status, &r.Attempt, &outcome, &exit, &msg, &res.LogFile,
 			&res.Workdir, &res.Resumed, &res.SessionID, &res.Message, &res.CostUSD,
-			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens)
+			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

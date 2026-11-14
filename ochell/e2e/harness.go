@@ -106,6 +106,7 @@ func UseFakeSystemd(t *testing.T, c *config.Config) string {
 	c.Agent.Systemd.LaunchCommand = append(append([]string{}, overrides...), abs("../scripts/ochell-launch"))
 	c.Agent.Systemd.StopCommand = append(append([]string{}, overrides...), abs("../scripts/ochell-stop"))
 	c.Agent.Workdir = filepath.Join(root, "{{.Source}}-{{.Key}}")
+	c.Agent.RunDir = filepath.Join(root, "runs")
 	return root
 }
 
@@ -134,6 +135,17 @@ type Spawn struct {
 
 // Exit builds an exit step.
 func Exit(code int) Step { return Step{Exit: &code} }
+
+// Report builds the step in which the agent writes its result file, as the
+// prompt tells it to. More fields are given as name, value pairs.
+func Report(status, message string, more ...string) Step {
+	fields := map[string]string{"status": status, "message": message}
+	for i := 0; i+1 < len(more); i += 2 {
+		fields[more[i]] = more[i+1]
+	}
+	raw, _ := json.Marshal(fields)
+	return Step{WriteFile: &File{Path: "$ORCH_RESULT_FILE", Content: string(raw)}}
+}
 
 // Record is what the fake agent saw when it was started.
 type Record struct {
@@ -276,6 +288,7 @@ func Start(t *testing.T, opts Options) *Ochell {
 	cfg.Agent.PromptVia = "stdin"
 	cfg.Agent.Workdir = filepath.Join(dir, "work", "{{.Source}}-{{.Key}}")
 	cfg.Agent.LogDir = filepath.Join(dir, "logs")
+	cfg.Agent.RunDir = filepath.Join(dir, "runs")
 	cfg.Agent.Timeout = time.Minute
 	cfg.Agent.Env = map[string]string{"FAKEAGENT_RECORD_DIR": o.recordDir}
 	if len(opts.Script) > 0 {

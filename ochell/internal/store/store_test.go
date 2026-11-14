@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"ochell/internal/agent"
+	"ochell/internal/result"
 	"ochell/internal/task"
 	"ochell/internal/ticket"
 )
@@ -173,6 +174,7 @@ func TestAgentSession(t *testing.T) {
 	first := task.Result{
 		Outcome: task.OutcomeFinished, ExitCode: 0, Workdir: "/work/ENG-1", LogFile: "logs/r1.log",
 		Message: "Opened PR #7", SessionID: "sess-1", CostUSD: 0.25,
+		Signal: result.Done, SignalMessage: "Ready for review.", PRURL: "https://github.com/x/y/pull/7", Branch: "bot/ENG-1",
 		Usage: agent.Usage{InputTokens: 2, OutputTokens: 4, CacheReadTokens: 11852, CacheWriteTokens: 8403},
 	}
 	if got := run("r1", first); got.AgentSession != "" || got.Workspace != "" {
@@ -200,6 +202,10 @@ func TestAgentSession(t *testing.T) {
 	}
 	if tk, _ := s.Ticket("linear", "ENG-1"); tk.AgentSession != "sess-1" {
 		t.Errorf("session after a run that reported none = %q, want sess-1", tk.AgentSession)
+	}
+	// The pull request and the branch of the first run stay with the ticket.
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.PRURL != "https://github.com/x/y/pull/7" || tk.Branch != "bot/ENG-1" {
+		t.Errorf("ticket lost its pull request or branch: %q, %q", tk.PRURL, tk.Branch)
 	}
 
 	// A resumed run that fails without opening a session: the session is
@@ -238,7 +244,7 @@ func TestStateIsEnforced(t *testing.T) {
 	if got, _ := s.Claim(); got == nil || got.ID != "r1" {
 		t.Errorf("the run is no longer queued: %+v", got)
 	}
-	if err := s.Finish("r1", task.Result{Outcome: task.OutcomeFinished}); err != nil {
+	if err := s.Finish("r1", task.Result{Outcome: task.OutcomeFinished, Signal: result.Done}); err != nil {
 		t.Fatal(err)
 	}
 	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.InReview || tk.Reason != "" {
