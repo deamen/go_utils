@@ -180,6 +180,59 @@ func ParseClosed(body []byte) (key string, ok bool) {
 	return "", false
 }
 
+// Comment is a comment that someone added to an issue.
+type Comment struct {
+	Key     string
+	Summary string
+	URL     string
+	// Body is the text of the comment.
+	Body string
+	// Author is the accountId of who wrote it, and AuthorName their
+	// display name.
+	Author     string
+	AuthorName string
+	// Assignee is the accountId of the issue's assignee, as far as the
+	// payload has it.
+	Assignee string
+}
+
+// ParseComment returns the comment of a "comment_created" webhook, and
+// ErrIgnored for every other event.
+func ParseComment(body []byte) (*Comment, error) {
+	var ev struct {
+		WebhookEvent string `json:"webhookEvent"`
+		Issue        *Issue `json:"issue"`
+		Comment      *struct {
+			Body   json.RawMessage `json:"body"`
+			Author *User           `json:"author"`
+		} `json:"comment"`
+	}
+	if err := json.Unmarshal(body, &ev); err != nil {
+		return nil, fmt.Errorf("decode jira webhook: %w", err)
+	}
+	if ev.WebhookEvent != "comment_created" {
+		return nil, fmt.Errorf("%w: event %q", ErrIgnored, ev.WebhookEvent)
+	}
+	if ev.Issue == nil || ev.Issue.Key == "" || ev.Comment == nil {
+		return nil, errors.New("comment_created without an issue or a comment")
+	}
+	c := &Comment{
+		Key:     ev.Issue.Key,
+		Summary: ev.Issue.Fields.Summary,
+		URL:     BrowseURL(ev.Issue.Self, ev.Issue.Key),
+	}
+	// The webhook sends the text as it is. A body in another form (a
+	// document tree) is not read: the comment then counts as empty.
+	_ = json.Unmarshal(ev.Comment.Body, &c.Body)
+	if a := ev.Comment.Author; a != nil {
+		c.Author, c.AuthorName = a.AccountID, a.DisplayName
+	}
+	if a := ev.Issue.Fields.Assignee; a != nil {
+		c.Assignee = a.AccountID
+	}
+	return c, nil
+}
+
 func assignedTo(ev WebhookEvent, bot string) bool {
 	if ev.Changelog == nil {
 		return false

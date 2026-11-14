@@ -46,10 +46,10 @@ const (
 type Submitter interface {
 	// Submit queues a task.
 	Submit(*task.Task) error
-	// FollowUp queues a task for a message that a person wrote to the
-	// agent, on a ticket that ochell already knows (store.ErrUnknown
-	// otherwise).
-	FollowUp(*task.Task) error
+	// FollowUp queues a task for a message from a person on a ticket that
+	// ochell already knows (store.ErrUnknown otherwise). addressed: the
+	// person wrote to the agent itself, not only on the ticket.
+	FollowUp(t *task.Task, addressed bool) error
 	// TicketOfSession returns the key of the ticket that reports to a
 	// tracker session, or "".
 	TicketOfSession(source, session string) (string, error)
@@ -451,6 +451,10 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 			s.closed(w, "jira", key, log)
 			return
 		}
+		if c, cerr := jira.ParseComment(body); !errors.Is(cerr, jira.ErrIgnored) {
+			s.jiraCommented(w, c, cerr, deliveryKeys("jira", delivery, body), delivery, log)
+			return
+		}
 		log.Debug("ignored", "reason", err)
 		reply(w, http.StatusOK, "ignored")
 		return
@@ -474,6 +478,78 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 		s.forgetDelivery(keys, log)
 	}
 	s.jiraNotStarted(res, t.Key, log)
+}
+
+// jiraCommented handles a comment that someone added to a Jira ticket. A
+// comment of a person on a ticket that ochell holds starts a run of the
+// ticket with the comment; the run continues the agent session of the
+// ticket's earlier run.
+func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error, keys []string, delivery string, log *slog.Logger) {
+	cfg := s.cfg.Sources.JiraWebhook
+	if err != nil {
+		log.Warn("bad payload", "err", err)
+		reply(w, http.StatusBadRequest, "bad payload")
+		return
+	}
+	text := strings.TrimSpace(c.Body)
+	first, _, _ := strings.Cut(text, "\n")
+	switch {
+	case c.Author == cfg.BotAccountID:
+		// The loop guard: what the bot account writes (ochell's own
+		// comments, and the agent's through its ticket tool) must not wake
+		// the agent up.
+		log.Debug("ignored: a comment by the bot account", "key", c.Key)
+		reply(w, http.StatusOK, "ignored: comment by the bot")
+		return
+	case c.Author == "":
+		log.Warn("ignored: a comment without an author", "key", c.Key)
+		reply(w, http.StatusOK, "ignored")
+		return
+	case c.Assignee != "" && c.Assignee != cfg.BotAccountID:
+		log.Debug("ignored: a comment on a ticket that is not assigned to the bot", "key", c.Key)
+		reply(w, http.StatusOK, "ignored")
+		return
+	case text == "":
+		log.Debug("ignored: a comment without text", "key", c.Key)
+		reply(w, http.StatusOK, "ignored")
+		return
+	case strings.TrimSpace(first) == "/stop":
+		// Stopping a run from the ticket is not supported yet.
+		log.Info("stop command received but not supported yet", "key", c.Key, "author", c.Author)
+		reply(w, http.StatusOK, "ignored")
+		return
+	case !validKey.MatchString(c.Key):
+		log.Warn("rejecting invalid ticket key", "key", c.Key)
+		reply(w, http.StatusBadRequest, "invalid ticket key")
+		return
+	case !mayAssign(cfg.AllowedAssigners, c.Author):
+		log.Warn("ignored: the author of the comment is not on the allowlist", "key", c.Key, "author", c.Author)
+		reply(w, http.StatusOK, "ignored: the author is not allowed")
+		return
+	}
+	if s.firstDelivery(w, keys, log) != deliveryNew {
+		return
+	}
+	t := s.newTask("jira", c.Key, c.Summary, c.URL, "", delivery)
+	t.Comment = text
+	switch err := s.runner.FollowUp(t, false); {
+	case err == nil:
+		log.Info("follow-up queued", "task", t.ID, "key", t.Key, "author", c.Author, "chars", len(text))
+		reply(w, http.StatusOK, "queued "+t.ID)
+	case errors.Is(err, store.ErrUnknown), errors.Is(err, store.ErrReleased):
+		// Not a ticket that ochell holds: people talk to each other.
+		log.Debug("ignored: a comment on a ticket that ochell does not hold", "key", t.Key, "reason", err)
+		reply(w, http.StatusOK, "ignored")
+	case errors.Is(err, runner.ErrBusy):
+		// Comments to a running agent are not queued yet.
+		log.Info("follow-up not delivered: the ticket is in progress", "key", t.Key)
+		reply(w, http.StatusOK, "already in progress")
+	default:
+		// 503 makes Jira retry later.
+		log.Error("cannot queue the follow-up", "key", t.Key, "err", err)
+		s.forgetDelivery(keys, log)
+		reply(w, http.StatusServiceUnavailable, "cannot queue task")
+	}
 }
 
 // jiraNotStarted tells a Jira ticket that it was accepted but is not
@@ -623,7 +699,7 @@ func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, key
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, "", delivery)
 	t.TrackerSession = sess.SessionID
 	t.Comment = text
-	switch err := s.runner.FollowUp(t); {
+	switch err := s.runner.FollowUp(t, true); {
 	case err == nil:
 		log.Info("follow-up queued", "task", t.ID, "key", t.Key, "session", sess.SessionID, "chars", len(text))
 		s.linearActivity(sess.SessionID, linear.ActivityThought,

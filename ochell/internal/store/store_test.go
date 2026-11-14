@@ -617,7 +617,7 @@ func TestFollowUp(t *testing.T) {
 	follow := func(id, comment string) *task.Task {
 		return &task.Task{ID: id, Source: "linear", Key: "ENG-1", Comment: comment, TrackerSession: "session-reply", Cause: task.CauseFollowUp, Received: t0}
 	}
-	if err := s.FollowUp(follow("f0", "hello"), lim); !errors.Is(err, ErrUnknown) {
+	if err := s.FollowUp(follow("f0", "hello"), true, lim); !errors.Is(err, ErrUnknown) {
 		t.Fatalf("a follow-up on an unknown ticket: %v, want ErrUnknown", err)
 	}
 
@@ -626,7 +626,7 @@ func TestFollowUp(t *testing.T) {
 	if err := s.Enqueue(first, lim); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FollowUp(follow("f1", "hello"), lim); !errors.Is(err, ErrBusy) {
+	if err := s.FollowUp(follow("f1", "hello"), true, lim); !errors.Is(err, ErrBusy) {
 		t.Errorf("a follow-up on a queued ticket: %v, want ErrBusy", err)
 	}
 	run := func(id string) {
@@ -650,7 +650,7 @@ func TestFollowUp(t *testing.T) {
 		t.Fatalf("a third assignment: %v, want ErrAttempts", err)
 	}
 	// A person answers: that run is not stopped by the cap.
-	if err := s.FollowUp(follow("f2", "use the second page"), lim); err != nil {
+	if err := s.FollowUp(follow("f2", "use the second page"), true, lim); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Claim()
@@ -668,7 +668,8 @@ func TestFollowUp(t *testing.T) {
 	if err := s.Finish("f2", task.Result{Outcome: task.OutcomeFinished, Signal: result.Done}); err != nil {
 		t.Fatal(err)
 	}
-	// Two more runs are allowed from there, and no third.
+	// One more run is allowed from there (the reply itself was the first),
+	// and no further one.
 	if err := s.Enqueue(newTask("run-4", "ENG-1", t0), lim); err != nil {
 		t.Errorf("an assignment after the follow-up: %v", err)
 	}
@@ -678,6 +679,23 @@ func TestFollowUp(t *testing.T) {
 	}
 	if tk, _ := s.Ticket("linear", "ENG-1"); tk.Attempts != 4 {
 		t.Errorf("attempts = %d, want 4: the number still counts every run", tk.Attempts)
+	}
+	// A comment on the ticket is a message from a person as well.
+	if err := s.FollowUp(follow("run-4b", "and the footer"), false, lim); err != nil {
+		t.Errorf("a comment on a ticket that waits: %v", err)
+	}
+
+	// A comment on the ticket, which is not addressed to the agent, counts
+	// while ochell holds the ticket, and not once the ticket is done.
+	run("run-4b")
+	if _, err := s.CloseTicket("linear", "ENG-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FollowUp(follow("f3", "thanks!"), false, lim); !errors.Is(err, ErrReleased) {
+		t.Errorf("a comment on a ticket that is done: %v, want ErrReleased", err)
+	}
+	if err := s.FollowUp(follow("f4", "one more thing"), true, lim); err != nil {
+		t.Errorf("a message to the agent on a ticket that is done: %v", err)
 	}
 
 	if key, err := s.TicketOfSession("linear", "session-reply"); err != nil || key != "ENG-1" {

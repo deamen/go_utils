@@ -1218,7 +1218,7 @@ func TestJiraStartAndFinishComments(t *testing.T) {
 		id := o.JiraAutomation("DEV-43", "Fix the login page").TaskID(t)
 		o.WaitRun(id, 15*time.Second)
 		got := o.WaitJiraComments("DEV-43", 2, 10*time.Second)
-		if got[1] != "Which of the two login pages do you mean?" {
+		if !strings.HasPrefix(got[1], "Which of the two login pages do you mean?") {
 			t.Errorf("finish comment = %q, want the question", got[1])
 		}
 		if st := o.Jira.Status("DEV-43"); st != "In Progress" {
@@ -1449,5 +1449,76 @@ func TestLinearReplyResumesTheSession(t *testing.T) {
 	}
 	if tk, _ := st.Ticket("linear", "ENG-82"); tk == nil || tk.State != "in_review" || tk.Attempts != 2 {
 		t.Errorf("ticket = %+v, want in_review after two attempts", tk)
+	}
+}
+
+// The done-when of Jira follow-ups: a comment of a person resumes the agent
+// session, and a comment by the bot account does not.
+func TestJiraCommentResumesTheSession(t *testing.T) {
+	const session = "5a8d3f20-91c4-4e7b-b0de-6c2f7a4e1b90"
+	stream := func(result string) Step {
+		return Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"` + result + `","session_id":"` + session + `"}`}
+	}
+	script := append(OnRun(1, stream("Which page?"), Report("needs_input", "Which of the two login pages do you mean?")),
+		OnRun(2, stream("Fixed."), Report("done", "Fixed the second login page."))...)
+	o := Start(t, Options{Script: script, Configure: func(c *config.Config) { c.Agent.Adapter = "claude" }})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-83"})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	first := o.JiraAssigned("DEV-83", "Fix the login page").TaskID(t)
+	o.WaitStored(st, first, 15*time.Second)
+	comments := o.WaitJiraComments("DEV-83", 2, 10*time.Second)
+	if !strings.Contains(comments[1], "Which of the two login pages do you mean?") || !strings.Contains(comments[1], "Reply in a comment") {
+		t.Fatalf("the ticket got %q, want the question and how to answer", comments[1])
+	}
+
+	// Jira reports the bot's own two comments back. They start nothing.
+	for _, c := range comments {
+		if r := o.JiraCommented("DEV-83", BotAccountID, c); r.Status != 200 || !strings.Contains(r.Body, "comment by the bot") {
+			t.Errorf("a comment by the bot: %d %q", r.Status, r.Body)
+		}
+	}
+	// A person answers.
+	second := o.JiraCommented("DEV-83", "", "The second one, under /account.").TaskID(t)
+	run := o.WaitStored(st, second, 15*time.Second)
+	if !run.Result.Resumed || run.Attempt != 2 {
+		t.Errorf("the run of the comment = %+v, want a resumed second attempt", run)
+	}
+	recs := o.WaitRecords(2, 5*time.Second)
+	if len(recs) != 2 {
+		t.Fatalf("the agent was started %d times, want 2: the bot's comments must start nothing", len(recs))
+	}
+	var reply Record
+	for _, rec := range recs {
+		if slices.Contains(rec.Args, "--resume") {
+			reply = rec
+		}
+	}
+	if !slices.Contains(reply.Args, session) {
+		t.Fatalf("no run resumed the session %s: %+v", session, recs)
+	}
+	if !strings.Contains(reply.Stdin, "<comment>\nThe second one, under /account.\n</comment>") {
+		t.Errorf("the prompt of the second run lacks the comment:\n%s", reply.Stdin)
+	}
+	// The ticket shows the second run as well.
+	comments = o.WaitJiraComments("DEV-83", 4, 10*time.Second)
+	if !strings.Contains(comments[2], "again (attempt 2)") || !strings.Contains(comments[3], "Fixed the second login page.") {
+		t.Errorf("comments of the second run = %q", comments[2:])
+	}
+
+	// The ticket is done in Jira: people go on talking, and nothing starts.
+	if r := o.JiraResolved("DEV-83"); r.Status != 200 {
+		t.Fatalf("resolved: %d %q", r.Status, r.Body)
+	}
+	if r := o.JiraCommented("DEV-83", "", "Thanks, deployed."); r.Status != 200 || r.Body != "ignored" {
+		t.Errorf("a comment on a closed ticket: %d %q, want ignored", r.Status, r.Body)
+	}
+	// A comment on a ticket that ochell never worked on.
+	if r := o.JiraCommented("DEV-999", "", "hello"); r.Status != 200 || r.Body != "ignored" {
+		t.Errorf("a comment on an unknown ticket: %d %q, want ignored", r.Status, r.Body)
 	}
 }

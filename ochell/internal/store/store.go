@@ -329,9 +329,14 @@ func (s *Store) Enqueue(t *task.Task, lim Limits) error {
 //
 // A person has looked at the ticket, so its attempts count from here again.
 //
+// addressed says that the person wrote to the agent itself, as in a Linear
+// agent session. A message that is only a comment on the ticket counts
+// while ochell holds the ticket open; for a ticket that is done or was
+// released (cancelled), FollowUp then returns ErrReleased.
+//
 // It returns ErrUnknown for a ticket that ochell has never seen, ErrBusy
 // when the ticket has a queued or running run, and ErrQueueFull.
-func (s *Store) FollowUp(t *task.Task, lim Limits) error {
+func (s *Store) FollowUp(t *task.Task, addressed bool, lim Limits) error {
 	return s.tx(func(tx *sql.Tx) error {
 		from, err := state(tx, t.Source, t.Key)
 		if err != nil {
@@ -342,6 +347,8 @@ func (s *Store) FollowUp(t *task.Task, lim Limits) error {
 			return ErrUnknown
 		case from.Active():
 			return ErrBusy
+		case !addressed && (from == ticket.Done || from == ticket.Cancelled):
+			return ErrReleased
 		}
 		if full, err := queueFull(tx, lim.MaxQueued); err != nil {
 			return err
@@ -756,6 +763,10 @@ func (s *Store) SetPrepared(source, key, dir string) error {
 
 // ErrUnknown is returned for a ticket that ochell has never seen.
 var ErrUnknown = errors.New("unknown ticket")
+
+// ErrReleased is returned for a ticket that ochell no longer holds: it is
+// done, or it was stopped or released by a human.
+var ErrReleased = errors.New("the ticket is done or was released")
 
 // CloseTicket records that the tracker reports a ticket as closed, and
 // returns the ticket. A ticket that waits or is in review, or whose last
