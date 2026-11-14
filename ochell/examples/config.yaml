@@ -184,6 +184,10 @@ sources:
     token: ${JIRA_API_TOKEN}
     # Which tickets are the bot's open tickets. This is the default.
     jql: "assignee = currentUser() AND statusCategory != Done"
+    # With the API, ochell comments on a Jira ticket when a run starts and
+    # when it ends. Optional: also move the ticket to this status when the
+    # agent reports its work as done.
+    review_status: ""       # e.g. "In Review"
 
   # Linear agent app (OAuth app installed with actor=app).
   linear:

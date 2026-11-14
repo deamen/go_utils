@@ -26,6 +26,7 @@ Behaviour common to all sources:
 - **Replay:** a signed request is rejected with 401 when its timestamp (`timestamp` for Jira, `webhookTimestamp` for Linear) is further than `max_skew` from now. The default is 60s for Linear and 2h for Jira: Jira retries a failed delivery up to five times, 5 to 15 minutes apart, and a retry may carry the timestamp of the event. Jira Automation requests carry no timestamp.
 - **One run per ticket:** a ticket that is already queued or running is not started again. The request is answered with 200 `already in progress`. A new Linear session on such a ticket gets a `response` activity that says so, which closes that session; the result is posted in the first session.
 - **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the run ends it posts what the agent reported in its result file (see [The result file](#the-result-file)): a `response` for finished work, an `elicitation` for anything that needs a human. A run that failed, timed out or was stopped gets an `error`.
+- **Jira ticket updates:** with the Jira API configured (see [Jira API access](#jira-api-access)), ochell comments on a Jira ticket when a run starts, and again when it ends, with the same text a Linear session gets: the agent's message and its pull request, its question, or why the run failed. A ticket that was accepted but not started (no repository, attempts used up) gets a comment that says so. With `review_status` the ticket is also moved to that status when the agent reports its work as done. Without the API a Jira ticket gets no answer.
 - **Linear follow-ups:** `prompted` events are logged but not yet delivered to an agent. So a reply to an `elicitation` does not start a run yet; delegate the ticket again.
 
 ### Stopping agents and shutting down
@@ -129,7 +130,7 @@ So a restart loses no queued task, and a retried or replayed delivery from befor
 Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user.
 
 ### Jira API access
-The webhooks only bring events in. For what ochell does on its own in Jira (finding the bot's tickets, commenting on one, changing a status) it needs the Jira REST API, with the API token of the digital employee's account:
+The webhooks only bring events in. For what ochell does on its own in Jira (commenting on a ticket when a run starts and ends, changing a status, and later finding the bot's tickets) it needs the Jira REST API, with the API token of the digital employee's account:
 
 ```yaml
 sources:
@@ -142,6 +143,7 @@ sources:
 - **Use the same Jira account as the agent's `twg`.** What ochell writes then comes from the bot account, like what the agent writes.
 - **`jql`** selects the bot's open tickets. The default is `assignee = currentUser() AND statusCategory != Done`: the account that owns the token, so no account id is needed.
 - **Check it** with `ochell jira-check --config config.yaml`. It lists the tickets that the JQL selects; with `--comment-on KEY` it also adds a test comment to that ticket.
+- **`review_status`** is optional: the status, for example `In Review`, that a ticket is moved to when the agent reports its work as done. The ticket's workflow must have a transition to it from where the ticket is. If the move fails, ochell logs a warning, and the comment is there all the same.
 - The token is ochell's own. It is not passed to the agent.
 - Without `base_url` ochell runs as before, and nothing that needs the API happens.
 

@@ -836,6 +836,18 @@ func (o *Ochell) WaitActivities(sessionID string, n int, timeout time.Duration) 
 	return acts
 }
 
+// WaitJiraComments waits until a ticket of the fake Jira site has n
+// comments, and returns them.
+func (o *Ochell) WaitJiraComments(key string, n int, timeout time.Duration) []string {
+	o.t.Helper()
+	var got []string
+	o.waitFor(timeout, fmt.Sprintf("%d Jira comments on %s", n, key), func() bool {
+		got = o.Jira.Comments(key)
+		return len(got) >= n
+	})
+	return got
+}
+
 type lockedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer

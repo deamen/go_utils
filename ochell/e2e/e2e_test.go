@@ -1122,3 +1122,52 @@ func TestJiraAPIAccess(t *testing.T) {
 		t.Errorf("jira-check against a failing site: exit %d: %s", code, out)
 	}
 }
+
+// The Jira back-channel: a Jira ticket shows a comment when its run starts
+// and a comment with the result when it ends.
+func TestJiraStartAndFinishComments(t *testing.T) {
+	t.Run("done", func(t *testing.T) {
+		o := Start(t, Options{
+			Script:    []Step{Report("done", "Added the retry and opened a pull request.", "pr_url", "https://github.com/example/repo/pull/7")},
+			Configure: func(c *config.Config) { c.Sources.JiraAPI.ReviewStatus = "In Review" },
+		})
+		o.Jira.Add(jiratest.Issue{Key: "DEV-42", Status: "In Progress", Statuses: []string{"To Do", "In Review"}})
+		id := o.JiraAssigned("DEV-42", "Add retry to the payment client").TaskID(t)
+		o.WaitRun(id, 15*time.Second)
+		got := o.WaitJiraComments("DEV-42", 2, 10*time.Second)
+		if got[0] != "The digital employee started work on this ticket." {
+			t.Errorf("start comment = %q", got[0])
+		}
+		for _, want := range []string{"ready for review", "Added the retry and opened a pull request.", "https://github.com/example/repo/pull/7"} {
+			if !strings.Contains(got[1], want) {
+				t.Errorf("finish comment missing %q: %q", want, got[1])
+			}
+		}
+		o.waitFor(5*time.Second, "DEV-42 to move to In Review", func() bool { return o.Jira.Status("DEV-42") == "In Review" })
+	})
+
+	t.Run("a question, through Jira Automation", func(t *testing.T) {
+		o := Start(t, Options{Script: []Step{Report("needs_input", "Which of the two login pages do you mean?")}})
+		o.Jira.Add(jiratest.Issue{Key: "DEV-43", Status: "In Progress", Statuses: []string{"In Review"}})
+		id := o.JiraAutomation("DEV-43", "Fix the login page").TaskID(t)
+		o.WaitRun(id, 15*time.Second)
+		got := o.WaitJiraComments("DEV-43", 2, 10*time.Second)
+		if got[1] != "Which of the two login pages do you mean?" {
+			t.Errorf("finish comment = %q, want the question", got[1])
+		}
+		if st := o.Jira.Status("DEV-43"); st != "In Progress" {
+			t.Errorf("status = %q; a ticket that waits for an answer must not move", st)
+		}
+	})
+
+	t.Run("a failed run", func(t *testing.T) {
+		o := Start(t, Options{Script: []Step{{Eprint: "fatal: cannot reach the repository"}, Exit(3)}})
+		o.Jira.Add(jiratest.Issue{Key: "DEV-44"})
+		id := o.JiraAssigned("DEV-44", "Update the docs").TaskID(t)
+		o.WaitRun(id, 15*time.Second)
+		got := o.WaitJiraComments("DEV-44", 2, 10*time.Second)
+		if !strings.Contains(got[1], "The agent failed (exit 3)") || !strings.Contains(got[1], "fatal: cannot reach the repository") {
+			t.Errorf("finish comment = %q, want the failure and the output", got[1])
+		}
+	})
+}

@@ -125,6 +125,9 @@ type JiraAPI struct {
 	// JQL selects the open tickets of the bot. Empty: the open tickets
 	// assigned to the account that owns the token.
 	JQL string `yaml:"jql"`
+	// ReviewStatus, when set, is the status a ticket is moved to when the
+	// agent reports its work as done, e.g. "In Review".
+	ReviewStatus string `yaml:"review_status"`
 }
 
 // Enabled reports whether the Jira API is configured.
