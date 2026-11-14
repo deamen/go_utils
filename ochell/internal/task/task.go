@@ -27,6 +27,10 @@ const (
 	CauseFollowUp Cause = "follow_up"
 )
 
+// CommentSeparator stands between the messages in Task.Comment when a run
+// delivers more than one. It is a character that no ticket text holds.
+const CommentSeparator = "\n\x1e\n"
+
 // NewID returns the id of a task that is received now. It is unique per
 // ticket and millisecond, and safe in a file name.
 func NewID(now time.Time, source, key string) string {
@@ -49,7 +53,8 @@ type Task struct {
 	Context string
 	// Comment is the comment that triggered this run, when a person asked
 	// for it in one: a mention in Linear, or a follow-up message. Empty for
-	// a plain assignment.
+	// a plain assignment. Several messages that waited for the same run
+	// are joined with CommentSeparator, oldest first.
 	Comment string
 	// Cause says why the run was queued; empty for a plain assignment.
 	Cause Cause

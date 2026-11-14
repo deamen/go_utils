@@ -1522,3 +1522,98 @@ func TestJiraCommentResumesTheSession(t *testing.T) {
 		t.Errorf("a comment on an unknown ticket: %d %q, want ignored", r.Status, r.Body)
 	}
 }
+
+// The done-when of queued follow-ups: two comments sent during a run are
+// both delivered, in order, after it.
+func TestCommentsDuringARunAreDeliveredAfterIt(t *testing.T) {
+	script := append(OnRun(1, Step{Print: "working"}, Step{Sleep: "2s"}, Report("done", "First part done.")),
+		OnRun(2, Report("done", "Both remarks are in."))...)
+	o := Start(t, Options{Script: script, Configure: func(c *config.Config) { c.Agent.MaxAttempts = 1 }})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-84"})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	first := o.JiraAssigned("DEV-84", "Rework the login page").TaskID(t)
+	o.WaitRecords(1, 10*time.Second)
+	for _, text := range []string{"Please keep the old URL working.", "And add a test for the redirect."} {
+		if r := o.JiraCommented("DEV-84", "", text); r.Status != 200 || r.Body != "queued for the next run" {
+			t.Fatalf("a comment during the run: %d %q", r.Status, r.Body)
+		}
+	}
+	if n := len(o.Records()); n != 1 {
+		t.Fatalf("the agent was started %d times while the first run was going", n)
+	}
+	if run := o.WaitStored(st, first, 15*time.Second); run.Result.Signal != "done" {
+		t.Errorf("the first run = %+v, want its own result", run.Result)
+	}
+
+	// The next run starts by itself, although the ticket had one attempt,
+	// and gets both comments, oldest first.
+	recs := o.WaitRecords(2, 15*time.Second)
+	var second Record
+	for _, rec := range recs {
+		if strings.Contains(rec.Stdin, "This is attempt 2") {
+			second = rec
+		}
+	}
+	want := "the following 2 comments from people on the ticket, oldest first"
+	both := "<comment>\nPlease keep the old URL working.\n</comment>\n<comment>\nAnd add a test for the redirect.\n</comment>"
+	if !strings.Contains(second.Stdin, want) || !strings.Contains(second.Stdin, both) {
+		t.Errorf("the prompt of the second run does not hold both comments in order:\n%s", second.Stdin)
+	}
+	// The ticket shows both runs: start, result, start, result.
+	comments := o.WaitJiraComments("DEV-84", 4, 15*time.Second)
+	if !strings.Contains(comments[1], "First part done.") || !strings.Contains(comments[3], "Both remarks are in.") {
+		t.Errorf("comments on the ticket = %q", comments)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := len(o.Records()); n != 2 {
+		t.Errorf("the agent was started %d times, want 2", n)
+	}
+	if n, _ := st.Waiting("jira", "DEV-84"); n != 0 {
+		t.Errorf("%d comments still wait", n)
+	}
+}
+
+// A reply in a Linear session during a run is kept as well, and the run
+// that delivers it answers in that session.
+func TestLinearReplyDuringARun(t *testing.T) {
+	script := append(OnRun(1, Step{Print: "working"}, Step{Sleep: "2s"}, Report("done", "First part done.")),
+		OnRun(2, Report("done", "Changed as you said."))...)
+	o := Start(t, Options{Script: script})
+	o.LinearCreated("ENG-84", "session-busy", "").TaskID(t)
+	o.WaitRecords(1, 10*time.Second)
+
+	if r := o.LinearPrompted("ENG-84", "session-busy", "Use the new colours."); r.Status != 200 || r.Body != "queued for the next run" {
+		t.Fatalf("a reply during the run: %d %q", r.Status, r.Body)
+	}
+	// A second session that came with a message: the same.
+	if r := o.LinearMentioned("ENG-84", "session-mention", "@agent and update the docs"); r.Status != 200 {
+		t.Fatalf("a mention during the run: %d %q", r.Status, r.Body)
+	}
+	if acts := o.WaitActivities("session-mention", 1, 10*time.Second); acts[0].Type != "thought" || !strings.Contains(acts[0].Body, "Your message is queued") {
+		t.Errorf("the second session got %+v", acts[0])
+	}
+
+	// First session: picked up, the reply acknowledged, the first result.
+	acts := o.WaitActivities("session-busy", 3, 15*time.Second)
+	if acts[1].Type != "thought" || !strings.Contains(acts[1].Body, "Your message is queued") {
+		t.Errorf("second activity = %+v, want the note that the reply waits", acts[1])
+	}
+	if acts[2].Type != "response" || acts[2].Body != "First part done." {
+		t.Errorf("third activity = %+v, want the result of the first run", acts[2])
+	}
+	// The run that delivers both messages answers where the last one came in.
+	last := o.WaitActivities("session-mention", 2, 15*time.Second)
+	if last[1].Type != "response" || last[1].Body != "Changed as you said." {
+		t.Errorf("the second session got %+v, want the result of the second run", last[1])
+	}
+	recs := o.WaitRecords(2, 5*time.Second)
+	prompts := recs[0].Stdin + recs[1].Stdin
+	if !strings.Contains(prompts, "<comment>\nUse the new colours.\n</comment>\n<comment>\n@agent and update the docs\n</comment>") {
+		t.Errorf("the second run did not get both messages in order:\n%s", prompts)
+	}
+}

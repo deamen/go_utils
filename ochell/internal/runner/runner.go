@@ -167,8 +167,11 @@ func (r *Runner) Submit(t *task.Task) error {
 
 // FollowUp queues a run of a ticket that ochell already knows, for a
 // message from a person (t.Comment). It never blocks. It returns
-// store.ErrUnknown for a ticket that ochell has never seen, ErrBusy when the
-// ticket already has a queued or running task, and ErrQueueFull.
+// store.ErrUnknown for a ticket that ochell has never seen, and
+// ErrQueueFull.
+//
+// When the ticket already has a queued or running task, the message is kept
+// and delivered with the run that follows it; later is then true.
 //
 // addressed says that the person wrote to the agent itself (a Linear agent
 // session). A comment on the ticket (Jira) is not addressed: it counts only
@@ -176,18 +179,18 @@ func (r *Runner) Submit(t *task.Task) error {
 //
 // The attempt cap does not stop it: a person asked for this run, and the
 // ticket's attempts count from here again.
-func (r *Runner) FollowUp(t *task.Task, addressed bool) error {
+func (r *Runner) FollowUp(t *task.Task, addressed bool) (later bool, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopped {
-		return ErrStopped
+		return false, ErrStopped
 	}
 	t.Cause = task.CauseFollowUp
-	if err := r.store.FollowUp(t, addressed, store.Limits{MaxQueued: max(r.cfg.QueueSize, 1)}); err != nil {
-		return err
+	if later, err = r.store.FollowUp(t, addressed, store.Limits{MaxQueued: max(r.cfg.QueueSize, 1)}); err != nil {
+		return false, err
 	}
 	r.wakeWorker()
-	return nil
+	return later, nil
 }
 
 // TicketOfSession returns the key of the ticket that reports to a tracker
@@ -282,7 +285,7 @@ func (r *Runner) Start() error {
 	}
 	for _, in := range interrupted {
 		t := in.Task
-		r.log.Warn("run was interrupted: ochell stopped while the agent was running", "task", t.ID, "source", t.Source, "key", t.Key, "queued_again", in.Requeued)
+		r.log.Warn("run was interrupted: ochell stopped while the agent was running", "task", t.ID, "source", t.Source, "key", t.Key, "queued_again", in.Next)
 		// An agent that outlived the ochell that started it must not go on
 		// working next to the run that takes its place.
 		if err := r.launcher.Reap(unsafeName.ReplaceAllString(t.ID, "_")); err != nil {
@@ -295,8 +298,10 @@ func (r *Runner) Start() error {
 			defer r.wg.Done()
 			for _, in := range interrupted {
 				res := task.Result{Outcome: task.OutcomeInterrupted, ExitCode: -1, Err: store.ErrInterrupted}
-				if in.Requeued {
-					res.Next = task.CauseRecovery
+				// A run that only delivers messages is not announced: the
+				// ticket gets the error first, like any other.
+				if in.Next != task.CauseFollowUp {
+					res.Next = in.Next
 				}
 				if err := r.notify.Finished(context.Background(), in.Task, res); err != nil {
 					r.log.Warn("finish notification failed", "task", in.Task.ID, "err", err)
@@ -414,22 +419,25 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	}
 	// Record the end before telling the ticket, so the ticket is free for
 	// a new run by the time someone reads the answer.
-	var err error
-	if again, ok := r.next(t, res); ok {
-		var queued bool
-		if queued, err = r.store.FinishAndQueue(t.ID, res, again); queued {
-			res.Next, res.NextAt = again.Cause, again.NotBefore
-			log.Info("the ticket is queued again", "cause", again.Cause, "run", again.ID, "not_before", again.NotBefore)
-			if wait := time.Until(again.NotBefore); wait > 0 {
-				// An idle worker looks at the queue when the wait is over.
-				time.AfterFunc(wait+10*time.Millisecond, r.wakeWorker)
-			}
-		}
-	} else {
-		err = r.store.Finish(t.ID, res)
+	var again *store.Again
+	if a, ok := r.next(t, res); ok {
+		again = &a
 	}
-	if err != nil {
+	next, err := r.store.FinishAndQueue(t.ID, res, again)
+	switch {
+	case err != nil:
 		log.Error("cannot record the end of the run", "err", err)
+	case next == task.CauseFollowUp:
+		// Messages from people arrived during the run. The ticket gets the
+		// result of this run as usual, and then the run that delivers them.
+		log.Info("the ticket is queued again: messages arrived during the run")
+	case next != "":
+		res.Next, res.NextAt = again.Cause, again.NotBefore
+		log.Info("the ticket is queued again", "cause", again.Cause, "run", again.ID, "not_before", again.NotBefore)
+		if wait := time.Until(again.NotBefore); wait > 0 {
+			// An idle worker looks at the queue when the wait is over.
+			time.AfterFunc(wait+10*time.Millisecond, r.wakeWorker)
+		}
 	}
 	if r.notify != nil {
 		if err := r.notify.Finished(notifyCtx, t, res); err != nil {

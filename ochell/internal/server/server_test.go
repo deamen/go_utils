@@ -38,6 +38,10 @@ type fakeRunner struct {
 	// closed are the tickets that were reported as closed, as source:key.
 	closed []string
 	err    error
+	// busy makes FollowUp keep its messages in later, as for a ticket that
+	// is in progress.
+	busy  bool
+	later []*task.Task
 	// addressed is what the last FollowUp was called with.
 	addressed bool
 	// submitErr is returned by Submit only, followErr by FollowUp only.
@@ -49,19 +53,23 @@ type fakeRunner struct {
 
 // FollowUp accepts a message for the tickets in known, and for every ticket
 // when known is nil.
-func (f *fakeRunner) FollowUp(t *task.Task, addressed bool) error {
+func (f *fakeRunner) FollowUp(t *task.Task, addressed bool) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.err != nil {
-		return f.err
-	}
 	if f.followErr != nil {
-		return f.followErr
+		return false, f.followErr
 	}
 	t.Cause = task.CauseFollowUp
 	f.addressed = addressed
+	if f.busy {
+		f.later = append(f.later, t)
+		return true, nil
+	}
+	if f.err != nil {
+		return false, f.err
+	}
 	f.tasks = append(f.tasks, t)
-	return nil
+	return false, nil
 }
 
 func (f *fakeRunner) TicketOfSession(source, session string) (string, error) {
@@ -820,12 +828,16 @@ func TestLinearFollowUp(t *testing.T) {
 		t.Errorf("tasks = %d, want 2", len(fr.tasks))
 	}
 
-	// The ticket is in progress: nothing is queued, and Linear does not retry.
-	fr.followErr = runner.ErrBusy
+	// The ticket is in progress: the message is kept for its next run.
+	fr.busy = true
 	body, hdr = linearPrompt("session-1", "ENG-7", "are you there?")
-	if w := do(s, "/webhooks/linear", body, hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "already in progress") {
+	if w := do(s, "/webhooks/linear", body, hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "queued for the next run") {
 		t.Errorf("busy: %d %s", w.Code, w.Body)
 	}
+	if len(fr.later) != 1 || fr.later[0].Comment != "are you there?" || fr.later[0].TrackerSession != "session-1" {
+		t.Errorf("kept for later = %+v", fr.later)
+	}
+	fr.busy = false
 	// A ticket that ochell never worked on: the message is its assignment.
 	fr.followErr = store.ErrUnknown
 	body, hdr = linearPrompt("session-new", "ENG-8", "please do this")
@@ -931,7 +943,6 @@ func TestJiraCommentFollowUp(t *testing.T) {
 	}{
 		"a ticket ochell never worked on": {store.ErrUnknown, 200, "ignored"},
 		"a ticket that is done":           {store.ErrReleased, 200, "ignored"},
-		"a ticket in progress":            {runner.ErrBusy, 200, "already in progress"},
 		"the store fails":                 {errors.New("disk full"), 503, "cannot queue task"},
 	} {
 		fr.followErr = c.err
@@ -939,6 +950,15 @@ func TestJiraCommentFollowUp(t *testing.T) {
 			t.Errorf("%s: %d %q, want %d %q", name, w.Code, w.Body.String(), c.code, c.want)
 		}
 	}
+	// A ticket in progress: the comment is kept for its next run.
+	fr.followErr, fr.busy = nil, true
+	if w := post("DEV-45", "557058:human", bot, "while you are at it"); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued for the next run") {
+		t.Errorf("a ticket in progress: %d %q", w.Code, w.Body.String())
+	}
+	if len(fr.later) != 1 || fr.later[0].Comment != "while you are at it" {
+		t.Errorf("kept for later = %+v", fr.later)
+	}
+	fr.busy = false
 	// After the 503 Jira sends the delivery again, and it is taken.
 	fr.followErr = nil
 	body, hdr := jiraComment("DEV-44", "557058:human", bot, "again")

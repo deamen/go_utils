@@ -48,8 +48,9 @@ type Submitter interface {
 	Submit(*task.Task) error
 	// FollowUp queues a task for a message from a person on a ticket that
 	// ochell already knows (store.ErrUnknown otherwise). addressed: the
-	// person wrote to the agent itself, not only on the ticket.
-	FollowUp(t *task.Task, addressed bool) error
+	// person wrote to the agent itself, not only on the ticket. later: the
+	// ticket is in progress, and the message is kept for its next run.
+	FollowUp(t *task.Task, addressed bool) (later bool, err error)
 	// TicketOfSession returns the key of the ticket that reports to a
 	// tracker session, or "".
 	TicketOfSession(source, session string) (string, error)
@@ -532,7 +533,10 @@ func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error
 	}
 	t := s.newTask("jira", c.Key, c.Summary, c.URL, "", delivery)
 	t.Comment = text
-	switch err := s.runner.FollowUp(t, false); {
+	switch later, err := s.runner.FollowUp(t, false); {
+	case err == nil && later:
+		log.Info("follow-up kept for the next run: the ticket is in progress", "key", t.Key, "author", c.Author, "chars", len(text))
+		reply(w, http.StatusOK, "queued for the next run")
 	case err == nil:
 		log.Info("follow-up queued", "task", t.ID, "key", t.Key, "author", c.Author, "chars", len(text))
 		reply(w, http.StatusOK, "queued "+t.ID)
@@ -540,10 +544,6 @@ func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error
 		// Not a ticket that ochell holds: people talk to each other.
 		log.Debug("ignored: a comment on a ticket that ochell does not hold", "key", t.Key, "reason", err)
 		reply(w, http.StatusOK, "ignored")
-	case errors.Is(err, runner.ErrBusy):
-		// Comments to a running agent are not queued yet.
-		log.Info("follow-up not delivered: the ticket is in progress", "key", t.Key)
-		reply(w, http.StatusOK, "already in progress")
 	default:
 		// 503 makes Jira retry later.
 		log.Error("cannot queue the follow-up", "key", t.Key, "err", err)
@@ -699,7 +699,11 @@ func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, key
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, "", delivery)
 	t.TrackerSession = sess.SessionID
 	t.Comment = text
-	switch err := s.runner.FollowUp(t, true); {
+	switch later, err := s.runner.FollowUp(t, true); {
+	case err == nil && later:
+		log.Info("follow-up kept for the next run: the ticket is in progress", "key", t.Key, "session", sess.SessionID, "chars", len(text))
+		s.linearActivity(sess.SessionID, linear.ActivityThought, waitsForRunText(sess.Key), log)
+		reply(w, http.StatusOK, "queued for the next run")
 	case err == nil:
 		log.Info("follow-up queued", "task", t.ID, "key", t.Key, "session", sess.SessionID, "chars", len(text))
 		s.linearActivity(sess.SessionID, linear.ActivityThought,
@@ -709,18 +713,18 @@ func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, key
 		// ochell has never worked on this ticket: the message is its
 		// assignment.
 		s.linearSubmit(w, t, sess, keys, log)
-	case errors.Is(err, runner.ErrBusy):
-		// Messages to a running agent are not queued yet.
-		log.Info("follow-up not delivered: the ticket is in progress", "key", t.Key)
-		s.linearActivity(sess.SessionID, linear.ActivityThought,
-			"The digital employee is still working on "+sess.Key+", and a message cannot reach it while it runs. Send your message again when this run has ended.", log)
-		reply(w, http.StatusOK, "already in progress")
 	default:
 		// 503 makes Linear retry later.
 		log.Error("cannot queue the follow-up", "key", t.Key, "err", err)
 		s.forgetDelivery(keys, log)
 		reply(w, http.StatusServiceUnavailable, "cannot queue task")
 	}
+}
+
+// waitsForRunText tells a Linear session that a message was kept for the
+// run after the current one.
+func waitsForRunText(key string) string {
+	return "The digital employee is still working on " + key + ". Your message is queued: it gets it, with any others, as soon as the current run has ended, and answers here."
 }
 
 // linearSubmit queues t as a new assignment from a Linear session, writes
@@ -734,10 +738,22 @@ func (s *Server) linearSubmit(w http.ResponseWriter, t *task.Task, sess *linear.
 			"Picked up "+sess.Key+", the digital employee is starting work.", log)
 	case submitBusy:
 		// A second session on a ticket that is already queued or running
-		// starts no run, but it must not be left without an answer. A
-		// response closes the session.
+		// starts no run, but it must not be left without an answer.
+		if strings.TrimSpace(t.Comment) != "" {
+			// It came with a message (the agent was mentioned in a
+			// comment): that is kept for the ticket's next run, which
+			// answers in this session.
+			if _, err := s.runner.FollowUp(t, true); err == nil {
+				log.Info("message of a second session kept for the next run", "key", t.Key, "session", sess.SessionID)
+				s.linearActivity(sess.SessionID, linear.ActivityThought, waitsForRunText(sess.Key), log)
+				return
+			} else {
+				log.Error("cannot keep the message of a second session", "key", t.Key, "err", err)
+			}
+		}
+		// A response closes the session.
 		s.linearActivity(sess.SessionID, linear.ActivityResponse,
-			sess.Key+" is already being worked on by the digital employee in an earlier session, so this request did not start a new run. The result will be posted in that session. Messages to a running agent are not supported yet.", log)
+			sess.Key+" is already being worked on by the digital employee in an earlier session, so this request did not start a new run. The result will be posted in that session. To send the agent a message, reply in that session.", log)
 	case submitCapped:
 		s.linearActivity(sess.SessionID, linear.ActivityElicitation,
 			fmt.Sprintf("The digital employee did not start work on %s: the issue has used its %d attempts. Someone who looks after the orchestrator has to look at it and reset it (ochell reset linear %s); then delegate the issue again.", sess.Key, s.cfg.Agent.MaxAttempts, sess.Key), log)

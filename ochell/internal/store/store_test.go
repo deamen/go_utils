@@ -126,7 +126,7 @@ func TestRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(interrupted) != 1 || interrupted[0].Task.ID != "run-a" || interrupted[0].Task.TrackerSession != "session-run-a" || interrupted[0].Requeued {
+	if len(interrupted) != 1 || interrupted[0].Task.ID != "run-a" || interrupted[0].Task.TrackerSession != "session-run-a" || interrupted[0].Next != "" {
 		t.Fatalf("interrupted = %+v, want run-a with its tracker session", interrupted)
 	}
 	if tk, _ := s.Ticket("linear", "ENG-run-a"); tk == nil || tk.State != ticket.Waiting || tk.Reason != ticket.ReasonInterrupted || tk.Attempts != 1 {
@@ -177,7 +177,7 @@ func TestRecoverQueuesAgain(t *testing.T) {
 		}
 	}
 	in, err := s.Recover(again(5))
-	if err != nil || len(in) != 1 || !in[0].Requeued {
+	if err != nil || len(in) != 1 || in[0].Next != task.CauseRecovery {
 		t.Fatalf("Recover = %+v, %v; want one run that was queued again", in, err)
 	}
 	if run, _ := s.Run("run-1"); run == nil || run.Status != "ended" || run.Result.Outcome != task.OutcomeInterrupted {
@@ -197,8 +197,8 @@ func TestRecoverQueuesAgain(t *testing.T) {
 	}
 
 	// FinishAndQueue does the same for a run that ochell stops itself.
-	queued, err := s.FinishAndQueue("run-1-again", task.Result{Outcome: task.OutcomeStopped}, Again{ID: "run-3", Cause: task.CauseRecovery, MaxAttempts: 5})
-	if err != nil || !queued {
+	queued, err := s.FinishAndQueue("run-1-again", task.Result{Outcome: task.OutcomeStopped}, &Again{ID: "run-3", Cause: task.CauseRecovery, MaxAttempts: 5})
+	if err != nil || queued != task.CauseRecovery {
 		t.Fatalf("FinishAndQueue = %v, %v", queued, err)
 	}
 	if got, _ := s.Claim(); got == nil || got.ID != "run-3" || got.Attempt != 3 {
@@ -207,7 +207,7 @@ func TestRecoverQueuesAgain(t *testing.T) {
 
 	// A ticket that has used up its attempts is not queued again: it waits.
 	in, err = s.Recover(again(3))
-	if err != nil || len(in) != 1 || in[0].Requeued {
+	if err != nil || len(in) != 1 || in[0].Next != "" {
 		t.Fatalf("Recover at the attempt cap = %+v, %v", in, err)
 	}
 	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.Waiting || tk.Reason != ticket.ReasonInterrupted {
@@ -584,8 +584,8 @@ func TestNotBefore(t *testing.T) {
 	if got, _ := s.Claim(); got == nil {
 		t.Fatal("nothing claimed")
 	}
-	queued, err := s.FinishAndQueue("run-1", task.Result{Outcome: task.OutcomeFailed}, Again{ID: "run-2", Cause: task.CauseRetry, NotBefore: now.Add(time.Minute)})
-	if err != nil || !queued {
+	queued, err := s.FinishAndQueue("run-1", task.Result{Outcome: task.OutcomeFailed}, &Again{ID: "run-2", Cause: task.CauseRetry, NotBefore: now.Add(time.Minute)})
+	if err != nil || queued != task.CauseRetry {
 		t.Fatalf("FinishAndQueue = %v, %v", queued, err)
 	}
 	if got, err := s.Claim(); got != nil || err != nil {
@@ -617,7 +617,7 @@ func TestFollowUp(t *testing.T) {
 	follow := func(id, comment string) *task.Task {
 		return &task.Task{ID: id, Source: "linear", Key: "ENG-1", Comment: comment, TrackerSession: "session-reply", Cause: task.CauseFollowUp, Received: t0}
 	}
-	if err := s.FollowUp(follow("f0", "hello"), true, lim); !errors.Is(err, ErrUnknown) {
+	if _, err := s.FollowUp(follow("f0", "hello"), true, lim); !errors.Is(err, ErrUnknown) {
 		t.Fatalf("a follow-up on an unknown ticket: %v, want ErrUnknown", err)
 	}
 
@@ -626,9 +626,7 @@ func TestFollowUp(t *testing.T) {
 	if err := s.Enqueue(first, lim); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FollowUp(follow("f1", "hello"), true, lim); !errors.Is(err, ErrBusy) {
-		t.Errorf("a follow-up on a queued ticket: %v, want ErrBusy", err)
-	}
+
 	run := func(id string) {
 		t.Helper()
 		if got, err := s.Claim(); err != nil || got == nil || got.ID != id {
@@ -650,7 +648,7 @@ func TestFollowUp(t *testing.T) {
 		t.Fatalf("a third assignment: %v, want ErrAttempts", err)
 	}
 	// A person answers: that run is not stopped by the cap.
-	if err := s.FollowUp(follow("f2", "use the second page"), true, lim); err != nil {
+	if _, err := s.FollowUp(follow("f2", "use the second page"), true, lim); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Claim()
@@ -681,7 +679,7 @@ func TestFollowUp(t *testing.T) {
 		t.Errorf("attempts = %d, want 4: the number still counts every run", tk.Attempts)
 	}
 	// A comment on the ticket is a message from a person as well.
-	if err := s.FollowUp(follow("run-4b", "and the footer"), false, lim); err != nil {
+	if _, err := s.FollowUp(follow("run-4b", "and the footer"), false, lim); err != nil {
 		t.Errorf("a comment on a ticket that waits: %v", err)
 	}
 
@@ -691,10 +689,10 @@ func TestFollowUp(t *testing.T) {
 	if _, err := s.CloseTicket("linear", "ENG-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.FollowUp(follow("f3", "thanks!"), false, lim); !errors.Is(err, ErrReleased) {
+	if _, err := s.FollowUp(follow("f3", "thanks!"), false, lim); !errors.Is(err, ErrReleased) {
 		t.Errorf("a comment on a ticket that is done: %v, want ErrReleased", err)
 	}
-	if err := s.FollowUp(follow("f4", "one more thing"), true, lim); err != nil {
+	if _, err := s.FollowUp(follow("f4", "one more thing"), true, lim); err != nil {
 		t.Errorf("a message to the agent on a ticket that is done: %v", err)
 	}
 
@@ -703,5 +701,103 @@ func TestFollowUp(t *testing.T) {
 	}
 	if key, _ := s.TicketOfSession("linear", "no-such-session"); key != "" {
 		t.Errorf("TicketOfSession of an unknown session = %q", key)
+	}
+}
+
+// Messages that arrive while a ticket has a run are kept, and delivered in
+// order with the run that follows.
+func TestFollowUpsDuringARun(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	lim := Limits{MaxAttempts: 1, MaxQueued: 10}
+	msg := func(id, comment, session string) *task.Task {
+		return &task.Task{ID: id, Source: "linear", Key: "ENG-1", Comment: comment, TrackerSession: session, Cause: task.CauseFollowUp, Received: t0}
+	}
+	if err := s.Enqueue(newTask("run-1", "ENG-1", t0), lim); err != nil {
+		t.Fatal(err)
+	}
+	// The ticket is queued, then running: both times the message waits.
+	if later, err := s.FollowUp(msg("m1", "first message", ""), false, lim); err != nil || !later {
+		t.Fatalf("a message for a queued ticket: later=%v, %v", later, err)
+	}
+	if got, _ := s.Claim(); got == nil || got.ID != "run-1" {
+		t.Fatalf("claimed %+v", got)
+	}
+	if later, err := s.FollowUp(msg("m2", "second message", "session-two"), true, lim); err != nil || !later {
+		t.Fatalf("a message for a running ticket: later=%v, %v", later, err)
+	}
+	if later, err := s.FollowUp(msg("m3", "third message", ""), false, lim); err != nil || !later {
+		t.Fatalf("a third message: later=%v, %v", later, err)
+	}
+	if n, _ := s.Waiting("linear", "ENG-1"); n != 3 {
+		t.Errorf("%d messages wait, want 3", n)
+	}
+	if n, _ := s.Active(); n != 1 {
+		t.Errorf("%d runs are queued or running, want 1: a waiting message is no run", n)
+	}
+
+	// The run ends. Its own result stands, and the next run is queued,
+	// although the ticket had only one attempt: people asked for it.
+	next, err := s.FinishAndQueue("run-1", task.Result{Outcome: task.OutcomeFinished, Signal: result.Done}, nil)
+	if err != nil || next != task.CauseFollowUp {
+		t.Fatalf("FinishAndQueue = %q, %v; want follow_up", next, err)
+	}
+	if run, _ := s.Run("run-1"); run == nil || run.Result.Signal != result.Done {
+		t.Errorf("the first run = %+v", run)
+	}
+	got, err := s.Claim()
+	if err != nil || got == nil {
+		t.Fatalf("Claim = %+v, %v", got, err)
+	}
+	want := strings.Join([]string{"first message", "second message", "third message"}, task.CommentSeparator)
+	if got.Comment != want || got.Cause != task.CauseFollowUp || got.Attempt != 2 {
+		t.Errorf("the next run = %+v", got)
+	}
+	// It reports where the last message that named a session came in.
+	if got.TrackerSession != "session-two" {
+		t.Errorf("tracker session = %q, want session-two", got.TrackerSession)
+	}
+	if got.Context != "context of run-1" {
+		t.Errorf("context = %q, want that of the ticket's run", got.Context)
+	}
+	if n, _ := s.Waiting("linear", "ENG-1"); n != 0 {
+		t.Errorf("%d messages still wait", n)
+	}
+
+	// A run that is retried or recovered takes the messages along, after
+	// the comment it had itself.
+	if _, err := s.FollowUp(msg("m4", "fourth message", ""), false, lim); err != nil {
+		t.Fatal(err)
+	}
+	next, err = s.FinishAndQueue(got.ID, task.Result{Outcome: task.OutcomeStopped}, &Again{ID: "run-3", Cause: task.CauseRecovery, MaxAttempts: 5})
+	if err != nil || next != task.CauseRecovery {
+		t.Fatalf("FinishAndQueue = %q, %v; want recovery", next, err)
+	}
+	got, _ = s.Claim()
+	if got == nil || got.ID != "run-3" || got.Comment != want+task.CommentSeparator+"fourth message" || got.TrackerSession != "session-two" {
+		t.Errorf("the recovery run = %+v", got)
+	}
+	// Without messages a finished run ends the matter.
+	if next, err := s.FinishAndQueue("run-3", task.Result{Outcome: task.OutcomeFinished, Signal: result.Done}, nil); err != nil || next != "" {
+		t.Errorf("FinishAndQueue = %q, %v; want nothing queued", next, err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.InReview {
+		t.Errorf("ticket = %s, want in_review", tk.State)
+	}
+
+	// The list of waiting messages is bounded.
+	if err := s.Enqueue(newTask("run-9", "ENG-2", t0), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	m := msg("m", "x", "")
+	m.Key = "ENG-2"
+	for i := range maxWaitingMessages + 1 {
+		_, err := s.FollowUp(m, false, lim)
+		if i < maxWaitingMessages && err != nil {
+			t.Fatalf("message %d: %v", i, err)
+		}
+		if i == maxWaitingMessages && !errors.Is(err, ErrQueueFull) {
+			t.Errorf("message %d: %v, want ErrQueueFull", i, err)
+		}
 	}
 }
