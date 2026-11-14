@@ -109,6 +109,9 @@ var migrations = []string{
 
 	// Version 5: the comment that triggered a run.
 	`ALTER TABLE runs ADD COLUMN comment TEXT NOT NULL DEFAULT '';`,
+
+	// Version 6: the repository a ticket belongs to.
+	`ALTER TABLE tickets ADD COLUMN repo TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is safe for concurrent use.
@@ -244,11 +247,7 @@ func (s *Store) Enqueue(t *task.Task, maxQueued int) error {
 				return ErrQueueFull
 			}
 		}
-		// A new ticket is created in the state "none", then moved like any other.
-		if _, err := tx.Exec(`INSERT INTO tickets (source, key, title, url, state, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (source, key) DO UPDATE SET title = excluded.title, url = excluded.url`,
-			t.Source, t.Key, t.Title, t.URL, ticket.None, now, now); err != nil {
+		if err := s.upsert(tx, t, now); err != nil {
 			return err
 		}
 		if err := s.move(tx, t.Source, t.Key, ticket.Queued, ""); err != nil {
@@ -261,14 +260,44 @@ func (s *Store) Enqueue(t *task.Task, maxQueued int) error {
 	})
 }
 
+// upsert records the ticket of t, or brings its title, URL and repository
+// up to date. A new ticket is created in the state "none", and then moved
+// like any other.
+func (s *Store) upsert(tx *sql.Tx, t *task.Task, now int64) error {
+	_, err := tx.Exec(`INSERT INTO tickets (source, key, title, url, repo, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (source, key) DO UPDATE SET title = excluded.title, url = excluded.url, repo = excluded.repo`,
+		t.Source, t.Key, t.Title, t.URL, t.Repo, ticket.None, now, now)
+	return err
+}
+
+// Hold records the ticket of t as waiting for a human, without a run: the
+// ticket cannot be started as it is. It returns ErrBusy when the ticket has
+// a queued or running run.
+func (s *Store) Hold(t *task.Task, reason ticket.Reason) error {
+	return s.tx(func(tx *sql.Tx) error {
+		from, err := state(tx, t.Source, t.Key)
+		if err != nil {
+			return err
+		}
+		if from.Active() {
+			return ErrBusy
+		}
+		if err := s.upsert(tx, t, ms(s.now())); err != nil {
+			return err
+		}
+		return s.move(tx, t.Source, t.Key, ticket.Waiting, reason)
+	})
+}
+
 const taskColumns = `r.id, r.source, r.key, t.title, t.url, r.context, r.tracker_session, r.delivery_id, r.received_at, r.attempt,
-	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch`
+	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo`
 
 func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 	var t task.Task
 	var received int64
 	if err := row.Scan(&t.ID, &t.Source, &t.Key, &t.Title, &t.URL, &t.Context, &t.TrackerSession, &t.DeliveryID, &received, &t.Attempt,
-		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch); err != nil {
+		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo); err != nil {
 		return nil, err
 	}
 	t.Received = time.UnixMilli(received).UTC()
@@ -424,7 +453,9 @@ func (s *Store) Active() (int, error) {
 // Ticket is the stored state of one work item.
 type Ticket struct {
 	Source, Key, Title, URL string
-	State                   ticket.State
+	// Repo is the repository the ticket belongs to, if one is mapped.
+	Repo  string
+	State ticket.State
 	// Reason is set when State is ticket.Waiting.
 	Reason ticket.Reason
 	// Attempts is the number of runs that were started.
@@ -445,9 +476,9 @@ type Ticket struct {
 func (s *Store) Ticket(source, key string) (*Ticket, error) {
 	t := Ticket{Source: source, Key: key}
 	var created, updated int64
-	err := s.db.QueryRow(`SELECT title, url, state, reason, attempts, workspace, agent_session, pr_url, branch, created_at, updated_at
+	err := s.db.QueryRow(`SELECT title, url, repo, state, reason, attempts, workspace, agent_session, pr_url, branch, created_at, updated_at
 		FROM tickets WHERE source = ? AND key = ?`, source, key).
-		Scan(&t.Title, &t.URL, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
+		Scan(&t.Title, &t.URL, &t.Repo, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

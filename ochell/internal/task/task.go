@@ -17,6 +17,9 @@ type Task struct {
 	Key   string
 	Title string
 	URL   string
+	// Repo is the repository the ticket belongs to, from the repos setting.
+	// Empty when no mapping is configured.
+	Repo string
 	// Context is optional extra text from the source (e.g. Linear promptContext).
 	Context string
 	// Comment is the comment that triggered this run, when a person asked

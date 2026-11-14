@@ -46,8 +46,23 @@ type User struct {
 }
 
 type Fields struct {
-	Summary  string `json:"summary"`
-	Assignee *User  `json:"assignee"`
+	Summary    string   `json:"summary"`
+	Assignee   *User    `json:"assignee"`
+	Labels     []string `json:"labels"`
+	Components []struct {
+		Name string `json:"name"`
+	} `json:"components"`
+}
+
+// labels returns the labels and component names of the issue.
+func (f Fields) labels() []string {
+	out := append([]string{}, f.Labels...)
+	for _, c := range f.Components {
+		if c.Name != "" {
+			out = append(out, c.Name)
+		}
+	}
+	return out
 }
 
 type Issue struct {
@@ -83,6 +98,9 @@ type Ticket struct {
 	Key     string
 	Summary string
 	URL     string
+	// Labels holds the labels and component names of the issue, as far as
+	// the payload has them.
+	Labels []string
 }
 
 // BrowseURL turns the REST "self" link into the user facing issue URL.
@@ -121,6 +139,7 @@ func ParseWebhook(body []byte, botAccountID string) (*Ticket, error) {
 		Key:     ev.Issue.Key,
 		Summary: ev.Issue.Fields.Summary,
 		URL:     BrowseURL(ev.Issue.Self, ev.Issue.Key),
+		Labels:  ev.Issue.Fields.labels(),
 	}, nil
 }
 
@@ -144,8 +163,33 @@ type AutomationPayload struct {
 	URL       string `json:"url"`
 	Assignee  string `json:"assigneeAccountId"`
 	EventName string `json:"event"`
+	// Labels is optional: a list, or one text with commas, which is what
+	// the smart value {{issue.labels}} gives.
+	Labels labelList `json:"labels"`
 	// Issue is set when the rule sends "Work item data (Jira format)".
 	Issue *Issue `json:"issue"`
+}
+
+// labelList reads a JSON list of texts, or one text with commas.
+type labelList []string
+
+func (l *labelList) UnmarshalJSON(raw []byte) error {
+	var list []string
+	if err := json.Unmarshal(raw, &list); err == nil {
+		*l = list
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return errors.New("labels must be a list of texts or one text")
+	}
+	*l = nil
+	for _, part := range strings.Split(text, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			*l = append(*l, part)
+		}
+	}
+	return nil
 }
 
 // ErrNoAssignee marks an Automation payload that does not say who the ticket
@@ -161,7 +205,7 @@ func ParseAutomation(body []byte, botAccountID string) (*Ticket, error) {
 	if err := json.Unmarshal(body, &p); err != nil {
 		return nil, fmt.Errorf("decode jira automation payload: %w", err)
 	}
-	t := &Ticket{Key: p.IssueKey, Summary: p.Summary, URL: p.URL}
+	t := &Ticket{Key: p.IssueKey, Summary: p.Summary, URL: p.URL, Labels: p.Labels}
 	assignee := p.Assignee
 	if p.Issue != nil {
 		if t.Key == "" {
@@ -173,6 +217,7 @@ func ParseAutomation(body []byte, botAccountID string) (*Ticket, error) {
 		if t.URL == "" {
 			t.URL = BrowseURL(p.Issue.Self, p.Issue.Key)
 		}
+		t.Labels = append(t.Labels, p.Issue.Fields.labels()...)
 		if assignee == "" && p.Issue.Fields.Assignee != nil {
 			assignee = p.Issue.Fields.Assignee.AccountID
 		}

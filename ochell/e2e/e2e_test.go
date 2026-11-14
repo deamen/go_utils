@@ -515,6 +515,76 @@ func TestAgentSignal(t *testing.T) {
 	})
 }
 
+// The repository mapping: a ticket of a mapped project runs for its
+// repository, and a ticket that no entry matches is not started.
+func TestRepoMapping(t *testing.T) {
+	const backend, engine = "git@example.com:org/backend.git", "https://example.com/org/engine.git"
+	o := Start(t, Options{Configure: func(c *config.Config) {
+		c.Repos = []config.Repo{
+			{Source: "jira", Project: "DEV", Repo: backend},
+			{Source: "linear", Project: "ENG", Repo: engine},
+		}
+	}})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// Each mapped ticket runs, and its agent is told the repository.
+	for id, repo := range map[string]string{
+		o.JiraAssigned("DEV-30", "Mapped Jira ticket").TaskID(t):  backend,
+		o.LinearCreated("ENG-30", "session-mapped", "").TaskID(t): engine,
+	} {
+		o.WaitRun(id, 15*time.Second)
+		found := false
+		for _, rec := range o.Records() {
+			if got, _ := rec.Getenv("ORCH_TASK_ID"); got != id {
+				continue
+			}
+			found = true
+			if got, _ := rec.Getenv("ORCH_TASK_REPO"); got != repo {
+				t.Errorf("%s: ORCH_TASK_REPO = %q, want %q", id, got, repo)
+			}
+			if !strings.Contains(rec.Stdin, "The repository for this ticket is "+repo+".") {
+				t.Errorf("%s: the prompt does not name the repository:\n%s", id, rec.Stdin)
+			}
+		}
+		if !found {
+			t.Errorf("no record of run %s", id)
+		}
+	}
+	if tk, _ := st.Ticket("jira", "DEV-30"); tk == nil || tk.Repo != backend {
+		t.Errorf("stored ticket = %+v, want the repository", tk)
+	}
+
+	// A project that no entry names: nothing starts, and the ticket waits.
+	runs := len(o.Records())
+	if r := o.JiraAssigned("OPS-30", "Unmapped Jira ticket"); r.Status != 200 || r.Body != "not started: no repository is mapped to OPS-30" {
+		t.Errorf("unmapped Jira ticket: %d %q", r.Status, r.Body)
+	}
+	if r := o.LinearCreated("DOC-30", "session-unmapped", ""); r.Status != 200 || r.Body != "not started: no repository is mapped to DOC-30" {
+		t.Errorf("unmapped Linear ticket: %d %q", r.Status, r.Body)
+	}
+	for source, key := range map[string]string{"jira": "OPS-30", "linear": "DOC-30"} {
+		if tk, _ := st.Ticket(source, key); tk == nil || tk.State != "waiting" || tk.Reason != "no_repo_mapping" || tk.Attempts != 0 {
+			t.Errorf("%s %s = %+v, want waiting (no_repo_mapping) without an attempt", source, key, tk)
+		}
+	}
+	// The Linear session is told why, so it does not look unanswered.
+	acts := o.WaitActivities("session-unmapped", 1, 10*time.Second)
+	if acts[0].Type != "elicitation" || !strings.Contains(acts[0].Body, "no repository is configured") {
+		t.Errorf("the session got %+v", acts[0])
+	}
+	if !strings.Contains(o.Output(), "ticket not started: no repository is mapped to it") {
+		t.Error("the refusal is not in ochell's log")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := len(o.Records()); n != runs {
+		t.Errorf("the agent was started for an unmapped ticket: %d runs, want %d", n, runs)
+	}
+}
+
 // The run context: the prompt of a later attempt says which attempt it is,
 // whether it continues the session, what the earlier attempt left behind,
 // and which comment asked for the run.

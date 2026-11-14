@@ -29,6 +29,7 @@ import (
 	"ochell/internal/result"
 	"ochell/internal/store"
 	"ochell/internal/task"
+	"ochell/internal/ticket"
 )
 
 var (
@@ -145,6 +146,17 @@ func (r *Runner) Submit(t *task.Task) error {
 	}
 	r.wakeWorker()
 	return nil
+}
+
+// Hold records the ticket of t as waiting for a human, without starting
+// anything. It returns ErrBusy when the ticket has a queued or running task.
+func (r *Runner) Hold(t *task.Task, reason ticket.Reason) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return ErrStopped
+	}
+	return r.store.Hold(t, reason)
 }
 
 func (r *Runner) wakeWorker() {
@@ -534,6 +546,9 @@ func (r *Runner) taskEnv(t *task.Task) []string {
 		"ORCH_TASK_SOURCE=" + t.Source,
 		"ORCH_TASK_KEY=" + t.Key,
 		"ORCH_TASK_URL=" + t.URL,
+	}
+	if t.Repo != "" {
+		env = append(env, "ORCH_TASK_REPO="+t.Repo)
 	}
 	for k, v := range r.cfg.Env {
 		env = append(env, k+"="+v)

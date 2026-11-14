@@ -28,6 +28,7 @@ import (
 	"ochell/internal/source/jira"
 	"ochell/internal/source/linear"
 	"ochell/internal/task"
+	"ochell/internal/ticket"
 )
 
 const (
@@ -39,7 +40,10 @@ const (
 
 // Submitter is implemented by *runner.Runner.
 type Submitter interface {
+	// Submit queues a task.
 	Submit(*task.Task) error
+	// Hold records a ticket as waiting for a human, without a task.
+	Hold(*task.Task, ticket.Reason) error
 }
 
 // Deliveries remembers the webhook deliveries that were handled. It is
@@ -305,18 +309,39 @@ const (
 	// submitBusy: the ticket is already queued or running. The delivery
 	// was handled and must not be retried.
 	submitBusy
+	// submitHeld: the ticket cannot be started as it is, and now waits for
+	// a human. The delivery was handled.
+	submitHeld
 )
 
-// submit queues t and writes the HTTP response.
-func (s *Server) submit(w http.ResponseWriter, t *task.Task, log *slog.Logger) submitResult {
+// submit queues t and writes the HTTP response. labels are the ticket's
+// labels, for the repository mapping.
+func (s *Server) submit(w http.ResponseWriter, t *task.Task, labels []string, log *slog.Logger) submitResult {
 	if !validKey.MatchString(t.Key) {
 		log.Warn("rejecting invalid ticket key", "key", t.Key)
 		reply(w, http.StatusBadRequest, "invalid ticket key")
 		return submitFailed
 	}
-	switch err := s.runner.Submit(t); {
+	// With a repository mapping, a ticket that no entry matches is not
+	// started: nobody said where its work belongs.
+	held := false
+	if len(s.cfg.Repos) > 0 {
+		repo, ok := s.cfg.RepoFor(t.Source, t.Key, labels)
+		t.Repo, held = repo, !ok
+	}
+	var err error
+	if held {
+		err = s.runner.Hold(t, ticket.ReasonNoRepoMapping)
+	} else {
+		err = s.runner.Submit(t)
+	}
+	switch {
+	case err == nil && held:
+		log.Warn("ticket not started: no repository is mapped to it", "key", t.Key, "project", config.ProjectOf(t.Key), "labels", labels)
+		reply(w, http.StatusOK, "not started: no repository is mapped to "+t.Key)
+		return submitHeld
 	case err == nil:
-		log.Info("task queued", "task", t.ID, "key", t.Key)
+		log.Info("task queued", "task", t.ID, "key", t.Key, "repo", t.Repo)
 		reply(w, http.StatusOK, "queued "+t.ID)
 		return submitQueued
 	case errors.Is(err, runner.ErrBusy):
@@ -367,7 +392,7 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	if s.firstDelivery(w, keys, log) != deliveryNew {
 		return
 	}
-	if s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery), log) == submitFailed {
+	if s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery), t.Labels, log) == submitFailed {
 		s.forgetDelivery(keys, log)
 	}
 }
@@ -402,7 +427,7 @@ func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 	}
 	// Automation has no delivery id; the runner's per-ticket in-flight guard
 	// prevents duplicate concurrent runs.
-	s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", ""), log)
+	s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", ""), t.Labels, log)
 }
 
 func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
@@ -444,7 +469,7 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 	t.Comment = sess.Comment
 	// Linear marks a session unresponsive unless it sees an activity within
 	// ~10s of "created", so answer now rather than when the agent starts.
-	switch s.submit(w, t, log) {
+	switch s.submit(w, t, sess.Labels, log) {
 	case submitQueued:
 		s.linearActivity(sess.SessionID, linear.ActivityThought,
 			"Picked up "+sess.Key+", the digital employee is starting work.", log)
@@ -454,6 +479,9 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		// response closes the session.
 		s.linearActivity(sess.SessionID, linear.ActivityResponse,
 			sess.Key+" is already being worked on by the digital employee in an earlier session, so this request did not start a new run. The result will be posted in that session. Messages to a running agent are not supported yet.", log)
+	case submitHeld:
+		s.linearActivity(sess.SessionID, linear.ActivityElicitation,
+			"The digital employee did not start work on "+sess.Key+": no repository is configured for it. Someone who looks after the orchestrator has to add one; then delegate the issue again.", log)
 	default:
 		s.forgetDelivery(keys, log)
 	}

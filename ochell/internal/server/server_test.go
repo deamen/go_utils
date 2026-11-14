@@ -22,6 +22,7 @@ import (
 	"ochell/internal/source/linear"
 	"ochell/internal/store"
 	"ochell/internal/task"
+	"ochell/internal/ticket"
 )
 
 const bot = "712020:digital-employee"
@@ -29,7 +30,22 @@ const bot = "712020:digital-employee"
 type fakeRunner struct {
 	mu    sync.Mutex
 	tasks []*task.Task
-	err   error
+	// held are the tickets that were recorded as waiting, by key.
+	held map[string]ticket.Reason
+	err  error
+}
+
+func (f *fakeRunner) Hold(t *task.Task, reason ticket.Reason) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if f.held == nil {
+		f.held = map[string]ticket.Reason{}
+	}
+	f.held[t.Key] = reason
+	return nil
 }
 
 func (f *fakeRunner) Submit(t *task.Task) error {
@@ -400,6 +416,46 @@ func TestLinearSecondSessionOnBusyTicket(t *testing.T) {
 	case <-api.got:
 		t.Error("a retried delivery posted a second activity")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// With a repository mapping, a ticket runs for the repository of its
+// project, and a ticket that no entry matches is not started.
+func TestRepoMapping(t *testing.T) {
+	cfg := testConfig()
+	cfg.Repos = []config.Repo{
+		{Source: "jira", Project: "DEV", Label: "frontend", Repo: "git@example.com:org/web.git"},
+		{Source: "jira", Project: "DEV", Repo: "git@example.com:org/backend.git"},
+	}
+	fr := &fakeRunner{}
+	s := newServer(t, cfg, fr)
+	post := func(body string) *httptest.ResponseRecorder {
+		return do(s, "/webhooks/jira-automation", body, map[string]string{"Authorization": "Bearer auto-token"})
+	}
+
+	if w := post(`{"issueKey":"DEV-1","summary":"s"}`); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued") {
+		t.Fatalf("mapped project: %d %s", w.Code, w.Body)
+	}
+	if w := post(`{"issueKey":"DEV-2","summary":"s","labels":"urgent, Frontend"}`); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued") {
+		t.Fatalf("mapped project with a label: %d %s", w.Code, w.Body)
+	}
+	if len(fr.tasks) != 2 || fr.tasks[0].Repo != "git@example.com:org/backend.git" || fr.tasks[1].Repo != "git@example.com:org/web.git" {
+		t.Fatalf("tasks = %+v", fr.tasks)
+	}
+
+	w := post(`{"issueKey":"OPS-7","summary":"s"}`)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "not started: no repository is mapped to OPS-7") {
+		t.Errorf("unmapped project: %d %s", w.Code, w.Body)
+	}
+	if len(fr.tasks) != 2 || fr.held["OPS-7"] != ticket.ReasonNoRepoMapping {
+		t.Errorf("unmapped project: %d tasks, held %v", len(fr.tasks), fr.held)
+	}
+
+	// Without a mapping nothing is held, and a task has no repository.
+	fr = &fakeRunner{}
+	s = newServer(t, testConfig(), fr)
+	if w := post(`{"issueKey":"OPS-7","summary":"s"}`); w.Code != 200 || len(fr.tasks) != 1 || fr.tasks[0].Repo != "" || len(fr.held) != 0 {
+		t.Errorf("no mapping configured: %d %s, tasks %+v", w.Code, w.Body, fr.tasks)
 	}
 }
 

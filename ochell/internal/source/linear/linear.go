@@ -50,6 +50,10 @@ type Issue struct {
 	Identifier string `json:"identifier"`
 	Title      string `json:"title"`
 	URL        string `json:"url"`
+	// Labels is used when the payload has it.
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
 }
 
 type AgentSession struct {
@@ -98,6 +102,8 @@ type Session struct {
 	// Comment is the comment the session was started from, when the agent
 	// was mentioned in one.
 	Comment string
+	// Labels holds the labels of the issue, as far as the payload has them.
+	Labels []string
 }
 
 // Parse returns a Session for AgentSessionEvent "created" events. "prompted"
@@ -126,6 +132,11 @@ func Parse(body []byte) (*Event, *Session, error) {
 	}
 	if is := ev.AgentSession.Issue; is != nil {
 		s.Key, s.Title, s.URL = is.Identifier, is.Title, is.URL
+		for _, l := range is.Labels {
+			if l.Name != "" {
+				s.Labels = append(s.Labels, l.Name)
+			}
+		}
 	}
 	if s.Key == "" {
 		// Sessions started outside an issue (e.g. a mention in a document)
