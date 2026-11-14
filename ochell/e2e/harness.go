@@ -34,6 +34,7 @@ import (
 
 	"ochell/internal/auth"
 	"ochell/internal/config"
+	"ochell/internal/store"
 )
 
 // Secrets and ids the harness configures ochell with.
@@ -642,6 +643,22 @@ func (o *Ochell) WaitRun(taskID string, timeout time.Duration) Run {
 		run.Log, run.Footer = string(raw), m[0]
 		run.ExitCode, _ = strconv.Atoi(m[1])
 		return true
+	})
+	return run
+}
+
+// WaitStored waits until ochell has recorded the end of a run in its store,
+// and returns the stored run. The log footer that WaitRun looks for is
+// written a moment earlier, so a test that reads the store must wait here.
+func (o *Ochell) WaitStored(st *store.Store, taskID string, timeout time.Duration) *store.Run {
+	o.t.Helper()
+	var run *store.Run
+	o.waitFor(timeout, "the end of "+taskID+" to be stored", func() bool {
+		var err error
+		if run, err = st.Run(taskID); err != nil {
+			o.t.Fatal(err)
+		}
+		return run != nil && run.Status == "ended"
 	})
 	return run
 }
