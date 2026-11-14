@@ -101,6 +101,10 @@ type Ticket struct {
 	// Labels holds the labels and component names of the issue, as far as
 	// the payload has them.
 	Labels []string
+	// Actor is the accountId of the user who assigned the issue: the user
+	// of the webhook event, or the initiator of the Automation rule. Empty
+	// when the payload does not say.
+	Actor string
 }
 
 // BrowseURL turns the REST "self" link into the user facing issue URL.
@@ -140,7 +144,15 @@ func ParseWebhook(body []byte, botAccountID string) (*Ticket, error) {
 		Summary: ev.Issue.Fields.Summary,
 		URL:     BrowseURL(ev.Issue.Self, ev.Issue.Key),
 		Labels:  ev.Issue.Fields.labels(),
+		Actor:   actor(ev.User),
 	}, nil
+}
+
+func actor(u *User) string {
+	if u == nil {
+		return ""
+	}
+	return u.AccountID
 }
 
 // ParseClosed reports whether a webhook payload says that an issue was
@@ -188,6 +200,9 @@ type AutomationPayload struct {
 	URL       string `json:"url"`
 	Assignee  string `json:"assigneeAccountId"`
 	EventName string `json:"event"`
+	// Initiator is who triggered the rule: {{initiator.accountId}}. It is
+	// needed when an allowlist of assigners is configured.
+	Initiator string `json:"initiatorAccountId"`
 	// Labels is optional: a list, or one text with commas, which is what
 	// the smart value {{issue.labels}} gives.
 	Labels labelList `json:"labels"`
@@ -230,7 +245,7 @@ func ParseAutomation(body []byte, botAccountID string) (*Ticket, error) {
 	if err := json.Unmarshal(body, &p); err != nil {
 		return nil, fmt.Errorf("decode jira automation payload: %w", err)
 	}
-	t := &Ticket{Key: p.IssueKey, Summary: p.Summary, URL: p.URL, Labels: p.Labels}
+	t := &Ticket{Key: p.IssueKey, Summary: p.Summary, URL: p.URL, Labels: p.Labels, Actor: strings.TrimSpace(p.Initiator)}
 	assignee := p.Assignee
 	if p.Issue != nil {
 		if t.Key == "" {

@@ -46,6 +46,9 @@ const (
 	BotAccountID    = "712020:digital-employee"
 	// AgentToken is in the environment file of UseFakeSystemd.
 	AgentToken = "e2e-agent-token"
+	// HumanAccountID is who assigns the tickets, unless Ochell.Actor says
+	// otherwise: the Jira accountId and the Linear user id of the payloads.
+	HumanAccountID = "557058:human"
 )
 
 // RequireVM skips a test that needs the systemd launcher and its sudo
@@ -195,6 +198,9 @@ type Ochell struct {
 	Dir    string
 	Config *config.Config
 	Linear *FakeLinear
+	// Actor is the user who assigns the tickets in the payloads that are
+	// sent from now on. Empty: HumanAccountID.
+	Actor string
 
 	t         *testing.T
 	bin       string
@@ -351,6 +357,27 @@ func Start(t *testing.T, opts Options) *Ochell {
 	return o
 }
 
+func (o *Ochell) actor() string {
+	if o.Actor != "" {
+		return o.Actor
+	}
+	return HumanAccountID
+}
+
+// Admin runs an admin subcommand of ochell (pause, resume, status, reset)
+// against the running process, as an operator would, and returns what it
+// printed and its exit code.
+func (o *Ochell) Admin(args ...string) (string, int) {
+	o.t.Helper()
+	cmd := exec.Command(o.bin, append(args, "--config", o.cfgFile)...)
+	cmd.Dir = o.Dir
+	out, err := cmd.CombinedOutput()
+	if _, ok := err.(*exec.ExitError); err != nil && !ok {
+		o.t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out)), cmd.ProcessState.ExitCode()
+}
+
 // run starts the ochell process and waits until it answers on /healthz.
 func (o *Ochell) run() {
 	o.t.Helper()
@@ -500,6 +527,7 @@ func (o *Ochell) JiraAssigned(key, summary string) Response {
 		"timestamp":             time.Now().UnixMilli(),
 		"webhookEvent":          "jira:issue_updated",
 		"issue_event_type_name": "issue_assigned",
+		"user":                  map[string]string{"accountId": o.actor()},
 		"issue": map[string]any{
 			"id": "10042", "key": key,
 			"self": "https://example.atlassian.net/rest/api/2/issue/10042",
@@ -549,6 +577,7 @@ func (o *Ochell) JiraAutomation(key, summary string) Response {
 		"issueKey": key, "summary": summary,
 		"url":               "https://example.atlassian.net/browse/" + key,
 		"assigneeAccountId": BotAccountID, "event": "assigned",
+		"initiatorAccountId": o.actor(),
 	})
 	if err != nil {
 		o.t.Fatal(err)
@@ -575,7 +604,8 @@ func (o *Ochell) LinearMentioned(key, sessionID, comment string) Response {
 func (o *Ochell) linearCreated(key, sessionID, promptContext, comment string) Response {
 	o.t.Helper()
 	session := map[string]any{
-		"id": sessionID,
+		"id":      sessionID,
+		"creator": map[string]string{"id": o.actor(), "email": "human@example.com"},
 		"issue": map[string]string{
 			"id": "issue-" + key, "identifier": key, "title": "Title of " + key,
 			"url": "https://linear.app/example/issue/" + key,

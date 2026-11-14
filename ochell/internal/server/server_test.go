@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +36,8 @@ type fakeRunner struct {
 	// closed are the tickets that were reported as closed, as source:key.
 	closed []string
 	err    error
+	// submitErr is returned by Submit only.
+	submitErr error
 }
 
 func (f *fakeRunner) Closed(source, key string) error {
@@ -65,6 +68,9 @@ func (f *fakeRunner) Submit(t *task.Task) error {
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
+	}
+	if f.submitErr != nil {
+		return f.submitErr
 	}
 	f.tasks = append(f.tasks, t)
 	return nil
@@ -468,6 +474,97 @@ func TestRepoMapping(t *testing.T) {
 	s = newServer(t, testConfig(), fr)
 	if w := post(`{"issueKey":"OPS-7","summary":"s"}`); w.Code != 200 || len(fr.tasks) != 1 || fr.tasks[0].Repo != "" || len(fr.held) != 0 {
 		t.Errorf("no mapping configured: %d %s, tasks %+v", w.Code, w.Body, fr.tasks)
+	}
+}
+
+// With an allowlist, only the people on it can assign work.
+func TestAssignerAllowlist(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sources.JiraWebhook.AllowedAssigners = []string{"557058:human"}
+	cfg.Sources.JiraAutomation.AllowedAssigners = []string{"557058:human"}
+	cfg.Sources.Linear.AllowedAssigners = []string{"user-1", "boss@example.com"}
+	fr := &fakeRunner{}
+	s := newServer(t, cfg, fr)
+	auto := func(body string) *httptest.ResponseRecorder {
+		return do(s, "/webhooks/jira-automation", body, map[string]string{"Authorization": "Bearer auto-token"})
+	}
+
+	if w := auto(`{"issueKey":"DEV-1","initiatorAccountId":"557058:human"}`); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued") {
+		t.Errorf("allowed initiator: %d %s", w.Code, w.Body)
+	}
+	if w := auto(`{"issueKey":"DEV-2","initiatorAccountId":"557058:stranger"}`); w.Code != 403 {
+		t.Errorf("initiator not on the list: %d %s", w.Code, w.Body)
+	}
+	// A rule that does not say who triggered it cannot be checked.
+	if w := auto(`{"issueKey":"DEV-3"}`); w.Code != 400 || !strings.Contains(w.Body.String(), "initiatorAccountId") {
+		t.Errorf("no initiator: %d %s", w.Code, w.Body)
+	}
+
+	hook := func(user string) *httptest.ResponseRecorder {
+		body := strings.Replace(jiraBody(t, time.Now()), `"accountId": "557058:human-reporter"`, `"accountId": "`+user+`"`, 1)
+		if !strings.Contains(body, user) {
+			t.Fatal("testdata/jira-issue-assigned.json: the user of the event changed")
+		}
+		return do(s, "/webhooks/jira", body, map[string]string{"X-Hub-Signature": "sha256=" + auth.SignHex("jira-secret", []byte(body))})
+	}
+	if w := hook("557058:stranger"); w.Code != 403 {
+		t.Errorf("webhook from a stranger: %d %s", w.Code, w.Body)
+	}
+	if w := hook("557058:human"); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued") {
+		t.Errorf("webhook from an allowed user: %d %s", w.Code, w.Body)
+	}
+
+	linearFrom := func(key, creator string) *httptest.ResponseRecorder {
+		body := `{"type":"AgentSessionEvent","action":"created","webhookTimestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10) +
+			`,"agentSession":{"id":"s-` + key + `","issue":{"identifier":"` + key + `"},` + creator + `}}`
+		return do(s, "/webhooks/linear", body, map[string]string{"Linear-Signature": auth.SignHex("linear-secret", []byte(body))})
+	}
+	for key, creator := range map[string]string{
+		"ENG-1": `"creator":{"id":"user-1"}`,
+		"ENG-2": `"creatorId":"user-1"`,
+		"ENG-3": `"creator":{"id":"user-9","email":"Boss@example.com"}`,
+	} {
+		if w := linearFrom(key, creator); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued") {
+			t.Errorf("%s from an allowed user (%s): %d %s", key, creator, w.Code, w.Body)
+		}
+	}
+	for key, creator := range map[string]string{
+		"ENG-4": `"creator":{"id":"user-9","email":"intern@example.com"}`,
+		"ENG-5": `"comment":null`, // the payload does not say who it was
+	} {
+		if w := linearFrom(key, creator); w.Code != 200 || !strings.Contains(w.Body.String(), "not allowed") {
+			t.Errorf("%s from someone else (%s): %d %s", key, creator, w.Code, w.Body)
+		}
+	}
+	keys := []string{}
+	for _, tk := range fr.tasks {
+		keys = append(keys, tk.Key)
+	}
+	slices.Sort(keys)
+	if got := strings.Join(keys, ","); got != "DEV-1,DEV-42,ENG-1,ENG-2,ENG-3" {
+		t.Errorf("queued tickets = %s", got)
+	}
+
+	// Without an allowlist nobody is asked who they are.
+	fr = &fakeRunner{}
+	s = newServer(t, testConfig(), fr)
+	if w := do(s, "/webhooks/jira-automation", `{"issueKey":"DEV-9"}`, map[string]string{"Authorization": "Bearer auto-token"}); w.Code != 200 || len(fr.tasks) != 1 {
+		t.Errorf("no allowlist: %d %s", w.Code, w.Body)
+	}
+}
+
+// A ticket that has used up its attempts is held, not queued.
+func TestAttemptCap(t *testing.T) {
+	fr := &fakeRunner{submitErr: runner.ErrAttempts}
+	cfg := testConfig()
+	cfg.Agent.MaxAttempts = 3
+	s := newServer(t, cfg, fr)
+	w := do(s, "/webhooks/jira-automation", `{"issueKey":"DEV-1"}`, map[string]string{"Authorization": "Bearer auto-token"})
+	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != "not started: DEV-1 has used its 3 attempts" {
+		t.Errorf("capped ticket: %d %s", w.Code, w.Body)
+	}
+	if fr.held["DEV-1"] != ticket.ReasonEscalation {
+		t.Errorf("held = %v, want DEV-1 waiting for an escalation", fr.held)
 	}
 }
 

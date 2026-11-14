@@ -3,5 +3,7 @@
   "summary": "{{issue.summary.jsonEncode}}",
   "url": "{{issue.url}}",
   "assigneeAccountId": "{{issue.assignee.accountId}}",
+  "initiatorAccountId": "{{initiator.accountId}}",
+  "labels": "{{issue.labels}}",
   "event": "assigned"
 }

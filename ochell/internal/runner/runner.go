@@ -35,6 +35,7 @@ import (
 var (
 	ErrBusy      = store.ErrBusy
 	ErrQueueFull = store.ErrQueueFull
+	ErrAttempts  = store.ErrAttempts
 	ErrStopped   = errors.New("runner is stopped")
 )
 
@@ -138,18 +139,65 @@ func render(t *template.Template, data any) (string, error) {
 }
 
 // Submit queues a task. It never blocks. It returns ErrBusy when the ticket
-// already has a queued or running task, and ErrQueueFull when queue_size
-// tasks are waiting.
+// already has a queued or running task, ErrAttempts when the ticket has had
+// max_attempts runs, and ErrQueueFull when queue_size tasks are waiting.
 func (r *Runner) Submit(t *task.Task) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopped {
 		return ErrStopped
 	}
-	if err := r.store.Enqueue(t, max(r.cfg.QueueSize, 1)); err != nil {
+	if err := r.store.Enqueue(t, store.Limits{MaxQueued: max(r.cfg.QueueSize, 1), MaxAttempts: r.cfg.MaxAttempts}); err != nil {
 		return err
 	}
 	r.wakeWorker()
+	return nil
+}
+
+// Pause holds the queue: no new run starts until Resume. Running agents go
+// on, and webhooks are still accepted and queued. The flag is in the store,
+// so it is kept across a restart.
+func (r *Runner) Pause() error {
+	if err := r.store.SetPaused(true); err != nil {
+		return err
+	}
+	r.log.Warn("paused: no new run starts until ochell is resumed")
+	return nil
+}
+
+// Resume ends a pause.
+func (r *Runner) Resume() error {
+	if err := r.store.SetPaused(false); err != nil {
+		return err
+	}
+	r.log.Info("resumed")
+	r.wakeWorker()
+	return nil
+}
+
+// Status is what ochell is doing right now.
+type Status struct {
+	Paused  bool `json:"paused"`
+	Queued  int  `json:"queued"`
+	Running int  `json:"running"`
+}
+
+func (r *Runner) Status() (Status, error) {
+	var st Status
+	var err error
+	if st.Paused, err = r.store.Paused(); err != nil {
+		return st, err
+	}
+	st.Queued, st.Running, err = r.store.Counts()
+	return st, err
+}
+
+// ResetAttempts lets a ticket that used up its attempts be started again.
+func (r *Runner) ResetAttempts(source, key string) error {
+	if err := r.store.ResetAttempts(source, key); err != nil {
+		return err
+	}
+	r.log.Info("attempts reset", "source", source, "key", key)
 	return nil
 }
 
@@ -200,6 +248,9 @@ func (r *Runner) Start() error {
 	}
 	if n, err := r.store.Active(); err == nil && n > 0 {
 		r.log.Info("tasks queued before the restart will be run", "tasks", n)
+	}
+	if held, err := r.store.Paused(); err == nil && held {
+		r.log.Warn("ochell is paused: no run starts until it is resumed (ochell resume)")
 	}
 
 	n := max(r.cfg.MaxConcurrent, 1)

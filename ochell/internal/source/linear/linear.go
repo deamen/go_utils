@@ -64,6 +64,12 @@ type AgentSession struct {
 		ID   string `json:"id"`
 		Body string `json:"body"`
 	} `json:"comment"`
+	// Creator is the user who delegated the issue or mentioned the agent.
+	CreatorID string `json:"creatorId"`
+	Creator   *struct {
+		ID    string `json:"id"`
+		Email string `json:"email"`
+	} `json:"creator"`
 }
 
 type AgentActivity struct {
@@ -111,6 +117,10 @@ type Session struct {
 	Comment string
 	// Labels holds the labels of the issue, as far as the payload has them.
 	Labels []string
+	// Actor and ActorEmail identify the user who started the session, as
+	// far as the payload has them.
+	Actor      string
+	ActorEmail string
 }
 
 // Parse returns a Session for AgentSessionEvent "created" events. "prompted"
@@ -136,6 +146,13 @@ func Parse(body []byte) (*Event, *Session, error) {
 	}
 	if c := ev.AgentSession.Comment; c != nil {
 		s.Comment = c.Body
+	}
+	s.Actor = ev.AgentSession.CreatorID
+	if c := ev.AgentSession.Creator; c != nil {
+		if c.ID != "" {
+			s.Actor = c.ID
+		}
+		s.ActorEmail = c.Email
 	}
 	if is := ev.AgentSession.Issue; is != nil {
 		s.Key, s.Title, s.URL = is.Identifier, is.Title, is.URL

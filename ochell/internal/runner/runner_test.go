@@ -511,7 +511,7 @@ func TestStartClosesInterruptedRuns(t *testing.T) {
 	cfg := agentCfg(t, "echo")
 	path := filepath.Join(t.TempDir(), "ochell.db")
 	st := openStore(t, path)
-	if err := st.Enqueue(newTask(), 0); err != nil {
+	if err := st.Enqueue(newTask(), store.Limits{}); err != nil {
 		t.Fatal(err)
 	}
 	if tk, err := st.Claim(); err != nil || tk == nil {

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"text/template"
@@ -315,7 +316,25 @@ const (
 	// submitHeld: the ticket cannot be started as it is, and now waits for
 	// a human. The delivery was handled.
 	submitHeld
+	// submitCapped: the ticket has used up its attempts, and now waits for
+	// a human. The delivery was handled.
+	submitCapped
 )
+
+// mayAssign reports whether one of ids, the ways a payload names the person
+// who assigned the work, is on the allowlist. An empty allowlist allows
+// everyone.
+func mayAssign(allowed []string, ids ...string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, id := range ids {
+		if id != "" && slices.ContainsFunc(allowed, func(a string) bool { return strings.EqualFold(a, id) }) {
+			return true
+		}
+	}
+	return false
+}
 
 // submit queues t and writes the HTTP response. labels are the ticket's
 // labels, for the repository mapping.
@@ -337,6 +356,15 @@ func (s *Server) submit(w http.ResponseWriter, t *task.Task, labels []string, lo
 		err = s.runner.Hold(t, ticket.ReasonNoRepoMapping)
 	} else {
 		err = s.runner.Submit(t)
+	}
+	// A ticket that has used up its attempts is not started again by
+	// anything: it waits until a human looks at it and resets it.
+	if errors.Is(err, runner.ErrAttempts) {
+		if err = s.runner.Hold(t, ticket.ReasonEscalation); err == nil {
+			log.Warn("ticket not started: it has used up its attempts", "key", t.Key, "max_attempts", s.cfg.Agent.MaxAttempts)
+			reply(w, http.StatusOK, fmt.Sprintf("not started: %s has used its %d attempts", t.Key, s.cfg.Agent.MaxAttempts))
+			return submitCapped
+		}
 	}
 	switch {
 	case err == nil && held:
@@ -418,6 +446,11 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusBadRequest, "bad payload")
 		return
 	}
+	if !mayAssign(cfg.AllowedAssigners, t.Actor) {
+		log.Warn("rejected: the assigner is not on the allowlist", "key", t.Key, "assigner", t.Actor)
+		reply(w, http.StatusForbidden, "the assigner is not allowed to assign work")
+		return
+	}
 	keys := deliveryKeys("jira", delivery, body)
 	if s.firstDelivery(w, keys, log) != deliveryNew {
 		return
@@ -453,6 +486,16 @@ func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Warn("bad payload", "err", err)
 		reply(w, http.StatusBadRequest, "bad payload")
+		return
+	}
+	if len(cfg.AllowedAssigners) > 0 && t.Actor == "" {
+		log.Warn("rejected: the payload does not say who triggered the rule; check the rule's request body", "key", t.Key)
+		reply(w, http.StatusBadRequest, "no initiator in the payload: send initiatorAccountId")
+		return
+	}
+	if !mayAssign(cfg.AllowedAssigners, t.Actor) {
+		log.Warn("rejected: the assigner is not on the allowlist", "key", t.Key, "assigner", t.Actor)
+		reply(w, http.StatusForbidden, "the assigner is not allowed to assign work")
 		return
 	}
 	// Automation has no delivery id; the runner's per-ticket in-flight guard
@@ -498,6 +541,15 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 	if s.firstDelivery(w, keys, log) != deliveryNew {
 		return
 	}
+	if !mayAssign(cfg.AllowedAssigners, sess.Actor, sess.ActorEmail) {
+		// The delivery stays handled, and the session gets an answer: it
+		// must not look unanswered, and a retry must not post twice.
+		log.Warn("rejected: the assigner is not on the allowlist", "key", sess.Key, "assigner", sess.Actor, "email", sess.ActorEmail)
+		s.linearActivity(sess.SessionID, linear.ActivityError,
+			"The digital employee did not start work on "+sess.Key+": you are not on the list of people who may delegate work to it.", log)
+		reply(w, http.StatusOK, "the assigner is not allowed to assign work")
+		return
+	}
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, sess.Context, delivery)
 	t.TrackerSession = sess.SessionID
 	t.Comment = sess.Comment
@@ -513,6 +565,9 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		// response closes the session.
 		s.linearActivity(sess.SessionID, linear.ActivityResponse,
 			sess.Key+" is already being worked on by the digital employee in an earlier session, so this request did not start a new run. The result will be posted in that session. Messages to a running agent are not supported yet.", log)
+	case submitCapped:
+		s.linearActivity(sess.SessionID, linear.ActivityElicitation,
+			fmt.Sprintf("The digital employee did not start work on %s: the issue has used its %d attempts. Someone who looks after the orchestrator has to look at it and reset it (ochell reset linear %s); then delegate the issue again.", sess.Key, s.cfg.Agent.MaxAttempts, sess.Key), log)
 	case submitHeld:
 		s.linearActivity(sess.SessionID, linear.ActivityElicitation,
 			"The digital employee did not start work on "+sess.Key+": no repository is configured for it. Someone who looks after the orchestrator has to add one; then delegate the issue again.", log)

@@ -64,8 +64,11 @@ type Agent struct {
 	Env           map[string]string `yaml:"env"`
 	Timeout       time.Duration     `yaml:"timeout"`
 	MaxConcurrent int               `yaml:"max_concurrent"`
-	QueueSize     int               `yaml:"queue_size"`
-	LogDir        string            `yaml:"log_dir"`
+	// MaxAttempts is how many runs one ticket may have. A ticket that
+	// reaches it is not started again until someone resets it. 0: no limit.
+	MaxAttempts int    `yaml:"max_attempts"`
+	QueueSize   int    `yaml:"queue_size"`
+	LogDir      string `yaml:"log_dir"`
 	// RunDir holds one directory per run, where the agent leaves its
 	// result file for ochell. The agent must be able to write there and
 	// ochell to read; it must not be inside a working directory.
@@ -85,6 +88,9 @@ type JiraWebhook struct {
 	Path         string `yaml:"path"`
 	Secret       string `yaml:"secret"`
 	BotAccountID string `yaml:"bot_account_id"`
+	// AllowedAssigners, when not empty, are the Jira accountIds of the
+	// people who may assign work: the user who made the change.
+	AllowedAssigners []string `yaml:"allowed_assigners"`
 	// MaxSkew is how far the payload's timestamp may be from now. Jira
 	// retries a failed delivery up to five times, 5 to 15 minutes apart, and
 	// a retry may carry the timestamp of the event, so this must cover those
@@ -100,6 +106,10 @@ type JiraAutomation struct {
 	Header       string `yaml:"header"`
 	Token        string `yaml:"token"`
 	BotAccountID string `yaml:"bot_account_id"`
+	// AllowedAssigners, when not empty, are the Jira accountIds of the
+	// people who may assign work. The rule must then send who triggered it
+	// as initiatorAccountId.
+	AllowedAssigners []string `yaml:"allowed_assigners"`
 }
 
 type Linear struct {
@@ -113,6 +123,9 @@ type Linear struct {
 	RedirectURL  string `yaml:"redirect_url"`
 	CallbackPath string `yaml:"callback_path"`
 	TokenFile    string `yaml:"token_file"`
+	// AllowedAssigners, when not empty, are the Linear user ids or email
+	// addresses of the people who may delegate work.
+	AllowedAssigners []string `yaml:"allowed_assigners"`
 	// Optional: only accept an OAuth install for this workspace.
 	OrganizationID string `yaml:"organization_id"`
 	// Optional: link shown on the agent session, templated with the task.
@@ -219,10 +232,19 @@ func (h Hooks) All() []struct {
 	}
 }
 
+// Admin configures the local admin channel.
+type Admin struct {
+	// Socket is the unix socket on which a running ochell takes commands
+	// (ochell pause, resume, status, reset). Only ochell's own OS user can
+	// open it. Empty: no admin channel.
+	Socket string `yaml:"socket"`
+}
+
 type Config struct {
 	LogLevel string   `yaml:"log_level"`
 	HTTP     Listener `yaml:"http"`
 	HTTPS    Listener `yaml:"https"`
+	Admin    Admin    `yaml:"admin"`
 	Store    Store    `yaml:"store"`
 	// Repos says which repository a ticket belongs to. The first entry
 	// that matches wins. When the list is not empty, a ticket that no
@@ -296,6 +318,7 @@ func Default() *Config {
 		LogLevel:  "info",
 		HTTP:      Listener{Enabled: true, Address: "0.0.0.0", Port: 8080},
 		HTTPS:     Listener{Enabled: false, Address: "0.0.0.0", Port: 8443},
+		Admin:     Admin{Socket: "ochell.sock"},
 		Store:     Store{Path: "ochell.db"},
 		Workspace: Workspace{Branch: "bot/{{.Key}}", HookTimeout: 10 * time.Minute},
 		Agent: Agent{
@@ -315,6 +338,7 @@ func Default() *Config {
 			EnvPass:       append([]string(nil), DefaultEnvPass...),
 			Timeout:       2 * time.Hour,
 			MaxConcurrent: 1,
+			MaxAttempts:   5,
 			QueueSize:     100,
 			LogDir:        "logs",
 			RunDir:        "runs",
@@ -438,6 +462,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.HTTPS.CertFile, "tls-cert", c.HTTPS.CertFile, "TLS certificate file (PEM)")
 	fs.StringVar(&c.HTTPS.KeyFile, "tls-key", c.HTTPS.KeyFile, "TLS private key file (PEM)")
 
+	fs.StringVar(&c.Admin.Socket, "admin-socket", c.Admin.Socket, "unix socket of the admin channel (ochell pause, resume, status, reset)")
 	fs.StringVar(&c.Store.Path, "store-path", c.Store.Path, "file that holds the tickets, the task queue and the handled deliveries")
 
 	fs.StringVar(&c.Agent.Command, "agent-cmd", c.Agent.Command, "agent CLI command")
@@ -451,6 +476,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.DurationVar(&c.Agent.StopGrace, "agent-stop-grace", c.Agent.StopGrace, "time between SIGTERM and SIGKILL when an agent is stopped")
 	fs.DurationVar(&c.Agent.DrainTimeout, "agent-drain-timeout", c.Agent.DrainTimeout, "how long a shutdown waits for running agents before it stops them")
 	fs.IntVar(&c.Agent.MaxConcurrent, "agent-max-concurrent", c.Agent.MaxConcurrent, "maximum concurrent agent runs")
+	fs.IntVar(&c.Agent.MaxAttempts, "agent-max-attempts", c.Agent.MaxAttempts, "maximum number of runs of one ticket (0: no limit)")
 	fs.StringVar(&c.Agent.LogDir, "agent-log-dir", c.Agent.LogDir, "directory for per-task agent logs")
 	fs.StringVar(&c.Agent.RunDir, "agent-run-dir", c.Agent.RunDir, "directory where each run leaves its result file for ochell")
 
@@ -623,6 +649,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Agent.MaxConcurrent < 1 {
 		errs = append(errs, errors.New("agent.max_concurrent must be >= 1"))
+	}
+	if c.Agent.MaxAttempts < 0 {
+		errs = append(errs, errors.New("agent.max_attempts must not be negative"))
 	}
 
 	s := c.Sources

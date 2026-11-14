@@ -17,6 +17,12 @@ https:
   cert_file: /etc/ochell/tls.crt
   key_file: /etc/ochell/tls.key
 
+# The admin channel: a unix socket on which the running ochell takes the
+# commands "ochell pause", "resume", "status" and "reset". Only ochell's own
+# OS user can open it. Keep it where the agent cannot write.
+admin:
+  socket: /run/ochell/admin.sock
+
 # The SQLite file with the tickets, the task queue and the handled webhook
 # deliveries. It is created when missing. Keep it where the agent cannot
 # read it.
@@ -131,6 +137,10 @@ agent:
     CI: "true"
   timeout: 2h
   max_concurrent: 1
+  # How many runs one ticket may have (0: no limit). A ticket that has used
+  # them up waits for a human; "ochell reset <jira|linear> <KEY>" sets the
+  # count back.
+  max_attempts: 5
   queue_size: 100
   log_dir: /var/log/ochell
 
@@ -142,6 +152,9 @@ sources:
     path: /webhooks/jira
     secret: ${JIRA_WEBHOOK_SECRET}
     bot_account_id: "712020:00000000-0000-0000-0000-000000000000"
+    # Optional: the Jira accountIds of the people who may assign work. An
+    # assignment by anyone else is rejected with 403. Empty: everyone.
+    allowed_assigners: []
     # A payload whose "timestamp" is further than this from now is rejected,
     # so a captured request cannot be replayed later. Jira retries a failed
     # delivery up to five times, 5 to 15 minutes apart, and a retry may carry
@@ -158,6 +171,9 @@ sources:
     # assignee is ignored, no assignee is rejected with 400. Leave it out
     # only if the rule's own condition is all you want to rely on.
     bot_account_id: "712020:00000000-0000-0000-0000-000000000000"
+    # Optional, as above. The rule's body must then carry who triggered it:
+    # "initiatorAccountId": "{{initiator.accountId}}".
+    allowed_assigners: []
 
   # Linear agent app (OAuth app installed with actor=app).
   linear:
@@ -170,6 +186,9 @@ sources:
     redirect_url: https://example.ngrok-free.app/oauth/linear/callback
     callback_path: /oauth/linear/callback
     token_file: /var/lib/ochell/linear-token.json
+    # Optional: the Linear user ids or email addresses of the people who may
+    # delegate work. Empty: everyone.
+    allowed_assigners: []
     organization_id: ""     # optional: only accept installs into this workspace
     external_url: ""        # optional: e.g. https://runs.example.com/{{.ID}}
 
