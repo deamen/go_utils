@@ -24,7 +24,7 @@ Behaviour common to all sources:
   - 400 when the payload is unusable, for example a Jira Automation request that names no assignee;
 - **Duplicate deliveries:** a signed request is dropped when its body, or its `X-Atlassian-Webhook-Identifier` / `Linear-Delivery` id, was seen before. The body counts because the signature covers it; the id is a header that a replayed request can change. Both are kept in the store for 24 hours, also across a restart.
 - **Replay:** a signed request is rejected with 401 when its timestamp (`timestamp` for Jira, `webhookTimestamp` for Linear) is further than `max_skew` from now. The default is 60s for Linear and 2h for Jira: Jira retries a failed delivery up to five times, 5 to 15 minutes apart, and a retry may carry the timestamp of the event. Jira Automation requests carry no timestamp.
-- **One run per ticket:** a ticket that is already queued or running is not started again. The request is answered with 200 `already in progress`. A new Linear session on such a ticket gets a `response` activity that says so, which closes that session; the result is posted in the first session.
+- **One run per ticket:** a ticket that is already queued or running is not started again. A second assignment is answered with 200 `already in progress`. A new Linear session on such a ticket that brings no message gets a `response` activity that says so, which closes that session; the result is posted in the first session. A message to a busy ticket is kept for its next run (see *Messages during a run* below).
 - **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the run ends it posts what the agent reported in its result file (see [The result file](#the-result-file)): a `response` for finished work, an `elicitation` for anything that needs a human. A run that failed, timed out or was stopped gets an `error`.
 - **Jira ticket updates:** with the Jira API configured (see [Jira API access](#jira-api-access)), ochell comments on a Jira ticket when a run starts, and again when it ends, with the same text a Linear session gets: the agent's message and its pull request, its question, or why the run failed. A ticket that was accepted but not started (no repository, attempts used up) gets a comment that says so. With `review_status` the ticket is also moved to that status when the agent reports its work as done. Without the API a Jira ticket gets no answer.
 - **Jira follow-ups:** a comment that a person writes on a Jira ticket starts a new run of the ticket with that comment, for example the answer to a question the agent asked, or a remark of the reviewer. It needs the *Comment created* event on the system webhook (see [Jira system webhook](#jira-system-webhook-recommended)).
@@ -32,14 +32,21 @@ Behaviour common to all sources:
   - **Comments by the bot account are ignored** (`bot_account_id`). That covers what ochell writes itself and what the agent writes with its ticket tool, so the agent cannot wake itself up. This is why ochell's API token and the agent's `twg` must use the same Jira account.
   - **Only tickets that ochell holds:** a ticket it has worked on that waits for a human, is in review, or failed. A comment on a ticket that ochell never worked on, that is done or that was released is ignored: people talk to each other there. A comment on a ticket whose issue is assigned to someone else is ignored as well.
   - **Every comment of a person on such a ticket starts a run,** also one that was meant for a colleague. Jira has no way to address the agent only.
-  - A comment that arrives while the agent is running is not delivered yet.
+  - A comment that arrives while the ticket has a run is kept (see below).
   - Who wrote the comment is checked against `allowed_assigners`.
   - **Jira Automation stays a start-only trigger.** It cannot sign requests and has no delivery id, so follow-ups work with the system webhook only.
   - A comment whose first line is `/stop` starts nothing; stopping a run from the ticket is not handled yet.
+- **Messages during a run:** a comment or reply that arrives while a ticket has a queued or running run is kept in the store, and **delivered with the ticket's next run**, which ochell queues itself as soon as the current one has ended. Several messages are delivered together, oldest first, each in its own `<comment>` block of the run context.
+  - The run that was going ends as it would have: its result is posted, and then the next run starts.
+  - A Linear session is told that the message is queued. A Jira ticket is not, so that ochell does not answer every comment; the webhook is answered with `queued for the next run`.
+  - The next run reports to the Linear session that the last message came in.
+  - A new Linear session on a busy ticket that comes with a message (the agent was mentioned in a comment) is treated the same way. One without a message is told that the ticket is already being worked on, as before.
+  - A run that ochell starts again by itself (a retry, a run after a restart) takes the waiting messages along.
+  - At most 50 messages wait per ticket; a further one is answered with 503.
 - **Linear follow-ups:** a reply in a Linear agent session (the `prompted` event) starts a new run of the ticket with that message, for example the answer to a question the agent asked.
   - The run continues the **same agent session** as the ticket's earlier run when the adapter has sessions (`claude`), in the same working directory. The message is in the run context of the prompt, marked as a message from a person that does not change what the agent may do.
   - The session gets a `thought` at once, and the result of the run when it ends, like a first run.
-  - A message that arrives while the agent is running is not delivered yet: the session is told to send it again later.
+  - A message that arrives while the ticket has a run is kept (see below), and the session is told so.
   - A reply in a session of a ticket that ochell has never worked on is taken as a new assignment.
   - Who wrote the reply is checked against `allowed_assigners`, like an assignment. Whether the payload names the author of a prompt was not checked against Linear; without one, the creator of the session counts.
   - The `stop` signal is not handled yet.

@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -134,6 +135,18 @@ var migrations = []string{
 	// attempt cap counts from there.
 	`ALTER TABLE tickets ADD COLUMN attempts_base INTEGER NOT NULL DEFAULT 0;
 	CREATE INDEX runs_by_session ON runs (source, tracker_session);`,
+
+	// Version 12: messages from people that arrived while the ticket had a
+	// run. They are delivered with the ticket's next run.
+	`CREATE TABLE followups (
+		id              INTEGER PRIMARY KEY AUTOINCREMENT,
+		source          TEXT NOT NULL,
+		key             TEXT NOT NULL,
+		body            TEXT NOT NULL,
+		tracker_session TEXT NOT NULL DEFAULT '',
+		received_at     INTEGER NOT NULL
+	);
+	CREATE INDEX followups_by_ticket ON followups (source, key, id);`,
 }
 
 // Store is safe for concurrent use.
@@ -334,10 +347,15 @@ func (s *Store) Enqueue(t *task.Task, lim Limits) error {
 // while ochell holds the ticket open; for a ticket that is done or was
 // released (cancelled), FollowUp then returns ErrReleased.
 //
-// It returns ErrUnknown for a ticket that ochell has never seen, ErrBusy
-// when the ticket has a queued or running run, and ErrQueueFull.
-func (s *Store) FollowUp(t *task.Task, addressed bool, lim Limits) error {
-	return s.tx(func(tx *sql.Tx) error {
+// A ticket that has a queued or running run takes no second one. The
+// message is then kept, and delivered with the run that follows the current
+// one (Finish queues it): later is true, and t itself is not queued.
+//
+// It returns ErrUnknown for a ticket that ochell has never seen, and
+// ErrQueueFull when the queue, or the list of messages that wait for this
+// ticket, is full.
+func (s *Store) FollowUp(t *task.Task, addressed bool, lim Limits) (later bool, err error) {
+	err = s.tx(func(tx *sql.Tx) error {
 		from, err := state(tx, t.Source, t.Key)
 		if err != nil {
 			return err
@@ -346,7 +364,17 @@ func (s *Store) FollowUp(t *task.Task, addressed bool, lim Limits) error {
 		case from == ticket.None:
 			return ErrUnknown
 		case from.Active():
-			return ErrBusy
+			var n int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM followups WHERE source = ? AND key = ?`, t.Source, t.Key).Scan(&n); err != nil {
+				return err
+			}
+			if n >= maxWaitingMessages {
+				return ErrQueueFull
+			}
+			later = true
+			_, err := tx.Exec(`INSERT INTO followups (source, key, body, tracker_session, received_at) VALUES (?, ?, ?, ?, ?)`,
+				t.Source, t.Key, t.Comment, t.TrackerSession, ms(t.Received))
+			return err
 		case !addressed && (from == ticket.Done || from == ticket.Cancelled):
 			return ErrReleased
 		}
@@ -366,6 +394,44 @@ func (s *Store) FollowUp(t *task.Task, addressed bool, lim Limits) error {
 		}
 		return insertRun(tx, t)
 	})
+	return later, err
+}
+
+// maxWaitingMessages is how many messages may wait for the next run of one
+// ticket.
+const maxWaitingMessages = 50
+
+// takeFollowUps removes and returns the messages that wait for the next
+// run of a ticket, oldest first, and the tracker session of the last one
+// that names one.
+func takeFollowUps(tx *sql.Tx, source, key string) (bodies []string, session string, err error) {
+	rows, err := tx.Query(`SELECT body, tracker_session FROM followups WHERE source = ? AND key = ? ORDER BY id`, source, key)
+	if err != nil {
+		return nil, "", err
+	}
+	for rows.Next() {
+		var body, sess string
+		if err := rows.Scan(&body, &sess); err != nil {
+			rows.Close()
+			return nil, "", err
+		}
+		bodies = append(bodies, body)
+		if sess != "" {
+			session = sess
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, "", err
+	}
+	_, err = tx.Exec(`DELETE FROM followups WHERE source = ? AND key = ?`, source, key)
+	return bodies, session, err
+}
+
+// Waiting returns how many messages wait for the next run of a ticket.
+func (s *Store) Waiting(source, key string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM followups WHERE source = ? AND key = ?`, source, key).Scan(&n)
+	return n, err
 }
 
 // TicketOfSession returns the key of the ticket whose run reported to this
@@ -519,11 +585,12 @@ func (s *Store) Claim() (*task.Task, error) {
 
 // Finish records how a run ended, and moves the ticket to the state that
 // follows from it (ticket.AfterRun). The ticket is then free for a new run.
+//
+// When messages from people arrived during the run (FollowUp), the ticket
+// is queued again instead, with a run that delivers them.
 func (s *Store) Finish(id string, res task.Result) error {
-	return s.tx(func(tx *sql.Tx) error {
-		_, err := s.finish(tx, id, res, nil)
-		return err
-	})
+	_, err := s.FinishAndQueue(id, res, nil)
+	return err
 }
 
 // Again describes the run that takes the place of one that has ended.
@@ -537,51 +604,103 @@ type Again struct {
 	MaxAttempts int
 }
 
-// FinishAndQueue records how a run ended, like Finish, and queues another
-// run of the same ticket in its place: the ticket goes back to queued. The
-// new run has the context, the comment and the tracker session of the one
-// that ended.
+// FinishAndQueue records how a run ended, like Finish. With again it also
+// queues another run of the same ticket in its place: the ticket goes back
+// to queued. The new run has the context, the comment and the tracker
+// session of the one that ended.
 //
-// When the ticket has used up its attempts, nothing is queued, the ticket
-// moves as Finish would move it, and queued is false.
-func (s *Store) FinishAndQueue(id string, res task.Result, again Again) (queued bool, err error) {
+// next says why the ticket was queued again, and is empty when it was not:
+//   - again.Cause, when the run asked for with again was queued;
+//   - task.CauseFollowUp, when again is nil or the ticket has used up its
+//     attempts, and messages from people arrived during the run. The new
+//     run delivers them, oldest first.
+//
+// Messages that arrived during the run are delivered with the new run in
+// either case, and the ticket's attempts then count from there.
+func (s *Store) FinishAndQueue(id string, res task.Result, again *Again) (next task.Cause, err error) {
 	err = s.tx(func(tx *sql.Tx) error {
-		queued, err = s.finish(tx, id, res, &again)
+		next, err = s.finish(tx, id, res, again)
 		return err
 	})
-	return queued, err
+	return next, err
 }
 
-func (s *Store) finish(tx *sql.Tx, id string, res task.Result, again *Again) (queued bool, err error) {
+func (s *Store) finish(tx *sql.Tx, id string, res task.Result, again *Again) (next task.Cause, err error) {
 	if err := s.end(tx, id, res); err != nil {
-		return false, err
+		return "", err
 	}
-	var source, key string
-	if err := tx.QueryRow(`SELECT source, key FROM runs WHERE id = ?`, id).Scan(&source, &key); err != nil {
-		return false, err
+	var source, key, comment, session string
+	if err := tx.QueryRow(`SELECT source, key, comment, tracker_session FROM runs WHERE id = ?`, id).Scan(&source, &key, &comment, &session); err != nil {
+		return "", err
 	}
-	left := again != nil
-	if left {
-		var err error
-		if left, err = attemptsLeft(tx, source, key, again.MaxAttempts); err != nil {
-			return false, err
+	if again != nil {
+		left, err := attemptsLeft(tx, source, key, again.MaxAttempts)
+		if err != nil {
+			return "", err
+		}
+		if !left {
+			again = nil
 		}
 	}
-	if !left {
+	waiting, waitingSession, err := takeFollowUps(tx, source, key)
+	if err != nil {
+		return "", err
+	}
+	fromPeople := len(waiting) > 0
+	var newID string
+	var notBefore int64
+	switch {
+	case again != nil:
+		// The run that ended is done again, so what it was asked in a
+		// comment still holds; the new messages come after it.
+		next, newID = again.Cause, again.ID
+		if !again.NotBefore.IsZero() {
+			notBefore = ms(again.NotBefore)
+		}
+		if comment != "" {
+			waiting = append([]string{comment}, waiting...)
+		}
+	case len(waiting) > 0:
+		next = task.CauseFollowUp
+		if newID, err = s.freeID(tx, source, key); err != nil {
+			return "", err
+		}
+	default:
 		to, reason := ticket.AfterRun(res.Outcome, res.Signal)
-		return false, s.move(tx, source, key, to, reason)
+		return "", s.move(tx, source, key, to, reason)
 	}
 	if err := s.move(tx, source, key, ticket.Queued, ""); err != nil {
-		return false, err
+		return "", err
 	}
-	var notBefore int64
-	if !again.NotBefore.IsZero() {
-		notBefore = ms(again.NotBefore)
+	if fromPeople {
+		// A person wrote: the ticket's attempts count from here.
+		if _, err := tx.Exec(`UPDATE tickets SET attempts_base = attempts WHERE source = ? AND key = ?`, source, key); err != nil {
+			return "", err
+		}
+	}
+	if waitingSession != "" {
+		// The next run answers where the last message came in.
+		session = waitingSession
 	}
 	_, err = tx.Exec(`INSERT INTO runs (id, source, key, status, context, comment, tracker_session, received_at, cause, not_before)
-		SELECT ?, source, key, ?, context, comment, tracker_session, ?, ?, ? FROM runs WHERE id = ?`,
-		again.ID, runQueued, ms(s.now()), again.Cause, notBefore, id)
-	return err == nil, err
+		SELECT ?, source, key, ?, context, ?, ?, ?, ?, ? FROM runs WHERE id = ?`,
+		newID, runQueued, strings.Join(waiting, task.CommentSeparator), session, ms(s.now()), next, notBefore, id)
+	return next, err
+}
+
+// freeID returns an id for a run of a ticket that the store queues by
+// itself, which no other run has.
+func (s *Store) freeID(tx *sql.Tx, source, key string) (string, error) {
+	for at := s.now(); ; at = at.Add(time.Millisecond) {
+		id := task.NewID(at, source, key)
+		var n int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM runs WHERE id = ?`, id).Scan(&n); err != nil {
+			return "", err
+		}
+		if n == 0 {
+			return id, nil
+		}
+	}
 }
 
 // end records how a run ended, and what the ticket keeps from it. It does
@@ -647,8 +766,9 @@ var ErrInterrupted = errors.New("ochell stopped while the agent was running")
 // Interrupted is a run that Recover closed.
 type Interrupted struct {
 	Task *task.Task
-	// Requeued says that another run of the ticket was queued in its place.
-	Requeued bool
+	// Next says why the ticket was queued again, as FinishAndQueue does;
+	// empty when it was not.
+	Next task.Cause
 }
 
 // Recover is called once at start, before any run is claimed. Runs that
@@ -689,7 +809,7 @@ func (s *Store) Recover(again func(*task.Task) Again) ([]Interrupted, error) {
 			if err != nil {
 				return err
 			}
-			out = append(out, Interrupted{Task: t, Requeued: queued})
+			out = append(out, Interrupted{Task: t, Next: queued})
 		}
 		return nil
 	})
