@@ -41,6 +41,9 @@ type Task struct {
 	// the session if the agent can.
 	AgentSession string
 	Workspace    string
+	// PreparedWorkspace is the working directory in which the after_create
+	// hook has run for this ticket; the store sets it too.
+	PreparedWorkspace string
 	// PRURL and Branch are the pull request and the branch that earlier
 	// runs of the ticket reported, if any. The store sets them too.
 	PRURL  string

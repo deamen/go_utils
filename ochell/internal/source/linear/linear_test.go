@@ -68,6 +68,29 @@ func TestParseComment(t *testing.T) {
 	}
 }
 
+func TestClosed(t *testing.T) {
+	for name, c := range map[string]struct {
+		body string
+		key  string
+	}{
+		"completed":     {`{"type":"Issue","action":"update","data":{"identifier":"ENG-1","state":{"type":"completed"}}}`, "ENG-1"},
+		"cancelled":     {`{"type":"Issue","action":"update","data":{"identifier":"ENG-2","state":{"type":"canceled"}}}`, "ENG-2"},
+		"removed":       {`{"type":"Issue","action":"remove","data":{"identifier":"ENG-3","state":{"type":"started"}}}`, "ENG-3"},
+		"in progress":   {`{"type":"Issue","action":"update","data":{"identifier":"ENG-4","state":{"type":"started"}}}`, ""},
+		"no state":      {`{"type":"Issue","action":"update","data":{"identifier":"ENG-5"}}`, ""},
+		"no identifier": {`{"type":"Issue","action":"remove","data":{}}`, ""},
+		"a comment":     {`{"type":"Comment","action":"create","data":{"identifier":"ENG-6","state":{"type":"completed"}}}`, ""},
+	} {
+		ev, _, err := Parse([]byte(c.body))
+		if !errors.Is(err, ErrIgnored) || ev == nil {
+			t.Fatalf("%s: Parse = %v, %v", name, ev, err)
+		}
+		if key, ok := ev.Closed(); key != c.key || ok != (c.key != "") {
+			t.Errorf("%s: %q, %v; want %q", name, key, ok, c.key)
+		}
+	}
+}
+
 func TestState(t *testing.T) {
 	st := NewState("secret", time.Minute)
 	if err := VerifyState("secret", st, time.Now()); err != nil {

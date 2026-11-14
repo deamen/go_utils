@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -515,6 +516,109 @@ func TestAgentSignal(t *testing.T) {
 			t.Errorf("ticket is %s, want failed", tk.State)
 		}
 	})
+}
+
+// git runs git with a fixed identity, and fails the test when it fails.
+func git(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-c", "user.name=e2e", "-c", "user.email=e2e@example.com", "-c", "init.defaultBranch=main"}, args...)...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// The workspace hooks: a new ticket gets a clone of its repository on the
+// branch bot/<KEY>, a second run reuses it, and the working directory of a
+// closed ticket is removed.
+func TestWorkspaceLifecycle(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	// A repository to clone, with one commit.
+	origin := filepath.Join(t.TempDir(), "backend.git")
+	seed := t.TempDir()
+	git(t, seed, "init", "-q")
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("backend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, seed, "add", "README.md")
+	git(t, seed, "commit", "-q", "-m", "first commit")
+	git(t, seed, "clone", "-q", "--bare", seed, origin)
+
+	o := Start(t, Options{
+		// The agent leaves a file behind, as work in progress.
+		Script: []Step{{WriteFile: &File{Path: "notes.txt", Content: "work in progress"}}, Report("done", "Pushed a branch.")},
+		Configure: func(c *config.Config) {
+			c.Repos = []config.Repo{{Source: "jira", Project: "DEV", Repo: origin}}
+			c.Workspace.Root = filepath.Dir(c.Agent.Workdir)
+			c.Workspace.Cleanup = true
+			c.Workspace.Hooks.AfterCreate = []string{"/bin/sh", "-c", `git clone -q "$ORCH_TASK_REPO" . && git checkout -q -b "$ORCH_TASK_BRANCH"`}
+			c.Workspace.Hooks.BeforeRun = []string{"/bin/sh", "-c", `git fetch -q origin && echo "fetched on $(git rev-parse --abbrev-ref HEAD)"`}
+		},
+	})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// A new ticket: its working directory is a clone on the branch bot/DEV-44.
+	first := o.JiraAssigned("DEV-44", "Needs a workspace").TaskID(t)
+	run := o.WaitRun(first, 30*time.Second)
+	if !strings.Contains(run.Footer, "outcome=finished") {
+		t.Fatalf("first run: %s\n%s", run.Footer, run.Log)
+	}
+	dir := o.WaitStored(st, first, 10*time.Second).Result.Workdir
+	if got := git(t, dir, "rev-parse", "--abbrev-ref", "HEAD"); got != "bot/DEV-44" {
+		t.Errorf("branch of the working directory = %q, want bot/DEV-44", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "README.md")); err != nil {
+		t.Errorf("the working directory is not a clone of the repository: %v", err)
+	}
+	if !strings.Contains(run.Log, "# ---- hook after_create: ") || !strings.Contains(run.Log, "fetched on bot/DEV-44") {
+		t.Errorf("the first run's log does not show the hooks:\n%s", run.Log)
+	}
+	rec := o.WaitRecords(1, 5*time.Second)[0]
+	if got, _ := rec.Getenv("ORCH_TASK_BRANCH"); got != "bot/DEV-44" || rec.Dir != dir {
+		t.Errorf("the agent ran in %q with ORCH_TASK_BRANCH=%q", rec.Dir, got)
+	}
+
+	// A second run reuses it: no second clone, and the first run's file is there.
+	second := o.JiraAssigned("DEV-44", "Needs a workspace").TaskID(t)
+	run = o.WaitRun(second, 30*time.Second)
+	o.WaitStored(st, second, 10*time.Second)
+	if !strings.Contains(run.Footer, "outcome=finished") || strings.Contains(run.Log, "hook after_create") || !strings.Contains(run.Log, "fetched on bot/DEV-44") {
+		t.Errorf("second run: %s\n%s", run.Footer, run.Log)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "notes.txt")); err != nil {
+		t.Errorf("the second run did not get the first run's working directory: %v", err)
+	}
+
+	// The ticket is closed in Jira: the working directory goes.
+	if r := o.JiraResolved("DEV-44"); r.Status != 200 || r.Body != "closed DEV-44" {
+		t.Fatalf("resolved ticket: %d %q", r.Status, r.Body)
+	}
+	o.waitFor(15*time.Second, "the working directory to be removed", func() bool {
+		_, err := os.Stat(dir)
+		return os.IsNotExist(err)
+	})
+	o.waitFor(5*time.Second, "the removal to be recorded", func() bool {
+		tk, _ := st.Ticket("jira", "DEV-44")
+		return tk != nil && tk.Workspace == ""
+	})
+	if tk, _ := st.Ticket("jira", "DEV-44"); tk.State != "done" || tk.PreparedWorkspace != "" {
+		t.Errorf("ticket after the close = %+v, want done without a working directory", tk)
+	}
+	if _, err := os.Stat(o.Config.Workspace.Root); err != nil {
+		t.Errorf("the workspace root must stay: %v", err)
+	}
+	// A close of a ticket ochell never worked on is ignored.
+	if r := o.JiraResolved("DEV-99"); r.Status != 200 || r.Body != "ignored" {
+		t.Errorf("close of an unknown ticket: %d %q", r.Status, r.Body)
+	}
 }
 
 // The repository mapping: a ticket of a mapped project runs for its

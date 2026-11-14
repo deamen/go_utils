@@ -131,6 +131,9 @@ func serve(args []string) error {
 		return err
 	}
 	r.SetNotifier(srv)
+	if err := r.UseWorkspace(cfg.Workspace); err != nil {
+		return err
+	}
 	if cfg.NgrokSync.Enabled {
 		go ipsync.RunSync(ctx, cfg.NgrokSync, ipsync.NewFetcher(), log)
 	}

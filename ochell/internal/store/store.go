@@ -112,6 +112,9 @@ var migrations = []string{
 
 	// Version 6: the repository a ticket belongs to.
 	`ALTER TABLE tickets ADD COLUMN repo TEXT NOT NULL DEFAULT '';`,
+
+	// Version 7: the working directory that the after_create hook prepared.
+	`ALTER TABLE tickets ADD COLUMN prepared_workspace TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is safe for concurrent use.
@@ -291,13 +294,13 @@ func (s *Store) Hold(t *task.Task, reason ticket.Reason) error {
 }
 
 const taskColumns = `r.id, r.source, r.key, t.title, t.url, r.context, r.tracker_session, r.delivery_id, r.received_at, r.attempt,
-	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo`
+	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo, t.prepared_workspace`
 
 func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 	var t task.Task
 	var received int64
 	if err := row.Scan(&t.ID, &t.Source, &t.Key, &t.Title, &t.URL, &t.Context, &t.TrackerSession, &t.DeliveryID, &received, &t.Attempt,
-		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo); err != nil {
+		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo, &t.PreparedWorkspace); err != nil {
 		return nil, err
 	}
 	t.Received = time.UnixMilli(received).UTC()
@@ -461,6 +464,9 @@ type Ticket struct {
 	// Attempts is the number of runs that were started.
 	Attempts  int
 	Workspace string
+	// PreparedWorkspace is the working directory in which the after_create
+	// hook has run.
+	PreparedWorkspace string
 	// AgentSession is the agent's session id from the last run that
 	// reported one.
 	AgentSession string
@@ -476,9 +482,9 @@ type Ticket struct {
 func (s *Store) Ticket(source, key string) (*Ticket, error) {
 	t := Ticket{Source: source, Key: key}
 	var created, updated int64
-	err := s.db.QueryRow(`SELECT title, url, repo, state, reason, attempts, workspace, agent_session, pr_url, branch, created_at, updated_at
+	err := s.db.QueryRow(`SELECT title, url, repo, state, reason, attempts, workspace, prepared_workspace, agent_session, pr_url, branch, created_at, updated_at
 		FROM tickets WHERE source = ? AND key = ?`, source, key).
-		Scan(&t.Title, &t.URL, &t.Repo, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
+		Scan(&t.Title, &t.URL, &t.Repo, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -487,6 +493,52 @@ func (s *Store) Ticket(source, key string) (*Ticket, error) {
 	}
 	t.Created, t.Updated = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
 	return &t, nil
+}
+
+// SetPrepared records the working directory in which the after_create hook
+// has run for a ticket.
+func (s *Store) SetPrepared(source, key, dir string) error {
+	_, err := s.db.Exec(`UPDATE tickets SET prepared_workspace = ? WHERE source = ? AND key = ?`, dir, source, key)
+	return err
+}
+
+// ErrUnknown is returned for a ticket that ochell has never seen.
+var ErrUnknown = errors.New("unknown ticket")
+
+// CloseTicket records that the tracker reports a ticket as closed, and
+// returns the ticket. A ticket that waits or is in review, or whose last
+// run failed, becomes done. It returns ErrBusy for a ticket with a queued
+// or running run, which is left as it is, and ErrUnknown for a ticket that
+// ochell has never seen.
+func (s *Store) CloseTicket(source, key string) (*Ticket, error) {
+	err := s.tx(func(tx *sql.Tx) error {
+		from, err := state(tx, source, key)
+		if err != nil {
+			return err
+		}
+		switch {
+		case from == ticket.None:
+			return ErrUnknown
+		case from.Active():
+			return ErrBusy
+		}
+		if ticket.Move(from, ticket.Done, "") == nil {
+			return s.move(tx, source, key, ticket.Done, "")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.Ticket(source, key)
+}
+
+// ClearWorkspace forgets the working directory of a ticket, after it was
+// removed. The agent session goes with it: its files were in there.
+func (s *Store) ClearWorkspace(source, key string) error {
+	_, err := s.db.Exec(`UPDATE tickets SET workspace = '', prepared_workspace = '', agent_session = ''
+		WHERE source = ? AND key = ?`, source, key)
+	return err
 }
 
 // Run is the stored record of one run.

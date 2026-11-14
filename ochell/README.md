@@ -137,6 +137,41 @@ repos:
 - **A ticket that no entry matches is not started.** It is recorded as `waiting` with the reason `no_repo_mapping`, the request is answered with 200 `not started: …`, ochell logs a warning, and a Linear session is told why. After the mapping is added, assign the ticket again.
 - With no `repos` at all, every ticket runs, without a repository.
 
+### Workspaces
+The working directory of a ticket is `agent.workdir`, rendered per ticket, for example `/work/{{.Source}}/{{.Key}}`. `workspace` says where it may be, how it is prepared and when it goes.
+
+```yaml
+workspace:
+  root: /work
+  branch: "bot/{{.Key}}"
+  hooks:
+    after_create: [/bin/sh, -c, 'git clone "$ORCH_TASK_REPO" . && git checkout -b "$ORCH_TASK_BRANCH"']
+    before_run:   [/bin/sh, -c, 'git fetch origin']
+  cleanup: true
+```
+
+- **`root`**: every working directory must be inside it. A run whose `workdir` is outside is refused (`not_started`) before anything is created. Without a root nothing is checked and nothing is ever removed.
+- **Hooks** are ochell's own; they are not the hooks inside the agent's runtime. Each is a command with arguments, run without a shell, in the working directory, through the same launcher and as the same OS user as the agent. So with the `systemd` launcher the agent user owns the clone.
+
+  | Hook | When | If it fails |
+  |---|---|---|
+  | `after_create` | once, before the first run in a new working directory | the agent is not started (`not_started`); the next run tries the hook again |
+  | `before_run` | before every run | the agent is not started |
+  | `after_run` | after every run in which the agent was started, except one cut short by a shutdown | a warning; the run's outcome stays |
+  | `before_remove` | before the working directory is removed | a warning; the directory is removed all the same |
+
+  - A hook gets the task's environment (`ORCH_TASK_ID`, `…_SOURCE`, `…_KEY`, `…_URL`, `…_REPO`, `…_BRANCH`), `ORCH_HOOK` with its name, and `agent.env`. Its output is in the run log.
+  - Arguments are templates with `.ID`, `.Source`, `.Key`, `.Repo` and `.Branch`: nothing that holds ticket text. Prefer the environment variables inside a `sh -c` script, as above. Write `$NAME`, not `${NAME}`: the configuration file replaces `${NAME}` from ochell's own environment when it is loaded.
+  - `hook_timeout` (10m) limits each hook.
+- **`branch`** (default `bot/{{.Key}}`) is the branch the ticket is worked on. Hooks and the agent get it as `ORCH_TASK_BRANCH`.
+- **A second run of a ticket reuses its working directory.** ochell remembers for which directory `after_create` has run.
+- **`cleanup: true`** removes a ticket's working directory when the tracker reports the ticket as closed. It needs `root`, and `{{.Key}}` in `agent.workdir`, so that a directory can only be that of one ticket. The root itself is never removed.
+  - **Jira:** the system webhook reports it: an issue that was resolved (its resolution was set) or deleted. A workflow that closes issues without a resolution is not recognised.
+  - **Linear:** an `Issue` event whose issue is completed, cancelled or removed. Linear sends these only when the app's webhook also subscribes to **Issues**. The shape of that payload was not checked against Linear.
+  - The closed ticket becomes `done` if it was waiting, in review or failed. **A ticket whose run is queued or running is left alone**: stopping a run from the tracker is not supported yet.
+  - With the `systemd` launcher the directory is removed as the agent user (`/bin/rm -rf`, through the launch script). What was done is in `<log_dir>/<time>-<source>-<key>.remove.log`.
+  - The agent session is forgotten with the directory. A ticket that is assigned again gets a new directory and a new session.
+
 ### Ticket states
 Every ticket ochell has seen is in one of these states. They are defined, with the allowed moves, in [internal/ticket/state.go](internal/ticket/state.go), and the store refuses any other move.
 
@@ -146,8 +181,8 @@ Every ticket ochell has seen is in one of these states. They are defined, with t
 | `running` | an agent is working on the ticket | any state below, or `queued` again (a retry) |
 | `waiting` | nothing happens until a human acts; always with a reason | `queued`, `done`, `cancelled` |
 | `in_review` | the agent handed its work over and a human reviews it | `queued`, `done`, `waiting`, `cancelled` |
-| `done` | the work was accepted, or the ticket was closed | `queued` |
-| `failed` | the last run did not succeed and nothing retries it | `queued`, `waiting`, `cancelled` |
+| `done` | the work was accepted, or the ticket was closed in the tracker | `queued` |
+| `failed` | the last run did not succeed and nothing retries it | `queued`, `waiting`, `done`, `cancelled` |
 | `cancelled` | stopped or released by a human; not started again until it is assigned again | `queued` |
 
 A ticket that is `queued` or `running` takes no second run. From every other state a new assignment queues it again.
@@ -284,7 +319,7 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 ### Agent environment
 The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:
 - the variables named in `agent.env_pass`, copied from ochell's environment when they are set. The default list is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), `SSL_CERT_FILE` and `SSL_CERT_DIR`;
-- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL` and `ORCH_RESULT_FILE`, and `ORCH_TASK_REPO` when a repository is mapped to the ticket;
+- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL`, `ORCH_TASK_BRANCH` and `ORCH_RESULT_FILE`, and `ORCH_TASK_REPO` when a repository is mapped to the ticket;
 - the variables set in `agent.env`.
 
 Setting `env_pass` (or `--agent-env-pass`) replaces the default list. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, add that name to `env_pass`. Never add a variable that holds one of ochell's own secrets.
@@ -296,7 +331,7 @@ Requires a Jira admin.
 2. Go to *Settings → System → WebHooks → Create*.
    - URL: `https://<ngrok-domain>/webhooks/jira`
    - Set a **Secret**.
-   - Event: *Issue updated* (and *created*).
+   - Event: *Issue updated* (and *created*). With `workspace.cleanup`, also *deleted*.
    - JQL: `assignee = <accountId>`
 3. Put the secret in `sources.jira_webhook.secret` and the accountId in `bot_account_id`.
 

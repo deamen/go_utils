@@ -143,6 +143,31 @@ func ParseWebhook(body []byte, botAccountID string) (*Ticket, error) {
 	}, nil
 }
 
+// ParseClosed reports whether a webhook payload says that an issue was
+// closed, and returns its key: the issue was deleted, or it was resolved
+// (its changelog sets the resolution). A workflow that closes issues
+// without a resolution is not recognised.
+func ParseClosed(body []byte) (key string, ok bool) {
+	var ev WebhookEvent
+	if json.Unmarshal(body, &ev) != nil || ev.Issue == nil || ev.Issue.Key == "" {
+		return "", false
+	}
+	switch ev.WebhookEvent {
+	case "jira:issue_deleted":
+		return ev.Issue.Key, true
+	case "jira:issue_updated":
+		if ev.Changelog == nil {
+			return "", false
+		}
+		for _, it := range ev.Changelog.Items {
+			if (it.FieldID == "resolution" || it.Field == "resolution") && (it.To != "" || it.ToString != "") {
+				return ev.Issue.Key, true
+			}
+		}
+	}
+	return "", false
+}
+
 func assignedTo(ev WebhookEvent, bot string) bool {
 	if ev.Changelog == nil {
 		return false

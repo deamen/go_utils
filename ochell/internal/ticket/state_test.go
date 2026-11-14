@@ -20,7 +20,7 @@ func TestMoves(t *testing.T) {
 		Waiting:   "  -     yes    -       yes     -         yes  -      yes",
 		InReview:  "  -     yes    -       yes     -         yes  -      yes",
 		Done:      "  -     yes    -       yes     -         -    -      -",
-		Failed:    "  -     yes    -       yes     -         -    -      yes",
+		Failed:    "  -     yes    -       yes     -         yes  -      yes",
 		Cancelled: "  -     yes    -       yes     -         -    -      -",
 	}
 	for _, from := range all {

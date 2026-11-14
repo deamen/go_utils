@@ -226,6 +226,69 @@ func TestAgentSession(t *testing.T) {
 	}
 }
 
+// What the tracker's report of a closed ticket does, by the ticket's state.
+func TestCloseTicket(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	if _, err := s.CloseTicket("linear", "ENG-0"); !errors.Is(err, ErrUnknown) {
+		t.Errorf("unknown ticket: %v, want ErrUnknown", err)
+	}
+	ended := func(key string, res task.Result) {
+		t.Helper()
+		if err := s.Enqueue(newTask("run-"+key, key, t0), 0); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := s.Claim(); err != nil || got == nil {
+			t.Fatalf("Claim = %v, %v", got, err)
+		}
+		if err := s.Finish("run-"+key, res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ended("ENG-1", task.Result{Outcome: task.OutcomeFinished, Signal: result.Done, Workdir: "/work/ENG-1", SessionID: "sess-1"}) // in_review
+	ended("ENG-2", task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput})                                        // waiting
+	ended("ENG-3", task.Result{Outcome: task.OutcomeFailed})                                                                     // failed
+	for _, key := range []string{"ENG-1", "ENG-2", "ENG-3"} {
+		tk, err := s.CloseTicket("linear", key)
+		if err != nil || tk.State != ticket.Done || tk.Reason != "" {
+			t.Errorf("%s: %+v, %v; want done", key, tk, err)
+		}
+	}
+	// The ticket still has what is needed to remove its working directory.
+	if tk, _ := s.CloseTicket("linear", "ENG-1"); tk == nil || tk.State != ticket.Done || tk.Workspace != "/work/ENG-1" {
+		t.Errorf("closing a done ticket again: %+v", tk)
+	}
+
+	// A queued and a running ticket are left as they are.
+	if err := s.Enqueue(newTask("run-q", "ENG-4", t0), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloseTicket("linear", "ENG-4"); !errors.Is(err, ErrBusy) {
+		t.Errorf("queued ticket: %v, want ErrBusy", err)
+	}
+	s.Claim()
+	if _, err := s.CloseTicket("linear", "ENG-4"); !errors.Is(err, ErrBusy) {
+		t.Errorf("running ticket: %v, want ErrBusy", err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-4"); tk.State != ticket.Running {
+		t.Errorf("state = %s, want running", tk.State)
+	}
+
+	// The working directory and what depends on it.
+	if err := s.SetPrepared("linear", "ENG-1", "/work/ENG-1"); err != nil {
+		t.Fatal(err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.PreparedWorkspace != "/work/ENG-1" || tk.AgentSession != "sess-1" {
+		t.Errorf("ticket = %+v", tk)
+	}
+	if err := s.ClearWorkspace("linear", "ENG-1"); err != nil {
+		t.Fatal(err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.Workspace != "" || tk.PreparedWorkspace != "" || tk.AgentSession != "" {
+		t.Errorf("after ClearWorkspace: %+v", tk)
+	}
+}
+
 // A ticket that cannot be started is recorded as waiting, without a run.
 func TestHold(t *testing.T) {
 	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))

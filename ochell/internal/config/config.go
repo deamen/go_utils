@@ -170,6 +170,55 @@ type Repo struct {
 	Repo string `yaml:"repo"`
 }
 
+// Workspace configures the working directory of a ticket: where it may be,
+// how it is prepared, and when it is removed. The hooks are ochell's own;
+// they are not the hooks inside the agent's runtime.
+type Workspace struct {
+	// Root is the directory that every working directory must be inside.
+	// Empty: not checked, and nothing is ever removed.
+	Root string `yaml:"root"`
+	// Branch is the branch a ticket is worked on, a template with .Key and
+	// .Source. Hooks and the agent get it as ORCH_TASK_BRANCH.
+	Branch string `yaml:"branch"`
+	// Hooks are commands that ochell runs in the working directory, the
+	// same way and as the same OS user as the agent.
+	Hooks Hooks `yaml:"hooks"`
+	// HookTimeout is the time limit of one hook.
+	HookTimeout time.Duration `yaml:"hook_timeout"`
+	// Cleanup removes the working directory of a ticket when the tracker
+	// reports the ticket as closed.
+	Cleanup bool `yaml:"cleanup"`
+}
+
+// Hooks are the workspace hooks. Each is a command with its arguments,
+// executed without a shell; an empty list means no hook. The arguments are
+// templates with .ID, .Source, .Key, .Repo and .Branch.
+type Hooks struct {
+	// AfterCreate runs once, before the first run in a new working
+	// directory: clone the repository, create the branch.
+	AfterCreate []string `yaml:"after_create"`
+	// BeforeRun runs before every run: fetch, rebase.
+	BeforeRun []string `yaml:"before_run"`
+	// AfterRun runs after every run in which the agent was started.
+	AfterRun []string `yaml:"after_run"`
+	// BeforeRemove runs before the working directory is removed.
+	BeforeRemove []string `yaml:"before_remove"`
+}
+
+// All returns the hooks by name, in the order they run.
+func (h Hooks) All() []struct {
+	Name    string
+	Command []string
+} {
+	return []struct {
+		Name    string
+		Command []string
+	}{
+		{"after_create", h.AfterCreate}, {"before_run", h.BeforeRun},
+		{"after_run", h.AfterRun}, {"before_remove", h.BeforeRemove},
+	}
+}
+
 type Config struct {
 	LogLevel string   `yaml:"log_level"`
 	HTTP     Listener `yaml:"http"`
@@ -180,6 +229,7 @@ type Config struct {
 	// entry matches is not started and waits for a human. When it is
 	// empty, tickets run without a repository.
 	Repos       []Repo      `yaml:"repos"`
+	Workspace   Workspace   `yaml:"workspace"`
 	Agent       Agent       `yaml:"agent"`
 	Sources     Sources     `yaml:"sources"`
 	IPAllowlist IPAllowlist `yaml:"ip_allowlist"`
@@ -243,10 +293,11 @@ var DefaultEnvPass = []string{
 
 func Default() *Config {
 	return &Config{
-		LogLevel: "info",
-		HTTP:     Listener{Enabled: true, Address: "0.0.0.0", Port: 8080},
-		HTTPS:    Listener{Enabled: false, Address: "0.0.0.0", Port: 8443},
-		Store:    Store{Path: "ochell.db"},
+		LogLevel:  "info",
+		HTTP:      Listener{Enabled: true, Address: "0.0.0.0", Port: 8080},
+		HTTPS:     Listener{Enabled: false, Address: "0.0.0.0", Port: 8443},
+		Store:     Store{Path: "ochell.db"},
+		Workspace: Workspace{Branch: "bot/{{.Key}}", HookTimeout: 10 * time.Minute},
 		Agent: Agent{
 			Command:        "claude",
 			Args:           []string{"-p"},
@@ -455,6 +506,38 @@ func (c *Config) Validate() error {
 		// The value reaches the agent's environment and prompt.
 		if r.Repo == "" || strings.ContainsAny(r.Repo, " \t\n\r") {
 			errs = append(errs, fmt.Errorf("repos[%d].repo is required, without spaces", i))
+		}
+	}
+	ws := c.Workspace
+	if ws.Root != "" && !strings.HasPrefix(ws.Root, "/") {
+		errs = append(errs, errors.New("workspace.root must be an absolute path"))
+	}
+	if ws.Branch == "" {
+		errs = append(errs, errors.New("workspace.branch is required"))
+	}
+	if ws.HookTimeout <= 0 {
+		errs = append(errs, errors.New("workspace.hook_timeout must be positive"))
+	}
+	if ws.Cleanup {
+		// A working directory is only removed when it cannot be anything
+		// but the directory of one ticket, inside a known root.
+		if ws.Root == "" {
+			errs = append(errs, errors.New("workspace.cleanup requires workspace.root"))
+		}
+		if !strings.Contains(c.Agent.Workdir, ".Key") {
+			errs = append(errs, errors.New("workspace.cleanup requires agent.workdir to contain {{.Key}}, so that each ticket has a directory of its own"))
+		}
+	}
+	for _, h := range ws.Hooks.All() {
+		if len(h.Command) == 0 {
+			continue
+		}
+		if h.Command[0] == "" {
+			errs = append(errs, fmt.Errorf("workspace.hooks.%s: the command is empty", h.Name))
+		}
+		// PATH in the unit is the system default.
+		if c.Agent.Launcher == "systemd" && !strings.HasPrefix(h.Command[0], "/") {
+			errs = append(errs, fmt.Errorf("workspace.hooks.%s: agent.launcher systemd requires the command to be an absolute path", h.Name))
 		}
 	}
 	if c.Agent.Command == "" {
