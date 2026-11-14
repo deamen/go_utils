@@ -413,6 +413,48 @@ func TestSecondSignalStopsAgentsNow(t *testing.T) {
 	expectAllGone(t, rec, 1)
 }
 
+// The task queue, the record of what was running and the handled deliveries
+// are in the store: they survive ochell being killed.
+func TestQueueSurvivesRestart(t *testing.T) {
+	o := Start(t, Options{Script: []Step{{Print: "working"}, {Sleep: "2s"}, {Print: "all done"}}})
+	running := o.LinearCreated("ENG-40", "session-running", "").TaskID(t)
+	rec := o.WaitRecords(1, 10*time.Second)[0]
+	queued := o.JiraAssigned("DEV-40", "Waits for the worker").TaskID(t)
+	if _, err := os.Stat(o.LogFile(queued)); err == nil {
+		t.Fatal("the second task started although the only worker is busy")
+	}
+
+	o.Kill()
+	// The crash leaves the agent behind; this test is not about that.
+	syscall.Kill(-rec.PID, syscall.SIGKILL)
+	o.Restart()
+
+	// The task that was queued runs now.
+	if run := o.WaitRun(queued, 20*time.Second); !strings.Contains(run.Footer, "outcome=finished") || !strings.Contains(run.Log, "all done") {
+		t.Errorf("queued task after the restart: %s\n%s", run.Footer, run.Log)
+	}
+	// The run that was cut short is not started again, and its ticket is told.
+	acts := o.WaitActivities("session-running", 2, 10*time.Second)
+	if acts[1].Type != "error" || !strings.Contains(acts[1].Body, "ochell stopped while the agent was running") {
+		t.Errorf("activities of the interrupted run = %+v", acts)
+	}
+	if n := len(o.Records()); n != 2 {
+		t.Errorf("the agent was started %d times in all, want 2: the interrupted run must not start again", n)
+	}
+	if _, err := os.Stat(o.LogFile(running)); err != nil {
+		t.Errorf("log of the interrupted run: %v", err)
+	}
+	// A retry of a delivery from before the restart is still a duplicate.
+	if r := o.Replay(); r.Status != 200 || r.Body != "duplicate delivery" {
+		t.Errorf("replayed delivery after the restart: %d %q, want duplicate delivery", r.Status, r.Body)
+	}
+	// The interrupted ticket can be delegated again.
+	again := o.LinearCreated("ENG-40", "session-again", "").TaskID(t)
+	if run := o.WaitRun(again, 20*time.Second); !strings.Contains(run.Footer, "outcome=finished") {
+		t.Errorf("new run of the interrupted ticket: %s", run.Footer)
+	}
+}
+
 // With the systemd launcher a shutdown stops the unit through the stop
 // script. The stand-in has no cgroup; that a stop reaches every process of
 // a unit is checked on the VM.

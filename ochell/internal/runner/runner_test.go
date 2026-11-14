@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ochell/internal/config"
+	"ochell/internal/store"
 	"ochell/internal/task"
 )
 
@@ -76,8 +77,23 @@ func newTask() *task.Task {
 
 func logger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+func openStore(t *testing.T, path string) *store.Store {
+	t.Helper()
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
+
+func testStore(t *testing.T) *store.Store {
+	t.Helper()
+	return openStore(t, filepath.Join(t.TempDir(), "ochell.db"))
+}
+
 func TestRunArgsAreNotShellInterpreted(t *testing.T) {
-	r, err := New(agentCfg(t, "echo", "{{.Prompt}}"), logger())
+	r, err := New(agentCfg(t, "echo", "{{.Prompt}}"), logger(), testStore(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +115,7 @@ func TestRunArgsAreNotShellInterpreted(t *testing.T) {
 func TestRunStdin(t *testing.T) {
 	cfg := agentCfg(t, "stdin")
 	cfg.PromptVia = "stdin"
-	r, _ := New(cfg, logger())
+	r, _ := New(cfg, logger(), testStore(t))
 	res := r.Run(context.Background(), newTask())
 	if res.Err != nil || !strings.Contains(res.Tail, "stdin:Fix DEV-1") {
 		t.Fatalf("err=%v tail=%q", res.Err, res.Tail)
@@ -122,7 +138,7 @@ func TestRunEnvironmentIsAllowlisted(t *testing.T) {
 	cfg := agentCfg(t, "env")
 	cfg.EnvPass = append([]string{"OCHELL_TEST_PASSED", "OCHELL_TEST_UNSET"}, cfg.EnvPass...)
 	cfg.Env["AGENT_SETTING"] = "from-config"
-	r, err := New(cfg, logger())
+	r, err := New(cfg, logger(), testStore(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,19 +170,19 @@ func TestRunEnvironmentIsAllowlisted(t *testing.T) {
 }
 
 func TestRunOutcomes(t *testing.T) {
-	r, _ := New(agentCfg(t, "echo"), logger())
+	r, _ := New(agentCfg(t, "echo"), logger(), testStore(t))
 	if res := r.Run(context.Background(), newTask()); res.Outcome != task.OutcomeFinished || res.Err != nil || res.ExitCode != 0 {
 		t.Errorf("finished run: %+v", res)
 	}
 
-	r, _ = New(agentCfg(t, "fail"), logger())
+	r, _ = New(agentCfg(t, "fail"), logger(), testStore(t))
 	if res := r.Run(context.Background(), newTask()); res.Outcome != task.OutcomeFailed || res.Err == nil || res.ExitCode != 3 {
 		t.Errorf("failed run: outcome %s exit %d err %v", res.Outcome, res.ExitCode, res.Err)
 	}
 
 	cfg := agentCfg(t, "sleep")
 	cfg.Timeout = 200 * time.Millisecond
-	r, _ = New(cfg, logger())
+	r, _ = New(cfg, logger(), testStore(t))
 	res := r.Run(context.Background(), newTask())
 	if res.Outcome != task.OutcomeTimedOut || res.Err == nil || !strings.Contains(res.Err.Error(), "timed out") {
 		t.Errorf("timed out run: outcome %s err %v", res.Outcome, res.Err)
@@ -176,7 +192,7 @@ func TestRunOutcomes(t *testing.T) {
 	}
 
 	// A run that ochell stops is reported as stopped, whatever the exit code.
-	r, _ = New(agentCfg(t, "sleep"), logger())
+	r, _ = New(agentCfg(t, "sleep"), logger(), testStore(t))
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(200*time.Millisecond, cancel)
 	res = r.Run(ctx, newTask())
@@ -190,7 +206,7 @@ func TestRunOutcomes(t *testing.T) {
 
 	cfg = agentCfg(t, "echo")
 	cfg.Command = filepath.Join(t.TempDir(), "no-such-agent")
-	r, _ = New(cfg, logger())
+	r, _ = New(cfg, logger(), testStore(t))
 	if res := r.Run(context.Background(), newTask()); res.Outcome != task.OutcomeNotStarted || res.Err == nil || res.ExitCode != -1 {
 		t.Errorf("agent that cannot start: outcome %s exit %d err %v", res.Outcome, res.ExitCode, res.Err)
 	}
@@ -202,49 +218,56 @@ func TestSystemdLauncherRefusesTicketTextInArguments(t *testing.T) {
 	for _, field := range []string{".Title", ".URL", ".Context", ".Prompt", ".DeliveryID"} {
 		cfg := agentCfg(t, "echo", "--name={{"+field+"}}")
 		cfg.Launcher = "systemd"
-		if _, err := New(cfg, logger()); err == nil || !strings.Contains(err.Error(), "only .ID, .Source and .Key") {
+		if _, err := New(cfg, logger(), testStore(t)); err == nil || !strings.Contains(err.Error(), "only .ID, .Source and .Key") {
 			t.Errorf("{{%s}} in an argument: got %v", field, err)
 		}
 	}
 	cfg := agentCfg(t, "echo", "--session={{.Source}}-{{.Key}}-{{.ID}}")
 	cfg.Launcher = "systemd"
-	if _, err := New(cfg, logger()); err != nil {
+	if _, err := New(cfg, logger(), testStore(t)); err != nil {
 		t.Errorf(".ID, .Source and .Key must be allowed: %v", err)
 	}
 	cfg = agentCfg(t, "echo")
 	cfg.Launcher = "systemd"
 	cfg.Workdir = "/work/{{.Title}}"
-	if _, err := New(cfg, logger()); err == nil {
+	if _, err := New(cfg, logger(), testStore(t)); err == nil {
 		t.Error("{{.Title}} in workdir must be refused")
 	}
 	// The direct launcher keeps the old behaviour.
-	if _, err := New(agentCfg(t, "echo", "{{.Title}}"), logger()); err != nil {
+	if _, err := New(agentCfg(t, "echo", "{{.Title}}"), logger(), testStore(t)); err != nil {
 		t.Errorf("direct launcher: %v", err)
 	}
 }
 
-func TestSubmitInFlightAndCallbacks(t *testing.T) {
-	r, _ := New(agentCfg(t, "echo"), logger())
-	done := make(chan task.Result, 1)
-	tk := newTask()
-	tk.OnFinish = func(_ context.Context, _ *task.Task, res task.Result) error {
-		done <- res
-		return nil
-	}
-	if err := r.Submit(tk); err != nil {
+func TestSubmitBusyAndNotifications(t *testing.T) {
+	r, _ := New(agentCfg(t, "echo"), logger(), testStore(t))
+	f := &finished{done: make(chan string, 4)}
+	r.SetNotifier(f)
+	if err := r.Submit(newTask()); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Submit(newTask()); err != ErrBusy {
 		t.Fatalf("second submit for same ticket: got %v, want ErrBusy", err)
 	}
-	r.Start()
-	select {
-	case res := <-done:
-		if res.Err != nil {
-			t.Fatalf("task failed: %v", res.Err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("task did not finish")
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	f.wait(t, "DEV-1")
+	if res := f.result("DEV-1"); res.Err != nil {
+		t.Fatalf("task failed: %v", res.Err)
+	}
+	if got := f.attempt("DEV-1"); got != 1 {
+		t.Errorf("the task was started as attempt %d, want 1", got)
+	}
+	// The ticket is free again, and its next run is the second attempt.
+	tk := newTask()
+	tk.ID = "t2"
+	if err := r.Submit(tk); err != nil {
+		t.Fatalf("submit after the first run ended: %v", err)
+	}
+	f.wait(t, "DEV-1")
+	if got := f.attempt("DEV-1"); got != 2 {
+		t.Errorf("the second run was started as attempt %d, want 2", got)
 	}
 	r.Shutdown(context.Background())
 	if err := r.Submit(newTask()); err != ErrStopped {
@@ -252,31 +275,68 @@ func TestSubmitInFlightAndCallbacks(t *testing.T) {
 	}
 }
 
-// finished collects the result of each task by ticket key.
+// finished is a Notifier that collects the result of each task by ticket key.
 type finished struct {
-	mu  sync.Mutex
-	res map[string]task.Result
+	mu      sync.Mutex
+	res     map[string]task.Result
+	started map[string]int // attempt number, by ticket key
+	done    chan string    // receives the key of each finished task, if set
+}
+
+func (f *finished) Started(_ context.Context, t *task.Task) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.started == nil {
+		f.started = map[string]int{}
+	}
+	f.started[t.Key] = t.Attempt
+	return nil
+}
+
+func (f *finished) Finished(_ context.Context, t *task.Task, res task.Result) error {
+	f.mu.Lock()
+	if f.res == nil {
+		f.res = map[string]task.Result{}
+	}
+	f.res[t.Key] = res
+	f.mu.Unlock()
+	if f.done != nil {
+		f.done <- t.Key
+	}
+	return nil
+}
+
+func (f *finished) wait(t *testing.T, key string) {
+	t.Helper()
+	select {
+	case got := <-f.done:
+		if got != key {
+			t.Fatalf("task %s finished, want %s", got, key)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("task %s did not finish", key)
+	}
 }
 
 func (f *finished) task(key string) *task.Task {
 	tk := newTask()
 	tk.ID, tk.Key = "t-"+key, key
-	tk.OnFinish = func(_ context.Context, t *task.Task, res task.Result) error {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if f.res == nil {
-			f.res = map[string]task.Result{}
-		}
-		f.res[t.Key] = res
-		return nil
-	}
 	return tk
 }
 
-func (f *finished) outcome(key string) task.Outcome {
+func (f *finished) result(key string) task.Result {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.res[key].Outcome
+	return f.res[key]
+}
+
+func (f *finished) outcome(key string) task.Outcome { return f.result(key).Outcome }
+
+// attempt returns the attempt number the ticket's last run was started with.
+func (f *finished) attempt(key string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.started[key]
 }
 
 func waitRunning(t *testing.T, r *Runner, logDir, id string) {
@@ -291,40 +351,99 @@ func waitRunning(t *testing.T, r *Runner, logDir, id string) {
 	}
 }
 
-// A shutdown waits for the running agent, and starts nothing new.
+// A shutdown waits for the running agent, and starts nothing new. What was
+// queued stays queued, and runs after a restart.
 func TestShutdownDrains(t *testing.T) {
 	cfg := agentCfg(t, "nap")
-	r, _ := New(cfg, logger())
-	var f finished
-	for _, key := range []string{"A-1", "A-2"} {
-		if err := r.Submit(f.task(key)); err != nil {
+	path := filepath.Join(t.TempDir(), "ochell.db")
+	st := openStore(t, path)
+	r, _ := New(cfg, logger(), st)
+	f := &finished{}
+	r.SetNotifier(f)
+	for i, key := range []string{"A-1", "A-2"} {
+		tk := f.task(key)
+		tk.Received = time.Now().Add(time.Duration(i) * time.Second)
+		if err := r.Submit(tk); err != nil {
 			t.Fatal(err)
 		}
 	}
-	r.Start()
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
 	waitRunning(t, r, cfg.LogDir, "t-A-1")
 	r.Shutdown(context.Background())
 	if got := f.outcome("A-1"); got != task.OutcomeFinished {
 		t.Errorf("running task: outcome %q, want finished: the shutdown must wait for it", got)
 	}
-	if got := f.outcome("A-2"); got != task.OutcomeNotStarted {
-		t.Errorf("queued task: outcome %q, want not_started", got)
+	if got := f.outcome("A-2"); got != "" {
+		t.Errorf("queued task: outcome %q, want none: it must not be started or reported", got)
 	}
-	if n := r.Running(); n != 0 {
-		t.Errorf("Running() = %d after shutdown, want 0", n)
+	if n := r.Running(); n != 1 {
+		t.Errorf("Running() = %d after shutdown, want the 1 queued task", n)
 	}
+	st.Close()
+
+	// The restart: a new runner on the same store runs the queued task.
+	r2, _ := New(cfg, logger(), openStore(t, path))
+	f2 := &finished{done: make(chan string, 1)}
+	r2.SetNotifier(f2)
+	if err := r2.Start(); err != nil {
+		t.Fatal(err)
+	}
+	f2.wait(t, "A-2")
+	if got := f2.outcome("A-2"); got != task.OutcomeFinished {
+		t.Errorf("queued task after the restart: outcome %q, want finished", got)
+	}
+	r2.Shutdown(context.Background())
+}
+
+// A run that was in progress when ochell died is closed at the next start,
+// and its ticket is told. It is not started again.
+func TestStartClosesInterruptedRuns(t *testing.T) {
+	cfg := agentCfg(t, "echo")
+	path := filepath.Join(t.TempDir(), "ochell.db")
+	st := openStore(t, path)
+	if err := st.Enqueue(newTask(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if tk, err := st.Claim(); err != nil || tk == nil {
+		t.Fatalf("Claim = %v, %v", tk, err)
+	}
+	// ochell is killed here: the run stays "running" in the store.
+
+	r, _ := New(cfg, logger(), openStore(t, path))
+	f := &finished{done: make(chan string, 1)}
+	r.SetNotifier(f)
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	f.wait(t, "DEV-1")
+	res := f.result("DEV-1")
+	if res.Outcome != task.OutcomeInterrupted || res.Err == nil {
+		t.Errorf("result = %+v, want interrupted with an error", res)
+	}
+	if f.attempt("DEV-1") != 0 {
+		t.Error("the interrupted run was started again")
+	}
+	if err := r.Submit(&task.Task{ID: "t2", Source: "jira", Key: "DEV-1"}); err != nil {
+		t.Errorf("a new run of the interrupted ticket: %v", err)
+	}
+	r.Shutdown(context.Background())
 }
 
 // When the wait is over, the running agent is stopped.
 func TestShutdownStopsAfterTheWait(t *testing.T) {
 	cfg := agentCfg(t, "sleep")
 	cfg.Timeout = time.Minute
-	r, _ := New(cfg, logger())
-	var f finished
+	r, _ := New(cfg, logger(), testStore(t))
+	f := &finished{}
+	r.SetNotifier(f)
 	if err := r.Submit(f.task("B-1")); err != nil {
 		t.Fatal(err)
 	}
-	r.Start()
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
 	waitRunning(t, r, cfg.LogDir, "t-B-1")
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -340,7 +459,7 @@ func TestShutdownStopsAfterTheWait(t *testing.T) {
 
 func TestBadTemplate(t *testing.T) {
 	cfg := agentCfg(t, "echo", "{{.Nope")
-	if _, err := New(cfg, logger()); err == nil {
+	if _, err := New(cfg, logger(), testStore(t)); err == nil {
 		t.Fatal("expected template parse error")
 	}
 }

@@ -139,10 +139,18 @@ type NgrokSync struct {
 	Interval          time.Duration `yaml:"interval"`
 }
 
+// Store configures the file that holds ochell's durable state.
+type Store struct {
+	// Path is the SQLite file with the tickets, the task queue and the
+	// handled webhook deliveries. It is created when missing.
+	Path string `yaml:"path"`
+}
+
 type Config struct {
 	LogLevel    string      `yaml:"log_level"`
 	HTTP        Listener    `yaml:"http"`
 	HTTPS       Listener    `yaml:"https"`
+	Store       Store       `yaml:"store"`
 	Agent       Agent       `yaml:"agent"`
 	Sources     Sources     `yaml:"sources"`
 	IPAllowlist IPAllowlist `yaml:"ip_allowlist"`
@@ -171,6 +179,7 @@ func Default() *Config {
 		LogLevel: "info",
 		HTTP:     Listener{Enabled: true, Address: "0.0.0.0", Port: 8080},
 		HTTPS:    Listener{Enabled: false, Address: "0.0.0.0", Port: 8443},
+		Store:    Store{Path: "ochell.db"},
 		Agent: Agent{
 			Command:        "claude",
 			Args:           []string{"-p"},
@@ -309,6 +318,8 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.HTTPS.CertFile, "tls-cert", c.HTTPS.CertFile, "TLS certificate file (PEM)")
 	fs.StringVar(&c.HTTPS.KeyFile, "tls-key", c.HTTPS.KeyFile, "TLS private key file (PEM)")
 
+	fs.StringVar(&c.Store.Path, "store-path", c.Store.Path, "file that holds the tickets, the task queue and the handled deliveries")
+
 	fs.StringVar(&c.Agent.Command, "agent-cmd", c.Agent.Command, "agent CLI command")
 	fs.Var(&stringList{dst: &c.Agent.Args}, "agent-arg", "agent CLI argument, repeatable, Go template (replaces config args)")
 	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: stdin or arg")
@@ -359,6 +370,9 @@ func (c *Config) Validate() error {
 	}
 	if c.HTTPS.Enabled && (c.HTTPS.CertFile == "" || c.HTTPS.KeyFile == "") {
 		errs = append(errs, errors.New("https requires cert_file and key_file"))
+	}
+	if c.Store.Path == "" {
+		errs = append(errs, errors.New("store.path is required"))
 	}
 	if c.Agent.Command == "" {
 		errs = append(errs, errors.New("agent.command is required"))

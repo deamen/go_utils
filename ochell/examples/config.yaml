@@ -17,6 +17,12 @@ https:
   cert_file: /etc/ochell/tls.crt
   key_file: /etc/ochell/tls.key
 
+# The SQLite file with the tickets, the task queue and the handled webhook
+# deliveries. It is created when missing. Keep it where the agent cannot
+# read it.
+store:
+  path: /var/lib/ochell/ochell.db
+
 agent:
   # One agent process is started per ticket; it manages any sub-agents itself.
   command: claude

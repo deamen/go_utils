@@ -184,11 +184,15 @@ type Ochell struct {
 	Linear *FakeLinear
 
 	t         *testing.T
+	bin       string
+	cfgFile   string
+	env       []string
 	cmd       *exec.Cmd
 	out       *lockedBuffer
 	recordDir string
 	exited    chan struct{}
 	exitErr   error
+	last      func() Response
 }
 
 var (
@@ -243,7 +247,7 @@ func Start(t *testing.T, opts Options) *Ochell {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	o := &Ochell{t: t, Dir: dir, recordDir: filepath.Join(dir, "records"), out: &lockedBuffer{}, exited: make(chan struct{})}
+	o := &Ochell{t: t, Dir: dir, bin: ochellBin, env: opts.Env, recordDir: filepath.Join(dir, "records"), out: &lockedBuffer{}}
 	for _, d := range []string{o.recordDir, filepath.Join(dir, "work")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
@@ -266,6 +270,7 @@ func Start(t *testing.T, opts Options) *Ochell {
 	cfg := config.Default()
 	cfg.LogLevel = "debug"
 	cfg.HTTP = config.Listener{Enabled: true, Address: "127.0.0.1", Port: port}
+	cfg.Store.Path = filepath.Join(dir, "ochell.db")
 	cfg.Agent.Command = agentBin
 	cfg.Agent.Args = nil
 	cfg.Agent.PromptVia = "stdin"
@@ -311,23 +316,12 @@ func Start(t *testing.T, opts Options) *Ochell {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfgFile := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(cfgFile, raw, 0o600); err != nil {
+	o.cfgFile = filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(o.cfgFile, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	o.URL = fmt.Sprintf("http://127.0.0.1:%d", port)
-	o.cmd = exec.Command(ochellBin, "serve", "--config", cfgFile)
-	o.cmd.Dir = dir
-	o.cmd.Env = append(os.Environ(), opts.Env...)
-	o.cmd.Stdout, o.cmd.Stderr = o.out, o.out
-	if err := o.cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		o.exitErr = o.cmd.Wait()
-		close(o.exited)
-	}()
 	t.Cleanup(func() {
 		select {
 		case <-o.exited:
@@ -339,11 +333,30 @@ func Start(t *testing.T, opts Options) *Ochell {
 			t.Logf("ochell output:\n%s", o.out.String())
 		}
 	})
+	o.run()
+	return o
+}
 
+// run starts the ochell process and waits until it answers on /healthz.
+func (o *Ochell) run() {
+	o.t.Helper()
+	o.exited = make(chan struct{})
+	o.cmd = exec.Command(o.bin, "serve", "--config", o.cfgFile)
+	o.cmd.Dir = o.Dir
+	o.cmd.Env = append(os.Environ(), o.env...)
+	o.cmd.Stdout, o.cmd.Stderr = o.out, o.out
+	if err := o.cmd.Start(); err != nil {
+		o.t.Fatal(err)
+	}
+	cmd, exited := o.cmd, o.exited
+	go func() {
+		o.exitErr = cmd.Wait()
+		close(exited)
+	}()
 	o.waitFor(10*time.Second, "ochell to answer on /healthz", func() bool {
 		select {
 		case <-o.exited:
-			t.Fatalf("ochell exited during start: %v\n%s", o.exitErr, o.out.String())
+			o.t.Fatalf("ochell exited during start: %v\n%s", o.exitErr, o.out.String())
 		default:
 		}
 		resp, err := http.Get(o.URL + "/healthz")
@@ -353,7 +366,28 @@ func Start(t *testing.T, opts Options) *Ochell {
 		resp.Body.Close()
 		return resp.StatusCode == http.StatusOK
 	})
-	return o
+}
+
+// Kill ends the ochell process at once, as a crash would: nothing is shut
+// down, and a running agent is left behind.
+func (o *Ochell) Kill() {
+	o.t.Helper()
+	if err := o.cmd.Process.Kill(); err != nil {
+		o.t.Fatal(err)
+	}
+	<-o.exited
+}
+
+// Restart starts ochell again after it has exited, with the same
+// configuration, store and logs.
+func (o *Ochell) Restart() {
+	o.t.Helper()
+	select {
+	case <-o.exited:
+	default:
+		o.t.Fatal("Restart: ochell is still running")
+	}
+	o.run()
 }
 
 func freePort(t *testing.T) int {
@@ -398,6 +432,22 @@ func (r Response) TaskID(t *testing.T) string {
 
 // Post sends a request body with headers to one of ochell's paths.
 func (o *Ochell) Post(path string, body []byte, headers map[string]string) Response {
+	o.t.Helper()
+	o.last = func() Response { return o.post(path, body, headers) }
+	return o.post(path, body, headers)
+}
+
+// Replay sends the last request again, byte for byte, as a sender that
+// retries a delivery does.
+func (o *Ochell) Replay() Response {
+	o.t.Helper()
+	if o.last == nil {
+		o.t.Fatal("Replay: nothing was sent yet")
+	}
+	return o.last()
+}
+
+func (o *Ochell) post(path string, body []byte, headers map[string]string) Response {
 	o.t.Helper()
 	req, err := http.NewRequest(http.MethodPost, o.URL+path, bytes.NewReader(body))
 	if err != nil {

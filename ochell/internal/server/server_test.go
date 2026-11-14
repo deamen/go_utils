@@ -19,6 +19,7 @@ import (
 	"ochell/internal/config"
 	"ochell/internal/runner"
 	"ochell/internal/source/linear"
+	"ochell/internal/store"
 	"ochell/internal/task"
 )
 
@@ -54,7 +55,12 @@ func testConfig() *config.Config {
 
 func newServer(t *testing.T, cfg *config.Config, r Submitter) *Server {
 	t.Helper()
-	s, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), r)
+	st, err := store.Open(filepath.Join(t.TempDir(), "ochell.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	s, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), r, st)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,10 +330,10 @@ func TestLinearAgentSession(t *testing.T) {
 		t.Fatalf("tasks = %d", len(fr.tasks))
 	}
 	tk := fr.tasks[0]
-	if tk.Key != "ENG-123" || !strings.Contains(tk.Context, "<issue") || tk.OnFinish == nil {
+	if tk.Key != "ENG-123" || !strings.Contains(tk.Context, "<issue") || tk.TrackerSession != "session-0000" {
 		t.Fatalf("task = %+v", tk)
 	}
-	if err := tk.OnFinish(context.Background(), tk, task.Result{Tail: "Opened PR #7"}); err != nil {
+	if err := s.Finished(context.Background(), tk, task.Result{Tail: "Opened PR #7"}); err != nil {
 		t.Fatal(err)
 	}
 	<-api.got

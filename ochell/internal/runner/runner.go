@@ -4,6 +4,9 @@
 // managed by that agent. The command is executed without a shell, so ticket
 // content can never be interpreted as shell syntax. A launcher (package
 // launcher) starts and stops the process.
+//
+// The queue is in the store (package store), so queued tasks survive a
+// restart of ochell.
 package runner
 
 import (
@@ -23,29 +26,41 @@ import (
 
 	"ochell/internal/config"
 	"ochell/internal/launcher"
+	"ochell/internal/store"
 	"ochell/internal/task"
 )
 
 var (
-	ErrBusy      = errors.New("a task for this ticket is already queued or running")
-	ErrQueueFull = errors.New("task queue is full")
+	ErrBusy      = store.ErrBusy
+	ErrQueueFull = store.ErrQueueFull
 	ErrStopped   = errors.New("runner is stopped")
 )
 
 const tailSize = 4096
 
+// Notifier tells the source of a task how its run went. The server
+// implements it.
+type Notifier interface {
+	// Started is called when a worker picks the task up.
+	Started(ctx context.Context, t *task.Task) error
+	// Finished is called when the run has ended, in any way.
+	Finished(ctx context.Context, t *task.Task, res task.Result) error
+}
+
 type Runner struct {
 	cfg      config.Agent
 	log      *slog.Logger
+	store    *store.Store
+	notify   Notifier
 	launcher launcher.Launcher
 	prompt   *template.Template
 	args     []*template.Template
 	workdir  *template.Template
-	queue    chan *task.Task
 	mu       sync.Mutex
-	inFlight map[string]bool
 	stopped  bool
 	wg       sync.WaitGroup
+	// wake tells an idle worker to look at the queue.
+	wake chan struct{}
 	// quit is closed when Shutdown begins: workers start no more tasks.
 	quit chan struct{}
 	// runCtx is cancelled to stop the agents that are still running.
@@ -53,8 +68,9 @@ type Runner struct {
 	stopRuns context.CancelFunc
 }
 
-func New(cfg config.Agent, log *slog.Logger) (*Runner, error) {
-	r := &Runner{cfg: cfg, log: log, inFlight: map[string]bool{}, quit: make(chan struct{})}
+// New returns a runner that keeps its queue in st.
+func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
+	r := &Runner{cfg: cfg, log: log, store: st, wake: make(chan struct{}, 1), quit: make(chan struct{})}
 	r.runCtx, r.stopRuns = context.WithCancel(context.Background())
 	var err error
 	if r.prompt, err = parse("prompt_template", cfg.PromptTemplate); err != nil {
@@ -83,13 +99,11 @@ func New(cfg config.Agent, log *slog.Logger) (*Runner, error) {
 			}
 		}
 	}
-	size := cfg.QueueSize
-	if size < 1 {
-		size = 1
-	}
-	r.queue = make(chan *task.Task, size)
 	return r, nil
 }
+
+// SetNotifier sets who is told about the runs. Call it before Start.
+func (r *Runner) SetNotifier(n Notifier) { r.notify = n }
 
 func parse(name, text string) (*template.Template, error) {
 	t, err := template.New(name).Option("missingkey=error").Parse(text)
@@ -107,30 +121,60 @@ func render(t *template.Template, data any) (string, error) {
 	return b.String(), nil
 }
 
-func ticketKey(t *task.Task) string { return t.Source + ":" + t.Key }
-
-// Submit queues a task. It never blocks.
+// Submit queues a task. It never blocks. It returns ErrBusy when the ticket
+// already has a queued or running task, and ErrQueueFull when queue_size
+// tasks are waiting.
 func (r *Runner) Submit(t *task.Task) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopped {
 		return ErrStopped
 	}
-	k := ticketKey(t)
-	if r.inFlight[k] {
-		return ErrBusy
+	if err := r.store.Enqueue(t, max(r.cfg.QueueSize, 1)); err != nil {
+		return err
 	}
+	r.wakeWorker()
+	return nil
+}
+
+func (r *Runner) wakeWorker() {
 	select {
-	case r.queue <- t:
-		r.inFlight[k] = true
-		return nil
+	case r.wake <- struct{}{}:
 	default:
-		return ErrQueueFull
 	}
 }
 
-// Start launches the worker pool. Shutdown ends it.
-func (r *Runner) Start() {
+// idlePoll is how often an idle worker looks at the queue without being
+// woken. It only matters after a store error.
+const idlePoll = 30 * time.Second
+
+// Start launches the worker pool. Shutdown ends it. Tasks that were queued
+// before a restart are run; runs that the restart cut short are closed and
+// their tickets told.
+func (r *Runner) Start() error {
+	interrupted, err := r.store.Recover()
+	if err != nil {
+		return fmt.Errorf("recover the task store: %w", err)
+	}
+	for _, t := range interrupted {
+		r.log.Warn("run was interrupted: ochell stopped while the agent was running", "task", t.ID, "source", t.Source, "key", t.Key)
+	}
+	if len(interrupted) > 0 && r.notify != nil {
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			for _, t := range interrupted {
+				res := task.Result{Outcome: task.OutcomeInterrupted, ExitCode: -1, Err: store.ErrInterrupted}
+				if err := r.notify.Finished(context.Background(), t, res); err != nil {
+					r.log.Warn("finish notification failed", "task", t.ID, "err", err)
+				}
+			}
+		}()
+	}
+	if n, err := r.store.Active(); err == nil && n > 0 {
+		r.log.Info("tasks queued before the restart will be run", "tasks", n)
+	}
+
 	n := max(r.cfg.MaxConcurrent, 1)
 	for range n {
 		r.wg.Add(1)
@@ -143,20 +187,31 @@ func (r *Runner) Start() {
 					return
 				default:
 				}
+				t, err := r.store.Claim()
+				if err != nil {
+					r.log.Error("cannot read the task queue", "err", err)
+				}
+				if t != nil {
+					// There may be more work for the other workers.
+					r.wakeWorker()
+					r.handle(r.runCtx, t)
+					continue
+				}
 				select {
 				case <-r.quit:
 					return
-				case t := <-r.queue:
-					r.handle(r.runCtx, t)
+				case <-r.wake:
+				case <-time.After(idlePoll):
 				}
 			}
 		}()
 	}
+	return nil
 }
 
 // Shutdown rejects new tasks and waits for the running agents to finish.
 // When ctx is done first, it stops them and waits for that. Tasks that were
-// queued but not started are reported as not started.
+// queued but not started stay in the store and are run after a restart.
 //
 // Runs that a shutdown interrupts are not resumed after a restart.
 func (r *Runner) Shutdown(ctx context.Context) {
@@ -183,51 +238,26 @@ func (r *Runner) Shutdown(ctx context.Context) {
 		<-done
 	}
 	r.stopRuns()
-
-	// No worker is left, so nothing else reads the queue.
-	for {
-		select {
-		case t := <-r.queue:
-			r.drop(t)
-		default:
-			return
-		}
+	if n := r.Running(); n > 0 {
+		r.log.Info("tasks stay queued for the next start", "tasks", n)
 	}
 }
 
 // Running returns the number of tasks that are queued or running.
 func (r *Runner) Running() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.inFlight)
-}
-
-// drop reports a queued task that will not be started.
-func (r *Runner) drop(t *task.Task) {
-	r.mu.Lock()
-	delete(r.inFlight, ticketKey(t))
-	r.mu.Unlock()
-	r.log.Warn("task dropped: ochell shut down before it started", "task", t.ID, "source", t.Source, "key", t.Key)
-	if t.OnFinish == nil {
-		return
+	n, err := r.store.Active()
+	if err != nil {
+		r.log.Error("cannot count the tasks", "err", err)
 	}
-	res := task.Result{Outcome: task.OutcomeNotStarted, ExitCode: -1, Err: errors.New("ochell shut down before the run started")}
-	if err := t.OnFinish(context.Background(), t, res); err != nil {
-		r.log.Warn("finish notification failed", "task", t.ID, "err", err)
-	}
+	return n
 }
 
 func (r *Runner) handle(ctx context.Context, t *task.Task) {
-	defer func() {
-		r.mu.Lock()
-		delete(r.inFlight, ticketKey(t))
-		r.mu.Unlock()
-	}()
-	log := r.log.With("task", t.ID, "source", t.Source, "key", t.Key)
+	log := r.log.With("task", t.ID, "source", t.Source, "key", t.Key, "attempt", t.Attempt)
 
 	notifyCtx := context.WithoutCancel(ctx)
-	if t.OnStart != nil {
-		if err := t.OnStart(notifyCtx, t); err != nil {
+	if r.notify != nil {
+		if err := r.notify.Started(notifyCtx, t); err != nil {
 			log.Warn("start notification failed", "err", err)
 		}
 	}
@@ -237,8 +267,13 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	} else {
 		log.Info("agent finished", "duration", res.Duration, "log", res.LogFile)
 	}
-	if t.OnFinish != nil {
-		if err := t.OnFinish(notifyCtx, t, res); err != nil {
+	// Record the end before telling the ticket, so the ticket is free for
+	// a new run by the time someone reads the answer.
+	if err := r.store.Finish(t.ID, res); err != nil {
+		log.Error("cannot record the end of the run", "err", err)
+	}
+	if r.notify != nil {
+		if err := r.notify.Finished(notifyCtx, t, res); err != nil {
 			log.Warn("finish notification failed", "err", err)
 		}
 	}
@@ -301,6 +336,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		res.Err = fmt.Errorf("render workdir: %w", err)
 		return res
 	}
+	res.Workdir = dir
 
 	if err := os.MkdirAll(r.cfg.LogDir, 0o750); err != nil {
 		res.Err = fmt.Errorf("create log dir: %w", err)

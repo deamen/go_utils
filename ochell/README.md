@@ -22,7 +22,7 @@ Behaviour common to all sources:
   - 200 when a task is queued, ignored or a duplicate;
   - 401 when authentication fails;
   - 400 when the payload is unusable, for example a Jira Automation request that names no assignee;
-- **Duplicate deliveries:** a signed request is dropped when its body, or its `X-Atlassian-Webhook-Identifier` / `Linear-Delivery` id, was seen before. The body counts because the signature covers it; the id is a header that a replayed request can change. Both are kept in memory for 24 hours and are lost on a restart.
+- **Duplicate deliveries:** a signed request is dropped when its body, or its `X-Atlassian-Webhook-Identifier` / `Linear-Delivery` id, was seen before. The body counts because the signature covers it; the id is a header that a replayed request can change. Both are kept in the store for 24 hours, also across a restart.
 - **Replay:** a signed request is rejected with 401 when its timestamp (`timestamp` for Jira, `webhookTimestamp` for Linear) is further than `max_skew` from now. The default is 60s for Linear and 2h for Jira: Jira retries a failed delivery up to five times, 5 to 15 minutes apart, and a retry may carry the timestamp of the event. Jira Automation requests carry no timestamp.
 - **One run per ticket:** a ticket that is already queued or running is not started again. The request is answered with 200 `already in progress`. A new Linear session on such a ticket gets a `response` activity that says so, which closes that session; the result is posted in the first session.
 - **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the agent exits it posts a `response` (the tail of the agent output) or an `error`.
@@ -32,9 +32,10 @@ Behaviour common to all sources:
 - **A stop ends the whole agent**, not only its top process: sub-agents, MCP servers and git children too. ochell sends SIGTERM, and SIGKILL after `agent.stop_grace` (10s). This happens at `agent.timeout` and on shutdown.
   - With the `systemd` launcher ochell stops the unit, and systemd signals every process in it.
   - With the `direct` launcher the agent runs in its own process group and ochell signals the group. A child that leaves the group (`setsid`) is not reached; use the `systemd` launcher where that matters. When the agent exits by itself, what it left running in its group is killed as well.
-- **Shutdown** (SIGTERM or Ctrl-C): ochell stops accepting webhooks and waits up to `agent.drain_timeout` (30s) for running agents to finish. Then it stops the ones still running; their tickets get an error that says so. A second signal ends the wait at once. Tasks that were queued but not started are dropped and reported the same way.
+- **Shutdown** (SIGTERM or Ctrl-C): ochell stops accepting webhooks and waits up to `agent.drain_timeout` (30s) for running agents to finish. Then it stops the ones still running; their tickets get an error that says so. A second signal ends the wait at once. Tasks that were queued but not started stay in the store and run after the next start.
   - If ochell runs as a systemd service, set the service's `TimeoutStopSec` above `drain_timeout` plus `stop_grace`, or systemd kills ochell first.
   - Interrupted runs are not resumed after a restart.
+- **After a crash** (ochell was killed, or the host went down): at the next start, queued tasks run as usual. A run that was in progress is closed as `interrupted`, its ticket gets an error that says so, and it is not started again. ochell does not look for an agent that such a run may have left behind.
 
 ## Build
 ```
@@ -87,6 +88,7 @@ Common flags (run `ochell serve -h` for all of them):
 |---|---|
 | `--http`, `--http-addr`, `--http-port` | Enable the HTTP listener and set its address and port separately |
 | `--https`, `--https-addr`, `--https-port`, `--tls-cert`, `--tls-key` | Same for HTTPS (TLS 1.2+) |
+| `--store-path` | File that holds the tickets, the task queue and the handled deliveries (default `ochell.db`); see [The store](#the-store) |
 | `--agent-cmd` | Agent CLI executable (default `claude`) |
 | `--agent-arg` | Agent argument; repeatable; replaces the YAML `args` (default `-p`). Go template: `{{.Key}}`, `{{.Source}}`, `{{.ID}}`. Keep ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`, `{{.Prompt}}`) out of arguments; see [The prompt](#the-prompt) |
 | `--agent-prompt-via` | `stdin` (default) or `arg` |
@@ -106,6 +108,16 @@ JIRA_SECRET=... ochell serve --http-addr 127.0.0.1 --http-port 8080 \
 ```
 
 The agent runs without a shell, with its working directory set to `workdir` (rendered per task). Output goes to `<log_dir>/<task id>.log`.
+
+### The store
+ochell keeps its durable state in one SQLite file, `store.path` (default `ochell.db` in the working directory). It is created when missing, readable by its owner only, and updated in place when a newer ochell needs more tables. It holds:
+- the **tickets** ochell has worked on: state, number of attempts, working directory;
+- the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to;
+- the **webhook deliveries** handled in the last 24 hours.
+
+So a restart loses no queued task, and a retried or replayed delivery from before the restart is still recognised. SQLite keeps two more files next to it while ochell runs (`-wal` and `-shm`); copy all three, or stop ochell first, when you back it up.
+
+Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user.
 
 ### Launchers
 A launcher starts and stops the agent process. `agent.launcher` selects it.
@@ -147,6 +159,7 @@ Then set `agent.launcher: systemd` and check the result with `scripts/check-laun
 | `timed_out` | ochell stopped it at `agent.timeout` |
 | `stopped` | ochell stopped it because it is shutting down |
 | `not_started` | the agent never ran: the command could not be executed, or the launch was refused. With the systemd launcher these are exit codes from 200 (250: refused by the launch script; 203: systemd could not execute the command) |
+| `interrupted` | ochell itself was killed during the run, and found it unfinished at the next start. This one is only in the store and in ochell's log, not in the run log |
 
 ochell sets the outcome from what it asked for, never from the exit code alone: a unit that systemd stopped exits with 0.
 
