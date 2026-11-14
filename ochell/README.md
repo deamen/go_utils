@@ -111,13 +111,40 @@ The agent runs without a shell, with its working directory set to `workdir` (ren
 
 ### The store
 ochell keeps its durable state in one SQLite file, `store.path` (default `ochell.db` in the working directory). It is created when missing, readable by its owner only, and updated in place when a newer ochell needs more tables. It holds:
-- the **tickets** ochell has worked on: state, number of attempts, working directory;
+- the **tickets** ochell has worked on: state (see [Ticket states](#ticket-states)), number of attempts, working directory;
 - the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to;
 - the **webhook deliveries** handled in the last 24 hours.
 
 So a restart loses no queued task, and a retried or replayed delivery from before the restart is still recognised. SQLite keeps two more files next to it while ochell runs (`-wal` and `-shm`); copy all three, or stop ochell first, when you back it up.
 
 Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user.
+
+### Ticket states
+Every ticket ochell has seen is in one of these states. They are defined, with the allowed moves, in [internal/ticket/state.go](internal/ticket/state.go), and the store refuses any other move.
+
+| State | Meaning | Next |
+|---|---|---|
+| `queued` | a run waits for a free worker | `running`, `cancelled` |
+| `running` | an agent is working on the ticket | any state below, or `queued` again (a retry) |
+| `waiting` | nothing happens until a human acts; always with a reason | `queued`, `done`, `cancelled` |
+| `in_review` | the agent handed its work over and a human reviews it | `queued`, `done`, `waiting`, `cancelled` |
+| `done` | the work was accepted, or the ticket was closed | `queued` |
+| `failed` | the last run did not succeed and nothing retries it | `queued`, `waiting`, `cancelled` |
+| `cancelled` | stopped or released by a human; not started again until it is assigned again | `queued` |
+
+A ticket that is `queued` or `running` takes no second run. From every other state a new assignment queues it again.
+
+Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation`, and `interrupted` (ochell itself stopped during the run).
+
+What a run leads to today:
+
+| Run outcome | Ticket state |
+|---|---|
+| `finished` | `in_review` |
+| `failed`, `timed_out`, `not_started` | `failed` |
+| `stopped`, `interrupted` | `waiting`, reason `interrupted` |
+
+Several states and reasons are not reached yet: they belong to features that come later (the agent's own result, the plan gate, stop from the ticket, handoff). Pausing will not be a state: it holds the queue, and queued tickets stay queued.
 
 ### Launchers
 A launcher starts and stops the agent process. `agent.launcher` selects it.
