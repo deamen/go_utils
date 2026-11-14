@@ -45,7 +45,7 @@ agent:
   #            development; the agent can read ochell's files.
   #   systemd  a transient unit under a separate OS user, started and stopped
   #            through two root-owned scripts (see README, "Launchers").
-  #            Requires prompt_via: stdin and an absolute command path; args
+  #            Requires prompt_via: stdin and an absolute command and workdir; args
   #            and workdir may only use .ID .Source .Key; env_pass is not used.
   launcher: direct
   systemd:

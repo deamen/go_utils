@@ -387,6 +387,11 @@ func (c *Config) Validate() error {
 		if !strings.HasPrefix(c.Agent.Command, "/") {
 			errs = append(errs, errors.New("agent.launcher systemd requires agent.command to be an absolute path"))
 		}
+		// The launch script refuses any other working directory, which
+		// would make every run end as not started.
+		if !strings.HasPrefix(c.Agent.Workdir, "/") {
+			errs = append(errs, errors.New("agent.launcher systemd requires agent.workdir to be an absolute path, inside the launcher's WORKSPACE_ROOT"))
+		}
 		if len(c.Agent.Systemd.LaunchCommand) == 0 || len(c.Agent.Systemd.StopCommand) == 0 {
 			errs = append(errs, errors.New("agent.systemd requires launch_command and stop_command"))
 		}
