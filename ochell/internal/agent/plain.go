@@ -27,7 +27,7 @@ func (p Plain) Start(run Run) (Command, error) {
 
 func (Plain) Resume(Run, string) (Command, error) { return Command{}, ErrNoResume }
 
-func (Plain) Output() Output { return &tail{max: tailSize} }
+func (Plain) Output(func(Event)) Output { return &tail{max: tailSize} }
 
 // tail keeps the last max bytes written to it.
 type tail struct {

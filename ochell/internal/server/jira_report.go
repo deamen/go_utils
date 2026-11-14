@@ -54,6 +54,9 @@ func jiraStarted(t *task.Task) string {
 // jiraFinished is the comment for the end of a run. It says the same as
 // the activity that a Linear session gets.
 func jiraFinished(res task.Result) string {
+	if res.Next != "" {
+		return queuedAgainText(res)
+	}
 	if res.Err != nil {
 		return strings.TrimSpace(failureText(res) + "\n\n" + noFormat(lastN(res.Message, replyMax)))
 	}

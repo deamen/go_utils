@@ -11,12 +11,17 @@ import (
 // prompt.
 const maxComment = 8000
 
+// recoveryNote is for the run that takes the place of one that ochell did
+// not see the end of.
+const recoveryNote = "The orchestrator was restarted while you were working on this ticket, and your run was cut off before it ended. You may have done part of the work already. Check git (the working directory, the branch and what was pushed), the pull request and the ticket's comments before you repeat anything that has an effect outside the working directory, such as a push, a pull request or a comment."
+
 // runContext is the part of the prompt that says what only ochell knows
 // about this run: which attempt it is and whether it continues the earlier
 // session, what the earlier attempts left behind, and the comment that
 // triggered it. The agent still reads the ticket itself.
 //
-// It is empty for a first attempt that no comment triggered.
+// It is empty for a first attempt that no comment triggered and that does
+// not take the place of an interrupted run.
 func runContext(t *task.Task, resumed bool) string {
 	var lines []string
 	if t.Attempt > 1 {
@@ -25,6 +30,9 @@ func runContext(t *task.Task, resumed bool) string {
 		} else {
 			lines = append(lines, fmt.Sprintf("This is attempt %d on this ticket. It starts a new agent session: you do not remember the earlier attempts. Look at the branch, the pull request and the ticket's comments before you repeat work or anything that has an effect outside the repository.", t.Attempt))
 		}
+	}
+	if t.Cause == task.CauseRecovery {
+		lines = append(lines, recoveryNote)
 	}
 	switch {
 	case t.Branch != "" && t.PRURL != "":

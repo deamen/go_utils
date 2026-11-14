@@ -60,7 +60,9 @@ func (c Claude) Resume(run Run, session string) (Command, error) {
 	return c.command(run, "--resume", session), nil
 }
 
-func (Claude) Output() Output { return &claudeOutput{other: tail{max: tailSize}} }
+func (Claude) Output(on func(Event)) Output {
+	return &claudeOutput{other: tail{max: tailSize}, on: on}
+}
 
 // Limits of the output reader. A line of the stream can be large (a tool
 // result); one that is longer than maxLine is skipped.
@@ -99,6 +101,9 @@ type claudeOutput struct {
 	mu       sync.Mutex
 	line     []byte
 	skipping bool // inside a line that is longer than maxLine
+
+	// on is told about the session as soon as the stream names it.
+	on func(Event)
 
 	rep       Report
 	gotResult bool
@@ -147,8 +152,11 @@ func (o *claudeOutput) event(line []byte) {
 		o.other.Write(append(line, '\n'))
 		return
 	}
-	if sessionID.MatchString(ev.SessionID) {
+	if sessionID.MatchString(ev.SessionID) && ev.SessionID != o.rep.SessionID {
 		o.rep.SessionID = ev.SessionID
+		if o.on != nil {
+			o.on(Event{SessionID: ev.SessionID})
+		}
 	}
 	switch ev.Type {
 	case "assistant":

@@ -51,7 +51,7 @@ func TestPlainCommand(t *testing.T) {
 }
 
 func TestPlainOutputKeepsTheTail(t *testing.T) {
-	out := Plain{}.Output()
+	out := Plain{}.Output(nil)
 	if got := out.Report(); got != (Report{}) {
 		t.Errorf("report of a silent run = %+v", got)
 	}

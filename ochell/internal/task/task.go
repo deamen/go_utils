@@ -2,11 +2,27 @@
 package task
 
 import (
+	"fmt"
 	"time"
 
 	"ochell/internal/agent"
 	"ochell/internal/result"
 )
+
+// Cause says why a run was queued, when it was not a plain assignment.
+type Cause string
+
+const (
+	// CauseRecovery: ochell itself stopped during the earlier run of the
+	// ticket, and this run takes its place.
+	CauseRecovery Cause = "recovery"
+)
+
+// NewID returns the id of a task that is received now. It is unique per
+// ticket and millisecond, and safe in a file name.
+func NewID(now time.Time, source, key string) string {
+	return fmt.Sprintf("%s-%s-%s", now.UTC().Format("20060102T150405.000Z"), source, key)
+}
 
 type Task struct {
 	// ID is unique per task and used for log file names.
@@ -25,6 +41,8 @@ type Task struct {
 	// Comment is the comment that triggered this run, when a person asked
 	// for it in one (a mention in Linear). Empty for a plain assignment.
 	Comment string
+	// Cause says why the run was queued; empty for a plain assignment.
+	Cause Cause
 	// TrackerSession is where the source wants progress reported: the id of
 	// the Linear agent session. Empty when there is no such place.
 	TrackerSession string
@@ -101,6 +119,10 @@ type Result struct {
 	SignalMessage string
 	PRURL         string
 	Branch        string
+	// Next is set when ochell has queued another run of the ticket in
+	// place of this one, and says why. The ticket is then not waiting for
+	// anyone.
+	Next Cause
 	// Message is the agent's final message, as its adapter read it: for
 	// the plain adapter, the last part of the output.
 	Message string

@@ -101,6 +101,44 @@ func TestSystemdLauncherStop(t *testing.T) {
 	}
 }
 
+// After a crash of ochell the unit of a run is still there. The next ochell
+// knows only the task id, and stops the unit by it.
+func TestSystemdLauncherReap(t *testing.T) {
+	e := newScriptEnv(t)
+	out := &syncBuffer{}
+	p, err := e.launcher().Start(Spec{TaskID: "T-left", Command: "/bin/sh", Args: []string{"-c", "echo started; exec sleep 600"}, Dir: e.root, Output: out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() {
+		_, err := p.Wait()
+		waited <- err
+	}()
+	for deadline := time.Now().Add(5 * time.Second); !strings.Contains(out.String(), "started"); {
+		if time.Now().After(deadline) {
+			t.Fatal("agent did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A launcher that did not start the run, as after a restart.
+	if err := e.launcher().Reap("T-left"); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run did not end after Reap")
+	}
+	// Nothing left of a run is not an error.
+	if err := e.launcher().Reap("T-never-ran"); err != nil {
+		t.Errorf("Reap of a run that left nothing: %v", err)
+	}
+	if err := (Direct{}).Reap("T-left"); err != nil {
+		t.Errorf("Direct.Reap: %v", err)
+	}
+}
+
 // A refused launch (250) or a unit that systemd could not start (200-243)
 // is not an agent failure.
 func TestSystemdLauncherNotStarted(t *testing.T) {

@@ -122,17 +122,17 @@ func TestRestart(t *testing.T) {
 	// No Close: ochell was killed.
 
 	s = open(t, path)
-	interrupted, err := s.Recover()
+	interrupted, err := s.Recover(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(interrupted) != 1 || interrupted[0].ID != "run-a" || interrupted[0].TrackerSession != "session-run-a" {
+	if len(interrupted) != 1 || interrupted[0].Task.ID != "run-a" || interrupted[0].Task.TrackerSession != "session-run-a" || interrupted[0].Requeued {
 		t.Fatalf("interrupted = %+v, want run-a with its tracker session", interrupted)
 	}
 	if tk, _ := s.Ticket("linear", "ENG-run-a"); tk == nil || tk.State != ticket.Waiting || tk.Reason != ticket.ReasonInterrupted || tk.Attempts != 1 {
 		t.Errorf("ticket of the interrupted run = %+v", tk)
 	}
-	if again, _ := s.Recover(); len(again) != 0 {
+	if again, _ := s.Recover(nil); len(again) != 0 {
 		t.Errorf("a second Recover returned %+v", again)
 	}
 	// The queued runs are still there, in order, with what a run needs.
@@ -148,6 +148,73 @@ func TestRestart(t *testing.T) {
 	// The interrupted ticket can be started again.
 	if err := s.Enqueue(newTask("run-a2", "ENG-run-a", t0), Limits{}); err != nil {
 		t.Errorf("new run of an interrupted ticket: %v", err)
+	}
+}
+
+// A run that ochell did not see the end of is closed, and another run of
+// its ticket takes its place: same context, comment and tracker session,
+// and the agent session that the interrupted run had opened.
+func TestRecoverQueuesAgain(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	first := newTask("run-1", "ENG-1", t0)
+	first.Comment = "please also fix the typo"
+	if err := s.Enqueue(first, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Claim(); got == nil || got.Cause != "" {
+		t.Fatalf("claimed %+v", got)
+	}
+	// The agent names its session while it runs.
+	if err := s.NoteSession("linear", "ENG-1", "session-abc", "/work/ENG-1"); err != nil {
+		t.Fatal(err)
+	}
+	// ochell is killed here.
+
+	again := func(max int) func(*task.Task) Again {
+		return func(tk *task.Task) Again {
+			return Again{ID: tk.ID + "-again", Cause: task.CauseRecovery, MaxAttempts: max}
+		}
+	}
+	in, err := s.Recover(again(5))
+	if err != nil || len(in) != 1 || !in[0].Requeued {
+		t.Fatalf("Recover = %+v, %v; want one run that was queued again", in, err)
+	}
+	if run, _ := s.Run("run-1"); run == nil || run.Status != "ended" || run.Result.Outcome != task.OutcomeInterrupted {
+		t.Errorf("the interrupted run = %+v", run)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk == nil || tk.State != ticket.Queued {
+		t.Fatalf("ticket = %+v, want queued", tk)
+	}
+	got, err := s.Claim()
+	if err != nil || got == nil {
+		t.Fatalf("Claim = %+v, %v", got, err)
+	}
+	if got.ID != "run-1-again" || got.Cause != task.CauseRecovery || got.Attempt != 2 ||
+		got.AgentSession != "session-abc" || got.Workspace != "/work/ENG-1" ||
+		got.Comment != first.Comment || got.Context != first.Context || got.TrackerSession != first.TrackerSession {
+		t.Errorf("the run that takes its place = %+v", got)
+	}
+
+	// FinishAndQueue does the same for a run that ochell stops itself.
+	queued, err := s.FinishAndQueue("run-1-again", task.Result{Outcome: task.OutcomeStopped}, Again{ID: "run-3", Cause: task.CauseRecovery, MaxAttempts: 5})
+	if err != nil || !queued {
+		t.Fatalf("FinishAndQueue = %v, %v", queued, err)
+	}
+	if got, _ := s.Claim(); got == nil || got.ID != "run-3" || got.Attempt != 3 {
+		t.Fatalf("claimed %+v, want run-3 as the third attempt", got)
+	}
+
+	// A ticket that has used up its attempts is not queued again: it waits.
+	in, err = s.Recover(again(3))
+	if err != nil || len(in) != 1 || in[0].Requeued {
+		t.Fatalf("Recover at the attempt cap = %+v, %v", in, err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.Waiting || tk.Reason != ticket.ReasonInterrupted {
+		t.Errorf("ticket = %s (%s), want waiting (interrupted)", tk.State, tk.Reason)
+	}
+	if n, _ := s.Active(); n != 0 {
+		t.Errorf("%d runs are queued or running, want none", n)
 	}
 }
 
