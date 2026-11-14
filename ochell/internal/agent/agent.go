@@ -60,6 +60,12 @@ type Usage struct {
 type Event struct {
 	// SessionID is the agent's session, as soon as the output names it.
 	SessionID string
+	// Tool is the name of a tool that the agent starts to use, and Param
+	// a short, harmless part of its input: enough to show progress. Tool
+	// input can hold ticket text and secrets, so an adapter passes on
+	// only what it knows to be neither (see toolParam).
+	Tool  string
+	Param string
 }
 
 // Output receives everything the agent writes to stdout and stderr during

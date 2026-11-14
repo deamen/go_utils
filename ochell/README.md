@@ -365,7 +365,11 @@ An adapter holds what differs between agent CLIs: how a run is started, how an e
 - **Resume:** when a ticket runs again, in the same working directory as before, ochell continues the session of its last run instead of starting from zero. The run log says `session=new` or `session=resumed <id>`.
   - Claude Code keeps its sessions under the agent user's configuration directory, so that directory must be the same for both runs.
   - If a resumed run fails without opening a session (the session is gone), ochell forgets the session, and the ticket's next run starts a new one.
-- Tool events are not sent to the ticket while the agent runs.
+- **Tool use in the Linear session:** while the agent runs, ochell shows the tools it uses as `action` activities in the ticket's Linear session, so the session shows progress between "picked up" and the result.
+  - **Not every use is shown:** at most one activity per `sources.linear.tool_activity_interval` (30s). The next one says how many tool calls were left out. Each is ephemeral: Linear replaces it with the next activity, so the session shows what the agent does now, not a list.
+  - **What is shown** is the tool's name and one short part of its input: the file or search pattern it works on, the host of a URL, or the name of the program that a command runs. The arguments of a command, prompts and queries are never shown: tool input can hold ticket text and secrets.
+  - `tool_activity_interval: 0s` posts none. A Jira ticket has no place for this, and gets none. The `plain` adapter does not know what the agent does.
+  - Whether Linear shows an ephemeral `action` as described was not checked against Linear.
 
 ### Launchers
 A launcher starts and stops the agent process. `agent.launcher` selects it.

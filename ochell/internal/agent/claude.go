@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -90,6 +91,9 @@ type claudeEvent struct {
 		Content []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
+			// Name and Input are those of a tool_use block.
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
 		} `json:"content"`
 	} `json:"message"`
 }
@@ -168,6 +172,9 @@ func (o *claudeOutput) event(line []byte) {
 			if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
 				text = append(text, c.Text)
 			}
+			if c.Type == "tool_use" && c.Name != "" && o.on != nil {
+				o.on(Event{Tool: toolName(c.Name), Param: toolParam(c.Input)})
+			}
 		}
 		if len(text) > 0 {
 			o.lastText = strings.Join(text, "\n")
@@ -181,6 +188,63 @@ func (o *claudeOutput) event(line []byte) {
 			o.rep.Usage = Usage{InputTokens: u.Input, OutputTokens: u.Output, CacheReadTokens: u.CacheRead, CacheWriteTokens: u.CacheWrite}
 		}
 	}
+}
+
+// maxToolParam is how much of a tool's input is shown.
+const maxToolParam = 80
+
+var notInToolName = regexp.MustCompile(`[^A-Za-z0-9_.:-]+`)
+
+// toolName keeps a tool name short and plain; it comes out of the agent's
+// output.
+func toolName(name string) string {
+	name = notInToolName.ReplaceAllString(name, "_")
+	if len(name) > 60 {
+		name = name[:60]
+	}
+	return name
+}
+
+// toolParam returns the part of a tool's input that is shown to the people
+// on the ticket: the file or the search pattern it works on, the host of a
+// URL, or the name of the program a command runs. Everything else stays
+// out, above all the text of commands and prompts: it can hold ticket
+// text and secrets.
+func toolParam(input json.RawMessage) string {
+	var in map[string]json.RawMessage
+	if json.Unmarshal(input, &in) != nil {
+		return ""
+	}
+	text := func(key string) string {
+		var s string
+		if json.Unmarshal(in[key], &s) != nil {
+			return ""
+		}
+		return strings.Join(strings.Fields(s), " ")
+	}
+	param := ""
+	switch {
+	case text("file_path") != "":
+		param = text("file_path")
+	case text("notebook_path") != "":
+		param = text("notebook_path")
+	case text("path") != "":
+		param = text("path")
+	case text("pattern") != "":
+		param = text("pattern")
+	case text("url") != "":
+		// The host only: a path or a query can hold a token.
+		if u, err := url.Parse(text("url")); err == nil {
+			param = u.Host
+		}
+	case text("command") != "":
+		// The program only, not its arguments.
+		param, _, _ = strings.Cut(text("command"), " ")
+	}
+	if len(param) > maxToolParam {
+		param = param[:maxToolParam] + "…"
+	}
+	return param
 }
 
 // Report gives the final message of the result event. A run that ended

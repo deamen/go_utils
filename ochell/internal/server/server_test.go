@@ -1473,3 +1473,71 @@ func TestPollLinear(t *testing.T) {
 		t.Errorf("ochell's own session started a second run: %+v", fr.tasks)
 	}
 }
+
+// Tool use is shown in the Linear session, but not every use: at most one
+// activity per interval, and the next says how many were left out.
+func TestToolUsedIsRateLimited(t *testing.T) {
+	api := lineartest.New(t, "access-1")
+	cfg := testConfig()
+	cfg.Sources.Linear.ClientID = "cid"
+	cfg.Sources.Linear.ClientSecret = "csecret"
+	cfg.Sources.Linear.TokenFile = filepath.Join(t.TempDir(), "token.json")
+	cfg.Sources.Linear.APIURL = api.URL
+	cfg.Sources.Linear.ToolActivityInterval = 30 * time.Second
+	s := newServer(t, cfg, &fakeRunner{})
+	if err := s.linear.SaveToken(&linear.Token{AccessToken: "access-1"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	tk := &task.Task{Source: "linear", Key: "ENG-1", TrackerSession: "session-1"}
+	wait := func(n int) []lineartest.Activity {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for len(api.Activities("session-1")) < n && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
+		acts := api.Activities("session-1")
+		if len(acts) != n {
+			t.Fatalf("%d activities, want %d: %+v", len(acts), n, acts)
+		}
+		return acts
+	}
+
+	// A hundred tool uses in one moment: one activity.
+	for i := range 100 {
+		s.ToolUsed(tk, "Read", "file-"+strconv.Itoa(i)+".go")
+	}
+	acts := wait(1)
+	if a := acts[0]; a.Type != "action" || a.Action != "Read" || a.Parameter != "file-0.go" || !a.Ephemeral {
+		t.Errorf("first activity = %+v", a)
+	}
+	// After the interval the next use is shown, with what was left out.
+	now = now.Add(31 * time.Second)
+	s.ToolUsed(tk, "Bash", "go")
+	s.ToolUsed(tk, "Edit", "main.go")
+	acts = wait(2)
+	if a := acts[1]; a.Action != "Bash" || a.Parameter != "go (and 99 more tool calls before it)" {
+		t.Errorf("second activity = %+v", a)
+	}
+
+	// The end of the run forgets the count: the next run starts fresh.
+	if err := s.Finished(context.Background(), tk, task.Result{Outcome: task.OutcomeFinished, Signal: result.Done, SignalMessage: "Done."}); err != nil {
+		t.Fatal(err)
+	}
+	s.ToolUsed(tk, "Read", "again.go")
+	acts = wait(4)
+	if a := acts[3]; a.Action != "Read" || a.Parameter != "again.go" {
+		t.Errorf("first activity of the next run = %+v", a)
+	}
+
+	// Nothing for a Jira ticket, for a Linear ticket without a session, or
+	// when the interval is zero.
+	s.ToolUsed(&task.Task{Source: "jira", Key: "DEV-1"}, "Read", "x")
+	s.ToolUsed(&task.Task{Source: "linear", Key: "ENG-2"}, "Read", "x")
+	s.cfg.Sources.Linear.ToolActivityInterval = 0
+	now = now.Add(time.Hour)
+	s.ToolUsed(tk, "Read", "x")
+	wait(4)
+}

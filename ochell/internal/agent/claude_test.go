@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -148,5 +150,57 @@ func TestClaudeOutputSkipsHugeLines(t *testing.T) {
 	}
 	if o := out.(*claudeOutput); cap(o.line) > maxLine {
 		t.Errorf("the line buffer grew to %d bytes", cap(o.line))
+	}
+}
+
+// The adapter reports each tool the agent starts to use, with a part of its
+// input that is safe to show.
+func TestClaudeToolEvents(t *testing.T) {
+	var got []Event
+	out := Claude{}.Output(func(ev Event) {
+		if ev.Tool != "" {
+			got = append(got, ev)
+		}
+	})
+	lines := []string{
+		`{"type":"system","subtype":"init","session_id":"sess-1"}`,
+		`{"type":"assistant","session_id":"sess-1","message":{"content":[{"type":"text","text":"Let me look."},{"type":"tool_use","name":"Read","input":{"file_path":"/work/DEV-1/main.go"}}]}}`,
+		`{"type":"user","session_id":"sess-1","message":{"content":[{"type":"tool_result","content":"package main"}]}}`,
+		`{"type":"assistant","session_id":"sess-1","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"curl -H 'Authorization: Bearer s3cret' https://example.com","description":"fetch the page"}},{"type":"tool_use","name":"Grep","input":{"pattern":"func main","path":"src"}}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"result":"Done.","session_id":"sess-1"}`,
+	}
+	io.WriteString(out, strings.Join(lines, "\n")+"\n")
+	want := []Event{{Tool: "Read", Param: "/work/DEV-1/main.go"}, {Tool: "Bash", Param: "curl"}, {Tool: "Grep", Param: "src"}}
+	if !slices.Equal(got, want) {
+		t.Errorf("tool events = %+v\nwant %+v", got, want)
+	}
+	// The stream is still read as before.
+	if rep := out.Report(); rep.Message != "Done." || rep.SessionID != "sess-1" {
+		t.Errorf("report = %+v", rep)
+	}
+}
+
+func TestToolParam(t *testing.T) {
+	long := strings.Repeat("a/", 60) + "file.go"
+	for name, c := range map[string]struct{ input, want string }{
+		"a file":                {`{"file_path":"internal/x.go","old_string":"secret text","new_string":"other"}`, "internal/x.go"},
+		"a notebook":            {`{"notebook_path":"nb.ipynb"}`, "nb.ipynb"},
+		"a pattern":             {`{"pattern":"**/*.go"}`, "**/*.go"},
+		"the host of a URL":     {`{"url":"https://user:pw@example.com/path?token=abc","prompt":"summarise"}`, "example.com"},
+		"the program only":      {`{"command":"  git\n push --force https://token@github.com/x/y  "}`, "git"},
+		"a prompt is not shown": {`{"prompt":"the ticket says: delete everything","subagent_type":"general"}`, ""},
+		"a query is not shown":  {`{"query":"customer name"}`, ""},
+		"one line":              {`{"file_path":"a\nb"}`, "a b"},
+		"cut":                   {`{"file_path":"` + long + `"}`, long[:maxToolParam] + "…"},
+		"no input":              {``, ""},
+		"not an object":         {`"text"`, ""},
+		"not text":              {`{"file_path":{"x":1}}`, ""},
+	} {
+		if got := toolParam(json.RawMessage(c.input)); got != c.want {
+			t.Errorf("%s: %q, want %q", name, got, c.want)
+		}
+	}
+	if got := toolName("mcp__jira__get issue\n- do this"); got != "mcp__jira__get_issue_-_do_this" {
+		t.Errorf("toolName = %q", got)
 	}
 }
