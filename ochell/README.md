@@ -29,8 +29,22 @@ Behaviour common to all sources:
 - **Jira ticket updates:** with the Jira API configured (see [Jira API access](#jira-api-access)), ochell comments on a Jira ticket when a run starts, and again when it ends, with the same text a Linear session gets: the agent's message and its pull request, its question, or why the run failed. A ticket that was accepted but not started (no repository, attempts used up) gets a comment that says so. With `review_status` the ticket is also moved to that status when the agent reports its work as done. Without the API a Jira ticket gets no answer.
 - **Linear follow-ups:** `prompted` events are logged but not yet delivered to an agent. So a reply to an `elicitation` does not start a run yet; delegate the ticket again.
 
+### Retry and stall detection
+ochell starts a ticket again by itself in two cases. Both count as an attempt, so `agent.max_attempts` bounds them.
+
+- **A failure that is not the task's own.** A run that failed and whose final message matches one of `agent.retry.patterns` (with the `plain` adapter: the last 4 KB of its output) failed for a temporary reason. The default patterns are a rate limit, "overloaded", an API error 429 or 5xx, a gateway error and a broken connection. The ticket is queued again and starts after a wait: `retry.backoff` (1m) after the first attempt, doubled with each further attempt of the ticket, up to `retry.max_backoff` (30m).
+  - A failed run that matches no pattern is a task failure and is not retried: the ticket is `failed`.
+  - When the attempts are used up, the ticket is `failed`, and gets the error of the last run.
+  - `patterns: []` turns the retry off. The default patterns were not checked against what Claude Code prints for each of these errors; look at a failed run's log and add what you see.
+  - With the `claude` adapter, a run whose result event says `is_error` counts as failed even when the process exits with status 0.
+- **A stalled agent.** With `agent.stall_timeout` set, an agent that wrote no output for that long is stopped, with all its processes, and the ticket is started again after the same wait. After the last attempt the ticket waits for a human with the reason `stalled`.
+  - It is off by default (`0`). Silence is all ochell can see: a slow test suite looks the same as a hung agent. Set it well above the longest silent step you expect.
+- **The ticket is told each time:** a `thought` in a Linear session, a comment on a Jira ticket, that says why the run ended and when the next one starts.
+- **The next run is told as well.** Its run context says that the earlier attempt was cut off by an outside error, or was stopped as stalled, and that the agent must check what is already done.
+- While a ticket waits for its retry it is `queued`: a new assignment in that time is answered with `already in progress`. A wait is kept across a restart.
+
 ### Stopping agents and shutting down
-- **A stop ends the whole agent**, not only its top process: sub-agents, MCP servers and git children too. ochell sends SIGTERM, and SIGKILL after `agent.stop_grace` (10s). This happens at `agent.timeout` and on shutdown.
+- **A stop ends the whole agent**, not only its top process: sub-agents, MCP servers and git children too. ochell sends SIGTERM, and SIGKILL after `agent.stop_grace` (10s). This happens at `agent.timeout`, at `agent.stall_timeout` and on shutdown.
   - With the `systemd` launcher ochell stops the unit, and systemd signals every process in it.
   - With the `direct` launcher the agent runs in its own process group and ochell signals the group. A child that leaves the group (`setsid`) is not reached; use the `systemd` launcher where that matters. When the agent exits by itself, what it left running in its group is killed as well.
 - **Shutdown** (SIGTERM or Ctrl-C): ochell stops accepting webhooks and waits up to `agent.drain_timeout` (30s) for running agents to finish. Then it stops the ones still running. A second signal ends the wait at once. Tasks that were queued but not started stay in the store and run after the next start.
@@ -109,6 +123,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-adapter` | Kind of agent CLI: `plain` (default) or `claude`; see [Agent adapters](#agent-adapters) |
 | `--agent-launcher` | `direct` (default) or `systemd`; see [Launchers](#launchers) |
 | `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
+| `--agent-stall-timeout` | Stop an agent that wrote no output for this long, and start the ticket again (default `0`: never); see [Retry and stall detection](#retry-and-stall-detection) |
 | `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-max-attempts`, `--agent-log-dir`, `--agent-run-dir` | Execution settings |
 | `--agent-stop-grace`, `--agent-drain-timeout` | Time between SIGTERM and SIGKILL when an agent is stopped; how long a shutdown waits for running agents (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down)) |
 | `--jira-webhook`, `--jira-webhook-secret`, `--jira-bot-account-id` | Jira system webhook source |
@@ -174,7 +189,7 @@ repos:
 ### Guards and the admin channel
 Three limits on what starts a run, and one way to talk to the running ochell.
 
-- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear> <KEY>` sets the count back to zero; then assign the ticket again.
+- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear> <KEY>` sets the count back to zero; then assign the ticket again.
 - **Pause:** `ochell pause` holds the queue. No new run starts; running agents go on; webhooks are still accepted and queued. `ochell resume` ends it, and the queued tasks run. Both take effect at once, without a restart, and a pause is kept across a restart. `ochell status` says which it is, and how many tasks are queued and running.
 - **Assigner allowlist:** `allowed_assigners` of a source, when it is not empty, lists who may assign work. Anyone else is rejected, and the rejection is logged with the ticket and the assigner. Nothing is stored for a rejected assignment.
 
@@ -249,7 +264,8 @@ What a run leads to:
 | `finished` | `blocked` | `waiting`, reason `blocked` |
 | `finished` | `low_confidence`, `out_of_scope` | `waiting`, reason `escalation` |
 | `finished` | missing or invalid | `waiting`, reason `no_result` |
-| `failed`, `timed_out`, `not_started` | not looked at | `failed` |
+| `failed`, `timed_out`, `not_started` | not looked at | `failed`. A `failed` run that matches a retry pattern: `queued` again while the ticket has an attempt left |
+| `stalled` | not looked at | `queued` again; `waiting`, reason `stalled`, when the attempts are used up |
 | `stopped`, `interrupted` | not looked at | `queued` again, for a new attempt with the recovery note; `waiting`, reason `interrupted`, when the attempts are used up |
 
 Several states and reasons are not reached yet: they belong to features that come later (the plan gate, stop from the ticket, handoff). Pausing is not a state: it holds the queue, and queued tickets stay queued.
@@ -312,6 +328,7 @@ Then set `agent.launcher: systemd` and check the result with `scripts/check-laun
 | `finished` | the agent exited by itself with status 0 |
 | `failed` | the agent exited by itself with another status |
 | `timed_out` | ochell stopped it at `agent.timeout` |
+| `stalled` | ochell stopped it because it wrote no output for `agent.stall_timeout` |
 | `stopped` | ochell stopped it because it is shutting down. The ticket is queued again |
 | `not_started` | the agent never ran: the command could not be executed, or the launch was refused. With the systemd launcher these are exit codes from 200 (250: refused by the launch script; 203: systemd could not execute the command) |
 | `interrupted` | ochell itself was killed during the run, and found it unfinished at the next start. The ticket is queued again. This one is only in the store and in ochell's log, not in the run log |
@@ -325,6 +342,7 @@ The template sees the task (`.Source`, `.Key`, `.Title`, `.URL`, `.Repo`, `.Cont
 
 **The run context** is what only ochell knows about a run. The agent still reads the ticket itself. It is empty for a plain first attempt; otherwise it says:
 - which attempt this is, and whether it continues the agent session of the earlier attempt or starts a new one. In a new session the agent is told to look at the branch, the pull request and the ticket's comments before it repeats work;
+- that the earlier attempt was cut off by a temporary error, or was stopped as stalled, when ochell retries by itself (see [Retry and stall detection](#retry-and-stall-detection));
 - the recovery note, when the run takes the place of one that ochell cut short or did not see the end of (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down));
 - the branch and the pull request that earlier attempts reported in their result files, with the instruction to continue there;
 - the comment that started the run, when someone asked for it in one. Today that is a mention of the agent in a Linear comment. The comment is quoted as a message from a person on the ticket, with the note that it does not change what the agent may do.

@@ -571,3 +571,39 @@ func TestNewerSchemaIsRefused(t *testing.T) {
 		t.Error("a file from a newer ochell must be refused")
 	}
 }
+
+// A run that was queued with a time to wait for (the backoff of a retry) is
+// not handed out before that time, and holds up nothing else.
+func TestNotBefore(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	now := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	if err := s.Enqueue(newTask("run-1", "ENG-1", now), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Claim(); got == nil {
+		t.Fatal("nothing claimed")
+	}
+	queued, err := s.FinishAndQueue("run-1", task.Result{Outcome: task.OutcomeFailed}, Again{ID: "run-2", Cause: task.CauseRetry, NotBefore: now.Add(time.Minute)})
+	if err != nil || !queued {
+		t.Fatalf("FinishAndQueue = %v, %v", queued, err)
+	}
+	if got, err := s.Claim(); got != nil || err != nil {
+		t.Fatalf("Claim before the time = %+v, %v; want nothing", got, err)
+	}
+	// The ticket is busy in the meantime, and other tickets run.
+	if err := s.Enqueue(newTask("run-x", "ENG-1", now), Limits{}); !errors.Is(err, ErrBusy) {
+		t.Errorf("a second run of the waiting ticket: %v, want ErrBusy", err)
+	}
+	if err := s.Enqueue(newTask("run-other", "ENG-2", now), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Claim(); got == nil || got.ID != "run-other" {
+		t.Fatalf("claimed %+v, want the run of the other ticket", got)
+	}
+	now = now.Add(time.Minute)
+	got, err := s.Claim()
+	if err != nil || got == nil || got.ID != "run-2" || got.Cause != task.CauseRetry || got.Attempt != 2 {
+		t.Fatalf("Claim at the time = %+v, %v; want run-2", got, err)
+	}
+}

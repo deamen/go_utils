@@ -36,6 +36,9 @@ type Report struct {
 	// Message is the agent's final message. An adapter that cannot tell it
 	// apart gives the last part of the output.
 	Message string
+	// Failed says that the agent itself reported the run as a failure, for
+	// example because the model's API answered with an error.
+	Failed bool
 	// SessionID identifies the agent's session, for Resume. Empty when the
 	// agent has no sessions.
 	SessionID string

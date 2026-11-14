@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/template"
 	"time"
 
@@ -58,6 +59,9 @@ type Runner struct {
 	prompt   *template.Template
 	args     []*template.Template
 	workdir  *template.Template
+	// transient are agent.retry.patterns: what the output of a run that
+	// failed for a temporary reason looks like.
+	transient []*regexp.Regexp
 	// runDir is the absolute path of agent.run_dir.
 	runDir  string
 	ws      *workspace
@@ -91,6 +95,13 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 			return nil, err
 		}
 		r.args = append(r.args, t)
+	}
+	for i, p := range cfg.Retry.Patterns {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return nil, fmt.Errorf("agent retry.patterns[%d]: %w", i, err)
+		}
+		r.transient = append(r.transient, re)
 	}
 	// The agent gets the path of its result file in its environment, and
 	// runs in another directory.
@@ -373,12 +384,15 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	// Record the end before telling the ticket, so the ticket is free for
 	// a new run by the time someone reads the answer.
 	var err error
-	if res.Outcome == task.OutcomeStopped {
-		// ochell is shutting down, and cut the run short. Its ticket is
-		// queued again, for after the restart.
+	if again, ok := r.next(t, res); ok {
 		var queued bool
-		if queued, err = r.store.FinishAndQueue(t.ID, res, r.again(t, task.CauseRecovery)); queued {
-			res.Next = task.CauseRecovery
+		if queued, err = r.store.FinishAndQueue(t.ID, res, again); queued {
+			res.Next, res.NextAt = again.Cause, again.NotBefore
+			log.Info("the ticket is queued again", "cause", again.Cause, "run", again.ID, "not_before", again.NotBefore)
+			if wait := time.Until(again.NotBefore); wait > 0 {
+				// An idle worker looks at the queue when the wait is over.
+				time.AfterFunc(wait+10*time.Millisecond, r.wakeWorker)
+			}
 		}
 	} else {
 		err = r.store.Finish(t.ID, res)
@@ -391,6 +405,55 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 			log.Warn("finish notification failed", "err", err)
 		}
 	}
+}
+
+// next says whether ochell itself starts the ticket of t again after a run
+// that ended as res did, and describes that run:
+//   - a run that a shutdown stopped goes on after the restart;
+//   - a run that stalled, or that failed for a temporary reason (a rate
+//     limit, an error of the model's API), is tried again after a wait.
+//
+// A failure of the task itself is not retried. Whether the ticket still has
+// an attempt left is decided by the store.
+func (r *Runner) next(t *task.Task, res task.Result) (store.Again, bool) {
+	switch {
+	case res.Outcome == task.OutcomeStopped:
+		return r.again(t, task.CauseRecovery), true
+	case res.Outcome == task.OutcomeStalled:
+		again := r.again(t, task.CauseStalled)
+		again.NotBefore = time.Now().Add(r.backoff(t.Attempt))
+		return again, true
+	case r.isTransient(res):
+		again := r.again(t, task.CauseRetry)
+		again.NotBefore = time.Now().Add(r.backoff(t.Attempt))
+		return again, true
+	}
+	return store.Again{}, false
+}
+
+// isTransient reports whether a run failed for a reason outside the ticket
+// that may be gone a little later. Only the configured patterns say so.
+func (r *Runner) isTransient(res task.Result) bool {
+	if res.Outcome != task.OutcomeFailed {
+		return false
+	}
+	for _, re := range r.transient {
+		if re.MatchString(res.Message) {
+			return true
+		}
+	}
+	return false
+}
+
+// backoff is the wait before the run that follows the given attempt of a
+// ticket: agent.retry.backoff after the first, doubled with each further
+// one, up to max_backoff.
+func (r *Runner) backoff(attempt int) time.Duration {
+	d, limit := r.cfg.Retry.Backoff, r.cfg.Retry.MaxBackoff
+	for i := 1; i < attempt && d < limit; i++ {
+		d *= 2
+	}
+	return max(min(d, limit), 0)
 }
 
 var unsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
@@ -561,7 +624,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		Output:    io.MultiWriter(lf, out),
 		Timeout:   r.cfg.Timeout,
 	}
-	w, outcome := r.execute(ctx, spec)
+	w, outcome := r.execute(ctx, spec, r.cfg.StallTimeout)
 	if outcome == task.OutcomeNotStarted {
 		res.Err = w.err
 		return res
@@ -569,6 +632,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	res.Outcome = outcome
 	rep := out.Report()
 	res.Message, res.SessionID, res.CostUSD, res.Usage = rep.Message, rep.SessionID, rep.CostUSD, rep.Usage
+	res.AgentError = rep.Failed
 	// What the agent says about its run. The file is read whenever the
 	// agent ran, and stored; it decides the ticket's state only for a run
 	// that ended by itself with status 0 (ticket.AfterRun).
@@ -583,6 +647,8 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	switch {
 	case res.Outcome == task.OutcomeTimedOut:
 		res.Err = fmt.Errorf("agent timed out after %s", r.cfg.Timeout)
+	case res.Outcome == task.OutcomeStalled:
+		res.Err = fmt.Errorf("the agent wrote no output for %s and was stopped", r.cfg.StallTimeout)
 	case res.Outcome == task.OutcomeStopped:
 		res.Err = errors.New("the agent was stopped because ochell is shutting down")
 	case errors.Is(w.err, launcher.ErrNotStarted):
@@ -594,6 +660,10 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	case w.code != 0:
 		res.Outcome = task.OutcomeFailed
 		res.Err = fmt.Errorf("exit status %d", w.code)
+	case res.AgentError:
+		// The agent exited with status 0 and says itself that it failed.
+		res.Outcome = task.OutcomeFailed
+		res.Err = errors.New("the agent reported an error")
 	}
 	if w.err != nil && res.Outcome != task.OutcomeNotStarted && res.Outcome != task.OutcomeFailed {
 		res.Err = fmt.Errorf("%w (%v)", res.Err, w.err)
@@ -608,15 +678,41 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	return res
 }
 
+// lastWrite notes when something was last written to the writer behind it.
+type lastWrite struct {
+	w  io.Writer
+	at atomic.Int64 // unix nanoseconds
+}
+
+func (l *lastWrite) Write(p []byte) (int, error) {
+	l.at.Store(time.Now().UnixNano())
+	return l.w.Write(p)
+}
+
+func (l *lastWrite) idle() time.Duration {
+	return time.Since(time.Unix(0, l.at.Load()))
+}
+
 // execute starts what spec describes and waits for it to end. It stops it
-// at spec.Timeout, and when ctx is done.
+// at spec.Timeout, when ctx is done, and, with stall set, when it has
+// written no output for that long.
 //
 // Why it ended is decided here, from what ochell asked for. The exit code
 // cannot tell: a unit that systemd stopped exits with 0, and one that hit
 // its own time limit exits with 1 like a failed agent. The outcome is
-// finished (it ended by itself, with any exit code), timed_out, stopped, or
-// not_started with the reason in the error.
-func (r *Runner) execute(ctx context.Context, spec launcher.Spec) (waitResult, task.Outcome) {
+// finished (it ended by itself, with any exit code), timed_out, stalled,
+// stopped, or not_started with the reason in the error.
+func (r *Runner) execute(ctx context.Context, spec launcher.Spec, stall time.Duration) (waitResult, task.Outcome) {
+	var silent <-chan time.Time
+	var out *lastWrite
+	if stall > 0 {
+		out = &lastWrite{w: spec.Output}
+		out.at.Store(time.Now().UnixNano())
+		spec.Output = out
+		tick := time.NewTicker(max(stall/10, 10*time.Millisecond))
+		defer tick.Stop()
+		silent = tick.C
+	}
 	proc, err := r.launcher.Start(spec)
 	if err != nil {
 		return waitResult{-1, err}, task.OutcomeNotStarted
@@ -632,13 +728,19 @@ func (r *Runner) execute(ctx context.Context, spec launcher.Spec) (waitResult, t
 		defer timer.Stop()
 		timeout = timer.C
 	}
-	select {
-	case w := <-waited:
-		return w, task.OutcomeFinished
-	case <-timeout:
-		return r.stop(proc, waited), task.OutcomeTimedOut
-	case <-ctx.Done():
-		return r.stop(proc, waited), task.OutcomeStopped
+	for {
+		select {
+		case w := <-waited:
+			return w, task.OutcomeFinished
+		case <-timeout:
+			return r.stop(proc, waited), task.OutcomeTimedOut
+		case <-ctx.Done():
+			return r.stop(proc, waited), task.OutcomeStopped
+		case <-silent:
+			if out.idle() >= stall {
+				return r.stop(proc, waited), task.OutcomeStalled
+			}
+		}
 	}
 }
 

@@ -126,6 +126,7 @@ type Step struct {
 	TryRead    string `json:"try_read,omitempty"`
 	IgnoreTerm bool   `json:"ignore_term,omitempty"`
 	Exit       *int   `json:"exit,omitempty"`
+	OnRun      int    `json:"on_run,omitempty"`
 }
 
 type File struct {
@@ -141,6 +142,14 @@ type Spawn struct {
 
 // Exit builds an exit step.
 func Exit(code int) Step { return Step{Exit: &code} }
+
+// OnRun limits steps to the n-th run of the fake agent, counting from 1.
+func OnRun(n int, steps ...Step) []Step {
+	for i := range steps {
+		steps[i].OnRun = n
+	}
+	return steps
+}
 
 // Report builds the step in which the agent writes its result file, as the
 // prompt tells it to. More fields are given as name, value pairs.

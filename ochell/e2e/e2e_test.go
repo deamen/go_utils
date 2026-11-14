@@ -1237,3 +1237,150 @@ func TestJiraStartAndFinishComments(t *testing.T) {
 		}
 	})
 }
+
+// A failure that is not the task's own, such as a rate limit, is retried by
+// ochell after a wait, and counts as an attempt. A task failure is not.
+func TestTransientFailureIsRetried(t *testing.T) {
+	script := append(OnRun(1, Step{Eprint: "API Error: 429 rate limit exceeded, try again later"}, Exit(1)),
+		Step{Print: "second try"}, Report("done", "Done on the second try."))
+	o := Start(t, Options{
+		Script: script,
+		Configure: func(c *config.Config) {
+			c.Agent.Retry.Backoff = time.Second
+			c.Agent.Retry.MaxBackoff = time.Second
+		},
+	})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	first := o.LinearCreated("ENG-60", "session-retry", "").TaskID(t)
+	failed := o.WaitStored(st, first, 15*time.Second)
+	if failed.Result.Outcome != "failed" {
+		t.Fatalf("first run = %+v, want failed", failed.Result)
+	}
+	ended := time.Now()
+
+	// The ticket: picked up, the retry announced, then the result.
+	acts := o.WaitActivities("session-retry", 3, 20*time.Second)
+	if acts[1].Type != "thought" || !strings.Contains(acts[1].Body, "looks temporary") || !strings.Contains(acts[1].Body, "queued again") {
+		t.Errorf("second activity = %+v, want the announcement of the retry", acts[1])
+	}
+	if acts[2].Type != "response" || acts[2].Body != "Done on the second try." {
+		t.Errorf("third activity = %+v, want the result", acts[2])
+	}
+	if wait := acts[2].At.Sub(ended); wait < 800*time.Millisecond {
+		t.Errorf("the retry ended %s after the failure, before the backoff of 1s was over", wait)
+	}
+	recs := o.WaitRecords(2, 5*time.Second)
+	if len(recs) != 2 {
+		t.Fatalf("the agent was started %d times, want 2", len(recs))
+	}
+	var prompts string
+	for _, rec := range recs {
+		prompts += rec.Stdin
+	}
+	for _, want := range []string{"This is attempt 2 on this ticket", "cut off by an error that had nothing to do with the ticket"} {
+		if !strings.Contains(prompts, want) {
+			t.Errorf("the prompt of the retry lacks %q", want)
+		}
+	}
+	tk, _ := st.Ticket("linear", "ENG-60")
+	if tk == nil || tk.State != "in_review" || tk.Attempts != 2 {
+		t.Errorf("ticket = %+v, want in_review after two attempts", tk)
+	}
+
+	// A failure of the task itself is not retried.
+	o2 := Start(t, Options{
+		Script: []Step{{Eprint: "error: the tests do not pass"}, Exit(1)},
+		Configure: func(c *config.Config) {
+			c.Agent.Retry.Backoff, c.Agent.Retry.MaxBackoff = 100*time.Millisecond, 100*time.Millisecond
+		},
+	})
+	id := o2.LinearCreated("ENG-61", "session-task-failure", "").TaskID(t)
+	o2.WaitRun(id, 15*time.Second)
+	if acts := o2.WaitActivities("session-task-failure", 2, 10*time.Second); acts[1].Type != "error" {
+		t.Errorf("the ticket got %+v, want an error", acts[1])
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := len(o2.Records()); n != 1 {
+		t.Errorf("the agent was started %d times, want 1: a task failure is not retried", n)
+	}
+}
+
+// A retry that keeps failing stops at the attempt cap.
+func TestRetryStopsAtTheAttemptCap(t *testing.T) {
+	o := Start(t, Options{
+		Script: []Step{{Eprint: "Overloaded"}, Exit(1)},
+		Configure: func(c *config.Config) {
+			c.Agent.MaxAttempts = 3
+			c.Agent.Retry.Backoff, c.Agent.Retry.MaxBackoff = 50*time.Millisecond, 50*time.Millisecond
+		},
+	})
+	o.LinearCreated("ENG-62", "session-cap", "").TaskID(t)
+	// Picked up, two retries announced, then the error.
+	acts := o.WaitActivities("session-cap", 4, 20*time.Second)
+	if acts[1].Type != "thought" || acts[2].Type != "thought" || acts[3].Type != "error" {
+		t.Errorf("activities = %+v, want two announced retries and then an error", acts)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := len(o.Records()); n != 3 {
+		t.Errorf("the agent was started %d times, want 3", n)
+	}
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if tk, _ := st.Ticket("linear", "ENG-62"); tk == nil || tk.State != "failed" || tk.Attempts != 3 {
+		t.Errorf("ticket = %+v, want failed after three attempts", tk)
+	}
+}
+
+// An agent that writes no output for stall_timeout is killed and started
+// again. After the last attempt the ticket waits for a human, reason stalled.
+func TestStalledAgentIsKilled(t *testing.T) {
+	o := Start(t, Options{
+		Script: spawning(Step{Spawn: &Spawn{Count: 1}}),
+		Configure: func(c *config.Config) {
+			c.Agent.StallTimeout = time.Second
+			c.Agent.StopGrace = time.Second
+			c.Agent.MaxAttempts = 2
+			c.Agent.Retry.Backoff, c.Agent.Retry.MaxBackoff = 100*time.Millisecond, 100*time.Millisecond
+		},
+	})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	first := o.LinearCreated("ENG-63", "session-stall", "").TaskID(t)
+	run := o.WaitRun(first, 15*time.Second)
+	if !strings.Contains(run.Footer, "outcome=stalled") || !strings.Contains(run.Footer, "wrote no output for 1s") {
+		t.Errorf("first run: %s", run.Footer)
+	}
+	// Picked up, the second attempt announced, then the error.
+	acts := o.WaitActivities("session-stall", 3, 20*time.Second)
+	if acts[1].Type != "thought" || !strings.Contains(acts[1].Body, "wrote no output") || !strings.Contains(acts[1].Body, "queued again") {
+		t.Errorf("second activity = %+v, want the announcement of the second attempt", acts[1])
+	}
+	if acts[2].Type != "error" || !strings.Contains(acts[2].Body, "waits for a human") {
+		t.Errorf("third activity = %+v, want the error after the last attempt", acts[2])
+	}
+	recs := o.Records()
+	if len(recs) != 2 {
+		t.Fatalf("the agent was started %d times, want 2", len(recs))
+	}
+	// Each stalled agent is gone, with its child.
+	for _, rec := range recs {
+		expectAllGone(t, rec, 1)
+	}
+	if !strings.Contains(recs[0].Stdin+recs[1].Stdin, "produced no output for a long time") {
+		t.Error("the prompt of the second attempt does not say that the first one stalled")
+	}
+	tk, _ := st.Ticket("linear", "ENG-63")
+	if tk == nil || tk.State != "waiting" || tk.Reason != "stalled" || tk.Attempts != 2 {
+		t.Errorf("ticket = %+v, want waiting (stalled) after two attempts", tk)
+	}
+}

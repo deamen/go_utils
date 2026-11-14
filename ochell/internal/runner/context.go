@@ -15,6 +15,13 @@ const maxComment = 8000
 // not see the end of.
 const recoveryNote = "The orchestrator was restarted while you were working on this ticket, and your run was cut off before it ended. You may have done part of the work already. Check git (the working directory, the branch and what was pushed), the pull request and the ticket's comments before you repeat anything that has an effect outside the working directory, such as a push, a pull request or a comment."
 
+// retryNote and stalledNote are for the run that ochell itself starts after
+// one that failed for a temporary reason, or that it stopped as stalled.
+const (
+	retryNote   = "The earlier attempt was cut off by an error that had nothing to do with the ticket, such as a rate limit or an error of the model's API. The orchestrator started this attempt by itself. You may have done part of the work already: check git, the pull request and the ticket's comments before you repeat anything that has an effect outside the working directory."
+	stalledNote = "The earlier attempt was stopped by the orchestrator because it produced no output for a long time; it probably waited for a command that never returned. The orchestrator started this attempt by itself. Check git, the pull request and the ticket's comments for what is already done, and do not wait without a time limit for a command that may hang."
+)
+
 // runContext is the part of the prompt that says what only ochell knows
 // about this run: which attempt it is and whether it continues the earlier
 // session, what the earlier attempts left behind, and the comment that
@@ -31,8 +38,13 @@ func runContext(t *task.Task, resumed bool) string {
 			lines = append(lines, fmt.Sprintf("This is attempt %d on this ticket. It starts a new agent session: you do not remember the earlier attempts. Look at the branch, the pull request and the ticket's comments before you repeat work or anything that has an effect outside the repository.", t.Attempt))
 		}
 	}
-	if t.Cause == task.CauseRecovery {
+	switch t.Cause {
+	case task.CauseRecovery:
 		lines = append(lines, recoveryNote)
+	case task.CauseRetry:
+		lines = append(lines, retryNote)
+	case task.CauseStalled:
+		lines = append(lines, stalledNote)
 	}
 	switch {
 	case t.Branch != "" && t.PRURL != "":
