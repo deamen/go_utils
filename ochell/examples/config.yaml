@@ -136,6 +136,27 @@ agent:
   env:
     CI: "true"
   timeout: 2h
+  # Stop an agent that wrote no output for this long, and start the ticket
+  # again. 0 (the default): never. A long silent command, such as a slow
+  # test suite, looks the same as a hung agent, so keep it well above the
+  # longest step you expect.
+  stall_timeout: 30m
+  # A failed run whose final message (plain adapter: the end of its output)
+  # matches one of these regular expressions failed for a temporary reason,
+  # and ochell starts the ticket again after a wait: backoff after the first
+  # attempt, doubled with each further one, up to max_backoff. Every retry
+  # counts as an attempt (max_attempts). These are the defaults;
+  # "patterns: []" turns the retry off.
+  retry:
+    patterns:
+      - '(?i)rate[ _-]?limit'
+      - '(?i)too many requests'
+      - '(?i)overloaded'
+      - '(?i)api error:? *\(?(429|5\d\d)'
+      - '(?i)service unavailable|bad gateway|gateway time-?out'
+      - '(?i)connection (reset|refused|timed out)'
+    backoff: 1m
+    max_backoff: 30m
   max_concurrent: 1
   # How many runs one ticket may have (0: no limit). A ticket that has used
   # them up waits for a human; "ochell reset <jira|linear> <KEY>" sets the

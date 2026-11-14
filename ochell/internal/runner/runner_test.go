@@ -45,6 +45,12 @@ func TestHelperAgent(t *testing.T) {
 		fmt.Print("stdin:", string(b))
 	case "sleep":
 		time.Sleep(10 * time.Second)
+	case "chatty":
+		// Works for a second, and says something all along.
+		for range 10 {
+			fmt.Println("still working")
+			time.Sleep(100 * time.Millisecond)
+		}
 	case "nap":
 		time.Sleep(300 * time.Millisecond)
 		fmt.Println("rested")
@@ -613,5 +619,73 @@ func TestBadTemplate(t *testing.T) {
 	cfg := agentCfg(t, "echo", "{{.Nope")
 	if _, err := New(cfg, logger(), testStore(t)); err == nil {
 		t.Fatal("expected template parse error")
+	}
+}
+
+// Which failed runs ochell starts again by itself, and after what wait.
+func TestRetryDecision(t *testing.T) {
+	cfg := agentCfg(t, "echo")
+	cfg.MaxAttempts = 5
+	cfg.Retry = config.Retry{Patterns: config.DefaultRetryPatterns, Backoff: time.Minute, MaxBackoff: 10 * time.Minute}
+	r, err := New(cfg, logger(), testStore(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := func(msg string) task.Result { return task.Result{Outcome: task.OutcomeFailed, Message: msg} }
+	for name, c := range map[string]struct {
+		res  task.Result
+		want task.Cause
+	}{
+		"rate limit":         {failed("API Error: 429 {\"type\":\"rate_limit_error\"}"), task.CauseRetry},
+		"overloaded":         {failed("API Error (529): Overloaded"), task.CauseRetry},
+		"gateway":            {failed("upstream: 502 Bad Gateway"), task.CauseRetry},
+		"connection":         {failed("read tcp: connection reset by peer"), task.CauseRetry},
+		"a task failure":     {failed("error: 3 tests failed in line 500"), ""},
+		"no output":          {failed(""), ""},
+		"stalled":            {task.Result{Outcome: task.OutcomeStalled}, task.CauseStalled},
+		"shutdown":           {task.Result{Outcome: task.OutcomeStopped, Message: "rate limit"}, task.CauseRecovery},
+		"timed out":          {task.Result{Outcome: task.OutcomeTimedOut, Message: "rate limit"}, ""},
+		"finished":           {task.Result{Outcome: task.OutcomeFinished, Message: "I hit a rate limit and waited."}, ""},
+		"could not start it": {task.Result{Outcome: task.OutcomeNotStarted, Message: "overloaded"}, ""},
+	} {
+		again, ok := r.next(&task.Task{Source: "jira", Key: "DEV-1", Attempt: 1}, c.res)
+		if ok != (c.want != "") || again.Cause != c.want {
+			t.Errorf("%s: next = %+v, %v; want cause %q", name, again, ok, c.want)
+		}
+		if ok && again.MaxAttempts != 5 {
+			t.Errorf("%s: the attempt cap was not passed on: %+v", name, again)
+		}
+		// Only what ochell retries waits; a recovery starts at once.
+		if wantWait := c.want == task.CauseRetry || c.want == task.CauseStalled; wantWait != !again.NotBefore.IsZero() {
+			t.Errorf("%s: NotBefore = %v", name, again.NotBefore)
+		}
+	}
+	for attempt, want := range map[int]time.Duration{1: time.Minute, 2: 2 * time.Minute, 3: 4 * time.Minute, 4: 8 * time.Minute, 5: 10 * time.Minute, 60: 10 * time.Minute} {
+		if got := r.backoff(attempt); got != want {
+			t.Errorf("backoff after attempt %d = %s, want %s", attempt, got, want)
+		}
+	}
+}
+
+// A run that says nothing for stall_timeout is stopped as stalled; one that
+// keeps writing is not.
+func TestStallDetection(t *testing.T) {
+	cfg := agentCfg(t, "sleep")
+	cfg.StallTimeout = 300 * time.Millisecond
+	r, _ := New(cfg, logger(), testStore(t))
+	start := time.Now()
+	res := r.Run(context.Background(), newTask())
+	if res.Outcome != task.OutcomeStalled || res.Err == nil || !strings.Contains(res.Err.Error(), "wrote no output for 300ms") {
+		t.Errorf("silent agent: %+v, want stalled", res)
+	}
+	if d := time.Since(start); d > 4*time.Second {
+		t.Errorf("the stalled agent was stopped after %s", d)
+	}
+
+	cfg = agentCfg(t, "chatty")
+	cfg.StallTimeout = 300 * time.Millisecond
+	r, _ = New(cfg, logger(), testStore(t))
+	if res := r.Run(context.Background(), newTask()); res.Outcome != task.OutcomeFinished {
+		t.Errorf("an agent that keeps writing: %+v, want finished", res)
 	}
 }

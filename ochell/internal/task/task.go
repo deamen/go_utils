@@ -16,6 +16,12 @@ const (
 	// CauseRecovery: ochell itself stopped during the earlier run of the
 	// ticket, and this run takes its place.
 	CauseRecovery Cause = "recovery"
+	// CauseRetry: the earlier run failed with an error that looked
+	// temporary, such as a rate limit.
+	CauseRetry Cause = "retry"
+	// CauseStalled: the earlier run was stopped because the agent was
+	// silent for too long.
+	CauseStalled Cause = "stalled"
 )
 
 // NewID returns the id of a task that is received now. It is unique per
@@ -82,6 +88,9 @@ const (
 	OutcomeFailed Outcome = "failed"
 	// OutcomeTimedOut: ochell stopped the agent at the time limit.
 	OutcomeTimedOut Outcome = "timed_out"
+	// OutcomeStalled: ochell stopped the agent because it wrote no output
+	// for agent.stall_timeout.
+	OutcomeStalled Outcome = "stalled"
 	// OutcomeStopped: ochell stopped the agent for another reason, such as
 	// its own shutdown.
 	OutcomeStopped Outcome = "stopped"
@@ -123,7 +132,12 @@ type Result struct {
 	// place of this one, and says why. The ticket is then not waiting for
 	// anyone.
 	Next Cause
+	// NextAt is when that run may start; zero: at once.
+	NextAt time.Time
 	// Message is the agent's final message, as its adapter read it: for
 	// the plain adapter, the last part of the output.
 	Message string
+	// AgentError says that the agent itself called the run a failure in
+	// its output, whatever its exit status was.
+	AgentError bool
 }

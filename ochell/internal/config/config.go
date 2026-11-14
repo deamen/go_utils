@@ -62,9 +62,14 @@ type Agent struct {
 	// environment. Everything else, including ochell's secrets, is dropped.
 	EnvPass []string `yaml:"env_pass"`
 	// Env is set for the agent in addition to EnvPass and ORCH_TASK_*.
-	Env           map[string]string `yaml:"env"`
-	Timeout       time.Duration     `yaml:"timeout"`
-	MaxConcurrent int               `yaml:"max_concurrent"`
+	Env     map[string]string `yaml:"env"`
+	Timeout time.Duration     `yaml:"timeout"`
+	// StallTimeout is how long an agent may write no output before ochell
+	// stops it and starts the ticket again. 0: never.
+	StallTimeout time.Duration `yaml:"stall_timeout"`
+	// Retry says which failed runs are started again by ochell itself.
+	Retry         Retry `yaml:"retry"`
+	MaxConcurrent int   `yaml:"max_concurrent"`
 	// MaxAttempts is how many runs one ticket may have. A ticket that
 	// reaches it is not started again until someone resets it. 0: no limit.
 	MaxAttempts int    `yaml:"max_attempts"`
@@ -74,6 +79,32 @@ type Agent struct {
 	// result file for ochell. The agent must be able to write there and
 	// ochell to read; it must not be inside a working directory.
 	RunDir string `yaml:"run_dir"`
+}
+
+// Retry configures the retry of runs that failed for a reason outside the
+// ticket, such as a rate limit. Every retry counts as an attempt of the
+// ticket (max_attempts).
+type Retry struct {
+	// Patterns are regular expressions. A failed run whose final message
+	// (for the plain adapter: the end of its output) matches one of them
+	// failed for a temporary reason and is started again. Empty: no run is
+	// retried.
+	Patterns []string `yaml:"patterns"`
+	// Backoff is the wait before the second attempt of a ticket; it
+	// doubles with each further attempt, up to MaxBackoff.
+	Backoff    time.Duration `yaml:"backoff"`
+	MaxBackoff time.Duration `yaml:"max_backoff"`
+}
+
+// DefaultRetryPatterns match what an agent CLI prints when the model's API
+// refuses or fails a request. They are not case sensitive.
+var DefaultRetryPatterns = []string{
+	`(?i)rate[ _-]?limit`,
+	`(?i)too many requests`,
+	`(?i)overloaded`,
+	`(?i)api error:? *\(?(429|5\d\d)`,
+	`(?i)service unavailable|bad gateway|gateway time-?out`,
+	`(?i)connection (reset|refused|timed out)`,
 }
 
 // Systemd configures the systemd launcher.
@@ -355,10 +386,15 @@ func Default() *Config {
 				LaunchCommand: []string{"sudo", "-n", "/usr/local/libexec/ochell/ochell-launch"},
 				StopCommand:   []string{"sudo", "-n", "/usr/local/libexec/ochell/ochell-stop"},
 			},
-			StopGrace:     10 * time.Second,
-			DrainTimeout:  30 * time.Second,
-			EnvPass:       append([]string(nil), DefaultEnvPass...),
-			Timeout:       2 * time.Hour,
+			StopGrace:    10 * time.Second,
+			DrainTimeout: 30 * time.Second,
+			EnvPass:      append([]string(nil), DefaultEnvPass...),
+			Timeout:      2 * time.Hour,
+			Retry: Retry{
+				Patterns:   append([]string(nil), DefaultRetryPatterns...),
+				Backoff:    time.Minute,
+				MaxBackoff: 30 * time.Minute,
+			},
 			MaxConcurrent: 1,
 			MaxAttempts:   5,
 			QueueSize:     100,
@@ -495,6 +531,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.Var(&stringList{dst: &c.Agent.EnvPass}, "agent-env-pass", "environment variable the agent inherits from ochell, repeatable (replaces config env_pass)")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
 	fs.DurationVar(&c.Agent.Timeout, "agent-timeout", c.Agent.Timeout, "maximum agent run time")
+	fs.DurationVar(&c.Agent.StallTimeout, "agent-stall-timeout", c.Agent.StallTimeout, "stop an agent that wrote no output for this long, and start the ticket again (0: never)")
 	fs.DurationVar(&c.Agent.StopGrace, "agent-stop-grace", c.Agent.StopGrace, "time between SIGTERM and SIGKILL when an agent is stopped")
 	fs.DurationVar(&c.Agent.DrainTimeout, "agent-drain-timeout", c.Agent.DrainTimeout, "how long a shutdown waits for running agents before it stops them")
 	fs.IntVar(&c.Agent.MaxConcurrent, "agent-max-concurrent", c.Agent.MaxConcurrent, "maximum concurrent agent runs")
@@ -687,6 +724,17 @@ func (c *Config) Validate() error {
 		if !envName.MatchString(n) {
 			errs = append(errs, fmt.Errorf("agent.env: %q is not a variable name", n))
 		}
+	}
+	if c.Agent.StallTimeout < 0 {
+		errs = append(errs, errors.New("agent.stall_timeout must not be negative"))
+	}
+	for i, p := range c.Agent.Retry.Patterns {
+		if _, err := regexp.Compile(p); err != nil || p == "" {
+			errs = append(errs, fmt.Errorf("agent.retry.patterns[%d] is not a regular expression: %v", i, err))
+		}
+	}
+	if len(c.Agent.Retry.Patterns) > 0 && (c.Agent.Retry.Backoff <= 0 || c.Agent.Retry.MaxBackoff < c.Agent.Retry.Backoff) {
+		errs = append(errs, errors.New("agent.retry: backoff must be positive, and max_backoff not below it"))
 	}
 	if c.Agent.MaxConcurrent < 1 {
 		errs = append(errs, errors.New("agent.max_concurrent must be >= 1"))

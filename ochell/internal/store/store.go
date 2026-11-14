@@ -126,6 +126,9 @@ var migrations = []string{
 
 	// Version 9: why a run was queued, when it was not a plain assignment.
 	`ALTER TABLE runs ADD COLUMN cause TEXT NOT NULL DEFAULT '';`,
+
+	// Version 10: a queued run that must wait, for the backoff of a retry.
+	`ALTER TABLE runs ADD COLUMN not_before INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Store is safe for concurrent use.
@@ -384,9 +387,10 @@ func (s *Store) ResetAttempts(source, key string) error {
 	return nil
 }
 
-// Claim takes the oldest queued run and marks it, and its ticket, as
-// running. It returns nil when nothing is queued, and while the pause flag
-// is set. The task's Attempt says
+// Claim takes the oldest queued run that may start and marks it, and its
+// ticket, as running. It returns nil when nothing is queued or every queued
+// run still waits for its time (a retry with backoff), and while the pause
+// flag is set. The task's Attempt says
 // which run of the ticket this is, counting from 1; AgentSession, Workspace,
 // PRURL and Branch come from the ticket's earlier runs.
 func (s *Store) Claim() (*task.Task, error) {
@@ -397,7 +401,7 @@ func (s *Store) Claim() (*task.Task, error) {
 			return err
 		}
 		var id string
-		err := tx.QueryRow(`SELECT id FROM runs WHERE status = ? ORDER BY received_at, rowid LIMIT 1`, runQueued).Scan(&id)
+		err := tx.QueryRow(`SELECT id FROM runs WHERE status = ? AND not_before <= ? ORDER BY received_at, rowid LIMIT 1`, runQueued, now).Scan(&id)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -439,6 +443,8 @@ type Again struct {
 	// ID is the id of the new run.
 	ID    string
 	Cause task.Cause
+	// NotBefore, when set, is the earliest time the new run may start.
+	NotBefore time.Time
 	// MaxAttempts is how many runs the ticket may have had; 0: no limit.
 	MaxAttempts int
 }
@@ -475,9 +481,13 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result, again *Again) (qu
 	if err := s.move(tx, source, key, ticket.Queued, ""); err != nil {
 		return false, err
 	}
-	_, err = tx.Exec(`INSERT INTO runs (id, source, key, status, context, comment, tracker_session, received_at, cause)
-		SELECT ?, source, key, ?, context, comment, tracker_session, ?, ? FROM runs WHERE id = ?`,
-		again.ID, runQueued, ms(s.now()), again.Cause, id)
+	var notBefore int64
+	if !again.NotBefore.IsZero() {
+		notBefore = ms(again.NotBefore)
+	}
+	_, err = tx.Exec(`INSERT INTO runs (id, source, key, status, context, comment, tracker_session, received_at, cause, not_before)
+		SELECT ?, source, key, ?, context, comment, tracker_session, ?, ?, ? FROM runs WHERE id = ?`,
+		again.ID, runQueued, ms(s.now()), again.Cause, notBefore, id)
 	return err == nil, err
 }
 

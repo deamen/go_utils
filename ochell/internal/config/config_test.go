@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -408,5 +409,64 @@ func TestJiraAPI(t *testing.T) {
 	}
 	if (JiraAPI{}).Enabled() || !ok.Enabled() {
 		t.Error("Enabled must follow base_url")
+	}
+}
+
+func TestRetryValidation(t *testing.T) {
+	base := func() *Config {
+		cfg := Default()
+		cfg.Sources.JiraAutomation.Enabled = true
+		cfg.Sources.JiraAutomation.Token = "t"
+		return cfg
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("the defaults: %v", err)
+	}
+	for name, tc := range map[string]struct {
+		change func(*Config)
+		want   string
+	}{
+		"bad pattern":       {func(c *Config) { c.Agent.Retry.Patterns = []string{"rate limit", "("} }, "retry.patterns[1]"},
+		"empty pattern":     {func(c *Config) { c.Agent.Retry.Patterns = []string{""} }, "retry.patterns[0]"},
+		"no backoff":        {func(c *Config) { c.Agent.Retry.Backoff = 0 }, "backoff must be positive"},
+		"max below backoff": {func(c *Config) { c.Agent.Retry.MaxBackoff = time.Second }, "max_backoff not below"},
+		"negative stall":    {func(c *Config) { c.Agent.StallTimeout = -time.Second }, "stall_timeout"},
+		// Without patterns nothing is retried, and the backoff is not looked at.
+		"retry turned off": {func(c *Config) { c.Agent.Retry = Retry{} }, ""},
+	} {
+		cfg := base()
+		tc.change(cfg)
+		err := cfg.Validate()
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("%s: unexpected error: %v", name, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+			t.Errorf("%s: error = %v, want %q", name, err, tc.want)
+		}
+	}
+	// An empty list in the file turns the retry off.
+	p := writeYAML(t, "agent: { retry: { patterns: [] } }\n")
+	cfg, err := Load("serve", []string{"--config", p}, nil)
+	if err != nil || len(cfg.Agent.Retry.Patterns) != 0 {
+		t.Errorf("patterns: [] gave %q, %v", cfg.Agent.Retry.Patterns, err)
+	}
+}
+
+// The example file is what people copy: it must load, be valid, and show
+// the defaults it claims to show.
+func TestExampleFile(t *testing.T) {
+	for _, name := range []string{"JIRA_WEBHOOK_SECRET", "JIRA_AUTOMATION_TOKEN", "JIRA_API_TOKEN", "LINEAR_WEBHOOK_SECRET", "LINEAR_CLIENT_ID", "LINEAR_CLIENT_SECRET", "NGROK_API_KEY"} {
+		t.Setenv(name, "x")
+	}
+	cfg := Default()
+	if err := LoadFile(cfg, "../../examples/config.yaml"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("examples/config.yaml is not valid:\n%v", err)
+	}
+	def := Default()
+	if !slices.Equal(cfg.Agent.Retry.Patterns, def.Agent.Retry.Patterns) || cfg.Agent.Retry.Backoff != def.Agent.Retry.Backoff || cfg.Agent.Retry.MaxBackoff != def.Agent.Retry.MaxBackoff {
+		t.Errorf("agent.retry in the example is not the default: %+v", cfg.Agent.Retry)
 	}
 }

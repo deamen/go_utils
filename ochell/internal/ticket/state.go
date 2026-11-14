@@ -145,6 +145,8 @@ func AfterRun(o task.Outcome, signal result.Status) (State, Reason) {
 		return Waiting, ReasonNoResult
 	case task.OutcomeStopped, task.OutcomeInterrupted:
 		return Waiting, ReasonInterrupted
+	case task.OutcomeStalled:
+		return Waiting, ReasonStalled
 	}
 	// failed, timed_out, not_started
 	return Failed, ""

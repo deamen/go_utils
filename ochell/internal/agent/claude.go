@@ -174,6 +174,7 @@ func (o *claudeOutput) event(line []byte) {
 		}
 	case "result":
 		o.gotResult = true
+		o.rep.Failed = ev.IsError
 		o.rep.Message = ev.Result
 		o.rep.CostUSD = ev.CostUSD
 		if u := ev.Usage; u != nil {

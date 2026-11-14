@@ -121,7 +121,7 @@ func TestClaudeOutputWithoutResult(t *testing.T) {
 	out = Claude{}.Output(nil)
 	io.WriteString(out, `{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","session_id":"sess-2","total_cost_usd":1.5}`+"\n")
 	io.WriteString(out, "Error: reached the turn limit\n")
-	if got := out.Report(); got.SessionID != "sess-2" || got.CostUSD != 1.5 || got.Message != "Error: reached the turn limit" {
+	if got := out.Report(); got.SessionID != "sess-2" || got.CostUSD != 1.5 || got.Message != "Error: reached the turn limit" || !got.Failed {
 		t.Errorf("error result: %+v", got)
 	}
 

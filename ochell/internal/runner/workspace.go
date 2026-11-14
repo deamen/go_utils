@@ -132,7 +132,7 @@ func (r *Runner) hook(ctx context.Context, name string, t *task.Task, dir, unit 
 		Output:    out,
 		Timeout:   r.ws.cfg.HookTimeout,
 	}
-	w, outcome := r.execute(ctx, spec)
+	w, outcome := r.execute(ctx, spec, 0)
 	var err error
 	switch {
 	case outcome == task.OutcomeTimedOut:
@@ -288,7 +288,7 @@ func (r *Runner) remove(ctx context.Context, dir, unit string, out io.Writer) er
 		Output:  out,
 		Timeout: r.ws.cfg.HookTimeout,
 	}
-	w, outcome := r.execute(ctx, spec)
+	w, outcome := r.execute(ctx, spec, 0)
 	switch {
 	case outcome != task.OutcomeFinished:
 		return fmt.Errorf("rm did not finish: %s", outcome)

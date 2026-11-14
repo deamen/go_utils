@@ -695,7 +695,17 @@ func signalActivity(res task.Result) (kind, msg string) {
 // queuedAgainText is what a ticket is told when its run ended and ochell
 // has queued another one in its place (res.Next).
 func queuedAgainText(res task.Result) string {
-	return "The run was cut off because the orchestrator was restarted. It is queued again; the agent goes on where it stopped and checks first what it has already done."
+	when := "It is queued again"
+	if wait := time.Until(res.NextAt).Round(time.Second); !res.NextAt.IsZero() && wait > 0 {
+		when = fmt.Sprintf("It is queued again and starts in about %s", wait)
+	}
+	switch res.Next {
+	case task.CauseRetry:
+		return fmt.Sprintf("The run failed with an error that looks temporary, such as a rate limit (%v). %s; the agent checks first what it has already done.", res.Err, when)
+	case task.CauseStalled:
+		return fmt.Sprintf("The run was stopped: %v. %s; the agent checks first what it has already done.", res.Err, when)
+	}
+	return "The run was cut off because the orchestrator was restarted. " + when + "; the agent goes on where it stopped and checks first what it has already done."
 }
 
 // failureText says why a run did not succeed. It goes by the outcome: the
@@ -704,6 +714,8 @@ func failureText(res task.Result) string {
 	switch res.Outcome {
 	case task.OutcomeTimedOut, task.OutcomeStopped, task.OutcomeInterrupted:
 		return fmt.Sprintf("The run is incomplete: %v.", res.Err)
+	case task.OutcomeStalled:
+		return fmt.Sprintf("The run is incomplete: %v. The ticket has no attempt left, so it now waits for a human.", res.Err)
 	case task.OutcomeNotStarted:
 		return fmt.Sprintf("The run did not start: %v.", res.Err)
 	}

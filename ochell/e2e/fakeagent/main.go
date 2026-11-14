@@ -45,6 +45,10 @@ type Step struct {
 	IgnoreTerm bool `json:"ignore_term,omitempty"`
 	// Exit ends the run with this status.
 	Exit *int `json:"exit,omitempty"`
+	// OnRun limits the step to one run of the fake agent: 1 is the first
+	// run that left a record in $FAKEAGENT_RECORD_DIR, 2 the second, and
+	// so on. 0: every run.
+	OnRun int `json:"on_run,omitempty"`
 }
 
 type File struct {
@@ -83,6 +87,9 @@ func main() {
 		child(len(os.Args) > 2 && os.Args[2] == "ignore-term")
 		return
 	}
+	// Which run this is: one more than the records that are already there.
+	earlier, _ := filepath.Glob(filepath.Join(os.Getenv("FAKEAGENT_RECORD_DIR"), "run-*.json"))
+	runNo := len(earlier) + 1
 	stdin, _ := io.ReadAll(os.Stdin)
 	dir, _ := os.Getwd()
 	rec := Record{PID: os.Getpid(), UID: os.Getuid(), Reads: map[string]string{}, Writes: map[string]string{}, Args: os.Args[1:], Env: os.Environ(), Stdin: string(stdin), Dir: dir}
@@ -106,6 +113,9 @@ func main() {
 	}
 
 	for _, st := range script.Steps {
+		if st.OnRun != 0 && st.OnRun != runNo {
+			continue
+		}
 		switch {
 		case st.Print != "":
 			fmt.Println(st.Print)
