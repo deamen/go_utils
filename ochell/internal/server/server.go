@@ -441,6 +441,7 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 	}
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, sess.Context, delivery)
 	t.TrackerSession = sess.SessionID
+	t.Comment = sess.Comment
 	// Linear marks a session unresponsive unless it sees an activity within
 	// ~10s of "created", so answer now rather than when the agent starts.
 	switch s.submit(w, t, log) {

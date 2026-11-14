@@ -515,6 +515,53 @@ func TestAgentSignal(t *testing.T) {
 	})
 }
 
+// The run context: the prompt of a later attempt says which attempt it is,
+// whether it continues the session, what the earlier attempt left behind,
+// and which comment asked for the run.
+func TestRunContextInThePrompt(t *testing.T) {
+	const session = "3dc26999-bd50-487b-b445-cb41a233c6a2"
+	const pr, branch = "https://github.com/example/repo/pull/7", "bot/ENG-8"
+	const comment = "@agent the reviewer wants the error message translated as well"
+	o := Start(t, Options{
+		Script: []Step{
+			{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`},
+			{Print: `{"type":"result","subtype":"success","result":"Opened a pull request.","session_id":"` + session + `"}`},
+			Report("done", "Opened a pull request.", "pr_url", pr, "branch", branch),
+		},
+		Configure: func(c *config.Config) { c.Agent.Adapter = "claude" },
+	})
+	prompt := func(id string) string {
+		t.Helper()
+		o.WaitRun(id, 15*time.Second)
+		for _, rec := range o.Records() {
+			if got, _ := rec.Getenv("ORCH_TASK_ID"); got == id {
+				return rec.Stdin
+			}
+		}
+		t.Fatalf("no record of run %s", id)
+		return ""
+	}
+
+	// A first attempt that nobody commented on has nothing to be told.
+	first := prompt(o.LinearCreated("ENG-8", "session-first", "").TaskID(t))
+	if strings.Contains(first, "Run context") || strings.Contains(first, "attempt") {
+		t.Errorf("the first prompt holds a run context:\n%s", first)
+	}
+
+	// Someone mentions the agent in a comment: the second attempt.
+	second := prompt(o.LinearMentioned("ENG-8", "session-second", comment).TaskID(t))
+	for _, want := range []string{
+		"Run context from the orchestrator:",
+		"This is attempt 2 on this ticket. It continues the agent session of the earlier attempt",
+		"pushed the branch " + branch + " and opened the pull request " + pr,
+		"<comment>\n" + comment + "\n</comment>",
+	} {
+		if !strings.Contains(second, want) {
+			t.Errorf("the prompt of the resumed run lacks %q:\n%s", want, second)
+		}
+	}
+}
+
 // The claude adapter: the agent is called with the event stream as output,
 // the final message (not the raw stream) goes to the ticket, the session id
 // and the cost are stored, and the ticket's next run resumes the session.

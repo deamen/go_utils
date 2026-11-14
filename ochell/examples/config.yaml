@@ -45,13 +45,18 @@ agent:
     Context provided by {{.Source}}:
     {{.Context}}
     {{- end}}
+    {{- if .RunContext}}
+
+    {{.RunContext}}
+    {{- end}}
 
     {{.ResultInstructions}}
   workdir: /work/{{.Source}}/{{.Key}}
   # One directory per run, where the agent leaves its result file for ochell
   # (the path is in its environment as ORCH_RESULT_FILE). Keep it outside
   # the working directories. The prompt template must include
-  # {{.ResultInstructions}}, which tells the agent what to write.
+  # {{.ResultInstructions}}, which tells the agent what to write, and
+  # {{.RunContext}}, which tells a later attempt about the earlier ones.
   run_dir: /work/runs
   # The kind of agent CLI: how it is called and how its output is read.
   #   plain    any CLI: the prompt goes in, the last part of the output is

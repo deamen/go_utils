@@ -129,9 +129,18 @@ func TestPromptTemplateMustHoldTheResultInstructions(t *testing.T) {
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "{{.ResultInstructions}}") {
 		t.Errorf("template without the instructions: got %v", err)
 	}
+	// The run context is required for the same reason: a custom template
+	// must not lose what only ochell knows.
 	cfg.Agent.PromptTemplate = "Fix {{.Key}}.\n{{ .ResultInstructions }}"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "{{.RunContext}}") {
+		t.Errorf("template without the run context: got %v", err)
+	}
+	if !strings.Contains(Default().Agent.PromptTemplate, "{{.RunContext}}") {
+		t.Error("the default prompt template lacks {{.RunContext}}")
+	}
+	cfg.Agent.PromptTemplate = "Fix {{.Key}}.\n{{.RunContext}}\n{{ .ResultInstructions }}"
 	if err := cfg.Validate(); err != nil {
-		t.Errorf("template with the instructions: %v", err)
+		t.Errorf("template with the instructions and the run context: %v", err)
 	}
 	cfg.Agent.RunDir = ""
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.run_dir") {

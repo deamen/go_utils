@@ -106,6 +106,9 @@ var migrations = []string{
 	ALTER TABLE runs ADD COLUMN branch TEXT NOT NULL DEFAULT '';
 	ALTER TABLE tickets ADD COLUMN pr_url TEXT NOT NULL DEFAULT '';
 	ALTER TABLE tickets ADD COLUMN branch TEXT NOT NULL DEFAULT '';`,
+
+	// Version 5: the comment that triggered a run.
+	`ALTER TABLE runs ADD COLUMN comment TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is safe for concurrent use.
@@ -251,21 +254,21 @@ func (s *Store) Enqueue(t *task.Task, maxQueued int) error {
 		if err := s.move(tx, t.Source, t.Key, ticket.Queued, ""); err != nil {
 			return err
 		}
-		_, err = tx.Exec(`INSERT INTO runs (id, source, key, status, context, tracker_session, delivery_id, received_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			t.ID, t.Source, t.Key, runQueued, t.Context, t.TrackerSession, t.DeliveryID, ms(t.Received))
+		_, err = tx.Exec(`INSERT INTO runs (id, source, key, status, context, comment, tracker_session, delivery_id, received_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			t.ID, t.Source, t.Key, runQueued, t.Context, t.Comment, t.TrackerSession, t.DeliveryID, ms(t.Received))
 		return err
 	})
 }
 
 const taskColumns = `r.id, r.source, r.key, t.title, t.url, r.context, r.tracker_session, r.delivery_id, r.received_at, r.attempt,
-	t.agent_session, t.workspace`
+	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch`
 
 func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 	var t task.Task
 	var received int64
 	if err := row.Scan(&t.ID, &t.Source, &t.Key, &t.Title, &t.URL, &t.Context, &t.TrackerSession, &t.DeliveryID, &received, &t.Attempt,
-		&t.AgentSession, &t.Workspace); err != nil {
+		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch); err != nil {
 		return nil, err
 	}
 	t.Received = time.UnixMilli(received).UTC()
@@ -274,8 +277,8 @@ func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 
 // Claim takes the oldest queued run and marks it, and its ticket, as
 // running. It returns nil when nothing is queued. The task's Attempt says
-// which run of the ticket this is, counting from 1; AgentSession and
-// Workspace come from the ticket's earlier runs.
+// which run of the ticket this is, counting from 1; AgentSession, Workspace,
+// PRURL and Branch come from the ticket's earlier runs.
 func (s *Store) Claim() (*task.Task, error) {
 	now := ms(s.now())
 	var t *task.Task

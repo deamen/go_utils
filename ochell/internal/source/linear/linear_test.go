@@ -54,6 +54,20 @@ func TestParse(t *testing.T) {
 	}
 }
 
+// A session that a comment started carries that comment.
+func TestParseComment(t *testing.T) {
+	body := `{"type":"AgentSessionEvent","action":"created","agentSession":{"id":"s-1",
+		"issue":{"identifier":"ENG-1","title":"T","url":"https://linear.app/x/issue/ENG-1"},
+		"comment":{"id":"c-1","body":"@agent please fix the typo too"}}}`
+	_, sess, err := Parse([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.Comment != "@agent please fix the typo too" || sess.Key != "ENG-1" {
+		t.Errorf("session = %+v", sess)
+	}
+}
+
 func TestState(t *testing.T) {
 	st := NewState("secret", time.Minute)
 	if err := VerifyState("secret", st, time.Now()); err != nil {

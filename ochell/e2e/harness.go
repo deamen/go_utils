@@ -540,16 +540,32 @@ func (o *Ochell) JiraAutomation(key, summary string) Response {
 // was delegated to the agent in a new session.
 func (o *Ochell) LinearCreated(key, sessionID, promptContext string) Response {
 	o.t.Helper()
+	return o.linearCreated(key, sessionID, promptContext, "")
+}
+
+// LinearMentioned sends the same event for a session that a comment
+// started: someone mentioned the agent on the issue.
+func (o *Ochell) LinearMentioned(key, sessionID, comment string) Response {
+	o.t.Helper()
+	return o.linearCreated(key, sessionID, "", comment)
+}
+
+func (o *Ochell) linearCreated(key, sessionID, promptContext, comment string) Response {
+	o.t.Helper()
+	session := map[string]any{
+		"id": sessionID,
+		"issue": map[string]string{
+			"id": "issue-" + key, "identifier": key, "title": "Title of " + key,
+			"url": "https://linear.app/example/issue/" + key,
+		},
+	}
+	if comment != "" {
+		session["comment"] = map[string]string{"id": "comment-" + sessionID, "body": comment}
+	}
 	body, err := json.Marshal(map[string]any{
 		"type": "AgentSessionEvent", "action": "created",
-		"organizationId": "org-0000",
-		"agentSession": map[string]any{
-			"id": sessionID,
-			"issue": map[string]string{
-				"id": "issue-" + key, "identifier": key, "title": "Title of " + key,
-				"url": "https://linear.app/example/issue/" + key,
-			},
-		},
+		"organizationId":   "org-0000",
+		"agentSession":     session,
 		"promptContext":    promptContext,
 		"webhookTimestamp": time.Now().UnixMilli(),
 	})
