@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ochell/internal/config"
+	"ochell/internal/source/linear/lineartest"
 	"ochell/internal/store"
 	"ochell/internal/tracker/jiraapi/jiratest"
 )
@@ -1903,4 +1904,211 @@ func TestManualStop(t *testing.T) {
 	o.JiraAssigned("DEV-97", "Waits for the worker").TaskID(t)
 	o.WaitRecords(2, 10*time.Second)
 	o.Admin("stop", "jira", "DEV-97")
+}
+
+// polling turns the poller on, with a short interval.
+func polling(c *config.Config) { c.Poller.Interval = 300 * time.Millisecond }
+
+// The done-when of the poller, first part: a ticket assigned while ochell
+// was down starts after the next poll.
+func TestPollerPicksUpMissedWebhooks(t *testing.T) {
+	o := Start(t, Options{Configure: polling})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	o.Kill()
+	// While ochell is down, two tickets are given to the digital employee.
+	// Their webhooks go nowhere.
+	o.Jira.Add(jiratest.Issue{Key: "DEV-47", Summary: "Assigned while ochell was down", AssignedBy: HumanAccountID})
+	o.Linear.Add(lineartest.Issue{Key: "ENG-47", Title: "Delegated while ochell was down", DelegatedBy: "u-anna"})
+	o.Restart()
+
+	// The poll at start finds both.
+	recs := o.WaitRecords(2, 15*time.Second)
+	var keys []string
+	for _, rec := range recs {
+		key, _ := rec.Getenv("ORCH_TASK_KEY")
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	if !slices.Equal(keys, []string{"DEV-47", "ENG-47"}) {
+		t.Fatalf("the agent was started for %v, want DEV-47 and ENG-47", keys)
+	}
+	// Jira: the usual comments, and the assigner from the ticket's history.
+	comments := o.WaitJiraComments("DEV-47", 2, 10*time.Second)
+	if comments[0] != "The digital employee started work on this ticket." || !strings.Contains(comments[1], "fake agent finished DEV-47") {
+		t.Errorf("comments on DEV-47 = %q", comments)
+	}
+	if tk, _ := st.Ticket("jira", "DEV-47"); tk == nil || tk.Assigner != HumanAccountID || tk.Title != "Assigned while ochell was down" {
+		t.Errorf("stored ticket = %+v", tk)
+	}
+	// Linear: no webhook, so no session. ochell opened one and reports there.
+	var sessions []string
+	o.waitFor(10*time.Second, "ochell to open a session on ENG-47", func() bool {
+		sessions = o.Linear.Sessions("ENG-47")
+		return len(sessions) > 0
+	})
+	acts := o.WaitActivities(sessions[0], 2, 10*time.Second)
+	if acts[0].Type != "thought" || !strings.Contains(acts[0].Body, "Picked up ENG-47") || acts[1].Type != "response" || !strings.Contains(acts[1].Body, "fake agent finished ENG-47") {
+		t.Errorf("activities in ochell's own session = %+v", acts)
+	}
+
+	// Both tickets are still assigned and now in review. More polls start
+	// nothing, and open no second session.
+	time.Sleep(time.Second)
+	if n := len(o.Records()); n != 2 {
+		t.Errorf("the agent was started %d times, want 2: a ticket in review is not started again", n)
+	}
+	if n := len(o.Linear.Sessions("ENG-47")); n != 1 {
+		t.Errorf("ochell opened %d sessions on ENG-47, want 1", n)
+	}
+	for src, key := range map[string]string{"jira": "DEV-47", "linear": "ENG-47"} {
+		if tk, _ := st.Ticket(src, key); tk == nil || tk.State != "in_review" || tk.Attempts != 1 {
+			t.Errorf("%s = %+v, want in_review after one attempt", key, tk)
+		}
+	}
+}
+
+// Second part: a ticket closed or unassigned during a run has its agent
+// stopped, also when no webhook says so.
+func TestPollerStopsClosedAndUnassignedTickets(t *testing.T) {
+	o := Start(t, Options{
+		Script: spawning(Step{Spawn: &Spawn{Count: 1}}),
+		Configure: func(c *config.Config) {
+			polling(c)
+			c.Agent.MaxConcurrent = 3
+			c.Agent.StopGrace = time.Second
+		},
+	})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, key := range []string{"DEV-1", "DEV-2", "DEV-3"} {
+		o.Jira.Add(jiratest.Issue{Key: key, AssignedBy: HumanAccountID})
+	}
+	ids := map[string]string{}
+	for _, key := range []string{"DEV-1", "DEV-2", "DEV-3"} {
+		ids[key] = o.JiraAssigned(key, "Works for a long time").TaskID(t)
+	}
+	var recs []Record
+	o.waitFor(15*time.Second, "three agents with their children", func() bool {
+		recs = o.Records()
+		if len(recs) != 3 {
+			return false
+		}
+		for _, rec := range recs {
+			if len(rec.Children) < 1 {
+				return false
+			}
+		}
+		return true
+	})
+	byKey := map[string]Record{}
+	for _, rec := range recs {
+		key, _ := rec.Getenv("ORCH_TASK_KEY")
+		byKey[key] = rec
+	}
+	// Several polls have passed, and all three still run.
+	time.Sleep(700 * time.Millisecond)
+	for key, rec := range byKey {
+		if !Alive(rec.PID) {
+			t.Fatalf("the agent of %s was stopped although the ticket is the bot's and open", key)
+		}
+	}
+
+	// In Jira, one ticket is taken away and one is closed. No webhook.
+	o.Jira.Unassign("DEV-1")
+	o.Jira.Close("DEV-2")
+	if run := o.WaitStored(st, ids["DEV-1"], 15*time.Second); run.Result.Outcome != "cancelled" {
+		t.Errorf("the run of the unassigned ticket = %+v, want cancelled", run.Result)
+	}
+	if run := o.WaitStored(st, ids["DEV-2"], 15*time.Second); run.Result.Outcome != "cancelled" {
+		t.Errorf("the run of the closed ticket = %+v, want cancelled", run.Result)
+	}
+	expectAllGone(t, byKey["DEV-1"], 1)
+	expectAllGone(t, byKey["DEV-2"], 1)
+	if tk, _ := st.Ticket("jira", "DEV-1"); tk == nil || tk.State != "cancelled" {
+		t.Errorf("DEV-1 = %+v, want cancelled", tk)
+	}
+	o.waitFor(5*time.Second, "the closed ticket to be done", func() bool {
+		tk, _ := st.Ticket("jira", "DEV-2")
+		return tk != nil && tk.State == "done"
+	})
+	comments := o.WaitJiraComments("DEV-1", 2, 10*time.Second)
+	if !strings.Contains(comments[1], "no longer assigned to the digital employee") {
+		t.Errorf("DEV-1 was told %q", comments[1])
+	}
+	// The third is untouched.
+	if !Alive(byKey["DEV-3"].PID) {
+		t.Error("the agent of DEV-3 was stopped")
+	}
+	if tk, _ := st.Ticket("jira", "DEV-3"); tk == nil || tk.State != "running" {
+		t.Errorf("DEV-3 = %+v, want running", tk)
+	}
+}
+
+// Third part: a ticket that waits for review, and one that was released by
+// hand, are not started again.
+func TestPollerLeavesKnownTicketsAlone(t *testing.T) {
+	script := append(OnRun(1, Report("done", "Ready for review.")), OnRun(2, Step{Print: "working"}, Step{Sleep: "10m"})...)
+	o := Start(t, Options{Script: script, Configure: polling})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, key := range []string{"DEV-10", "DEV-11", "DEV-12"} {
+		o.Jira.Add(jiratest.Issue{Key: key, AssignedBy: HumanAccountID})
+	}
+	// Found by the poller, one after the other: the first is done at once
+	// and waits for review; the second keeps running.
+	o.WaitRecords(2, 15*time.Second)
+	var review, running, queued string
+	o.waitFor(10*time.Second, "one ticket in review, one running, one queued", func() bool {
+		review, running, queued = "", "", ""
+		for _, key := range []string{"DEV-10", "DEV-11", "DEV-12"} {
+			switch tk, _ := st.Ticket("jira", key); {
+			case tk == nil:
+			case tk.State == "in_review":
+				review = key
+			case tk.State == "running":
+				running = key
+			case tk.State == "queued":
+				queued = key
+			}
+		}
+		return review != "" && running != "" && queued != ""
+	})
+	// An operator releases the running one and the queued one by hand.
+	for _, key := range []string{queued, running} {
+		if out, code := o.Admin("stop", "jira", key); code != 0 {
+			t.Fatalf("ochell stop jira %s: exit %d: %s", key, code, out)
+		}
+	}
+	o.waitFor(10*time.Second, "both to be cancelled", func() bool {
+		a, _ := st.Ticket("jira", running)
+		b, _ := st.Ticket("jira", queued)
+		return a != nil && b != nil && a.State == "cancelled" && b.State == "cancelled"
+	})
+
+	// All three are still assigned to the bot and open in Jira. Many polls
+	// later nothing was started again.
+	time.Sleep(1500 * time.Millisecond)
+	if n := len(o.Records()); n != 2 {
+		t.Errorf("the agent was started %d times, want 2: the poller must leave these tickets alone", n)
+	}
+	for key, want := range map[string]string{review: "in_review", running: "cancelled", queued: "cancelled"} {
+		if tk, _ := st.Ticket("jira", key); tk == nil || string(tk.State) != want {
+			t.Errorf("%s = %+v, want %s", key, tk, want)
+		}
+	}
+	// Assigned again, which only a webhook can tell, a released ticket runs.
+	o.JiraAssigned(queued, "Assigned again").TaskID(t)
+	o.WaitRecords(3, 10*time.Second)
+	o.Admin("stop", "jira", queued)
 }

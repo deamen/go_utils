@@ -25,6 +25,9 @@ const (
 	// CauseFollowUp: a person wrote to the agent on a ticket that ochell
 	// already knows. The message is in Comment.
 	CauseFollowUp Cause = "follow_up"
+	// CausePoll: ochell found the ticket itself when it asked the tracker
+	// for the bot's tickets; the webhook of its assignment never arrived.
+	CausePoll Cause = "poll"
 )
 
 // CommentSeparator stands between the messages in Task.Comment when a run

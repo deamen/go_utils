@@ -12,10 +12,11 @@ import (
 	"testing"
 )
 
-// Credentials that the server accepts.
+// Credentials that the server accepts, and the account behind them.
 const (
-	Email = "bot@example.com"
-	Token = "jira-api-token"
+	Email     = "bot@example.com"
+	Token     = "jira-api-token"
+	AccountID = "712020:digital-employee"
 )
 
 // Issue is one ticket of the fake site.
@@ -26,6 +27,14 @@ type Issue struct {
 	// Status is the current status; Statuses are the ones it can move to.
 	Status   string
 	Statuses []string
+	// Creator is the accountId of who created the ticket, and AssignedBy
+	// of who assigned it to the bot; empty: it was created that way.
+	Creator    string
+	AssignedBy string
+
+	// unassigned and closed tickets are no longer among the bot's open
+	// tickets, but can still be read.
+	unassigned, closed bool
 }
 
 // Comment is one comment that was posted.
@@ -73,6 +82,24 @@ func (s *Server) Remove(key string) {
 			s.issues = append(s.issues[:i], s.issues[i+1:]...)
 			return
 		}
+	}
+}
+
+// Unassign takes a ticket away from the bot, and Close closes it. Both stay
+// readable.
+func (s *Server) Unassign(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if is := s.find(key); is != nil {
+		is.unassigned = true
+	}
+}
+
+func (s *Server) Close(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if is := s.find(key); is != nil {
+		is.closed = true
 	}
 }
 
@@ -147,6 +174,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.search(w, body)
 		return
 	}
+	if r.Method == http.MethodGet && r.URL.Path == "/rest/api/2/myself" {
+		answer(w, http.StatusOK, map[string]string{"accountId": AccountID, "emailAddress": Email})
+		return
+	}
 	rest, ok := strings.CutPrefix(r.URL.Path, "/rest/api/2/issue/")
 	key, what, _ := strings.Cut(rest, "/")
 	is := s.find(key)
@@ -155,6 +186,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case what == "" && r.Method == http.MethodGet:
+		s.issue(w, is, r.URL.Query().Get("expand") == "changelog")
 	case what == "comment" && r.Method == http.MethodPost:
 		var in struct {
 			Body string `json:"body"`
@@ -198,6 +231,46 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// issue answers a GET of one ticket, with every field ochell asks for.
+func (s *Server) issue(w http.ResponseWriter, is *Issue, changelog bool) {
+	type account struct {
+		AccountID string `json:"accountId"`
+	}
+	category := "indeterminate"
+	if is.closed {
+		category = "done"
+	}
+	fields := map[string]any{
+		"status": map[string]any{"name": is.Status, "statusCategory": map[string]string{"key": category}},
+	}
+	if !is.unassigned {
+		fields["assignee"] = account{AccountID}
+	} else {
+		fields["assignee"] = nil
+	}
+	if is.Creator != "" {
+		fields["creator"] = account{is.Creator}
+	}
+	out := map[string]any{"key": is.Key, "fields": fields}
+	if changelog {
+		histories := []map[string]any{}
+		if is.AssignedBy != "" {
+			histories = append(histories,
+				// An older assignment to someone else, and a change that is
+				// no assignment, which must both be passed over.
+				map[string]any{"created": "2026-11-01T09:00:00.000+0000", "author": account{"557058:earlier"},
+					"items": []map[string]string{{"field": "assignee", "to": "557058:someone"}}},
+				map[string]any{"created": "2026-11-14T09:00:00.000+0000", "author": account{is.AssignedBy},
+					"items": []map[string]string{{"field": "assignee", "to": AccountID}}},
+				map[string]any{"created": "2026-11-14T10:00:00.000+0000", "author": account{"557058:later"},
+					"items": []map[string]string{{"field": "status", "to": "3"}}},
+			)
+		}
+		out["changelog"] = map[string]any{"histories": histories}
+	}
+	answer(w, http.StatusOK, out)
+}
+
 func (s *Server) search(w http.ResponseWriter, body []byte) {
 	var in struct {
 		JQL           string `json:"jql"`
@@ -208,9 +281,15 @@ func (s *Server) search(w http.ResponseWriter, body []byte) {
 		return
 	}
 	s.jql = append(s.jql, in.JQL)
+	var open []*Issue
+	for _, is := range s.issues {
+		if !is.unassigned && !is.closed {
+			open = append(open, is)
+		}
+	}
 	start := 0
 	if in.NextPageToken != "" {
-		for i, is := range s.issues {
+		for i, is := range open {
 			if is.Key == in.NextPageToken {
 				start = i
 			}
@@ -230,13 +309,13 @@ func (s *Server) search(w http.ResponseWriter, body []byte) {
 	}
 	out := map[string]any{}
 	list := []issue{}
-	for i := start; i < len(s.issues); i++ {
+	for i := start; i < len(open); i++ {
 		if len(list) == max(s.PageSize, 1) {
 			// The token of the next page is the key of its first ticket.
-			out["nextPageToken"] = s.issues[i].Key
+			out["nextPageToken"] = open[i].Key
 			break
 		}
-		is := s.issues[i]
+		is := open[i]
 		f := fields{Summary: is.Summary, Labels: is.Labels}
 		for _, c := range is.Components {
 			f.Components = append(f.Components, name{c})

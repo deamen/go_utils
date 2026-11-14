@@ -59,6 +59,15 @@ workspace:
   # ticket as closed. Needs root, and {{.Key}} in agent.workdir.
   cleanup: true
 
+# The safety net behind the webhooks: at start and then at this interval,
+# ochell asks Jira (needs sources.jira_api) and Linear for the bot's open
+# tickets. It starts a ticket it has never seen, and stops the agent of one
+# that was closed or taken away from the bot. 0s turns it off.
+# On the first start with the poller, every open ticket of the bot is
+# started: check the list with "ochell jira-check" first.
+poller:
+  interval: 5m
+
 agent:
   # One agent process is started per ticket; it manages any sub-agents itself.
   command: claude
@@ -137,7 +146,7 @@ agent:
     CI: "true"
   timeout: 2h
   # Stop an agent that wrote no output for this long, and start the ticket
-  # again. 0 (the default): never. A long silent command, such as a slow
+  # again. 0s (the default): never. A long silent command, such as a slow
   # test suite, looks the same as a hung agent, so keep it well above the
   # longest step you expect.
   stall_timeout: 30m

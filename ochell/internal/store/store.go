@@ -815,6 +815,25 @@ func (s *Store) Stop(source, key string, why error) (queued *task.Task, err erro
 	return queued, err
 }
 
+// ActiveTickets returns the keys of the tickets of a source that have a
+// queued or running run.
+func (s *Store) ActiveTickets(source string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT key FROM tickets WHERE source = ? AND state IN (?, ?) ORDER BY key`, source, ticket.Queued, ticket.Running)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
 // LastTask returns the task of the most recent run of a ticket, with what
 // the ticket has now, or nil when the ticket never had a run. It says
 // where a message about the ticket goes (the tracker session).

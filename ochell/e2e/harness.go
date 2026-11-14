@@ -18,7 +18,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"os/user"
@@ -35,6 +34,7 @@ import (
 
 	"ochell/internal/auth"
 	"ochell/internal/config"
+	"ochell/internal/source/linear/lineartest"
 	"ochell/internal/store"
 	"ochell/internal/tracker/jiraapi/jiratest"
 )
@@ -296,7 +296,7 @@ func Start(t *testing.T, opts Options) *Ochell {
 			t.Fatal(err)
 		}
 	}
-	o.Linear = newFakeLinear(t)
+	o.Linear = lineartest.New(t, LinearToken)
 	o.Jira = jiratest.New(t)
 
 	port := freePort(t)
@@ -304,6 +304,9 @@ func Start(t *testing.T, opts Options) *Ochell {
 	cfg.LogLevel = "debug"
 	cfg.HTTP = config.Listener{Enabled: true, Address: "127.0.0.1", Port: port}
 	cfg.Store.Path = filepath.Join(dir, "ochell.db")
+	// Off, so that only what a test sends starts a run. The tests of the
+	// poller turn it on.
+	cfg.Poller.Interval = 0
 	cfg.Agent.Command = agentBin
 	cfg.Agent.Args = nil
 	cfg.Agent.PromptVia = "stdin"
@@ -873,68 +876,11 @@ func Alive(pid int) bool {
 }
 
 // Activity is one agent activity posted to the fake Linear API.
-type Activity struct {
-	SessionID string
-	Type      string
-	Body      string
-	At        time.Time
-}
+type Activity = lineartest.Activity
 
-// FakeLinear records the GraphQL calls ochell makes to Linear.
-type FakeLinear struct {
-	URL string
-
-	mu         sync.Mutex
-	activities []Activity
-}
-
-func newFakeLinear(t *testing.T) *FakeLinear {
-	f := &FakeLinear{}
-	srv := httptest.NewServer(f)
-	t.Cleanup(srv.Close)
-	f.URL = srv.URL
-	return f
-}
-
-func (f *FakeLinear) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	if r.Header.Get("Authorization") != "Bearer "+LinearToken {
-		w.WriteHeader(http.StatusUnauthorized)
-		io.WriteString(w, `{"errors":[{"message":"authentication failed"}]}`)
-		return
-	}
-	var req struct {
-		Variables struct {
-			Input struct {
-				AgentSessionID string `json:"agentSessionId"`
-				Content        struct {
-					Type string `json:"type"`
-					Body string `json:"body"`
-				} `json:"content"`
-			} `json:"input"`
-		} `json:"variables"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-	if in := req.Variables.Input; in.Content.Type != "" {
-		f.mu.Lock()
-		f.activities = append(f.activities, Activity{SessionID: in.AgentSessionID, Type: in.Content.Type, Body: in.Content.Body, At: time.Now()})
-		f.mu.Unlock()
-	}
-	io.WriteString(w, `{"data":{"agentActivityCreate":{"success":true},"agentSessionUpdate":{"success":true}}}`)
-}
-
-// Activities returns the activities posted to a session so far.
-func (f *FakeLinear) Activities(sessionID string) []Activity {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var out []Activity
-	for _, a := range f.activities {
-		if a.SessionID == sessionID {
-			out = append(out, a)
-		}
-	}
-	return out
-}
+// FakeLinear is the fake Linear API: it records the activities ochell
+// posts, and holds the issues that ochell finds when it asks.
+type FakeLinear = lineartest.Server
 
 // WaitActivities waits until a session has received n activities.
 func (o *Ochell) WaitActivities(sessionID string, n int, timeout time.Duration) []Activity {

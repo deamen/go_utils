@@ -22,6 +22,7 @@ import (
 	"ochell/internal/result"
 	"ochell/internal/runner"
 	"ochell/internal/source/linear"
+	"ochell/internal/source/linear/lineartest"
 	"ochell/internal/store"
 	"ochell/internal/task"
 	"ochell/internal/ticket"
@@ -51,6 +52,9 @@ type fakeRunner struct {
 	stopped    []string
 	stopResult runner.Stopped
 	stopErr    error
+	// states holds the state of the tickets that ochell knows, as
+	// "source:key". Submit, Hold, Stop and Closed keep it up to date.
+	states map[string]ticket.State
 	// assigners maps a ticket key to who assigned it.
 	assigners map[string]string
 	// sessions maps a tracker session to its ticket key.
@@ -78,6 +82,14 @@ func (f *fakeRunner) FollowUp(t *task.Task, addressed bool) (bool, error) {
 	return false, nil
 }
 
+// set notes the state of a ticket; the caller holds the lock.
+func (f *fakeRunner) set(source, key string, st ticket.State) {
+	if f.states == nil {
+		f.states = map[string]ticket.State{}
+	}
+	f.states[source+":"+key] = st
+}
+
 // Stop records the request, and answers with stopResult or stopErr.
 func (f *fakeRunner) Stop(source, key, by string) (runner.Stopped, error) {
 	f.mu.Lock()
@@ -86,10 +98,30 @@ func (f *fakeRunner) Stop(source, key, by string) (runner.Stopped, error) {
 		return 0, f.stopErr
 	}
 	f.stopped = append(f.stopped, source+":"+key+" by "+by)
+	f.set(source, key, ticket.Cancelled)
 	if f.stopResult == 0 {
 		return runner.StoppedRun, nil
 	}
 	return f.stopResult, nil
+}
+
+func (f *fakeRunner) State(source, key string) (ticket.State, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.states[source+":"+key], nil
+}
+
+func (f *fakeRunner) ActiveTickets(source string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var keys []string
+	for k, st := range f.states {
+		if src, key, _ := strings.Cut(k, ":"); src == source && st.Active() {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	return keys, nil
 }
 
 func (f *fakeRunner) Assigner(source, key string) (string, bool, error) {
@@ -112,6 +144,7 @@ func (f *fakeRunner) Closed(source, key string) error {
 		return f.err
 	}
 	f.closed = append(f.closed, source+":"+key)
+	f.set(source, key, ticket.Done)
 	return nil
 }
 
@@ -125,6 +158,7 @@ func (f *fakeRunner) Hold(t *task.Task, reason ticket.Reason) error {
 		f.held = map[string]ticket.Reason{}
 	}
 	f.held[t.Key] = reason
+	f.set(t.Source, t.Key, ticket.Waiting)
 	return nil
 }
 
@@ -138,6 +172,7 @@ func (f *fakeRunner) Submit(t *task.Task) error {
 		return f.submitErr
 	}
 	f.tasks = append(f.tasks, t)
+	f.set(t.Source, t.Key, ticket.Running)
 	return nil
 }
 
@@ -1245,5 +1280,196 @@ func TestCancelledText(t *testing.T) {
 	}
 	if got := cancelledText(&task.Task{Source: "linear", Key: "ENG-1"}, res); !strings.Contains(got, "Delegate it again") {
 		t.Errorf("Linear: %s", got)
+	}
+}
+
+// The poller starts the tickets that ochell has never seen, and no others.
+func TestPollStartsMissedTickets(t *testing.T) {
+	cfg := testConfig()
+	cfg.Repos = []config.Repo{{Source: "jira", Project: "DEV", Repo: "git@example.com:dev.git"}}
+	fr := &fakeRunner{states: map[string]ticket.State{
+		"jira:DEV-2": ticket.Waiting, "jira:DEV-3": ticket.InReview, "jira:DEV-4": ticket.Cancelled,
+		"jira:DEV-5": ticket.Done, "jira:DEV-6": ticket.Failed, "jira:DEV-7": ticket.Running,
+	}}
+	s := newServer(t, cfg, fr)
+	jira := &tracker.Fake{Assigners: map[string][]string{"DEV-1": {"557058:anna"}}}
+	for _, key := range []string{"DEV-1", "DEV-2", "DEV-3", "DEV-4", "DEV-5", "DEV-6", "DEV-7", "OPS-1", "not a key"} {
+		jira.Issues = append(jira.Issues, tracker.Issue{Key: key, Title: "Title of " + key, URL: "https://example.atlassian.net/browse/" + key, Labels: []string{"backend"}})
+	}
+	s.UseJira(jira)
+	s.Poll(context.Background())
+
+	// Only the ticket that ochell never saw is started.
+	if len(fr.tasks) != 1 {
+		t.Fatalf("started %d tickets, want DEV-1 only: %+v", len(fr.tasks), fr.tasks)
+	}
+	tk := fr.tasks[0]
+	if tk.Source != "jira" || tk.Key != "DEV-1" || tk.Title != "Title of DEV-1" || tk.URL != "https://example.atlassian.net/browse/DEV-1" ||
+		tk.Cause != task.CausePoll || tk.Actor != "557058:anna" || tk.Repo != "git@example.com:dev.git" {
+		t.Errorf("task = %+v", tk)
+	}
+	// A ticket with no repository waits, and is told so, as from a webhook.
+	if fr.held["OPS-1"] != ticket.ReasonNoRepoMapping {
+		t.Errorf("held = %v, want OPS-1 without a repository", fr.held)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(jira.Comments("OPS-1")) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := jira.Comments("OPS-1"); len(got) != 1 || !strings.Contains(got[0], "no repository is configured") {
+		t.Errorf("comments on OPS-1 = %q", got)
+	}
+	// The next round starts nothing again: ochell knows both now.
+	s.Poll(context.Background())
+	if len(fr.tasks) != 1 || len(jira.Comments("OPS-1")) != 1 {
+		t.Errorf("a second round started or said something: %d tasks, %d comments", len(fr.tasks), len(jira.Comments("OPS-1")))
+	}
+
+	// A list that cannot be read starts nothing and stops nothing.
+	jira.Set(func(f *tracker.Fake) { f.Err = errors.New("HTTP 503") })
+	s.Poll(context.Background())
+	if len(fr.tasks) != 1 || len(fr.stopped) != 0 || len(fr.closed) != 0 {
+		t.Errorf("a failed poll changed something: %d tasks, stopped %v, closed %v", len(fr.tasks), fr.stopped, fr.closed)
+	}
+}
+
+// The allowlist of assigners holds for what the poller finds.
+func TestPollRespectsTheAssignerAllowlist(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sources.JiraWebhook.AllowedAssigners = []string{"557058:lead"}
+	fr := &fakeRunner{}
+	s := newServer(t, cfg, fr)
+	jira := &tracker.Fake{
+		Issues:    []tracker.Issue{{Key: "DEV-1"}, {Key: "DEV-2"}, {Key: "DEV-3"}},
+		Assigners: map[string][]string{"DEV-1": {"557058:lead"}, "DEV-2": {"557058:outsider"}},
+	}
+	s.UseJira(jira)
+	s.Poll(context.Background())
+	s.Poll(context.Background())
+	if len(fr.tasks) != 1 || fr.tasks[0].Key != "DEV-1" {
+		t.Errorf("started %+v, want DEV-1 only: DEV-2 was assigned by an outsider, and nobody knows who assigned DEV-3", fr.tasks)
+	}
+}
+
+// The poller stops the agent of a ticket that was closed or taken away,
+// after asking the tracker about that ticket.
+func TestPollStopsTicketsThatAreNoLongerTheBots(t *testing.T) {
+	fr := &fakeRunner{states: map[string]ticket.State{
+		"jira:DEV-1": ticket.Running, "jira:DEV-2": ticket.Running, "jira:DEV-3": ticket.Queued,
+		"jira:DEV-4": ticket.Running, "jira:DEV-5": ticket.Running, "jira:DEV-6": ticket.Waiting,
+		"linear:ENG-1": ticket.Running,
+	}}
+	cfg := testConfig()
+	cfg.Sources.JiraAutomation.BotAccountID = bot
+	s := newServer(t, cfg, fr)
+	jira := &tracker.Fake{
+		// DEV-1 is still on the list.
+		Issues: []tracker.Issue{{Key: "DEV-1"}},
+		States: map[string]tracker.Status{
+			"DEV-2": {Unassigned: true},
+			"DEV-3": {Closed: true},
+			// Not on the list, but the tracker says it is open and the
+			// bot's: the list was behind, or the JQL is narrower.
+			"DEV-4": {},
+			"DEV-6": {Closed: true},
+		},
+	}
+	s.UseJira(jira)
+	s.Poll(context.Background())
+	if got := strings.Join(fr.stopped, "; "); got != "jira:DEV-2 by the orchestrator: the ticket is no longer assigned to the digital employee" {
+		t.Errorf("stopped = %q", got)
+	}
+	// DEV-6 is not in progress: the poller leaves it to the webhook.
+	if got := strings.Join(fr.closed, ","); got != "jira:DEV-3" {
+		t.Errorf("closed = %q, want jira:DEV-3", got)
+	}
+	if fr.states["jira:DEV-4"] != ticket.Running || fr.states["jira:DEV-5"] != ticket.Running || fr.states["linear:ENG-1"] != ticket.Running {
+		t.Errorf("a ticket that is still the bot's was touched: %v", fr.states)
+	}
+
+	// With a Jira Automation rule that names no bot account, a ticket may
+	// run without being assigned to the bot: nothing is stopped then.
+	cfg = testConfig()
+	cfg.Sources.JiraAutomation.BotAccountID = ""
+	fr2 := &fakeRunner{states: map[string]ticket.State{"jira:DEV-2": ticket.Running}}
+	s2 := newServer(t, cfg, fr2)
+	s2.UseJira(jira)
+	s2.Poll(context.Background())
+	if len(fr2.stopped) != 0 {
+		t.Errorf("stopped = %v", fr2.stopped)
+	}
+}
+
+// On Linear the poller opens the agent session itself, and that session
+// coming back as a webhook starts nothing.
+func TestPollLinear(t *testing.T) {
+	api := lineartest.New(t, "access-1")
+	api.Add(lineartest.Issue{Key: "ENG-1", Title: "Missed", DelegatedBy: "u-anna", Labels: []string{"backend"}})
+	api.Add(lineartest.Issue{Key: "ENG-2", Title: "Known", DelegatedBy: "u-anna"})
+	api.Add(lineartest.Issue{Key: "ENG-3", Title: "Only mentioned"})
+	api.Add(lineartest.Issue{Key: "ENG-4", Title: "Taken away", DelegatedBy: "u-anna"})
+	api.Add(lineartest.Issue{Key: "ENG-5", Title: "Closed", DelegatedBy: "u-anna"})
+	api.Undelegate("ENG-4")
+	api.Close("ENG-5")
+
+	cfg := testConfig()
+	cfg.Sources.Linear.ClientID = "cid"
+	cfg.Sources.Linear.ClientSecret = "csecret"
+	cfg.Sources.Linear.TokenFile = filepath.Join(t.TempDir(), "token.json")
+	cfg.Sources.Linear.APIURL = api.URL
+	cfg.Sources.Linear.AllowedAssigners = []string{"u-anna@example.com"}
+	fr := &fakeRunner{states: map[string]ticket.State{
+		"linear:ENG-2": ticket.InReview,
+		// In progress, and not delegated: the agent was mentioned on it.
+		"linear:ENG-3": ticket.Running,
+		"linear:ENG-4": ticket.Running, "linear:ENG-5": ticket.Running,
+	}}
+	s := newServer(t, cfg, fr)
+	if err := s.linear.SaveToken(&linear.Token{AccessToken: "access-1"}); err != nil {
+		t.Fatal(err)
+	}
+	s.Poll(context.Background())
+
+	if len(fr.tasks) != 1 {
+		t.Fatalf("started %d tickets, want ENG-1 only: %+v", len(fr.tasks), fr.tasks)
+	}
+	tk := fr.tasks[0]
+	sessions := api.Sessions("ENG-1")
+	if len(sessions) != 1 || tk.TrackerSession != sessions[0] || tk.Key != "ENG-1" || tk.Title != "Missed" || tk.Cause != task.CausePoll || tk.Actor != "u-anna" {
+		t.Errorf("task = %+v, sessions on the issue = %q", tk, sessions)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(api.Activities(tk.TrackerSession)) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if acts := api.Activities(tk.TrackerSession); len(acts) != 1 || acts[0].Type != "thought" || !strings.Contains(acts[0].Body, "Picked up ENG-1") {
+		t.Errorf("activities in the new session = %+v", acts)
+	}
+	if got := strings.Join(fr.stopped, "; "); !strings.HasPrefix(got, "linear:ENG-4 by the orchestrator") || strings.Contains(got, "ENG-3") {
+		t.Errorf("stopped = %q, want ENG-4 only: ENG-3 was never delegated", got)
+	}
+	if got := strings.Join(fr.closed, ","); got != "linear:ENG-5" {
+		t.Errorf("closed = %q", got)
+	}
+
+	// Linear reports the session that ochell created as a "created" event.
+	fr.sessions = map[string]string{tk.TrackerSession: "ENG-1"}
+	for name, creator := range map[string]string{"known by its session": "u-anna", "created by the app itself": lineartest.AppUserID} {
+		session := tk.TrackerSession
+		if creator == lineartest.AppUserID {
+			session = "a-session-not-stored-yet"
+		}
+		raw, _ := json.Marshal(map[string]any{
+			"type": "AgentSessionEvent", "action": "created", "appUserId": lineartest.AppUserID,
+			"agentSession":     map[string]any{"id": session, "creator": map[string]string{"id": creator, "email": creator + "@example.com"}, "issue": map[string]string{"identifier": "ENG-1"}},
+			"webhookTimestamp": time.Now().UnixMilli(),
+		})
+		w := do(s, "/webhooks/linear", string(raw), map[string]string{"Linear-Signature": auth.SignHex("linear-secret", raw)})
+		if w.Code != 200 || !strings.Contains(w.Body.String(), "own session") {
+			t.Errorf("%s: %d %s, want it ignored", name, w.Code, w.Body)
+		}
+	}
+	if len(fr.tasks) != 1 {
+		t.Errorf("ochell's own session started a second run: %+v", fr.tasks)
 	}
 }

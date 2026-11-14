@@ -20,6 +20,29 @@ type Issue struct {
 	Labels []string
 }
 
+// Status is what a tracker says about one ticket that the bot had.
+type Status struct {
+	// Closed: the ticket is done, cancelled or gone.
+	Closed bool
+	// Unassigned: the ticket was the bot's, and no longer is.
+	Unassigned bool
+}
+
+// Source is what the poller needs to bring ochell in line with one
+// tracker: which tickets are the bot's, who gave it one of them, and what
+// became of a ticket that is no longer on the list.
+type Source interface {
+	// Assigned returns every open ticket that is assigned to the bot. It
+	// returns an error rather than a part of the list.
+	Assigned(ctx context.Context) ([]Issue, error)
+	// Assigner returns the ways the tracker names the person who assigned
+	// a ticket to the bot (an account id, an email address), or nothing
+	// when it cannot tell.
+	Assigner(ctx context.Context, key string) ([]string, error)
+	// Lookup asks about one ticket.
+	Lookup(ctx context.Context, key string) (Status, error)
+}
+
 // Client is the access to one tracker, as the bot account.
 type Client interface {
 	// Assigned returns every open ticket that is assigned to the bot. It

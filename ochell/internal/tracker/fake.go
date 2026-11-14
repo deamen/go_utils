@@ -14,8 +14,37 @@ type Fake struct {
 	// Err, when set, is returned by every call.
 	Err error
 
+	// Assigners is what Assigner returns, by ticket key, and States what
+	// Lookup returns.
+	Assigners map[string][]string
+	States    map[string]Status
+
 	comments []FakeComment
 	statuses map[string]string
+}
+
+var (
+	_ Client = (*Fake)(nil)
+	_ Source = (*Fake)(nil)
+)
+
+func (f *Fake) Assigner(_ context.Context, key string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Assigners[key], f.Err
+}
+
+func (f *Fake) Lookup(_ context.Context, key string) (Status, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.States[key], f.Err
+}
+
+// Set changes what the fake answers, under its lock.
+func (f *Fake) Set(change func(*Fake)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	change(f)
 }
 
 // FakeComment is one comment that was added through a Fake.
