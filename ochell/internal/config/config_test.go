@@ -163,6 +163,7 @@ func TestSystemdLauncherValidation(t *testing.T) {
 		cfg.Sources.JiraAutomation.Token = "t"
 		cfg.Agent.Launcher = "systemd"
 		cfg.Agent.Command = "/usr/local/bin/claude"
+		cfg.Agent.Workdir = "/work/{{.Source}}/{{.Key}}"
 		return cfg
 	}
 	if err := base().Validate(); err != nil {
@@ -178,6 +179,14 @@ func TestSystemdLauncherValidation(t *testing.T) {
 	cfg.Agent.Command = "claude"
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "absolute path") {
 		t.Errorf("relative command with the systemd launcher: got %v", err)
+	}
+	// The default workdir is ".", which the launch script refuses.
+	for _, dir := range []string{Default().Agent.Workdir, "work/{{.Key}}"} {
+		cfg = base()
+		cfg.Agent.Workdir = dir
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.workdir to be an absolute path") {
+			t.Errorf("workdir %q with the systemd launcher: got %v", dir, err)
+		}
 	}
 	cfg = base()
 	cfg.Agent.Systemd.StopCommand = nil
