@@ -1,6 +1,6 @@
 // Package admin is the local admin channel: a unix socket on which a
 // running ochell takes commands from its operator (pause, resume, status,
-// reset).
+// reset, stop).
 //
 // The socket is a file that only ochell's own OS user may open. That is the
 // whole access control, and the reason it is not a loopback port: the agent
@@ -32,6 +32,8 @@ type Control interface {
 	Resume() error
 	Status() (runner.Status, error)
 	ResetAttempts(source, key string) error
+	// Stop ends the work on a ticket for the operator named in by.
+	Stop(source, key, by string) (runner.Stopped, error)
 }
 
 // Server serves the admin commands on a unix socket.
@@ -149,6 +151,33 @@ func routes(c Control, log *slog.Logger) http.Handler {
 			answer(w, http.StatusNotFound, fmt.Sprintf("ochell knows no %s ticket %s", source, key))
 		default:
 			log.Error("admin: reset failed", "err", err)
+			answer(w, http.StatusInternalServerError, err.Error())
+		}
+	})
+	mux.HandleFunc("POST /stop", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		source, key := q.Get("source"), q.Get("key")
+		// Who ran the command, as the client says: everyone who can open
+		// the socket is ochell's own OS user, so this is a note for the
+		// ticket, not a credential.
+		by := "an operator"
+		if user := strings.TrimSpace(q.Get("user")); user != "" {
+			by = "the operator " + user
+		}
+		by += `, with "ochell stop" on the host`
+		switch did, err := c.Stop(source, key, by); {
+		case err == nil && did == runner.StoppedRun:
+			answer(w, http.StatusOK, fmt.Sprintf("the agent of %s %s is being stopped; the ticket is released and is not started again until it is assigned again", source, key))
+		case err == nil && did == runner.StoppedQueued:
+			answer(w, http.StatusOK, fmt.Sprintf("the queued run of %s %s was removed; the ticket is released and is not started again until it is assigned again", source, key))
+		case err == nil:
+			answer(w, http.StatusOK, fmt.Sprintf("%s %s had no run; the ticket is released and is not started again until it is assigned again", source, key))
+		case errors.Is(err, store.ErrUnknown):
+			answer(w, http.StatusNotFound, fmt.Sprintf("ochell knows no %s ticket %s", source, key))
+		case errors.Is(err, store.ErrReleased):
+			answer(w, http.StatusConflict, fmt.Sprintf("nothing to stop: %s %s is done or was already released", source, key))
+		default:
+			log.Error("admin: stop failed", "err", err)
 			answer(w, http.StatusInternalServerError, err.Error())
 		}
 	})

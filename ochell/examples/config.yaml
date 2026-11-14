@@ -18,7 +18,7 @@ https:
   key_file: /etc/ochell/tls.key
 
 # The admin channel: a unix socket on which the running ochell takes the
-# commands "ochell pause", "resume", "status" and "reset". Only ochell's own
+# commands "ochell pause", "resume", "status", "reset" and "stop". Only ochell's own
 # OS user can open it. Keep it where the agent cannot write.
 admin:
   socket: /run/ochell/admin.sock
