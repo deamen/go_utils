@@ -333,7 +333,7 @@ func TestLinearAgentSession(t *testing.T) {
 	if tk.Key != "ENG-123" || !strings.Contains(tk.Context, "<issue") || tk.TrackerSession != "session-0000" {
 		t.Fatalf("task = %+v", tk)
 	}
-	if err := s.Finished(context.Background(), tk, task.Result{Tail: "Opened PR #7"}); err != nil {
+	if err := s.Finished(context.Background(), tk, task.Result{Message: "Opened PR #7"}); err != nil {
 		t.Fatal(err)
 	}
 	<-api.got

@@ -505,9 +505,9 @@ func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) er
 	defer cancel()
 	if res.Err != nil {
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityError,
-			strings.TrimSpace(failureText(res)+"\n\n"+codeBlock(lastN(res.Tail, replyMax))))
+			strings.TrimSpace(failureText(res)+"\n\n"+codeBlock(lastN(res.Message, replyMax))))
 	}
-	msg := strings.TrimSpace(lastN(res.Tail, replyMax))
+	msg := strings.TrimSpace(lastN(res.Message, replyMax))
 	if msg == "" {
 		msg = "The agent finished."
 	}

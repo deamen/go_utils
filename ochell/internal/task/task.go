@@ -61,6 +61,7 @@ type Result struct {
 	// Workdir is the working directory the agent ran in.
 	Workdir  string
 	Duration time.Duration
-	// Tail holds the last part of the agent output.
-	Tail string
+	// Message is the agent's final message, as its adapter read it: for
+	// the plain adapter, the last part of the output.
+	Message string
 }
