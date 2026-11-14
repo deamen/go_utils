@@ -20,23 +20,12 @@ import (
 	_ "modernc.org/sqlite"
 
 	"ochell/internal/task"
+	"ochell/internal/ticket"
 )
 
 var (
 	ErrBusy      = errors.New("a task for this ticket is already queued or running")
 	ErrQueueFull = errors.New("task queue is full")
-)
-
-// Ticket states.
-const (
-	// StateQueued: a run of the ticket waits for a free worker.
-	StateQueued = "queued"
-	// StateRunning: an agent is working on the ticket.
-	StateRunning = "running"
-	// StateEnded: the last run ended by itself, or at its time limit.
-	StateEnded = "ended"
-	// StateInterrupted: the last run was cut short because ochell stopped.
-	StateInterrupted = "interrupted"
 )
 
 // Run statuses.
@@ -85,6 +74,16 @@ var migrations = []string{
 		key        TEXT PRIMARY KEY,
 		expires_at INTEGER NOT NULL
 	);`,
+
+	// Version 2: the ticket states of package ticket replace the first,
+	// provisional ones ("ended" and "interrupted").
+	`ALTER TABLE tickets ADD COLUMN reason TEXT NOT NULL DEFAULT '';
+	UPDATE tickets SET state = 'waiting', reason = 'interrupted' WHERE state = 'interrupted';
+	UPDATE tickets SET state = CASE (
+			SELECT r.outcome FROM runs r WHERE r.source = tickets.source AND r.key = tickets.key
+			ORDER BY r.ended_at DESC, r.rowid DESC LIMIT 1
+		) WHEN 'finished' THEN 'in_review' ELSE 'failed' END
+		WHERE state = 'ended';`,
 }
 
 // Store is safe for concurrent use.
@@ -173,19 +172,42 @@ func (s *Store) tx(fn func(*sql.Tx) error) error {
 
 func ms(t time.Time) int64 { return t.UnixMilli() }
 
+// state returns the state of a ticket, ticket.None when there is none.
+func state(tx *sql.Tx, source, key string) (ticket.State, error) {
+	var s ticket.State
+	err := tx.QueryRow(`SELECT state FROM tickets WHERE source = ? AND key = ?`, source, key).Scan(&s)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ticket.None, nil
+	}
+	return s, err
+}
+
+// move changes the state of an existing ticket. Every change of state goes
+// through here, so that package ticket decides what is allowed.
+func (s *Store) move(tx *sql.Tx, source, key string, to ticket.State, reason ticket.Reason) error {
+	from, err := state(tx, source, key)
+	if err != nil {
+		return err
+	}
+	if err := ticket.Move(from, to, reason); err != nil {
+		return fmt.Errorf("%s %s: %w", source, key, err)
+	}
+	_, err = tx.Exec(`UPDATE tickets SET state = ?, reason = ?, updated_at = ? WHERE source = ? AND key = ?`,
+		to, reason, ms(s.now()), source, key)
+	return err
+}
+
 // Enqueue records t as a queued run of its ticket. It returns ErrBusy when
 // the ticket already has a queued or running run, and ErrQueueFull when
 // maxQueued runs are waiting (0 means no limit).
 func (s *Store) Enqueue(t *task.Task, maxQueued int) error {
 	now := ms(s.now())
 	return s.tx(func(tx *sql.Tx) error {
-		var state string
-		err := tx.QueryRow(`SELECT state FROM tickets WHERE source = ? AND key = ?`, t.Source, t.Key).Scan(&state)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-		case err != nil:
+		from, err := state(tx, t.Source, t.Key)
+		if err != nil {
 			return err
-		case state == StateQueued || state == StateRunning:
+		}
+		if from.Active() {
 			return ErrBusy
 		}
 		if maxQueued > 0 {
@@ -197,11 +219,14 @@ func (s *Store) Enqueue(t *task.Task, maxQueued int) error {
 				return ErrQueueFull
 			}
 		}
+		// A new ticket is created in the state "none", then moved like any other.
 		if _, err := tx.Exec(`INSERT INTO tickets (source, key, title, url, state, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (source, key) DO UPDATE SET
-				title = excluded.title, url = excluded.url, state = excluded.state, updated_at = excluded.updated_at`,
-			t.Source, t.Key, t.Title, t.URL, StateQueued, now, now); err != nil {
+			ON CONFLICT (source, key) DO UPDATE SET title = excluded.title, url = excluded.url`,
+			t.Source, t.Key, t.Title, t.URL, ticket.None, now, now); err != nil {
+			return err
+		}
+		if err := s.move(tx, t.Source, t.Key, ticket.Queued, ""); err != nil {
 			return err
 		}
 		_, err = tx.Exec(`INSERT INTO runs (id, source, key, status, context, tracker_session, delivery_id, received_at)
@@ -238,8 +263,14 @@ func (s *Store) Claim() (*task.Task, error) {
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE tickets SET state = ?, attempts = attempts + 1, updated_at = ?
-			WHERE (source, key) = (SELECT source, key FROM runs WHERE id = ?)`, StateRunning, now, id); err != nil {
+		var source, key string
+		if err := tx.QueryRow(`SELECT source, key FROM runs WHERE id = ?`, id).Scan(&source, &key); err != nil {
+			return err
+		}
+		if err := s.move(tx, source, key, ticket.Running, ""); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE tickets SET attempts = attempts + 1 WHERE source = ? AND key = ?`, source, key); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`UPDATE runs SET status = ?, started_at = ?,
@@ -253,17 +284,14 @@ func (s *Store) Claim() (*task.Task, error) {
 	return t, err
 }
 
-// Finish records how a run ended. The ticket is then free for a new run.
+// Finish records how a run ended, and moves the ticket to the state that
+// follows from it (ticket.AfterRun). The ticket is then free for a new run.
 func (s *Store) Finish(id string, res task.Result) error {
 	return s.tx(func(tx *sql.Tx) error { return s.finish(tx, id, res) })
 }
 
 func (s *Store) finish(tx *sql.Tx, id string, res task.Result) error {
 	now := ms(s.now())
-	state := StateEnded
-	if res.Outcome == task.OutcomeStopped || res.Outcome == task.OutcomeInterrupted {
-		state = StateInterrupted
-	}
 	var exit any
 	if res.ExitCode >= 0 {
 		exit = res.ExitCode
@@ -280,10 +308,17 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result) error {
 	if n, _ := r.RowsAffected(); n == 0 {
 		return fmt.Errorf("store: run %s is unknown or has already ended", id)
 	}
-	_, err = tx.Exec(`UPDATE tickets SET state = ?, updated_at = ?,
-			workspace = CASE WHEN ? != '' THEN ? ELSE workspace END
-		WHERE (source, key) = (SELECT source, key FROM runs WHERE id = ?)`,
-		state, now, res.Workdir, res.Workdir, id)
+	var source, key string
+	if err := tx.QueryRow(`SELECT source, key FROM runs WHERE id = ?`, id).Scan(&source, &key); err != nil {
+		return err
+	}
+	to, reason := ticket.AfterRun(res.Outcome)
+	if err := s.move(tx, source, key, to, reason); err != nil {
+		return err
+	}
+	if res.Workdir != "" {
+		_, err = tx.Exec(`UPDATE tickets SET workspace = ? WHERE source = ? AND key = ?`, res.Workdir, source, key)
+	}
 	return err
 }
 
@@ -334,7 +369,9 @@ func (s *Store) Active() (int, error) {
 // Ticket is the stored state of one work item.
 type Ticket struct {
 	Source, Key, Title, URL string
-	State                   string
+	State                   ticket.State
+	// Reason is set when State is ticket.Waiting.
+	Reason ticket.Reason
 	// Attempts is the number of runs that were started.
 	Attempts  int
 	Workspace string
@@ -346,9 +383,9 @@ type Ticket struct {
 func (s *Store) Ticket(source, key string) (*Ticket, error) {
 	t := Ticket{Source: source, Key: key}
 	var created, updated int64
-	err := s.db.QueryRow(`SELECT title, url, state, attempts, workspace, created_at, updated_at
+	err := s.db.QueryRow(`SELECT title, url, state, reason, attempts, workspace, created_at, updated_at
 		FROM tickets WHERE source = ? AND key = ?`, source, key).
-		Scan(&t.Title, &t.URL, &t.State, &t.Attempts, &t.Workspace, &created, &updated)
+		Scan(&t.Title, &t.URL, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

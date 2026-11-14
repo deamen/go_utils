@@ -1,13 +1,16 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"ochell/internal/task"
+	"ochell/internal/ticket"
 )
 
 func open(t *testing.T, path string) *Store {
@@ -79,7 +82,7 @@ func TestQueue(t *testing.T) {
 	if err != nil || tk == nil {
 		t.Fatalf("Ticket = %v, %v", tk, err)
 	}
-	if tk.State != StateEnded || tk.Attempts != 1 || tk.Workspace != "/work/ENG-1" || tk.Title != "Title of ENG-1" {
+	if tk.State != ticket.Failed || tk.Reason != "" || tk.Attempts != 1 || tk.Workspace != "/work/ENG-1" || tk.Title != "Title of ENG-1" {
 		t.Errorf("ticket = %+v", tk)
 	}
 
@@ -124,7 +127,7 @@ func TestRestart(t *testing.T) {
 	if len(interrupted) != 1 || interrupted[0].ID != "run-a" || interrupted[0].TrackerSession != "session-run-a" {
 		t.Fatalf("interrupted = %+v, want run-a with its tracker session", interrupted)
 	}
-	if tk, _ := s.Ticket("linear", "ENG-run-a"); tk == nil || tk.State != StateInterrupted || tk.Attempts != 1 {
+	if tk, _ := s.Ticket("linear", "ENG-run-a"); tk == nil || tk.State != ticket.Waiting || tk.Reason != ticket.ReasonInterrupted || tk.Attempts != 1 {
 		t.Errorf("ticket of the interrupted run = %+v", tk)
 	}
 	if again, _ := s.Recover(); len(again) != 0 {
@@ -143,6 +146,78 @@ func TestRestart(t *testing.T) {
 	// The interrupted ticket can be started again.
 	if err := s.Enqueue(newTask("run-a2", "ENG-run-a", t0), 0); err != nil {
 		t.Errorf("new run of an interrupted ticket: %v", err)
+	}
+}
+
+// The store refuses a change of state that package ticket does not allow,
+// and changes nothing then.
+func TestStateIsEnforced(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	if err := s.Enqueue(newTask("r1", "ENG-1", time.Now()), 0); err != nil {
+		t.Fatal(err)
+	}
+	// A queued ticket cannot go straight to review.
+	err := s.tx(func(tx *sql.Tx) error { return s.move(tx, "linear", "ENG-1", ticket.InReview, "") })
+	if err == nil || !strings.Contains(err.Error(), "from queued to in_review is not allowed") {
+		t.Errorf("queued -> in_review: %v", err)
+	}
+	// Finishing a run that was never started would move queued to failed.
+	if err := s.Finish("r1", task.Result{Outcome: task.OutcomeFailed}); err == nil {
+		t.Error("finishing a run that is still queued must fail")
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.Queued {
+		t.Errorf("state after the refused moves = %s, want queued", tk.State)
+	}
+	if got, _ := s.Claim(); got == nil || got.ID != "r1" {
+		t.Errorf("the run is no longer queued: %+v", got)
+	}
+	if err := s.Finish("r1", task.Result{Outcome: task.OutcomeFinished}); err != nil {
+		t.Fatal(err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.InReview || tk.Reason != "" {
+		t.Errorf("after a finished run: %s (%q), want in_review", tk.State, tk.Reason)
+	}
+}
+
+// A file written before the state machine existed is converted.
+func TestMigrateProvisionalStates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ochell.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(migrations[0] + `; PRAGMA user_version = 1;
+		INSERT INTO tickets (source, key, state, created_at, updated_at) VALUES
+			('jira', 'OK-1', 'ended', 0, 0), ('jira', 'BAD-1', 'ended', 0, 0),
+			('jira', 'CUT-1', 'interrupted', 0, 0), ('jira', 'Q-1', 'queued', 0, 0);
+		INSERT INTO runs (id, source, key, status, received_at, ended_at, outcome) VALUES
+			('a', 'jira', 'OK-1', 'ended', 0, 1, 'failed'), ('b', 'jira', 'OK-1', 'ended', 0, 2, 'finished'),
+			('c', 'jira', 'BAD-1', 'ended', 0, 1, 'timed_out'), ('d', 'jira', 'CUT-1', 'ended', 0, 1, 'interrupted'),
+			('e', 'jira', 'Q-1', 'queued', 0, NULL, '');`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s := open(t, path)
+	for key, want := range map[string]struct {
+		state  ticket.State
+		reason ticket.Reason
+	}{
+		"OK-1":  {ticket.InReview, ""},
+		"BAD-1": {ticket.Failed, ""},
+		"CUT-1": {ticket.Waiting, ticket.ReasonInterrupted},
+		"Q-1":   {ticket.Queued, ""},
+	} {
+		tk, err := s.Ticket("jira", key)
+		if err != nil || tk == nil {
+			t.Fatalf("%s: %v, %v", key, tk, err)
+		}
+		if tk.State != want.state || tk.Reason != want.reason {
+			t.Errorf("%s: %s (%q), want %s (%q)", key, tk.State, tk.Reason, want.state, want.reason)
+		}
+	}
+	if got, _ := s.Claim(); got == nil || got.ID != "e" {
+		t.Errorf("the queued run of the old file: %+v", got)
 	}
 }
 
