@@ -19,7 +19,7 @@ Linear (agent app)  ─────────┘  IP policy +   │ verify →
 
 Behaviour common to all sources:
 - **Responses:**
-  - 200 when a task is queued, ignored or a duplicate;
+  - 200 when a task is queued, ignored or a duplicate, and when a ticket is not started because no repository is mapped to it;
   - 401 when authentication fails;
   - 400 when the payload is unusable, for example a Jira Automation request that names no assignee;
 - **Duplicate deliveries:** a signed request is dropped when its body, or its `X-Atlassian-Webhook-Identifier` / `Linear-Delivery` id, was seen before. The body counts because the signature covers it; the id is a header that a replayed request can change. Both are kept in the store for 24 hours, also across a restart.
@@ -120,6 +120,23 @@ So a restart loses no queued task, and a retried or replayed delivery from befor
 
 Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user.
 
+### Repositories
+`repos` says which repository a ticket belongs to. ochell needs it to prepare a workspace; the agent is told the repository in its prompt and in `ORCH_TASK_REPO`.
+
+```yaml
+repos:
+  - {source: jira, project: DEV, label: frontend, repo: git@github.com:example/web.git}
+  - {source: jira, project: DEV, repo: git@github.com:example/backend.git}
+  - {source: linear, project: ENG, repo: git@github.com:example/engine.git}
+```
+
+- **`project`** is the Jira project key or the Linear team key: the part of the ticket key before the number (`DEV` in `DEV-42`). `"*"` matches every project.
+- **`source`** is `jira` or `linear`; leave it out to match both.
+- **`label`** is optional and narrows an entry to tickets with that label, or in Jira that component. Labels come from the webhook payload: the Jira system webhook has them; for Jira Automation add `"labels": "{{issue.labels}}"` to the request body. Whether the Linear agent session payload carries labels has not been checked against Linear.
+- **The first entry that matches wins**, so put the narrower entries first.
+- **A ticket that no entry matches is not started.** It is recorded as `waiting` with the reason `no_repo_mapping`, the request is answered with 200 `not started: …`, ochell logs a warning, and a Linear session is told why. After the mapping is added, assign the ticket again.
+- With no `repos` at all, every ticket runs, without a repository.
+
 ### Ticket states
 Every ticket ochell has seen is in one of these states. They are defined, with the allowed moves, in [internal/ticket/state.go](internal/ticket/state.go), and the store refuses any other move.
 
@@ -218,7 +235,7 @@ ochell sets the outcome from what it asked for, never from the exit code alone: 
 ### The prompt
 The prompt is rendered from `agent.prompt_template` and written to the agent's **stdin** (`prompt_via: stdin`, the default), which is how `claude -p` reads it when no prompt argument is given.
 
-The template sees the task (`.Source`, `.Key`, `.Title`, `.URL`, `.Context`, `.Comment`, `.ID`, `.Attempt`) and what ochell adds: `.RunContext`, `.ResultInstructions` and `.ResultFile`. **A template must include `{{.RunContext}}` and `{{.ResultInstructions}}`**; ochell refuses to start without them. See [The result file](#the-result-file).
+The template sees the task (`.Source`, `.Key`, `.Title`, `.URL`, `.Repo`, `.Context`, `.Comment`, `.ID`, `.Attempt`) and what ochell adds: `.RunContext`, `.ResultInstructions` and `.ResultFile`. **A template must include `{{.RunContext}}` and `{{.ResultInstructions}}`**; ochell refuses to start without them. See [The result file](#the-result-file).
 
 **The run context** is what only ochell knows about a run. The agent still reads the ticket itself. It is empty for a first attempt that no comment asked for; otherwise it says:
 - which attempt this is, and whether it continues the agent session of the earlier attempt or starts a new one. In a new session the agent is told to look at the branch, the pull request and the ticket's comments before it repeats work;
@@ -267,7 +284,7 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 ### Agent environment
 The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:
 - the variables named in `agent.env_pass`, copied from ochell's environment when they are set. The default list is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), `SSL_CERT_FILE` and `SSL_CERT_DIR`;
-- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL` and `ORCH_RESULT_FILE`;
+- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL` and `ORCH_RESULT_FILE`, and `ORCH_TASK_REPO` when a repository is mapped to the ticket;
 - the variables set in `agent.env`.
 
 Setting `env_pass` (or `--agent-env-pass`) replaces the default list. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, add that name to `env_pass`. Never add a variable that holds one of ochell's own secrets.

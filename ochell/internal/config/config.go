@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -154,19 +155,71 @@ type Store struct {
 	Path string `yaml:"path"`
 }
 
+// Repo maps tickets to the repository they are worked on in.
+type Repo struct {
+	// Source is "jira" or "linear"; empty matches both.
+	Source string `yaml:"source"`
+	// Project is the Jira project key or the Linear team key, which is the
+	// part of the ticket key before the number (DEV in DEV-42). "*"
+	// matches every project.
+	Project string `yaml:"project"`
+	// Label, when set, narrows the entry to tickets that carry this label
+	// (in Jira also: this component).
+	Label string `yaml:"label"`
+	// Repo is the repository, as git clone takes it.
+	Repo string `yaml:"repo"`
+}
+
 type Config struct {
-	LogLevel    string      `yaml:"log_level"`
-	HTTP        Listener    `yaml:"http"`
-	HTTPS       Listener    `yaml:"https"`
-	Store       Store       `yaml:"store"`
+	LogLevel string   `yaml:"log_level"`
+	HTTP     Listener `yaml:"http"`
+	HTTPS    Listener `yaml:"https"`
+	Store    Store    `yaml:"store"`
+	// Repos says which repository a ticket belongs to. The first entry
+	// that matches wins. When the list is not empty, a ticket that no
+	// entry matches is not started and waits for a human. When it is
+	// empty, tickets run without a repository.
+	Repos       []Repo      `yaml:"repos"`
 	Agent       Agent       `yaml:"agent"`
 	Sources     Sources     `yaml:"sources"`
 	IPAllowlist IPAllowlist `yaml:"ip_allowlist"`
 	NgrokSync   NgrokSync   `yaml:"ngrok_sync"`
 }
 
+// ProjectOf returns the project of a ticket key: the part before the last
+// "-" (DEV in DEV-42), or the whole key when there is none.
+func ProjectOf(key string) string {
+	if i := strings.LastIndexByte(key, '-'); i > 0 {
+		return key[:i]
+	}
+	return key
+}
+
+// RepoFor returns the repository of a ticket: that of the first entry of
+// repos that matches its source, its project and, where the entry names
+// one, one of its labels. ok is false when no entry matches.
+func (c *Config) RepoFor(source, key string, labels []string) (repo string, ok bool) {
+	project := ProjectOf(key)
+	for _, r := range c.Repos {
+		if r.Source != "" && r.Source != source {
+			continue
+		}
+		if r.Project != "*" && !strings.EqualFold(r.Project, project) {
+			continue
+		}
+		if r.Label != "" && !slices.ContainsFunc(labels, func(l string) bool { return strings.EqualFold(l, r.Label) }) {
+			continue
+		}
+		return r.Repo, true
+	}
+	return "", false
+}
+
 const DefaultPromptTemplate = `You are the digital employee assigned {{.Source}} ticket {{.Key}} ({{.URL}}).
 Use twg to retrieve the full ticket details, complete the task, and open a pull request.
+{{- if .Repo}}
+The repository for this ticket is {{.Repo}}.
+{{- end}}
 {{- if .Context}}
 
 Context provided by {{.Source}}:
@@ -391,6 +444,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Store.Path == "" {
 		errs = append(errs, errors.New("store.path is required"))
+	}
+	for i, r := range c.Repos {
+		if r.Source != "" && r.Source != "jira" && r.Source != "linear" {
+			errs = append(errs, fmt.Errorf("repos[%d].source must be jira, linear or empty", i))
+		}
+		if r.Project == "" {
+			errs = append(errs, fmt.Errorf(`repos[%d].project is required; "*" matches every project`, i))
+		}
+		// The value reaches the agent's environment and prompt.
+		if r.Repo == "" || strings.ContainsAny(r.Repo, " \t\n\r") {
+			errs = append(errs, fmt.Errorf("repos[%d].repo is required, without spaces", i))
+		}
 	}
 	if c.Agent.Command == "" {
 		errs = append(errs, errors.New("agent.command is required"))

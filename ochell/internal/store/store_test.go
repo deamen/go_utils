@@ -226,6 +226,43 @@ func TestAgentSession(t *testing.T) {
 	}
 }
 
+// A ticket that cannot be started is recorded as waiting, without a run.
+func TestHold(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	if err := s.Hold(newTask("r1", "OPS-7", t0), ticket.ReasonNoRepoMapping); err != nil {
+		t.Fatal(err)
+	}
+	tk, _ := s.Ticket("linear", "OPS-7")
+	if tk == nil || tk.State != ticket.Waiting || tk.Reason != ticket.ReasonNoRepoMapping || tk.Attempts != 0 || tk.Title != "Title of OPS-7" {
+		t.Fatalf("held ticket = %+v", tk)
+	}
+	if got, _ := s.Claim(); got != nil {
+		t.Errorf("a held ticket has a run: %+v", got)
+	}
+	if n, _ := s.Active(); n != 0 {
+		t.Errorf("Active = %d, want 0", n)
+	}
+
+	// Once a repository is mapped, the same ticket is queued, and its
+	// task carries the repository.
+	mapped := newTask("r2", "OPS-7", t0)
+	mapped.Repo = "git@example.com:org/ops.git"
+	if err := s.Enqueue(mapped, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Hold(newTask("r3", "OPS-7", t0), ticket.ReasonNoRepoMapping); !errors.Is(err, ErrBusy) {
+		t.Errorf("holding a queued ticket: %v, want ErrBusy", err)
+	}
+	got, _ := s.Claim()
+	if got == nil || got.Repo != "git@example.com:org/ops.git" {
+		t.Errorf("claimed %+v, want the repository", got)
+	}
+	if tk, _ := s.Ticket("linear", "OPS-7"); tk.Repo != "git@example.com:org/ops.git" {
+		t.Errorf("ticket repo = %q", tk.Repo)
+	}
+}
+
 // The store refuses a change of state that package ticket does not allow,
 // and changes nothing then.
 func TestStateIsEnforced(t *testing.T) {

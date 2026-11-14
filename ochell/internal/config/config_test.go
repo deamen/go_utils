@@ -148,6 +148,67 @@ func TestPromptTemplateMustHoldTheResultInstructions(t *testing.T) {
 	}
 }
 
+func TestRepoFor(t *testing.T) {
+	cfg := Default()
+	cfg.Repos = []Repo{
+		{Source: "jira", Project: "DEV", Label: "Frontend", Repo: "web"},
+		{Source: "jira", Project: "DEV", Repo: "backend"},
+		{Source: "linear", Project: "ENG", Repo: "engine"},
+		{Project: "DOCS", Repo: "docs"},
+	}
+	for _, c := range []struct {
+		source, key string
+		labels      []string
+		want        string
+	}{
+		{"jira", "DEV-42", nil, "backend"},
+		{"jira", "dev-42", nil, "backend"},
+		{"jira", "DEV-42", []string{"urgent", "frontend"}, "web"},
+		{"jira", "DEV-42", []string{"urgent"}, "backend"},
+		{"linear", "ENG-1", nil, "engine"},
+		{"linear", "DEV-1", nil, ""},    // the DEV entries are for Jira
+		{"jira", "ENG-1", nil, ""},      // and ENG is for Linear
+		{"jira", "DOCS-3", nil, "docs"}, // an entry without a source
+		{"linear", "DOCS-3", nil, "docs"},
+		{"jira", "DEVOPS-1", nil, ""},  // not a prefix match
+		{"jira", "MY-PROJ-5", nil, ""}, // the project is MY-PROJ
+		{"linear", "session-0d9a", nil, ""},
+	} {
+		got, ok := cfg.RepoFor(c.source, c.key, c.labels)
+		if got != c.want || ok != (c.want != "") {
+			t.Errorf("RepoFor(%s, %s, %v) = %q, %v; want %q", c.source, c.key, c.labels, got, ok, c.want)
+		}
+	}
+	// "*" catches what the entries before it did not.
+	cfg.Repos = append(cfg.Repos, Repo{Project: "*", Repo: "everything-else"})
+	if got, ok := cfg.RepoFor("jira", "OPS-1", nil); !ok || got != "everything-else" {
+		t.Errorf("catch-all: %q, %v", got, ok)
+	}
+	if got, _ := cfg.RepoFor("jira", "DEV-1", nil); got != "backend" {
+		t.Errorf("an earlier entry must win over the catch-all: %q", got)
+	}
+	if ProjectOf("MY-PROJ-5") != "MY-PROJ" || ProjectOf("nodash") != "nodash" {
+		t.Error("ProjectOf")
+	}
+}
+
+func TestRepoValidation(t *testing.T) {
+	cfg := Default()
+	cfg.Sources.JiraAutomation.Enabled = true
+	cfg.Sources.JiraAutomation.Token = "t"
+	cfg.Repos = []Repo{{Source: "jira", Project: "DEV", Repo: "git@example.com:org/backend.git"}, {Project: "*", Repo: "https://example.com/org/misc.git"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid repos: %v", err)
+	}
+	cfg.Repos = []Repo{{Source: "github", Project: "DEV", Repo: "x"}, {Repo: "x"}, {Project: "DEV"}, {Project: "DEV", Repo: "x y"}}
+	err := cfg.Validate()
+	for _, want := range []string{"repos[0].source", "repos[1].project", "repos[2].repo", "repos[3].repo"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("expected %q in %v", want, err)
+		}
+	}
+}
+
 func TestAgentEnvValidation(t *testing.T) {
 	p := writeYAML(t, `
 agent:

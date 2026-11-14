@@ -95,6 +95,38 @@ func TestParseAutomationRequiresAssignee(t *testing.T) {
 	}
 }
 
+// Labels and components are read where the payload has them, for the
+// repository mapping.
+func TestLabels(t *testing.T) {
+	hook := `{"webhookEvent":"jira:issue_created","issue":{"key":"DEV-1","fields":{
+		"assignee":{"accountId":"bot"},"labels":["urgent","frontend"],"components":[{"name":"Checkout"},{"name":""}]}}}`
+	tk, err := ParseWebhook([]byte(hook), "bot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(tk.Labels, ","); got != "urgent,frontend,Checkout" {
+		t.Errorf("webhook labels = %q", got)
+	}
+	for body, want := range map[string]string{
+		`{"issueKey":"DEV-1","labels":["a","b"]}`:                                         "a,b",
+		`{"issueKey":"DEV-1","labels":"a, b ,,c"}`:                                        "a,b,c",
+		`{"issueKey":"DEV-1","labels":""}`:                                                "",
+		`{"issueKey":"DEV-1"}`:                                                            "",
+		`{"issue":{"key":"DEV-1","fields":{"labels":["x"],"components":[{"name":"Y"}]}}}`: "x,Y",
+	} {
+		tk, err := ParseAutomation([]byte(body), "")
+		if err != nil {
+			t.Fatalf("%s: %v", body, err)
+		}
+		if got := strings.Join(tk.Labels, ","); got != want {
+			t.Errorf("%s: labels = %q, want %q", body, got, want)
+		}
+	}
+	if _, err := ParseAutomation([]byte(`{"issueKey":"DEV-1","labels":7}`), ""); err == nil {
+		t.Error("labels that are neither a list nor a text must be refused")
+	}
+}
+
 func TestCheckTimestamp(t *testing.T) {
 	now := time.UnixMilli(1760152365200)
 	body := func(ts string) []byte { return []byte(`{"timestamp":` + ts + `,"webhookEvent":"jira:issue_updated"}`) }

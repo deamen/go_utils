@@ -23,6 +23,16 @@ https:
 store:
   path: /var/lib/ochell/ochell.db
 
+# Which repository a ticket belongs to. "project" is the Jira project key or
+# the Linear team key (DEV in DEV-42); "*" matches every project. "label" is
+# optional. The first entry that matches wins. A ticket that no entry
+# matches is not started and waits for a human. Leave "repos" out to run
+# every ticket without a repository.
+repos:
+  - {source: jira, project: DEV, label: frontend, repo: "git@github.com:example/web.git"}
+  - {source: jira, project: DEV, repo: "git@github.com:example/backend.git"}
+  - {source: linear, project: ENG, repo: "git@github.com:example/engine.git"}
+
 agent:
   # One agent process is started per ticket; it manages any sub-agents itself.
   command: claude
@@ -40,6 +50,9 @@ agent:
   prompt_template: |
     You are the digital employee assigned {{.Source}} ticket {{.Key}} ({{.URL}}).
     Use twg to retrieve the full ticket details, complete the task, and open a pull request.
+    {{- if .Repo}}
+    The repository for this ticket is {{.Repo}}.
+    {{- end}}
     {{- if .Context}}
 
     Context provided by {{.Source}}:
