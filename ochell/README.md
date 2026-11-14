@@ -25,8 +25,8 @@ Behaviour common to all sources:
 - **Duplicate deliveries:** a signed request is dropped when its body, or its `X-Atlassian-Webhook-Identifier` / `Linear-Delivery` id, was seen before. The body counts because the signature covers it; the id is a header that a replayed request can change. Both are kept in the store for 24 hours, also across a restart.
 - **Replay:** a signed request is rejected with 401 when its timestamp (`timestamp` for Jira, `webhookTimestamp` for Linear) is further than `max_skew` from now. The default is 60s for Linear and 2h for Jira: Jira retries a failed delivery up to five times, 5 to 15 minutes apart, and a retry may carry the timestamp of the event. Jira Automation requests carry no timestamp.
 - **One run per ticket:** a ticket that is already queued or running is not started again. The request is answered with 200 `already in progress`. A new Linear session on such a ticket gets a `response` activity that says so, which closes that session; the result is posted in the first session.
-- **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the agent exits it posts a `response` (the tail of the agent output) or an `error`.
-- **Linear follow-ups:** `prompted` events are logged but not yet delivered to a running agent.
+- **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the run ends it posts what the agent reported in its result file (see [The result file](#the-result-file)): a `response` for finished work, an `elicitation` for anything that needs a human. A run that failed, timed out or was stopped gets an `error`.
+- **Linear follow-ups:** `prompted` events are logged but not yet delivered to an agent. So a reply to an `elicitation` does not start a run yet; delegate the ticket again.
 
 ### Stopping agents and shutting down
 - **A stop ends the whole agent**, not only its top process: sub-agents, MCP servers and git children too. ochell sends SIGTERM, and SIGKILL after `agent.stop_grace` (10s). This happens at `agent.timeout` and on shutdown.
@@ -95,7 +95,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-adapter` | Kind of agent CLI: `plain` (default) or `claude`; see [Agent adapters](#agent-adapters) |
 | `--agent-launcher` | `direct` (default) or `systemd`; see [Launchers](#launchers) |
 | `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
-| `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-log-dir` | Execution settings |
+| `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-log-dir`, `--agent-run-dir` | Execution settings |
 | `--agent-stop-grace`, `--agent-drain-timeout` | Time between SIGTERM and SIGKILL when an agent is stopped; how long a shutdown waits for running agents (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down)) |
 | `--jira-webhook`, `--jira-webhook-secret`, `--jira-bot-account-id` | Jira system webhook source |
 | `--jira-automation`, `--jira-automation-header`, `--jira-automation-token` | Jira Automation source |
@@ -137,15 +137,19 @@ A ticket that is `queued` or `running` takes no second run. From every other sta
 
 Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation`, and `interrupted` (ochell itself stopped during the run).
 
-What a run leads to today:
+What a run leads to:
 
-| Run outcome | Ticket state |
-|---|---|
-| `finished` | `in_review` |
-| `failed`, `timed_out`, `not_started` | `failed` |
-| `stopped`, `interrupted` | `waiting`, reason `interrupted` |
+| Run outcome | Agent's result file | Ticket state |
+|---|---|---|
+| `finished` | `done` | `in_review` |
+| `finished` | `needs_input` | `waiting`, reason `input` |
+| `finished` | `blocked` | `waiting`, reason `blocked` |
+| `finished` | `low_confidence`, `out_of_scope` | `waiting`, reason `escalation` |
+| `finished` | missing or invalid | `waiting`, reason `no_result` |
+| `failed`, `timed_out`, `not_started` | not looked at | `failed` |
+| `stopped`, `interrupted` | not looked at | `waiting`, reason `interrupted` |
 
-Several states and reasons are not reached yet: they belong to features that come later (the agent's own result, the plan gate, stop from the ticket, handoff). Pausing will not be a state: it holds the queue, and queued tickets stay queued.
+Several states and reasons are not reached yet: they belong to features that come later (the plan gate, stop from the ticket, handoff). Pausing will not be a state: it holds the queue, and queued tickets stay queued.
 
 ### Agent adapters
 An adapter holds what differs between agent CLIs: how a run is started, how an earlier session is resumed, and how the output is read (final message, session id, cost). It only builds commands and parses output. Running and stopping the process is the launcher's job, so every adapter works with every launcher. `agent.adapter` selects it.
@@ -195,6 +199,7 @@ Then set `agent.launcher: systemd` and check the result with `scripts/check-laun
 - **Command:** `agent.command` must be an absolute path, because `PATH` in the unit is the system default. Install the agent CLI in a system path such as `/usr/local/bin`; that also stops the agent user from replacing its own binary.
 - **No ticket text in arguments:** systemd replaces `${VAR}` in a unit's arguments from its environment, which holds the agent's token. A ticket titled `${CLAUDE_CODE_OAUTH_TOKEN}` would put the real token on the command line. So ochell refuses to start with `prompt_via: arg`, `args` and `workdir` may only use `{{.ID}}`, `{{.Source}}` and `{{.Key}}`, and the launch script escapes every `$` in the arguments it passes.
 - **Working directory:** `workdir` must be an absolute path inside `WORKSPACE_ROOT`, which belongs to the agent user. The default `.` is refused at start.
+- **Run directory:** `run_dir` must be an absolute path inside `WORKSPACE_ROOT` too, for example `/work/runs`. The launch script creates each run's directory as the agent user, and the unit runs with umask 027. **Add the ochell user to the agent user's group**, so that ochell can read the result files; without that every run ends as `no_result`.
 - **Time limit:** ochell keeps the timer and stops the unit. The unit also gets its own limit, one minute longer, in case ochell is gone.
 
 **Why a run ended** is in the last line of the run log and in ochell's log, as `outcome`:
@@ -213,16 +218,41 @@ ochell sets the outcome from what it asked for, never from the exit code alone: 
 ### The prompt
 The prompt is rendered from `agent.prompt_template` and written to the agent's **stdin** (`prompt_via: stdin`, the default), which is how `claude -p` reads it when no prompt argument is given.
 
+The template sees the task (`.Source`, `.Key`, `.Title`, `.URL`, `.Context`, `.ID`, `.Attempt`) and two things ochell adds: `.ResultInstructions` and `.ResultFile`. **A template must include `{{.ResultInstructions}}`**; ochell refuses to start without it. See [The result file](#the-result-file).
+
 `prompt_via: arg` passes it as an argument instead: put `{{.Prompt}}` in `args`. Use this only for an agent CLI that cannot read stdin, because:
 - command-line arguments are visible to every local user in the process list, and the prompt contains ticket text;
 - the kernel limits one argument to 128 KB, and a Linear prompt context can be larger, in which case the agent cannot be started.
 
 For the same reasons, do not put other ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`) in `args`.
 
+### The result file
+The agent tells ochell how its run ended by writing a small JSON file. This works with any agent CLI, whatever its output looks like.
+
+```json
+{"status": "needs_input", "message": "Which of the two login pages do you mean?", "pr_url": "", "branch": ""}
+```
+
+| `status` | Meaning | The ticket then |
+|---|---|---|
+| `done` | the work is finished and ready for review | is `in_review` |
+| `needs_input` | the agent needs an answer from a human | waits, reason `input` |
+| `blocked` | something outside the ticket stops the agent | waits, reason `blocked` |
+| `low_confidence` | the agent finished but is not sure of the result | waits, reason `escalation` |
+| `out_of_scope` | the ticket asks for something the agent must not or cannot do | waits, reason `escalation` |
+
+- **`message`** is a short text for the people on the ticket; it is required for every status but `done`. **`pr_url`** and **`branch`** are optional. ochell keeps the last ones a ticket's runs named. Other fields are ignored.
+- **Where:** the path is in the agent's environment as `ORCH_RESULT_FILE`: `<agent.run_dir>/<task id>/result.json`. Every run has a directory of its own, so a file of an earlier run is never read. Keep `run_dir` outside the working directories, so the file cannot be committed.
+- **How the agent knows:** `{{.ResultInstructions}}` in the prompt template is the text that tells it. It names the variable, the format and the statuses.
+- **No file, or an invalid one:** the run has no result, and the ticket waits for a human with the reason `no_result`. The last line of the run log says `result=none` or `result=invalid`, and ochell's log says what was wrong with the file.
+- **Only a run that ended by itself with status 0 is believed.** For a run that failed, timed out or was stopped, the file is stored but does not change what happens to the ticket.
+- **The file is untrusted.** ochell reads at most 64 KB of a regular file, and does not follow a link out of `run_dir`.
+- Result files are not removed yet.
+
 ### Agent environment
 The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:
 - the variables named in `agent.env_pass`, copied from ochell's environment when they are set. The default list is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), `SSL_CERT_FILE` and `SSL_CERT_DIR`;
-- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY` and `ORCH_TASK_URL`;
+- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL` and `ORCH_RESULT_FILE`;
 - the variables set in `agent.env`.
 
 Setting `env_pass` (or `--agent-env-pass`) replaces the default list. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, add that name to `env_pass`. Never add a variable that holds one of ochell's own secrets.

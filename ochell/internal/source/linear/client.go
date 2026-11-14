@@ -257,6 +257,9 @@ const (
 	ActivityThought  = "thought"
 	ActivityResponse = "response"
 	ActivityError    = "error"
+	// ActivityElicitation asks the user for something; the session then
+	// waits for their reply.
+	ActivityElicitation = "elicitation"
 )
 
 const activityMutation = `mutation AgentActivityCreate($input: AgentActivityCreateInput!) {

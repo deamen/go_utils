@@ -26,6 +26,7 @@ import (
 	"ochell/internal/agent"
 	"ochell/internal/config"
 	"ochell/internal/launcher"
+	"ochell/internal/result"
 	"ochell/internal/store"
 	"ochell/internal/task"
 )
@@ -55,9 +56,11 @@ type Runner struct {
 	prompt   *template.Template
 	args     []*template.Template
 	workdir  *template.Template
-	mu       sync.Mutex
-	stopped  bool
-	wg       sync.WaitGroup
+	// runDir is the absolute path of agent.run_dir.
+	runDir  string
+	mu      sync.Mutex
+	stopped bool
+	wg      sync.WaitGroup
 	// wake tells an idle worker to look at the queue.
 	wake chan struct{}
 	// quit is closed when Shutdown begins: workers start no more tasks.
@@ -84,6 +87,11 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 			return nil, err
 		}
 		r.args = append(r.args, t)
+	}
+	// The agent gets the path of its result file in its environment, and
+	// runs in another directory.
+	if r.runDir, err = filepath.Abs(cfg.RunDir); err != nil {
+		return nil, fmt.Errorf("agent run_dir: %w", err)
 	}
 	if r.adapter, err = agent.New(cfg); err != nil {
 		return nil, err
@@ -302,6 +310,16 @@ func (r *Runner) argData(t *task.Task) any {
 	return t
 }
 
+// promptView is what the prompt template sees: the task, and what ochell
+// adds for this run.
+type promptView struct {
+	*task.Task
+	// ResultFile is where the agent writes its result file.
+	ResultFile string
+	// ResultInstructions tells the agent to write it, and how.
+	ResultInstructions string
+}
+
 // stopWait is how long Run waits for an agent to exit after asking the
 // launcher to stop it, beyond the grace period.
 const stopWait = 45 * time.Second
@@ -319,8 +337,15 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	res.Outcome = task.OutcomeNotStarted
 	defer func() { res.Duration = time.Since(start) }()
 
+	// Each run has a directory of its own for its result file, so a file
+	// of an earlier run is never taken for this one.
+	runName := unsafeName.ReplaceAllString(t.ID, "_")
+	runDir := filepath.Join(r.runDir, runName)
+	resultFile := filepath.Join(runDir, result.FileName)
+
 	var err error
-	if t.Prompt, err = render(r.prompt, t); err != nil {
+	view := promptView{Task: t, ResultFile: resultFile, ResultInstructions: result.Instructions}
+	if t.Prompt, err = render(r.prompt, view); err != nil {
 		res.Err = fmt.Errorf("render prompt: %w", err)
 		return res
 	}
@@ -375,18 +400,21 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	}
 	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s\n# command=%s (%d args) workdir=%s session=%s\n# prompt:\n%s\n# ---- agent output ----\n",
 		t.ID, t.Source, t.Key, t.URL, r.cfg.Command, len(cmd.Args), dir, session, t.Prompt)
+	// signal is what the footer of the log says about the result file.
+	signal := "none"
 	defer func() {
-		fmt.Fprintf(lf, "\n# ---- exit=%d outcome=%s err=%v duration=%s ----\n", res.ExitCode, res.Outcome, res.Err, time.Since(start))
+		fmt.Fprintf(lf, "\n# ---- exit=%d outcome=%s result=%s err=%v duration=%s ----\n", res.ExitCode, res.Outcome, signal, res.Err, time.Since(start))
 	}()
 
 	out := r.adapter.Output()
 	spec := launcher.Spec{
-		TaskID:    unsafeName.ReplaceAllString(t.ID, "_"),
+		TaskID:    runName,
 		Command:   r.cfg.Command,
 		Args:      cmd.Args,
 		Stdin:     cmd.Stdin,
 		Dir:       dir,
-		Env:       r.taskEnv(t),
+		RunDir:    runDir,
+		Env:       append(r.taskEnv(t), result.EnvVar+"="+resultFile),
 		Inherited: r.inheritedEnv(),
 		Output:    io.MultiWriter(lf, out),
 		Timeout:   r.cfg.Timeout,
@@ -424,6 +452,16 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	}
 	rep := out.Report()
 	res.Message, res.SessionID, res.CostUSD, res.Usage = rep.Message, rep.SessionID, rep.CostUSD, rep.Usage
+	// What the agent says about its run. The file is read whenever the
+	// agent ran, and stored; it decides the ticket's state only for a run
+	// that ended by itself with status 0 (ticket.AfterRun).
+	if f, err := result.Read(r.runDir, runName); err == nil {
+		res.Signal, res.SignalMessage, res.PRURL, res.Branch = f.Status, f.Message, f.PRURL, f.Branch
+		signal = string(f.Status)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		signal = "invalid"
+		r.log.Warn("the agent's result file cannot be used", "task", t.ID, "file", resultFile, "err", err)
+	}
 	res.ExitCode = w.code
 	switch {
 	case res.Outcome == task.OutcomeTimedOut:

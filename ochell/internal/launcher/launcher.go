@@ -31,6 +31,10 @@ type Spec struct {
 	Args    []string
 	// Dir is the working directory. The launcher creates it when missing.
 	Dir string
+	// RunDir is a directory of this run alone, for what the agent leaves
+	// for ochell (the result file). The launcher creates it when missing,
+	// so that the agent can write in it. Empty: none.
+	RunDir string
 	// Env is set for the agent, as NAME=VALUE: ORCH_TASK_* and agent.env.
 	// With the systemd launcher other local users can read these values.
 	Env []string

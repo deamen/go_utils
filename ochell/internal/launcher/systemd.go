@@ -46,9 +46,13 @@ func (s *Systemd) Start(spec Spec) (Process, error) {
 	if len(s.LaunchCommand) == 0 || len(s.StopCommand) == 0 {
 		return nil, errors.New("systemd launcher: launch_command and stop_command are required")
 	}
-	// The launch script creates the working directory, as the agent user.
+	// The launch script creates the working directory and the run
+	// directory, as the agent user.
 	args := append([]string{}, s.LaunchCommand[1:]...)
 	args = append(args, "--task", spec.TaskID, "--workdir", spec.Dir)
+	if spec.RunDir != "" {
+		args = append(args, "--rundir", spec.RunDir)
+	}
 	if spec.Timeout > 0 {
 		args = append(args, "--runtime-max", seconds(spec.Timeout+runtimeBackstop))
 	}

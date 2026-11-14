@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"ochell/internal/result"
 	"ochell/internal/task"
 )
 
@@ -71,21 +72,34 @@ func TestActive(t *testing.T) {
 // Whatever a run ends with, the ticket can move there from running, and is
 // then free for a new run.
 func TestAfterRun(t *testing.T) {
-	want := map[task.Outcome]struct {
+	type run struct {
+		outcome task.Outcome
+		signal  result.Status
+	}
+	want := map[run]struct {
 		state  State
 		reason Reason
 	}{
-		task.OutcomeFinished:    {InReview, ""},
-		task.OutcomeFailed:      {Failed, ""},
-		task.OutcomeTimedOut:    {Failed, ""},
-		task.OutcomeNotStarted:  {Failed, ""},
-		task.OutcomeStopped:     {Waiting, ReasonInterrupted},
-		task.OutcomeInterrupted: {Waiting, ReasonInterrupted},
+		// A run that ended by itself with status 0: the agent's signal decides.
+		{task.OutcomeFinished, result.Done}:          {InReview, ""},
+		{task.OutcomeFinished, result.NeedsInput}:    {Waiting, ReasonInput},
+		{task.OutcomeFinished, result.Blocked}:       {Waiting, ReasonBlocked},
+		{task.OutcomeFinished, result.LowConfidence}: {Waiting, ReasonEscalation},
+		{task.OutcomeFinished, result.OutOfScope}:    {Waiting, ReasonEscalation},
+		{task.OutcomeFinished, result.None}:          {Waiting, ReasonNoResult},
+		// Any other run: the outcome decides, whatever the agent wrote.
+		{task.OutcomeFailed, result.None}:      {Failed, ""},
+		{task.OutcomeFailed, result.Done}:      {Failed, ""},
+		{task.OutcomeTimedOut, result.Done}:    {Failed, ""},
+		{task.OutcomeNotStarted, result.None}:  {Failed, ""},
+		{task.OutcomeStopped, result.Done}:     {Waiting, ReasonInterrupted},
+		{task.OutcomeInterrupted, result.None}: {Waiting, ReasonInterrupted},
 	}
-	for o, w := range want {
-		state, reason := AfterRun(o)
+	for r, w := range want {
+		o := r.outcome
+		state, reason := AfterRun(r.outcome, r.signal)
 		if state != w.state || reason != w.reason {
-			t.Errorf("AfterRun(%s) = %s, %q; want %s, %q", o, state, reason, w.state, w.reason)
+			t.Errorf("AfterRun(%s, %q) = %s, %q; want %s, %q", o, r.signal, state, reason, w.state, w.reason)
 		}
 		if err := Move(Running, state, reason); err != nil {
 			t.Errorf("after a %s run: %v", o, err)

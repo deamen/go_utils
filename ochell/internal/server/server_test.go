@@ -17,6 +17,7 @@ import (
 
 	"ochell/internal/auth"
 	"ochell/internal/config"
+	"ochell/internal/result"
 	"ochell/internal/runner"
 	"ochell/internal/source/linear"
 	"ochell/internal/store"
@@ -333,7 +334,7 @@ func TestLinearAgentSession(t *testing.T) {
 	if tk.Key != "ENG-123" || !strings.Contains(tk.Context, "<issue") || tk.TrackerSession != "session-0000" {
 		t.Fatalf("task = %+v", tk)
 	}
-	if err := s.Finished(context.Background(), tk, task.Result{Message: "Opened PR #7"}); err != nil {
+	if err := s.Finished(context.Background(), tk, task.Result{Message: "Opened PR #7", Signal: result.Done}); err != nil {
 		t.Fatal(err)
 	}
 	<-api.got
@@ -399,6 +400,29 @@ func TestLinearSecondSessionOnBusyTicket(t *testing.T) {
 	case <-api.got:
 		t.Error("a retried delivery posted a second activity")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// What a Linear session is told when a run ended by itself.
+func TestSignalActivity(t *testing.T) {
+	for name, c := range map[string]struct {
+		res  task.Result
+		kind string
+		body string
+	}{
+		"done":                    {task.Result{Signal: result.Done, SignalMessage: "Opened PR #7.", Message: "raw output"}, "response", "Opened PR #7."},
+		"done without a message":  {task.Result{Signal: result.Done, Message: "the agent's last words"}, "response", "the agent's last words"},
+		"done and silent":         {task.Result{Signal: result.Done}, "response", "The agent finished."},
+		"a question":              {task.Result{Signal: result.NeedsInput, SignalMessage: "Which page?"}, "elicitation", "Which page?"},
+		"blocked":                 {task.Result{Signal: result.Blocked, SignalMessage: "No access to the repo."}, "elicitation", "The agent is blocked: No access to the repo."},
+		"not sure":                {task.Result{Signal: result.LowConfidence, SignalMessage: "The tests do not cover this."}, "elicitation", "The agent finished, but is not sure of the result: The tests do not cover this."},
+		"out of scope":            {task.Result{Signal: result.OutOfScope, SignalMessage: "This needs a production change."}, "elicitation", "The agent did not do this, because it is out of its scope: This needs a production change."},
+		"no result":               {task.Result{Message: "I am done."}, "elicitation", "I am done.\n\nThe agent stopped without reporting a result, so this ticket now waits for a human."},
+		"no result and no output": {task.Result{}, "elicitation", "The agent stopped without reporting a result, so this ticket now waits for a human."},
+	} {
+		if kind, body := signalActivity(c.res); kind != c.kind || body != c.body {
+			t.Errorf("%s: %s %q\nwant %s %q", name, kind, body, c.kind, c.body)
+		}
 	}
 }
 

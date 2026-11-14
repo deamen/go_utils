@@ -65,6 +65,10 @@ type Agent struct {
 	MaxConcurrent int               `yaml:"max_concurrent"`
 	QueueSize     int               `yaml:"queue_size"`
 	LogDir        string            `yaml:"log_dir"`
+	// RunDir holds one directory per run, where the agent leaves its
+	// result file for ochell. The agent must be able to write there and
+	// ochell to read; it must not be inside a working directory.
+	RunDir string `yaml:"run_dir"`
 }
 
 // Systemd configures the systemd launcher.
@@ -168,6 +172,8 @@ Use twg to retrieve the full ticket details, complete the task, and open a pull 
 Context provided by {{.Source}}:
 {{.Context}}
 {{- end}}
+
+{{.ResultInstructions}}
 `
 
 // DefaultEnvPass is what an agent CLI needs to find its binaries, home
@@ -203,6 +209,7 @@ func Default() *Config {
 			MaxConcurrent: 1,
 			QueueSize:     100,
 			LogDir:        "logs",
+			RunDir:        "runs",
 		},
 		Sources: Sources{
 			JiraWebhook:    JiraWebhook{Path: "/webhooks/jira", MaxSkew: 2 * time.Hour},
@@ -337,6 +344,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.DurationVar(&c.Agent.DrainTimeout, "agent-drain-timeout", c.Agent.DrainTimeout, "how long a shutdown waits for running agents before it stops them")
 	fs.IntVar(&c.Agent.MaxConcurrent, "agent-max-concurrent", c.Agent.MaxConcurrent, "maximum concurrent agent runs")
 	fs.StringVar(&c.Agent.LogDir, "agent-log-dir", c.Agent.LogDir, "directory for per-task agent logs")
+	fs.StringVar(&c.Agent.RunDir, "agent-run-dir", c.Agent.RunDir, "directory where each run leaves its result file for ochell")
 
 	fs.BoolVar(&c.Sources.JiraWebhook.Enabled, "jira-webhook", c.Sources.JiraWebhook.Enabled, "enable the Jira native webhook source")
 	fs.StringVar(&c.Sources.JiraWebhook.Path, "jira-webhook-path", c.Sources.JiraWebhook.Path, "Jira native webhook path")
@@ -386,6 +394,14 @@ func (c *Config) Validate() error {
 	if c.Agent.PromptVia != "arg" && c.Agent.PromptVia != "stdin" {
 		errs = append(errs, errors.New("agent.prompt_via must be stdin or arg"))
 	}
+	// Without the instructions no agent writes a result file, and every
+	// run would end as "no result".
+	if !strings.Contains(c.Agent.PromptTemplate, ".ResultInstructions") {
+		errs = append(errs, errors.New("agent.prompt_template must include {{.ResultInstructions}}: it tells the agent how to report the result of its run"))
+	}
+	if c.Agent.RunDir == "" {
+		errs = append(errs, errors.New("agent.run_dir is required"))
+	}
 	if c.Agent.PromptVia == "stdin" {
 		for _, a := range c.Agent.Args {
 			if strings.Contains(a, ".Prompt") {
@@ -420,6 +436,11 @@ func (c *Config) Validate() error {
 		// would make every run end as not started.
 		if !strings.HasPrefix(c.Agent.Workdir, "/") {
 			errs = append(errs, errors.New("agent.launcher systemd requires agent.workdir to be an absolute path, inside the launcher's WORKSPACE_ROOT"))
+		}
+		// The launch script creates the run directory as the agent user,
+		// and only inside the workspace root.
+		if !strings.HasPrefix(c.Agent.RunDir, "/") {
+			errs = append(errs, errors.New("agent.launcher systemd requires agent.run_dir to be an absolute path, inside the launcher's WORKSPACE_ROOT"))
 		}
 		if len(c.Agent.Systemd.LaunchCommand) == 0 || len(c.Agent.Systemd.StopCommand) == 0 {
 			errs = append(errs, errors.New("agent.systemd requires launch_command and stop_command"))

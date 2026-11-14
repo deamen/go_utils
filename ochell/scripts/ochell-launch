@@ -3,11 +3,16 @@
 # agent user. ochell calls it through sudo; it is the only way ochell can
 # start a process as another user, so it checks everything it is given.
 #
-#   ochell-launch --task ID --workdir DIR [--runtime-max SEC] [--stop-grace SEC]
-#                 [--setenv NAME=VALUE]... -- /abs/command [ARG]...
+#   ochell-launch --task ID --workdir DIR [--rundir DIR] [--runtime-max SEC]
+#                 [--stop-grace SEC] [--setenv NAME=VALUE]... -- /abs/command [ARG]...
 #
 # The unit is ochell-run-<ID>.service. Stdin, stdout, stderr and the exit
 # status of the agent pass through. Stop a run with ochell-stop.
+#
+# --rundir is a directory for what the run leaves for ochell (the result
+# file). Like the working directory it must be inside the workspace root and
+# is created as the agent user. The unit runs with umask 027, so ochell can
+# read what the agent writes when it is in the agent user's group.
 #
 # Settings come from /etc/ochell/launcher.conf, which must belong to root
 # (see launcher.conf.example). Nothing in the caller's control selects the
@@ -72,6 +77,7 @@ fi
 
 task=
 workdir=
+rundir=
 runtime_max=
 stop_grace=
 setenv=()
@@ -79,6 +85,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --task)        [ $# -ge 2 ] || refuse "--task needs a value"; task=$2; shift 2 ;;
     --workdir)     [ $# -ge 2 ] || refuse "--workdir needs a value"; workdir=$2; shift 2 ;;
+    --rundir)      [ $# -ge 2 ] || refuse "--rundir needs a value"; rundir=$2; shift 2 ;;
     --runtime-max) [ $# -ge 2 ] || refuse "--runtime-max needs a value"; runtime_max=$2; shift 2 ;;
     --stop-grace)  [ $# -ge 2 ] || refuse "--stop-grace needs a value"; stop_grace=$2; shift 2 ;;
     --setenv)      [ $# -ge 2 ] || refuse "--setenv needs a value"; setenv+=("$2"); shift 2 ;;
@@ -95,39 +102,47 @@ for n in "$runtime_max" "$stop_grace"; do
   [ -z "$n" ] || [[ "$n" =~ ^[1-9][0-9]{0,6}$ ]] || refuse "time limits must be whole seconds"
 done
 
-# The working directory must be inside the workspace root. Check the text
+# A directory of the run must be inside the workspace root. Check the text
 # first, create it as the agent user, then check where it really is, so a
 # symlink in the workspace cannot lead outside.
-case "$workdir" in
-  /*) ;;
-  *) refuse "the working directory must be an absolute path" ;;
-esac
-case "$workdir/" in
-  */../*|*/./*|*//*) refuse "the working directory must not contain '..', '.' or empty components" ;;
-esac
-case "$workdir" in
-  "$root"|"$root"/*) ;;
-  *) refuse "the working directory is outside $root" ;;
-esac
-# Resolve the part that exists before creating anything, so nothing is
-# created outside the root either.
-planned=$(realpath -m -- "$workdir") || refuse "cannot resolve the working directory"
-case "$planned" in
-  "$root"|"$root"/*) ;;
-  *) refuse "the working directory resolves to a path outside $root" ;;
-esac
-if [ ! -d "$workdir" ]; then
-  if [ "$EUID" -eq 0 ]; then
-    runuser -u "$AGENT_USER" -- mkdir -p -- "$workdir" || refuse "cannot create the working directory as $AGENT_USER"
-  else
-    mkdir -p -- "$workdir" || refuse "cannot create the working directory"
+#   inside_root DIR NAME   leaves the resolved path in $resolved
+inside_root() {
+  local dir=$1 what=$2 planned
+  case "$dir" in
+    /*) ;;
+    *) refuse "the $what must be an absolute path" ;;
+  esac
+  case "$dir/" in
+    */../*|*/./*|*//*) refuse "the $what must not contain '..', '.' or empty components" ;;
+  esac
+  case "$dir" in
+    "$root"|"$root"/*) ;;
+    *) refuse "the $what is outside $root" ;;
+  esac
+  # Resolve the part that exists before creating anything, so nothing is
+  # created outside the root either.
+  planned=$(realpath -m -- "$dir") || refuse "cannot resolve the $what"
+  case "$planned" in
+    "$root"|"$root"/*) ;;
+    *) refuse "the $what resolves to a path outside $root" ;;
+  esac
+  if [ ! -d "$dir" ]; then
+    if [ "$EUID" -eq 0 ]; then
+      runuser -u "$AGENT_USER" -- mkdir -p -- "$dir" || refuse "cannot create the $what as $AGENT_USER"
+    else
+      mkdir -p -- "$dir" || refuse "cannot create the $what"
+    fi
   fi
-fi
-real=$(realpath -e -- "$workdir") || refuse "cannot resolve the working directory"
-case "$real" in
-  "$root"|"$root"/*) ;;
-  *) refuse "the working directory resolves to a path outside $root" ;;
-esac
+  resolved=$(realpath -e -- "$dir") || refuse "cannot resolve the $what"
+  case "$resolved" in
+    "$root"|"$root"/*) ;;
+    *) refuse "the $what resolves to a path outside $root" ;;
+  esac
+}
+resolved=
+inside_root "$workdir" "working directory"
+real=$resolved
+[ -z "$rundir" ] || inside_root "$rundir" "run directory"
 
 # Environment for the unit. These values are visible to every local user
 # (systemctl show), so they are not for secrets; secrets go in ENV_FILE.
@@ -158,7 +173,8 @@ cmd=("$SYSTEMD_RUN"
   --unit="ochell-run-$task"
   --wait --pipe --collect --quiet --no-ask-password
   --working-directory="$real"
-  -p KillMode=control-group)
+  -p KillMode=control-group
+  -p UMask=0027)
 [ -z "$ENV_FILE" ]    || cmd+=(-p "EnvironmentFile=$ENV_FILE")
 [ -z "$runtime_max" ] || cmd+=(-p "RuntimeMaxSec=$runtime_max")
 [ -z "$stop_grace" ]  || cmd+=(-p "TimeoutStopSec=$stop_grace")

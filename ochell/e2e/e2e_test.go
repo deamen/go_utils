@@ -245,7 +245,7 @@ func TestSystemdLauncherRefusedLaunch(t *testing.T) {
 // A second Linear session on a ticket that is running starts no second run,
 // and is answered within the 10 seconds Linear allows.
 func TestSecondLinearSessionOnRunningTicket(t *testing.T) {
-	o := Start(t, Options{Script: []Step{{Print: "working"}, {Sleep: "3s"}, {Print: "all done"}}})
+	o := Start(t, Options{Script: []Step{{Print: "working"}, {Sleep: "3s"}, {Print: "all done"}, Report("done", "all done")}})
 	id := o.LinearCreated("ENG-78", "session-first", "").TaskID(t)
 	o.WaitRecords(1, 10*time.Second)
 
@@ -372,7 +372,7 @@ func TestShutdownLeavesNoProcessBehind(t *testing.T) {
 // shutdown, and no new webhook is accepted meanwhile.
 func TestShutdownWaitsForRunningAgent(t *testing.T) {
 	o := Start(t, Options{
-		Script:    []Step{{Print: "started"}, {Sleep: "1500ms"}, {Print: "all done"}},
+		Script:    []Step{{Print: "started"}, {Sleep: "1500ms"}, {Print: "all done"}, Report("done", "all done")},
 		Configure: func(c *config.Config) { c.Agent.DrainTimeout = 30 * time.Second },
 	})
 	id := o.LinearCreated("ENG-28", "session-drain", "").TaskID(t)
@@ -415,6 +415,106 @@ func TestSecondSignalStopsAgentsNow(t *testing.T) {
 	expectAllGone(t, rec, 1)
 }
 
+// The agent signal contract: the agent says how its run ended in a result
+// file, and that decides what the ticket is told and which state it is in.
+func TestAgentSignal(t *testing.T) {
+	ticket := func(t *testing.T, o *Ochell, key string) *store.Ticket {
+		t.Helper()
+		st, err := store.Open(o.Config.Store.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+		tk, err := st.Ticket("linear", key)
+		if err != nil || tk == nil {
+			t.Fatalf("stored ticket %s: %v, %v", key, tk, err)
+		}
+		return tk
+	}
+
+	t.Run("a question", func(t *testing.T) {
+		o := Start(t, Options{Script: []Step{{Print: "I looked at the ticket."}, Report("needs_input", "Which of the two login pages do you mean?")}})
+		id := o.LinearCreated("ENG-41", "session-question", "").TaskID(t)
+		if run := o.WaitRun(id, 15*time.Second); !strings.Contains(run.Footer, "outcome=finished result=needs_input") {
+			t.Errorf("run: %s", run.Footer)
+		}
+		// The question is asked on the ticket, and the session waits for a reply.
+		acts := o.WaitActivities("session-question", 2, 10*time.Second)
+		if acts[1].Type != "elicitation" || acts[1].Body != "Which of the two login pages do you mean?" {
+			t.Errorf("the ticket got %+v, want the question as an elicitation", acts[1])
+		}
+		if tk := ticket(t, o, "ENG-41"); tk.State != "waiting" || tk.Reason != "input" {
+			t.Errorf("ticket is %s (%s), want waiting (input)", tk.State, tk.Reason)
+		}
+
+		// What the agent was given: the instructions in the prompt, and a
+		// path outside its working directory.
+		rec := o.WaitRecords(1, 5*time.Second)[0]
+		if !strings.Contains(rec.Stdin, "ORCH_RESULT_FILE") || !strings.Contains(rec.Stdin, "needs_input") {
+			t.Errorf("the prompt does not tell the agent to write the result file:\n%s", rec.Stdin)
+		}
+		file, _ := rec.Getenv("ORCH_RESULT_FILE")
+		if !filepath.IsAbs(file) || strings.HasPrefix(file, rec.Dir+string(filepath.Separator)) {
+			t.Errorf("ORCH_RESULT_FILE = %q, want an absolute path outside the working directory %q", file, rec.Dir)
+		}
+		if got := rec.Writes["$ORCH_RESULT_FILE"]; got != "ok" {
+			t.Errorf("the agent could not write its result file: %s", got)
+		}
+	})
+
+	t.Run("no result file", func(t *testing.T) {
+		o := Start(t, Options{Script: []Step{{Print: "I think I am done."}}})
+		id := o.LinearCreated("ENG-42", "session-silent", "").TaskID(t)
+		if run := o.WaitRun(id, 15*time.Second); !strings.Contains(run.Footer, "outcome=finished result=none") {
+			t.Errorf("run: %s", run.Footer)
+		}
+		acts := o.WaitActivities("session-silent", 2, 10*time.Second)
+		if acts[1].Type != "elicitation" || !strings.Contains(acts[1].Body, "I think I am done.") || !strings.Contains(acts[1].Body, "without reporting a result") {
+			t.Errorf("the ticket got %+v", acts[1])
+		}
+		if tk := ticket(t, o, "ENG-42"); tk.State != "waiting" || tk.Reason != "no_result" {
+			t.Errorf("ticket is %s (%s), want waiting (no_result)", tk.State, tk.Reason)
+		}
+	})
+
+	t.Run("an invalid result file", func(t *testing.T) {
+		o := Start(t, Options{Script: []Step{{WriteFile: &File{Path: "$ORCH_RESULT_FILE", Content: `{"status":"all good"}`}}}})
+		id := o.LinearCreated("ENG-43", "session-invalid", "").TaskID(t)
+		if run := o.WaitRun(id, 15*time.Second); !strings.Contains(run.Footer, "result=invalid") {
+			t.Errorf("run: %s", run.Footer)
+		}
+		if tk := ticket(t, o, "ENG-43"); tk.State != "waiting" || tk.Reason != "no_result" {
+			t.Errorf("ticket is %s (%s), want waiting (no_result)", tk.State, tk.Reason)
+		}
+	})
+
+	t.Run("done with a pull request", func(t *testing.T) {
+		o := Start(t, Options{Script: []Step{Report("done", "Opened a pull request.", "pr_url", "https://github.com/example/repo/pull/7", "branch", "bot/ENG-44")}})
+		id := o.LinearCreated("ENG-44", "session-done", "").TaskID(t)
+		o.WaitRun(id, 15*time.Second)
+		acts := o.WaitActivities("session-done", 2, 10*time.Second)
+		if acts[1].Type != "response" || acts[1].Body != "Opened a pull request." {
+			t.Errorf("the ticket got %+v", acts[1])
+		}
+		tk := ticket(t, o, "ENG-44")
+		if tk.State != "in_review" || tk.PRURL != "https://github.com/example/repo/pull/7" || tk.Branch != "bot/ENG-44" {
+			t.Errorf("ticket = %+v, want in_review with the pull request and the branch", tk)
+		}
+	})
+
+	t.Run("a failed run is not believed", func(t *testing.T) {
+		o := Start(t, Options{Script: []Step{Report("done", "All fine."), Exit(3)}})
+		id := o.LinearCreated("ENG-45", "session-failed", "").TaskID(t)
+		o.WaitRun(id, 15*time.Second)
+		if acts := o.WaitActivities("session-failed", 2, 10*time.Second); acts[1].Type != "error" {
+			t.Errorf("the ticket got %+v, want an error", acts[1])
+		}
+		if tk := ticket(t, o, "ENG-45"); tk.State != "failed" {
+			t.Errorf("ticket is %s, want failed", tk.State)
+		}
+	})
+}
+
 // The claude adapter: the agent is called with the event stream as output,
 // the final message (not the raw stream) goes to the ticket, the session id
 // and the cost are stored, and the ticket's next run resumes the session.
@@ -426,6 +526,8 @@ func TestClaudeAdapterRecordsAndResumesTheSession(t *testing.T) {
 			{Print: `{"type":"system","subtype":"init","session_id":"` + session + `","tools":["Bash"]}`},
 			{Print: `{"type":"assistant","message":{"content":[{"type":"text","text":"Reading the ticket."},{"type":"tool_use","name":"Bash"}]},"session_id":"` + session + `"}`},
 			{Print: `{"type":"result","subtype":"success","is_error":false,"result":"Opened PR #7.","session_id":"` + session + `","total_cost_usd":0.25,"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}`},
+			// No message of its own: the final message of the stream is used.
+			Report("done", ""),
 		},
 		Configure: func(c *config.Config) {
 			c.Agent.Adapter = "claude"
@@ -564,6 +666,7 @@ func TestSystemdLauncherOnVM(t *testing.T) {
 			c.Agent.Launcher = "systemd"
 			c.Agent.Args = []string{arg}
 			c.Agent.Workdir = filepath.Join(root, "e2e-{{.Key}}-{{.ID}}")
+			c.Agent.RunDir = filepath.Join(root, "e2e-runs")
 			c.Agent.Timeout = 5 * time.Second
 			c.Agent.StopGrace = 5 * time.Second
 		},
@@ -609,6 +712,7 @@ func TestSystemdLauncherShutdownOnVM(t *testing.T) {
 		Configure: func(c *config.Config) {
 			c.Agent.Launcher = "systemd"
 			c.Agent.Workdir = filepath.Join(root, "e2e-{{.Key}}-{{.ID}}")
+			c.Agent.RunDir = filepath.Join(root, "e2e-runs")
 			c.Agent.DrainTimeout = time.Second
 			c.Agent.StopGrace = 5 * time.Second
 		},

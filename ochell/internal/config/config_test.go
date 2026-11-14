@@ -113,6 +113,32 @@ func TestAdapterValidation(t *testing.T) {
 	}
 }
 
+// A prompt template that does not tell the agent to write its result file
+// would make every run end without a result.
+func TestPromptTemplateMustHoldTheResultInstructions(t *testing.T) {
+	cfg := Default()
+	cfg.Sources.JiraAutomation.Enabled = true
+	cfg.Sources.JiraAutomation.Token = "t"
+	if !strings.Contains(cfg.Agent.PromptTemplate, "{{.ResultInstructions}}") {
+		t.Fatal("the default prompt template lacks {{.ResultInstructions}}")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default configuration: %v", err)
+	}
+	cfg.Agent.PromptTemplate = "Fix {{.Key}}."
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "{{.ResultInstructions}}") {
+		t.Errorf("template without the instructions: got %v", err)
+	}
+	cfg.Agent.PromptTemplate = "Fix {{.Key}}.\n{{ .ResultInstructions }}"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("template with the instructions: %v", err)
+	}
+	cfg.Agent.RunDir = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.run_dir") {
+		t.Errorf("empty run_dir: got %v", err)
+	}
+}
+
 func TestAgentEnvValidation(t *testing.T) {
 	p := writeYAML(t, `
 agent:
@@ -186,6 +212,7 @@ func TestSystemdLauncherValidation(t *testing.T) {
 		cfg.Agent.Launcher = "systemd"
 		cfg.Agent.Command = "/usr/local/bin/claude"
 		cfg.Agent.Workdir = "/work/{{.Source}}/{{.Key}}"
+		cfg.Agent.RunDir = "/work/runs"
 		return cfg
 	}
 	if err := base().Validate(); err != nil {
@@ -209,6 +236,11 @@ func TestSystemdLauncherValidation(t *testing.T) {
 		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.workdir to be an absolute path") {
 			t.Errorf("workdir %q with the systemd launcher: got %v", dir, err)
 		}
+	}
+	cfg = base()
+	cfg.Agent.RunDir = "runs"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.run_dir to be an absolute path") {
+		t.Errorf("relative run_dir with the systemd launcher: got %v", err)
 	}
 	cfg = base()
 	cfg.Agent.Systemd.StopCommand = nil
