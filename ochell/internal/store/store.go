@@ -84,6 +84,19 @@ var migrations = []string{
 			ORDER BY r.ended_at DESC, r.rowid DESC LIMIT 1
 		) WHEN 'finished' THEN 'in_review' ELSE 'failed' END
 		WHERE state = 'ended';`,
+
+	// Version 3: what an agent adapter reads from a run, and the session
+	// that the next run of the ticket resumes.
+	`ALTER TABLE tickets ADD COLUMN agent_session TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN workdir TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN resumed INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN agent_session TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN message TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE runs ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Store is safe for concurrent use.
@@ -236,12 +249,14 @@ func (s *Store) Enqueue(t *task.Task, maxQueued int) error {
 	})
 }
 
-const taskColumns = `r.id, r.source, r.key, t.title, t.url, r.context, r.tracker_session, r.delivery_id, r.received_at, r.attempt`
+const taskColumns = `r.id, r.source, r.key, t.title, t.url, r.context, r.tracker_session, r.delivery_id, r.received_at, r.attempt,
+	t.agent_session, t.workspace`
 
 func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 	var t task.Task
 	var received int64
-	if err := row.Scan(&t.ID, &t.Source, &t.Key, &t.Title, &t.URL, &t.Context, &t.TrackerSession, &t.DeliveryID, &received, &t.Attempt); err != nil {
+	if err := row.Scan(&t.ID, &t.Source, &t.Key, &t.Title, &t.URL, &t.Context, &t.TrackerSession, &t.DeliveryID, &received, &t.Attempt,
+		&t.AgentSession, &t.Workspace); err != nil {
 		return nil, err
 	}
 	t.Received = time.UnixMilli(received).UTC()
@@ -250,7 +265,8 @@ func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 
 // Claim takes the oldest queued run and marks it, and its ticket, as
 // running. It returns nil when nothing is queued. The task's Attempt says
-// which run of the ticket this is, counting from 1.
+// which run of the ticket this is, counting from 1; AgentSession and
+// Workspace come from the ticket's earlier runs.
 func (s *Store) Claim() (*task.Task, error) {
 	now := ms(s.now())
 	var t *task.Task
@@ -300,8 +316,13 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result) error {
 	if res.Err != nil {
 		msg = res.Err.Error()
 	}
-	r, err := tx.Exec(`UPDATE runs SET status = ?, ended_at = ?, outcome = ?, exit_code = ?, error = ?, log_file = ?
-		WHERE id = ? AND status != ?`, runEnded, now, string(res.Outcome), exit, msg, res.LogFile, id, runEnded)
+	r, err := tx.Exec(`UPDATE runs SET status = ?, ended_at = ?, outcome = ?, exit_code = ?, error = ?, log_file = ?,
+			workdir = ?, resumed = ?, agent_session = ?, message = ?, cost_usd = ?,
+			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?
+		WHERE id = ? AND status != ?`, runEnded, now, string(res.Outcome), exit, msg, res.LogFile,
+		res.Workdir, res.Resumed, res.SessionID, res.Message, res.CostUSD,
+		res.Usage.InputTokens, res.Usage.OutputTokens, res.Usage.CacheReadTokens, res.Usage.CacheWriteTokens,
+		id, runEnded)
 	if err != nil {
 		return err
 	}
@@ -317,7 +338,18 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result) error {
 		return err
 	}
 	if res.Workdir != "" {
-		_, err = tx.Exec(`UPDATE tickets SET workspace = ? WHERE source = ? AND key = ?`, res.Workdir, source, key)
+		if _, err := tx.Exec(`UPDATE tickets SET workspace = ? WHERE source = ? AND key = ?`, res.Workdir, source, key); err != nil {
+			return err
+		}
+	}
+	switch {
+	case res.SessionID != "":
+		_, err = tx.Exec(`UPDATE tickets SET agent_session = ? WHERE source = ? AND key = ?`, res.SessionID, source, key)
+	case res.Resumed && (res.Outcome == task.OutcomeFailed || res.Outcome == task.OutcomeNotStarted):
+		// The agent did not even open the session it was asked to
+		// resume: the session is gone. Forget it, or every later run of
+		// the ticket would fail the same way.
+		_, err = tx.Exec(`UPDATE tickets SET agent_session = '' WHERE source = ? AND key = ?`, source, key)
 	}
 	return err
 }
@@ -375,17 +407,20 @@ type Ticket struct {
 	// Attempts is the number of runs that were started.
 	Attempts  int
 	Workspace string
-	Created   time.Time
-	Updated   time.Time
+	// AgentSession is the agent's session id from the last run that
+	// reported one.
+	AgentSession string
+	Created      time.Time
+	Updated      time.Time
 }
 
 // Ticket returns the stored ticket, or nil when ochell has never seen it.
 func (s *Store) Ticket(source, key string) (*Ticket, error) {
 	t := Ticket{Source: source, Key: key}
 	var created, updated int64
-	err := s.db.QueryRow(`SELECT title, url, state, reason, attempts, workspace, created_at, updated_at
+	err := s.db.QueryRow(`SELECT title, url, state, reason, attempts, workspace, agent_session, created_at, updated_at
 		FROM tickets WHERE source = ? AND key = ?`, source, key).
-		Scan(&t.Title, &t.URL, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &created, &updated)
+		Scan(&t.Title, &t.URL, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.AgentSession, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -394,6 +429,46 @@ func (s *Store) Ticket(source, key string) (*Ticket, error) {
 	}
 	t.Created, t.Updated = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
 	return &t, nil
+}
+
+// Run is the stored record of one run.
+type Run struct {
+	ID          string
+	Source, Key string
+	// Status is "queued", "running" or "ended".
+	Status  string
+	Attempt int
+	// Result holds what is known once the run has ended. Its Err is an
+	// error with the stored text, or nil.
+	Result task.Result
+}
+
+// Run returns the stored run, or nil when there is none with this id.
+func (s *Store) Run(id string) (*Run, error) {
+	r := Run{ID: id}
+	var exit sql.NullInt64
+	var outcome, msg string
+	res := &r.Result
+	err := s.db.QueryRow(`SELECT source, key, status, attempt, outcome, exit_code, error, log_file,
+			workdir, resumed, agent_session, message, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+		FROM runs WHERE id = ?`, id).
+		Scan(&r.Source, &r.Key, &r.Status, &r.Attempt, &outcome, &exit, &msg, &res.LogFile,
+			&res.Workdir, &res.Resumed, &res.SessionID, &res.Message, &res.CostUSD,
+			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	res.Outcome, res.ExitCode = task.Outcome(outcome), -1
+	if exit.Valid {
+		res.ExitCode = int(exit.Int64)
+	}
+	if msg != "" {
+		res.Err = errors.New(msg)
+	}
+	return &r, nil
 }
 
 // AddDelivery records a webhook delivery for ttl and reports whether it is

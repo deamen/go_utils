@@ -1,7 +1,11 @@
 // Package task defines the source-independent unit of work handed to the agent.
 package task
 
-import "time"
+import (
+	"time"
+
+	"ochell/internal/agent"
+)
 
 type Task struct {
 	// ID is unique per task and used for log file names.
@@ -24,6 +28,12 @@ type Task struct {
 	// Attempt says which run of the ticket this is, counting from 1. The
 	// store sets it when the run starts.
 	Attempt int
+	// AgentSession is the agent's session id from an earlier run of the
+	// ticket, and Workspace the working directory of that run. The store
+	// sets them when the run starts; a run in the same directory resumes
+	// the session if the agent can.
+	AgentSession string
+	Workspace    string
 	// Prompt is rendered by the runner from the prompt template.
 	Prompt string
 }
@@ -61,6 +71,14 @@ type Result struct {
 	// Workdir is the working directory the agent ran in.
 	Workdir  string
 	Duration time.Duration
+	// Resumed says that the run continued the session of an earlier run.
+	Resumed bool
+	// SessionID is the agent's session, for a later resume; CostUSD and
+	// Usage are what the run cost. All three are empty for an agent that
+	// does not report them.
+	SessionID string
+	CostUSD   float64
+	Usage     agent.Usage
 	// Message is the agent's final message, as its adapter read it: for
 	// the plain adapter, the last part of the output.
 	Message string

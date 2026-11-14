@@ -5,12 +5,14 @@ package e2e
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"ochell/internal/config"
+	"ochell/internal/store"
 )
 
 func TestMain(m *testing.M) {
@@ -411,6 +413,67 @@ func TestSecondSignalStopsAgentsNow(t *testing.T) {
 		t.Errorf("run: %s", run.Footer)
 	}
 	expectAllGone(t, rec, 1)
+}
+
+// The claude adapter: the agent is called with the event stream as output,
+// the final message (not the raw stream) goes to the ticket, the session id
+// and the cost are stored, and the ticket's next run resumes the session.
+func TestClaudeAdapterRecordsAndResumesTheSession(t *testing.T) {
+	const session = "3dc26999-bd50-487b-b445-cb41a233c6a2"
+	o := Start(t, Options{
+		Script: []Step{
+			{Eprint: `[claude-code:notice] a line on stderr that is not an event`},
+			{Print: `{"type":"system","subtype":"init","session_id":"` + session + `","tools":["Bash"]}`},
+			{Print: `{"type":"assistant","message":{"content":[{"type":"text","text":"Reading the ticket."},{"type":"tool_use","name":"Bash"}]},"session_id":"` + session + `"}`},
+			{Print: `{"type":"result","subtype":"success","is_error":false,"result":"Opened PR #7.","session_id":"` + session + `","total_cost_usd":0.25,"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}`},
+		},
+		Configure: func(c *config.Config) {
+			c.Agent.Adapter = "claude"
+			c.Agent.Args = []string{"-p", "--permission-mode", "acceptEdits"}
+		},
+	})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	first := o.LinearCreated("ENG-81", "session-one", "").TaskID(t)
+	o.WaitRun(first, 15*time.Second)
+	acts := o.WaitActivities("session-one", 2, 10*time.Second)
+	if acts[1].Type != "response" || acts[1].Body != "Opened PR #7." {
+		t.Errorf("the ticket got %+v, want the agent's final message only", acts[1])
+	}
+	run, err := st.Run(first)
+	if err != nil || run == nil {
+		t.Fatalf("stored run: %v, %v", run, err)
+	}
+	if res := run.Result; res.SessionID != session || res.CostUSD != 0.25 || res.Message != "Opened PR #7." || res.Resumed ||
+		res.Usage.InputTokens != 10 || res.Usage.OutputTokens != 20 || res.Usage.CacheReadTokens != 30 || res.Usage.CacheWriteTokens != 40 {
+		t.Errorf("stored result = %+v", res)
+	}
+	if tk, _ := st.Ticket("linear", "ENG-81"); tk == nil || tk.AgentSession != session {
+		t.Errorf("stored ticket = %+v, want the session id", tk)
+	}
+
+	// The ticket is delegated again: the same session goes on.
+	second := o.LinearCreated("ENG-81", "session-two", "").TaskID(t)
+	o.WaitRun(second, 15*time.Second)
+	if run, _ := st.Run(second); run == nil || !run.Result.Resumed || run.Attempt != 2 {
+		t.Errorf("second run = %+v, want a resumed second attempt", run)
+	}
+	const start = "-p --permission-mode acceptEdits --output-format stream-json --verbose"
+	var args []string
+	for _, rec := range o.WaitRecords(2, 5*time.Second) {
+		args = append(args, strings.Join(rec.Args, " "))
+		if !strings.Contains(rec.Stdin, "ENG-81") {
+			t.Errorf("the prompt was not on stdin: %q", rec.Stdin)
+		}
+	}
+	slices.Sort(args)
+	if len(args) != 2 || args[0] != start || args[1] != start+" --resume "+session {
+		t.Errorf("agent arguments of the two runs:\n%s", strings.Join(args, "\n"))
+	}
 }
 
 // The task queue, the record of what was running and the handled deliveries

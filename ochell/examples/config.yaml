@@ -49,7 +49,11 @@ agent:
   # The kind of agent CLI: how it is called and how its output is read.
   #   plain    any CLI: the prompt goes in, the last part of the output is
   #            the result.
-  adapter: plain
+  #   claude   Claude Code with its event stream: the final message, the
+  #            session id and the cost are recorded, and a ticket that runs
+  #            again resumes its session. It adds --output-format stream-json
+  #            --verbose (and --resume) itself; leave them out of args.
+  adapter: claude
   # How the agent process is run:
   #   direct   a child process of ochell, under ochell's own OS user. For
   #            development; the agent can read ochell's files.

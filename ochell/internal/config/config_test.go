@@ -102,6 +102,15 @@ func TestAdapterValidation(t *testing.T) {
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.adapter") {
 		t.Errorf("unknown adapter: got %v", err)
 	}
+	cfg.Agent.Adapter = "claude"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("claude adapter with the prompt on stdin: %v", err)
+	}
+	cfg.Agent.PromptVia = "arg"
+	cfg.Agent.Args = []string{"-p", "{{.Prompt}}"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "claude requires prompt_via: stdin") {
+		t.Errorf("claude adapter with prompt_via arg: got %v", err)
+	}
 }
 
 func TestAgentEnvValidation(t *testing.T) {

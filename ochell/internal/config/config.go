@@ -43,7 +43,8 @@ type Agent struct {
 	PromptTemplate string `yaml:"prompt_template"`
 	Workdir        string `yaml:"workdir"`
 	// Adapter names the kind of agent CLI: how it is called and how its
-	// output is read. "plain" works with any CLI.
+	// output is read. "plain" works with any CLI; "claude" is Claude Code
+	// with its event stream, which gives the session id and the cost.
 	Adapter string `yaml:"adapter"`
 	// Launcher is "direct" (the agent is a child process of ochell) or
 	// "systemd" (a transient unit under a separate OS user).
@@ -327,7 +328,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.Agent.Command, "agent-cmd", c.Agent.Command, "agent CLI command")
 	fs.Var(&stringList{dst: &c.Agent.Args}, "agent-arg", "agent CLI argument, repeatable, Go template (replaces config args)")
 	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: stdin or arg")
-	fs.StringVar(&c.Agent.Adapter, "agent-adapter", c.Agent.Adapter, "kind of agent CLI: plain")
+	fs.StringVar(&c.Agent.Adapter, "agent-adapter", c.Agent.Adapter, "kind of agent CLI: plain or claude")
 	fs.StringVar(&c.Agent.Launcher, "agent-launcher", c.Agent.Launcher, "how the agent is run: direct or systemd")
 	fs.Var(&stringList{dst: &c.Agent.EnvPass}, "agent-env-pass", "environment variable the agent inherits from ochell, repeatable (replaces config env_pass)")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
@@ -393,8 +394,14 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
-	if c.Agent.Adapter != "plain" {
-		errs = append(errs, errors.New("agent.adapter must be plain"))
+	switch c.Agent.Adapter {
+	case "plain":
+	case "claude":
+		if c.Agent.PromptVia != "stdin" {
+			errs = append(errs, errors.New("agent.adapter claude requires prompt_via: stdin"))
+		}
+	default:
+		errs = append(errs, errors.New("agent.adapter must be plain or claude"))
 	}
 	switch c.Agent.Launcher {
 	case "direct":

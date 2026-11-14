@@ -177,8 +177,8 @@ type fakeAdapter struct{}
 func (fakeAdapter) Start(run agent.Run) (agent.Command, error) {
 	return agent.Command{Args: append(run.Args, "--from-adapter"), Stdin: strings.NewReader("adapter stdin: " + run.Prompt)}, nil
 }
-func (fakeAdapter) Resume(agent.Run, string) (agent.Command, error) {
-	return agent.Command{}, agent.ErrNoResume
+func (fakeAdapter) Resume(run agent.Run, session string) (agent.Command, error) {
+	return agent.Command{Args: append(run.Args, "--resume", session)}, nil
 }
 func (fakeAdapter) Output() agent.Output { return &fakeOutput{} }
 
@@ -186,7 +186,54 @@ type fakeOutput struct{ n int }
 
 func (o *fakeOutput) Write(p []byte) (int, error) { o.n += len(p); return len(p), nil }
 func (o *fakeOutput) Report() agent.Report {
-	return agent.Report{Message: fmt.Sprintf("the adapter read %d bytes", o.n)}
+	return agent.Report{Message: fmt.Sprintf("the adapter read %d bytes", o.n), SessionID: "sess-1", CostUSD: 0.5}
+}
+
+// The second run of a ticket resumes the session of the first, when it runs
+// in the same working directory.
+func TestSecondRunResumesTheSession(t *testing.T) {
+	second := func(t *testing.T, cfg config.Agent) (first, again *store.Run, log string) {
+		st := testStore(t)
+		r, err := New(cfg, logger(), st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.adapter = fakeAdapter{}
+		f := &finished{done: make(chan string, 2)}
+		r.SetNotifier(f)
+		if err := r.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer r.Shutdown(context.Background())
+		for _, id := range []string{"t1", "t2"} {
+			tk := newTask()
+			tk.ID = id
+			if err := r.Submit(tk); err != nil {
+				t.Fatal(err)
+			}
+			f.wait(t, "DEV-1")
+		}
+		first, _ = st.Run("t1")
+		again, _ = st.Run("t2")
+		raw, _ := os.ReadFile(again.Result.LogFile)
+		return first, again, string(raw)
+	}
+
+	first, again, log := second(t, agentCfg(t, "echo"))
+	if first.Result.Resumed || first.Result.SessionID != "sess-1" || first.Result.CostUSD != 0.5 {
+		t.Errorf("first run = %+v, want a new session sess-1 and its cost", first.Result)
+	}
+	if !again.Result.Resumed || !strings.Contains(log, "args: --resume|sess-1") || !strings.Contains(log, "session=resumed sess-1") {
+		t.Errorf("second run: resumed = %v, log:\n%s", again.Result.Resumed, log)
+	}
+
+	// In another working directory the session's files are not there.
+	cfg := agentCfg(t, "echo")
+	cfg.Workdir = filepath.Join(t.TempDir(), "{{.ID}}")
+	_, again, log = second(t, cfg)
+	if again.Result.Resumed || strings.Contains(log, "--resume") || !strings.Contains(log, "session=new") {
+		t.Errorf("second run in another directory: resumed = %v, log:\n%s", again.Result.Resumed, log)
+	}
 }
 
 func TestRunGoesThroughTheAdapter(t *testing.T) {
