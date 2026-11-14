@@ -470,3 +470,30 @@ func TestExampleFile(t *testing.T) {
 		t.Errorf("agent.retry in the example is not the default: %+v", cfg.Agent.Retry)
 	}
 }
+
+func TestPollerSettings(t *testing.T) {
+	cfg := Default()
+	if cfg.Poller.Interval != 5*time.Minute {
+		t.Errorf("default poller.interval = %s, want 5m", cfg.Poller.Interval)
+	}
+	p := writeYAML(t, "poller: { interval: 0s }\n")
+	cfg, err := Load("serve", []string{"--config", p}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Poller.Interval != 0 {
+		t.Errorf("interval 0s in the file gave %s", cfg.Poller.Interval)
+	}
+	cfg, err = Load("serve", []string{"--config", p, "--poll-interval", "90s"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Poller.Interval != 90*time.Second {
+		t.Errorf("--poll-interval gave %s", cfg.Poller.Interval)
+	}
+	cfg.Sources.JiraAutomation.Enabled, cfg.Sources.JiraAutomation.Token = true, "t"
+	cfg.Poller.Interval = -time.Second
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "poller.interval") {
+		t.Errorf("a negative interval: %v", err)
+	}
+}

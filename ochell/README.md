@@ -50,7 +50,7 @@ Behaviour common to all sources:
   - **The ticket becomes `cancelled`.** It is not started again, and comments on a Jira ticket start nothing, until it is assigned again. Messages that waited for its next run are dropped. The run has the outcome `cancelled`.
   - **The ticket shows it:** a `response` in the Linear session, a comment on the Jira ticket, that says who stopped it and how, and that it has to be assigned again to go on.
   - A closed ticket becomes `done` once its run has ended, and its working directory is removed as for any closed ticket.
-  - **Jira may not send the unassign event** when the webhook's filter is `assignee = <bot>`: the ticket no longer matches after the change. ochell handles the event when it arrives. That was not tested against a real Jira (MMZ-94).
+  - **Jira may not send the unassign event** when the webhook's filter is `assignee = <bot>`: the ticket no longer matches after the change. ochell handles the event when it arrives, and [the poller](#the-poller) finds the ticket otherwise. That was not tested against a real Jira (MMZ-94).
   - The Linear events were not checked against Linear: where the payload carries the stop signal, and what an issue update looks like when the delegate changes. The second also needs the app's webhook to subscribe to **Issues**, and is only acted on when the payload names this app's user as the earlier delegate.
 - **Messages during a run:** a comment or reply that arrives while a ticket has a queued or running run is kept in the store, and **delivered with the ticket's next run**, which ochell queues itself as soon as the current one has ended. Several messages are delivered together, oldest first, each in its own `<comment>` block of the run context.
   - The run that was going ends as it would have: its result is posted, and then the next run starts.
@@ -67,6 +67,26 @@ Behaviour common to all sources:
   - Who wrote the reply is checked against `allowed_follow_ups` (see [Guards and the admin channel](#guards-and-the-admin-channel)). Whether the payload names the author of a prompt was not checked against Linear; without one, the creator of the session counts.
   - The `stop` signal stops the ticket (see *Stopping from the ticket* above).
 
+### The poller
+A webhook is fast, but it can be lost: ochell was down, the network failed, or the tracker does not send the event at all (Jira and the unassign event). So ochell also asks each tracker for the bot's open tickets, **at start and then every `poller.interval`** (default 5m; `0s` turns it off). The webhook stays for speed; the poll is for correctness.
+
+| The poller finds | It does |
+|---|---|
+| an open ticket of the bot that ochell has **never seen** | starts it, as its webhook would have |
+| a ticket with a queued or running task that is **closed** in the tracker | stops it; the ticket becomes `done` |
+| a ticket with a queued or running task that is **no longer the bot's** | stops it; the ticket becomes `cancelled`, and is told why |
+| any other ticket that ochell knows | nothing |
+
+- **Which trackers:** Jira needs the API access (`sources.jira_api`); Linear needs the installed app and its token. A tracker that cannot be asked is not polled; the log says so at start.
+- **A ticket that ochell knows is never started by the poller.** One that waits for a human or is in review has had its run. One that a person stopped or released (`cancelled`) stays stopped until it is assigned again, and only a webhook says that. So a new assignment of a ticket that ochell already knows is not recovered when its webhook is lost: assign it once more.
+- **On the first start with the poller, every open ticket of the bot is new to ochell and is started.** Look at what `ochell jira-check` lists before you turn it on, or pause first (`ochell pause`) and look at `ochell status`. `agent.queue_size` bounds how many wait.
+- **Linear sessions:** a ticket that came through a webhook has an agent session to report to. One that the poller finds has none, so ochell opens a session on the issue itself and reports there.
+- **Who assigned it** is read from the ticket's history (Jira: the last change of the assignee to the bot, else the creator; Linear: the last change of the delegate to the agent, else the creator). `allowed_assigners` holds for the poller as for a webhook: a ticket whose assigner is not on the list, or cannot be found, is not started, and the log says so once.
+- **Before it stops anything, the poller asks the tracker about that one ticket.** A ticket that is missing from the list but open and still the bot's is left alone: the search may be behind, or `jira_api.jql` narrower than the bot's tickets. A list that cannot be read changes nothing at all.
+- **Linear and mentions:** an issue on which the agent was only mentioned was never delegated to it, so it is not on the list. Its run is stopped by the poller only when the issue is closed.
+- **Jira Automation without `bot_account_id`** can start tickets that are not assigned to the bot. With that configuration the poller starts missed tickets but stops none.
+- Not covered: a comment whose webhook was lost is not recovered.
+
 ### Retry and stall detection
 ochell starts a ticket again by itself in two cases. Both count as an attempt, so `agent.max_attempts` bounds them.
 
@@ -76,7 +96,7 @@ ochell starts a ticket again by itself in two cases. Both count as an attempt, s
   - `patterns: []` turns the retry off. The default patterns were not checked against what Claude Code prints for each of these errors; look at a failed run's log and add what you see.
   - With the `claude` adapter, a run whose result event says `is_error` counts as failed even when the process exits with status 0.
 - **A stalled agent.** With `agent.stall_timeout` set, an agent that wrote no output for that long is stopped, with all its processes, and the ticket is started again after the same wait. After the last attempt the ticket waits for a human with the reason `stalled`.
-  - It is off by default (`0`). Silence is all ochell can see: a slow test suite looks the same as a hung agent. Set it well above the longest silent step you expect.
+  - It is off by default (`0s`). Silence is all ochell can see: a slow test suite looks the same as a hung agent. Set it well above the longest silent step you expect.
 - **The ticket is told each time:** a `thought` in a Linear session, a comment on a Jira ticket, that says why the run ended and when the next one starts.
 - **The next run is told as well.** Its run context says that the earlier attempt was cut off by an outside error, or was stopped as stalled, and that the agent must check what is already done.
 - While a ticket waits for its retry it is `queued`: a new assignment in that time is answered with `already in progress`. A wait is kept across a restart.
@@ -155,6 +175,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--http`, `--http-addr`, `--http-port` | Enable the HTTP listener and set its address and port separately |
 | `--https`, `--https-addr`, `--https-port`, `--tls-cert`, `--tls-key` | Same for HTTPS (TLS 1.2+) |
 | `--admin-socket` | Unix socket of the admin channel (default `ochell.sock`); see [Guards and the admin channel](#guards-and-the-admin-channel) |
+| `--poll-interval` | How often ochell asks the trackers for the bot's open tickets (default `5m`; `0s`: never); see [The poller](#the-poller) |
 | `--store-path` | File that holds the tickets, the task queue and the handled deliveries (default `ochell.db`); see [The store](#the-store) |
 | `--agent-cmd` | Agent CLI executable (default `claude`) |
 | `--agent-arg` | Agent argument; repeatable; replaces the YAML `args` (default `-p`). Go template: `{{.Key}}`, `{{.Source}}`, `{{.ID}}`. Keep ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`, `{{.Prompt}}`) out of arguments; see [The prompt](#the-prompt) |
@@ -189,7 +210,7 @@ So a restart loses no queued task, and a retried or replayed delivery from befor
 Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user.
 
 ### Jira API access
-The webhooks only bring events in. For what ochell does on its own in Jira (commenting on a ticket when a run starts and ends, changing a status, and later finding the bot's tickets) it needs the Jira REST API, with the API token of the digital employee's account:
+The webhooks only bring events in. For what ochell does on its own in Jira (commenting on a ticket when a run starts and ends, changing a status, and finding the bot's tickets for [the poller](#the-poller)) it needs the Jira REST API, with the API token of the digital employee's account:
 
 ```yaml
 sources:
@@ -200,7 +221,7 @@ sources:
 ```
 
 - **Use the same Jira account as the agent's `twg`.** What ochell writes then comes from the bot account, like what the agent writes.
-- **`jql`** selects the bot's open tickets. The default is `assignee = currentUser() AND statusCategory != Done`: the account that owns the token, so no account id is needed.
+- **`jql`** selects the bot's open tickets, which is what the poller starts from. The default is `assignee = currentUser() AND statusCategory != Done`: the account that owns the token, so no account id is needed.
 - **Check it** with `ochell jira-check --config config.yaml`. It lists the tickets that the JQL selects; with `--comment-on KEY` it also adds a test comment to that ticket.
 - **`review_status`** is optional: the status, for example `In Review`, that a ticket is moved to when the agent reports its work as done. The ticket's workflow must have a transition to it from where the ticket is. If the move fails, ochell logs a warning, and the comment is there all the same.
 - The token is ochell's own. It is not passed to the agent.

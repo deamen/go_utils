@@ -214,6 +214,22 @@ func (r *Runner) Assigner(source, key string) (assigner string, known bool, err 
 	return tk.Assigner, true, nil
 }
 
+// State returns the state of a ticket; ticket.None for one that ochell has
+// never seen.
+func (r *Runner) State(source, key string) (ticket.State, error) {
+	tk, err := r.store.Ticket(source, key)
+	if err != nil || tk == nil {
+		return ticket.None, err
+	}
+	return tk.State, nil
+}
+
+// ActiveTickets returns the keys of the tickets of a source that have a
+// queued or running task.
+func (r *Runner) ActiveTickets(source string) ([]string, error) {
+	return r.store.ActiveTickets(source)
+}
+
 // TicketOfSession returns the key of the ticket that reports to a tracker
 // session, or "" when ochell knows none.
 func (r *Runner) TicketOfSession(source, session string) (string, error) {

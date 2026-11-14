@@ -303,6 +303,13 @@ type Admin struct {
 	Socket string `yaml:"socket"`
 }
 
+// Poller configures the safety net behind the webhooks: ochell asks each
+// tracker for the bot's open tickets, at start and then at this interval.
+type Poller struct {
+	// Interval is the time between two polls. 0: no polling.
+	Interval time.Duration `yaml:"interval"`
+}
+
 type Config struct {
 	LogLevel string   `yaml:"log_level"`
 	HTTP     Listener `yaml:"http"`
@@ -315,6 +322,7 @@ type Config struct {
 	// empty, tickets run without a repository.
 	Repos       []Repo      `yaml:"repos"`
 	Workspace   Workspace   `yaml:"workspace"`
+	Poller      Poller      `yaml:"poller"`
 	Agent       Agent       `yaml:"agent"`
 	Sources     Sources     `yaml:"sources"`
 	IPAllowlist IPAllowlist `yaml:"ip_allowlist"`
@@ -384,6 +392,7 @@ func Default() *Config {
 		Admin:     Admin{Socket: "ochell.sock"},
 		Store:     Store{Path: "ochell.db"},
 		Workspace: Workspace{Branch: "bot/{{.Key}}", HookTimeout: 10 * time.Minute},
+		Poller:    Poller{Interval: 5 * time.Minute},
 		Agent: Agent{
 			Command:        "claude",
 			Args:           []string{"-p"},
@@ -533,6 +542,8 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.Admin.Socket, "admin-socket", c.Admin.Socket, "unix socket of the admin channel (ochell pause, resume, status, reset, stop)")
 	fs.StringVar(&c.Store.Path, "store-path", c.Store.Path, "file that holds the tickets, the task queue and the handled deliveries")
 
+	fs.DurationVar(&c.Poller.Interval, "poll-interval", c.Poller.Interval, "how often ochell asks the trackers for the bot's open tickets (0: never)")
+
 	fs.StringVar(&c.Agent.Command, "agent-cmd", c.Agent.Command, "agent CLI command")
 	fs.Var(&stringList{dst: &c.Agent.Args}, "agent-arg", "agent CLI argument, repeatable, Go template (replaces config args)")
 	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: stdin or arg")
@@ -653,6 +664,9 @@ func (c *Config) Validate() error {
 		if c.Agent.Launcher == "systemd" && !strings.HasPrefix(h.Command[0], "/") {
 			errs = append(errs, fmt.Errorf("workspace.hooks.%s: agent.launcher systemd requires the command to be an absolute path", h.Name))
 		}
+	}
+	if c.Poller.Interval < 0 {
+		errs = append(errs, errors.New("poller.interval must not be negative; 0s turns the poller off"))
 	}
 	if c.Agent.Command == "" {
 		errs = append(errs, errors.New("agent.command is required"))

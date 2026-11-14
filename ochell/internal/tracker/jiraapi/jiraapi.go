@@ -7,12 +7,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"ochell/internal/config"
@@ -40,9 +42,16 @@ type Client struct {
 	Token   string
 	// JQL selects the tickets that Assigned returns.
 	JQL string
+
+	mu sync.Mutex
+	// me is the accountId of the account that owns the token.
+	me string
 }
 
-var _ tracker.Client = (*Client)(nil)
+var (
+	_ tracker.Client = (*Client)(nil)
+	_ tracker.Source = (*Client)(nil)
+)
 
 // New returns the client for sources.jira_api.
 func New(cfg config.JiraAPI) *Client {
@@ -176,6 +185,113 @@ func (c *Client) Assigned(ctx context.Context) ([]tracker.Issue, error) {
 		}
 	}
 	return nil, fmt.Errorf("jira api: the search returns more than %d tickets; narrow sources.jira_api.jql", maxPages*pageSize)
+}
+
+// myself returns the accountId of the account that owns the token: the bot.
+func (c *Client) myself(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.me != "" {
+		return c.me, nil
+	}
+	var who struct {
+		AccountID string `json:"accountId"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/rest/api/2/myself", nil, &who); err != nil {
+		return "", err
+	}
+	if who.AccountID == "" {
+		return "", errors.New("jira api: the account of the token has no accountId")
+	}
+	c.me = who.AccountID
+	return c.me, nil
+}
+
+type account struct {
+	AccountID string `json:"accountId"`
+}
+
+// Assigner returns the accountId of who assigned the ticket to the bot:
+// the author of the last change of the assignee to the bot, or the creator
+// of a ticket that never had such a change.
+func (c *Client) Assigner(ctx context.Context, key string) ([]string, error) {
+	me, err := c.myself(ctx)
+	if err != nil {
+		return nil, err
+	}
+	path, err := issuePath(key, "?fields=creator&expand=changelog")
+	if err != nil {
+		return nil, err
+	}
+	var is struct {
+		Fields struct {
+			Creator *account `json:"creator"`
+		} `json:"fields"`
+		Changelog struct {
+			Histories []struct {
+				Created string   `json:"created"`
+				Author  *account `json:"author"`
+				Items   []struct {
+					Field string `json:"field"`
+					To    string `json:"to"`
+				} `json:"items"`
+			} `json:"histories"`
+		} `json:"changelog"`
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, &is); err != nil {
+		return nil, err
+	}
+	who, when := "", ""
+	for _, h := range is.Changelog.Histories {
+		for _, it := range h.Items {
+			// The timestamps are in one format, so they compare as text.
+			if it.Field == "assignee" && it.To == me && h.Author != nil && h.Created >= when {
+				who, when = h.Author.AccountID, h.Created
+			}
+		}
+	}
+	if who == "" && is.Fields.Creator != nil {
+		who = is.Fields.Creator.AccountID
+	}
+	if who == "" {
+		return nil, nil
+	}
+	return []string{who}, nil
+}
+
+// Lookup asks about one ticket. A ticket that Jira does not show any more
+// counts as closed.
+func (c *Client) Lookup(ctx context.Context, key string) (tracker.Status, error) {
+	me, err := c.myself(ctx)
+	if err != nil {
+		return tracker.Status{}, err
+	}
+	path, err := issuePath(key, "?fields=assignee,status")
+	if err != nil {
+		return tracker.Status{}, err
+	}
+	var is struct {
+		Fields struct {
+			Assignee *account `json:"assignee"`
+			Status   struct {
+				Category struct {
+					Key string `json:"key"`
+				} `json:"statusCategory"`
+			} `json:"status"`
+		} `json:"fields"`
+	}
+	err = c.do(ctx, http.MethodGet, path, nil, &is)
+	var apiErr *Error
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+		return tracker.Status{Closed: true}, nil
+	}
+	if err != nil {
+		return tracker.Status{}, err
+	}
+	return tracker.Status{
+		Closed:     is.Fields.Status.Category.Key == "done",
+		Unassigned: is.Fields.Assignee == nil || is.Fields.Assignee.AccountID != me,
+	}, nil
 }
 
 func issuePath(key, rest string) (string, error) {

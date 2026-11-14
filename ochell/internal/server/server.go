@@ -56,6 +56,11 @@ type Submitter interface {
 	// ticket that waited. store.ErrUnknown and store.ErrReleased say that
 	// there was nothing to stop.
 	Stop(source, key, by string) (runner.Stopped, error)
+	// State returns the state of a ticket, ticket.None for one that ochell
+	// has never seen. ActiveTickets returns the keys of the tickets of a
+	// source that have a queued or running task.
+	State(source, key string) (ticket.State, error)
+	ActiveTickets(source string) ([]string, error)
 	// Assigner returns who last assigned a ticket to the bot, as the
 	// source named them, or "". known: ochell has seen the ticket.
 	Assigner(source, key string) (assigner string, known bool, err error)
@@ -87,6 +92,11 @@ type Server struct {
 	extURL  *template.Template
 	handler http.Handler
 	now     func() time.Time
+
+	// pollRefused are the tickets that the poller found and did not start
+	// because of who assigned them, so that it says so once.
+	pollMu      sync.Mutex
+	pollRefused map[string]bool
 
 	// Allowlists, started by Run when ip_allowlist.enabled.
 	atlassianIPs *ipsync.Allowlist
@@ -181,6 +191,9 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.atlassianIPs != nil {
 		go s.atlassianIPs.Run(ctx, s.cfg.IPAllowlist.Refresh, s.log)
 		go s.linearIPs.Run(ctx, s.cfg.IPAllowlist.Refresh, s.log)
+	}
+	if s.cfg.Poller.Interval > 0 {
+		go s.runPoller(ctx)
 	}
 
 	var servers []*http.Server
@@ -411,10 +424,18 @@ func (s *Server) firstRefusal(source, key, author string) bool {
 // submit queues t and writes the HTTP response. labels are the ticket's
 // labels, for the repository mapping.
 func (s *Server) submit(w http.ResponseWriter, t *task.Task, labels []string, log *slog.Logger) submitResult {
+	res, code, msg := s.admit(t, labels, log)
+	reply(w, code, msg)
+	return res
+}
+
+// admit queues t, or records its ticket as waiting when it cannot be
+// started as it is. It returns what happened, and the HTTP status and text
+// that say so to a webhook's sender.
+func (s *Server) admit(t *task.Task, labels []string, log *slog.Logger) (submitResult, int, string) {
 	if !validKey.MatchString(t.Key) {
 		log.Warn("rejecting invalid ticket key", "key", t.Key)
-		reply(w, http.StatusBadRequest, "invalid ticket key")
-		return submitFailed
+		return submitFailed, http.StatusBadRequest, "invalid ticket key"
 	}
 	// With a repository mapping, a ticket that no entry matches is not
 	// started: nobody said where its work belongs.
@@ -434,28 +455,23 @@ func (s *Server) submit(w http.ResponseWriter, t *task.Task, labels []string, lo
 	if errors.Is(err, runner.ErrAttempts) {
 		if err = s.runner.Hold(t, ticket.ReasonEscalation); err == nil {
 			log.Warn("ticket not started: it has used up its attempts", "key", t.Key, "max_attempts", s.cfg.Agent.MaxAttempts)
-			reply(w, http.StatusOK, fmt.Sprintf("not started: %s has used its %d attempts", t.Key, s.cfg.Agent.MaxAttempts))
-			return submitCapped
+			return submitCapped, http.StatusOK, fmt.Sprintf("not started: %s has used its %d attempts", t.Key, s.cfg.Agent.MaxAttempts)
 		}
 	}
 	switch {
 	case err == nil && held:
 		log.Warn("ticket not started: no repository is mapped to it", "key", t.Key, "project", config.ProjectOf(t.Key), "labels", labels)
-		reply(w, http.StatusOK, "not started: no repository is mapped to "+t.Key)
-		return submitHeld
+		return submitHeld, http.StatusOK, "not started: no repository is mapped to " + t.Key
 	case err == nil:
 		log.Info("task queued", "task", t.ID, "key", t.Key, "repo", t.Repo)
-		reply(w, http.StatusOK, "queued "+t.ID)
-		return submitQueued
+		return submitQueued, http.StatusOK, "queued " + t.ID
 	case errors.Is(err, runner.ErrBusy):
 		log.Info("ticket already in progress", "key", t.Key)
-		reply(w, http.StatusOK, "already in progress")
-		return submitBusy
+		return submitBusy, http.StatusOK, "already in progress"
 	default:
 		// 503 makes Jira and Linear retry later.
 		log.Error("cannot queue task", "key", t.Key, "err", err)
-		reply(w, http.StatusServiceUnavailable, "cannot queue task")
-		return submitFailed
+		return submitFailed, http.StatusServiceUnavailable, "cannot queue task"
 	}
 }
 
@@ -763,6 +779,17 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		s.linearPrompted(w, sess, keys, delivery, log)
 		return
 	}
+	// A session that ochell created itself, for a ticket that its poller
+	// found, comes back as a "created" event. It is no new assignment.
+	own := ev.AppUserID != "" && sess.Actor == ev.AppUserID
+	if key, err := s.runner.TicketOfSession("linear", sess.SessionID); err == nil && key != "" {
+		own = true
+	}
+	if own {
+		log.Debug("ignored: a session that ochell created itself", "session", sess.SessionID, "key", sess.Key)
+		reply(w, http.StatusOK, "ignored: own session")
+		return
+	}
 	if !mayAssign(cfg.AllowedAssigners, sess.Actor, sess.ActorEmail) {
 		// The delivery stays handled, and the session gets an answer: it
 		// must not look unanswered, and a retry must not post twice.
@@ -882,6 +909,16 @@ func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, key
 	}
 }
 
+// pickedUpText and noRepoText are what a Linear session is told when its
+// ticket is queued, and when it is not started for want of a repository.
+func pickedUpText(key string) string {
+	return "Picked up " + key + ", the digital employee is starting work."
+}
+
+func noRepoText(key string) string {
+	return "The digital employee did not start work on " + key + ": no repository is configured for it. Someone who looks after the orchestrator has to add one; then delegate the issue again."
+}
+
 // waitsForRunText tells a Linear session that a message was kept for the
 // run after the current one.
 func waitsForRunText(key string) string {
@@ -895,8 +932,7 @@ func (s *Server) linearSubmit(w http.ResponseWriter, t *task.Task, sess *linear.
 	// ~10s of "created", so answer now rather than when the agent starts.
 	switch s.submit(w, t, sess.Labels, log) {
 	case submitQueued:
-		s.linearActivity(sess.SessionID, linear.ActivityThought,
-			"Picked up "+sess.Key+", the digital employee is starting work.", log)
+		s.linearActivity(sess.SessionID, linear.ActivityThought, pickedUpText(sess.Key), log)
 	case submitBusy:
 		// A second session on a ticket that is already queued or running
 		// starts no run, but it must not be left without an answer.
@@ -919,8 +955,7 @@ func (s *Server) linearSubmit(w http.ResponseWriter, t *task.Task, sess *linear.
 		s.linearActivity(sess.SessionID, linear.ActivityElicitation,
 			fmt.Sprintf("The digital employee did not start work on %s: the issue has used its %d attempts. Someone who looks after the orchestrator has to look at it and reset it (ochell reset linear %s); then delegate the issue again.", sess.Key, s.cfg.Agent.MaxAttempts, sess.Key), log)
 	case submitHeld:
-		s.linearActivity(sess.SessionID, linear.ActivityElicitation,
-			"The digital employee did not start work on "+sess.Key+": no repository is configured for it. Someone who looks after the orchestrator has to add one; then delegate the issue again.", log)
+		s.linearActivity(sess.SessionID, linear.ActivityElicitation, noRepoText(sess.Key), log)
 	default:
 		s.forgetDelivery(keys, log)
 	}
