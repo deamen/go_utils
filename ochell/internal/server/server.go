@@ -27,6 +27,7 @@ import (
 	"ochell/internal/runner"
 	"ochell/internal/source/jira"
 	"ochell/internal/source/linear"
+	"ochell/internal/store"
 	"ochell/internal/task"
 	"ochell/internal/ticket"
 )
@@ -44,6 +45,8 @@ type Submitter interface {
 	Submit(*task.Task) error
 	// Hold records a ticket as waiting for a human, without a task.
 	Hold(*task.Task, ticket.Reason) error
+	// Closed is called when the tracker reports a ticket as closed.
+	Closed(source, key string) error
 }
 
 // Deliveries remembers the webhook deliveries that were handled. It is
@@ -356,6 +359,29 @@ func (s *Server) submit(w http.ResponseWriter, t *task.Task, labels []string, lo
 	}
 }
 
+// closed handles the tracker's report that a ticket was closed, and writes
+// the HTTP response. It is safe to receive the same report twice.
+func (s *Server) closed(w http.ResponseWriter, source, key string, log *slog.Logger) {
+	if !validKey.MatchString(key) {
+		reply(w, http.StatusOK, "ignored")
+		return
+	}
+	switch err := s.runner.Closed(source, key); {
+	case err == nil:
+		reply(w, http.StatusOK, "closed "+key)
+	case errors.Is(err, store.ErrUnknown):
+		log.Debug("ignored: a ticket that ochell never worked on was closed", "key", key)
+		reply(w, http.StatusOK, "ignored")
+	case errors.Is(err, runner.ErrBusy):
+		// Stopping a run from the tracker is not supported yet.
+		log.Warn("ticket was closed while its run is queued or running; the run goes on", "key", key)
+		reply(w, http.StatusOK, "closed while in progress")
+	default:
+		log.Error("cannot record that the ticket was closed", "key", key, "err", err)
+		reply(w, http.StatusServiceUnavailable, "cannot record the close")
+	}
+}
+
 func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Sources.JiraWebhook
 	delivery := r.Header.Get("X-Atlassian-Webhook-Identifier")
@@ -379,6 +405,10 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	t, err := jira.ParseWebhook(body, cfg.BotAccountID)
 	if errors.Is(err, jira.ErrIgnored) {
+		if key, ok := jira.ParseClosed(body); ok {
+			s.closed(w, "jira", key, log)
+			return
+		}
 		log.Debug("ignored", "reason", err)
 		reply(w, http.StatusOK, "ignored")
 		return
@@ -445,6 +475,10 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 	}
 	ev, sess, err := linear.Parse(body)
 	if errors.Is(err, linear.ErrIgnored) {
+		if key, ok := ev.Closed(); ok {
+			s.closed(w, "linear", key, log)
+			return
+		}
 		if ev != nil && ev.Type == "AgentSessionEvent" && ev.Action == "prompted" {
 			// Follow-up messages are not delivered to a running agent yet.
 			log.Info("follow-up prompt received but not supported yet",

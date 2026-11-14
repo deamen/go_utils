@@ -51,6 +51,19 @@ func TestHelperAgent(t *testing.T) {
 	case "fail":
 		fmt.Println("boom")
 		os.Exit(3)
+	case "mark":
+		// Notes that it ran, in order, for the workspace hook tests.
+		wd, _ := os.Getwd()
+		f, err := os.OpenFile(os.Getenv("ORCH_TEST_MARKS"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(5)
+		}
+		fmt.Fprintf(f, "%s in %s branch=%s hook=%s\n", args[1], filepath.Base(wd), os.Getenv("ORCH_TASK_BRANCH"), os.Getenv("ORCH_HOOK"))
+		f.Close()
+		if len(args) > 2 && args[2] == "fail" {
+			os.Exit(4)
+		}
 	}
 	os.Exit(0)
 }

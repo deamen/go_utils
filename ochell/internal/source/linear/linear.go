@@ -77,18 +77,25 @@ type AgentActivity struct {
 
 // Event is the subset of the webhook payload used by the orchestrator.
 type Event struct {
-	Type             string         `json:"type"`
-	Action           string         `json:"action"`
-	OrganizationID   string         `json:"organizationId"`
-	AppUserID        string         `json:"appUserId"`
-	OAuthClientID    string         `json:"oauthClientId"`
-	WebhookID        string         `json:"webhookId"`
-	CreatedAt        string         `json:"createdAt"`
-	AgentSession     *AgentSession  `json:"agentSession"`
-	AgentActivity    *AgentActivity `json:"agentActivity"`
-	PromptContext    string         `json:"promptContext"`
-	Guidance         any            `json:"guidance"`
-	PreviousComments []any          `json:"previousComments"`
+	Type           string         `json:"type"`
+	Action         string         `json:"action"`
+	OrganizationID string         `json:"organizationId"`
+	AppUserID      string         `json:"appUserId"`
+	OAuthClientID  string         `json:"oauthClientId"`
+	WebhookID      string         `json:"webhookId"`
+	CreatedAt      string         `json:"createdAt"`
+	AgentSession   *AgentSession  `json:"agentSession"`
+	AgentActivity  *AgentActivity `json:"agentActivity"`
+	PromptContext  string         `json:"promptContext"`
+	// Data is the issue of an "Issue" event.
+	Data *struct {
+		Identifier string `json:"identifier"`
+		State      *struct {
+			Type string `json:"type"`
+		} `json:"state"`
+	} `json:"data"`
+	Guidance         any   `json:"guidance"`
+	PreviousComments []any `json:"previousComments"`
 }
 
 // Session is the normalized result of an AgentSessionEvent.
@@ -144,6 +151,23 @@ func Parse(body []byte) (*Event, *Session, error) {
 		s.Key = "session-" + s.SessionID
 	}
 	return &ev, s, nil
+}
+
+// Closed reports whether the event says that an issue was closed, and
+// returns its identifier: an "Issue" event whose issue was removed, or is
+// in a completed or cancelled state. Linear sends these only when the
+// app's webhook is subscribed to issue events.
+func (e *Event) Closed() (key string, ok bool) {
+	if e.Type != "Issue" || e.Data == nil || e.Data.Identifier == "" {
+		return "", false
+	}
+	if e.Action == "remove" {
+		return e.Data.Identifier, true
+	}
+	if s := e.Data.State; s != nil && (s.Type == "completed" || s.Type == "canceled") {
+		return e.Data.Identifier, true
+	}
+	return "", false
 }
 
 // PromptText returns the user's follow-up message of a "prompted" event.

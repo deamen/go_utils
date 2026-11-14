@@ -89,8 +89,9 @@ var moves = map[State][]State{
 	Waiting:  {Queued, Cancelled, Done, Waiting},
 	InReview: {Queued, Done, Cancelled, Waiting},
 	// From here on only a new assignment starts the ticket again.
-	Done:      {Queued, Waiting},
-	Failed:    {Queued, Cancelled, Waiting},
+	Done: {Queued, Waiting},
+	// Done: the ticket was closed in the tracker as it was.
+	Failed:    {Queued, Cancelled, Waiting, Done},
 	Cancelled: {Queued, Waiting},
 }
 

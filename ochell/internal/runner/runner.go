@@ -59,6 +59,8 @@ type Runner struct {
 	workdir  *template.Template
 	// runDir is the absolute path of agent.run_dir.
 	runDir  string
+	ws      *workspace
+	locks   ticketLocks
 	mu      sync.Mutex
 	stopped bool
 	wg      sync.WaitGroup
@@ -93,6 +95,9 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 	// runs in another directory.
 	if r.runDir, err = filepath.Abs(cfg.RunDir); err != nil {
 		return nil, fmt.Errorf("agent run_dir: %w", err)
+	}
+	if r.ws, err = newWorkspace(config.Workspace{Branch: "bot/{{.Key}}"}); err != nil {
+		return nil, err
 	}
 	if r.adapter, err = agent.New(cfg); err != nil {
 		return nil, err
@@ -277,6 +282,14 @@ func (r *Runner) Running() int {
 func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	log := r.log.With("task", t.ID, "source", t.Source, "key", t.Key, "attempt", t.Attempt)
 
+	// One thing at a time in the ticket's working directory. If the
+	// directory was removed since the task was claimed, the run must
+	// prepare it again.
+	defer r.locks.lock(t.Source, t.Key)()
+	if tk, err := r.store.Ticket(t.Source, t.Key); err == nil && tk != nil {
+		t.PreparedWorkspace, t.Workspace, t.AgentSession = tk.PreparedWorkspace, tk.Workspace, tk.AgentSession
+	}
+
 	notifyCtx := context.WithoutCancel(ctx)
 	if r.notify != nil {
 		if err := r.notify.Started(notifyCtx, t); err != nil {
@@ -388,6 +401,10 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		return res
 	}
 	res.Workdir = dir
+	if err := r.ws.check(dir); err != nil {
+		res.Err = err
+		return res
+	}
 
 	// The adapter says how this agent is called and reads what it prints;
 	// the launcher runs it. A ticket that ran before, in the same working
@@ -423,13 +440,24 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	if res.Resumed {
 		session = "resumed " + t.AgentSession
 	}
-	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s\n# command=%s (%d args) workdir=%s session=%s\n# prompt:\n%s\n# ---- agent output ----\n",
+	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s\n# command=%s (%d args) workdir=%s session=%s\n# prompt:\n%s\n",
 		t.ID, t.Source, t.Key, t.URL, r.cfg.Command, len(cmd.Args), dir, session, t.Prompt)
 	// signal is what the footer of the log says about the result file.
 	signal := "none"
 	defer func() {
 		fmt.Fprintf(lf, "\n# ---- exit=%d outcome=%s result=%s err=%v duration=%s ----\n", res.ExitCode, res.Outcome, signal, res.Err, time.Since(start))
 	}()
+
+	// The workspace hooks come first. If one fails, the agent is not
+	// started in a directory that is not ready.
+	if err := r.prepare(ctx, t, dir, runName, lf); err != nil {
+		res.Err = err
+		if ctx.Err() != nil {
+			res.Outcome = task.OutcomeStopped
+		}
+		return res
+	}
+	fmt.Fprintf(lf, "# ---- agent output ----\n")
 
 	out := r.adapter.Output()
 	spec := launcher.Spec{
@@ -444,37 +472,12 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		Output:    io.MultiWriter(lf, out),
 		Timeout:   r.cfg.Timeout,
 	}
-	proc, err := r.launcher.Start(spec)
-	if err != nil {
-		res.Err = err
+	w, outcome := r.execute(ctx, spec)
+	if outcome == task.OutcomeNotStarted {
+		res.Err = w.err
 		return res
 	}
-	waited := make(chan waitResult, 1)
-	go func() {
-		code, err := proc.Wait()
-		waited <- waitResult{code, err}
-	}()
-	var timeout <-chan time.Time
-	if r.cfg.Timeout > 0 {
-		timer := time.NewTimer(r.cfg.Timeout)
-		defer timer.Stop()
-		timeout = timer.C
-	}
-
-	// Why the run ended is decided here, from what ochell asked for. The
-	// exit code cannot tell: a unit that systemd stopped exits with 0, and
-	// one that hit its own time limit exits with 1 like a failed agent.
-	var w waitResult
-	select {
-	case w = <-waited:
-		res.Outcome = task.OutcomeFinished
-	case <-timeout:
-		res.Outcome = task.OutcomeTimedOut
-		w = r.stop(proc, waited)
-	case <-ctx.Done():
-		res.Outcome = task.OutcomeStopped
-		w = r.stop(proc, waited)
-	}
+	res.Outcome = outcome
 	rep := out.Report()
 	res.Message, res.SessionID, res.CostUSD, res.Usage = rep.Message, rep.SessionID, rep.CostUSD, rep.Usage
 	// What the agent says about its run. The file is read whenever the
@@ -506,7 +509,48 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	if w.err != nil && res.Outcome != task.OutcomeNotStarted && res.Outcome != task.OutcomeFailed {
 		res.Err = fmt.Errorf("%w (%v)", res.Err, w.err)
 	}
+	// after_run follows every run in which the agent was started, but not
+	// one that a shutdown cut short. It does not change how the run ended.
+	if res.Outcome != task.OutcomeNotStarted && ctx.Err() == nil {
+		if err := r.hook(ctx, "after_run", t, dir, runName, lf); err != nil {
+			r.log.Warn("after_run hook failed", "task", t.ID, "err", err)
+		}
+	}
 	return res
+}
+
+// execute starts what spec describes and waits for it to end. It stops it
+// at spec.Timeout, and when ctx is done.
+//
+// Why it ended is decided here, from what ochell asked for. The exit code
+// cannot tell: a unit that systemd stopped exits with 0, and one that hit
+// its own time limit exits with 1 like a failed agent. The outcome is
+// finished (it ended by itself, with any exit code), timed_out, stopped, or
+// not_started with the reason in the error.
+func (r *Runner) execute(ctx context.Context, spec launcher.Spec) (waitResult, task.Outcome) {
+	proc, err := r.launcher.Start(spec)
+	if err != nil {
+		return waitResult{-1, err}, task.OutcomeNotStarted
+	}
+	waited := make(chan waitResult, 1)
+	go func() {
+		code, err := proc.Wait()
+		waited <- waitResult{code, err}
+	}()
+	var timeout <-chan time.Time
+	if spec.Timeout > 0 {
+		timer := time.NewTimer(spec.Timeout)
+		defer timer.Stop()
+		timeout = timer.C
+	}
+	select {
+	case w := <-waited:
+		return w, task.OutcomeFinished
+	case <-timeout:
+		return r.stop(proc, waited), task.OutcomeTimedOut
+	case <-ctx.Done():
+		return r.stop(proc, waited), task.OutcomeStopped
+	}
 }
 
 // stop asks the launcher to end the run and waits for the agent to exit.
@@ -549,6 +593,9 @@ func (r *Runner) taskEnv(t *task.Task) []string {
 	}
 	if t.Repo != "" {
 		env = append(env, "ORCH_TASK_REPO="+t.Repo)
+	}
+	if branch := r.ws.view(t).Branch; branch != "" {
+		env = append(env, "ORCH_TASK_BRANCH="+branch)
 	}
 	for k, v := range r.cfg.Env {
 		env = append(env, k+"="+v)

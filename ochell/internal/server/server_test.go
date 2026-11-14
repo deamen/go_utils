@@ -32,7 +32,19 @@ type fakeRunner struct {
 	tasks []*task.Task
 	// held are the tickets that were recorded as waiting, by key.
 	held map[string]ticket.Reason
-	err  error
+	// closed are the tickets that were reported as closed, as source:key.
+	closed []string
+	err    error
+}
+
+func (f *fakeRunner) Closed(source, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.closed = append(f.closed, source+":"+key)
+	return nil
 }
 
 func (f *fakeRunner) Hold(t *task.Task, reason ticket.Reason) error {
@@ -456,6 +468,42 @@ func TestRepoMapping(t *testing.T) {
 	s = newServer(t, testConfig(), fr)
 	if w := post(`{"issueKey":"OPS-7","summary":"s"}`); w.Code != 200 || len(fr.tasks) != 1 || fr.tasks[0].Repo != "" || len(fr.held) != 0 {
 		t.Errorf("no mapping configured: %d %s, tasks %+v", w.Code, w.Body, fr.tasks)
+	}
+}
+
+// The tracker's report that a ticket was closed reaches the runner, from
+// both sources.
+func TestClosedTickets(t *testing.T) {
+	fr := &fakeRunner{}
+	s := newServer(t, testConfig(), fr)
+
+	resolved := `{"timestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `,"webhookEvent":"jira:issue_updated","issue":{"key":"DEV-42"},"changelog":{"items":[{"field":"resolution","to":"10000","toString":"Done"}]}}`
+	w := do(s, "/webhooks/jira", resolved, map[string]string{"X-Hub-Signature": "sha256=" + auth.SignHex("jira-secret", []byte(resolved))})
+	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != "closed DEV-42" {
+		t.Errorf("resolved Jira issue: %d %s", w.Code, w.Body)
+	}
+	completed := `{"type":"Issue","action":"update","webhookTimestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `,"data":{"identifier":"ENG-9","state":{"type":"completed"}}}`
+	w = do(s, "/webhooks/linear", completed, map[string]string{"Linear-Signature": auth.SignHex("linear-secret", []byte(completed))})
+	if w.Code != 200 || strings.TrimSpace(w.Body.String()) != "closed ENG-9" {
+		t.Errorf("completed Linear issue: %d %s", w.Code, w.Body)
+	}
+	if got := strings.Join(fr.closed, ","); got != "jira:DEV-42,linear:ENG-9" {
+		t.Errorf("closed = %q", got)
+	}
+	if len(fr.tasks) != 0 {
+		t.Errorf("a close started a task: %+v", fr.tasks)
+	}
+
+	// A close without a valid signature does nothing.
+	if w := do(s, "/webhooks/jira", resolved, map[string]string{"X-Hub-Signature": "sha256=00"}); w.Code != 401 || len(fr.closed) != 2 {
+		t.Errorf("unsigned close: %d, closed %v", w.Code, fr.closed)
+	}
+	// What the runner answers decides the response.
+	for err, want := range map[error]string{store.ErrUnknown: "ignored", runner.ErrBusy: "closed while in progress"} {
+		fr.err = err
+		if w := do(s, "/webhooks/linear", completed, map[string]string{"Linear-Signature": auth.SignHex("linear-secret", []byte(completed))}); w.Code != 200 || strings.TrimSpace(w.Body.String()) != want {
+			t.Errorf("runner says %v: %d %s, want 200 %s", err, w.Code, w.Body, want)
+		}
 	}
 }
 

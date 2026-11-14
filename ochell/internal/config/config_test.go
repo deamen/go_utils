@@ -209,6 +209,42 @@ func TestRepoValidation(t *testing.T) {
 	}
 }
 
+func TestWorkspaceValidation(t *testing.T) {
+	base := func() *Config {
+		cfg := Default()
+		cfg.Sources.JiraAutomation.Enabled = true
+		cfg.Sources.JiraAutomation.Token = "t"
+		cfg.Agent.Workdir = "/work/{{.Source}}/{{.Key}}"
+		cfg.Workspace.Root = "/work"
+		cfg.Workspace.Cleanup = true
+		cfg.Workspace.Hooks.AfterCreate = []string{"git", "clone", "{{.Repo}}", "."}
+		return cfg
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("valid workspace settings: %v", err)
+	}
+	if d := Default().Workspace; d.Branch != "bot/{{.Key}}" || d.HookTimeout <= 0 || d.Cleanup || d.Root != "" {
+		t.Errorf("default workspace = %+v", d)
+	}
+	for want, change := range map[string]func(*Config){
+		"workspace.root must be an absolute path":          func(c *Config) { c.Workspace.Root = "work" },
+		"workspace.cleanup requires workspace.root":        func(c *Config) { c.Workspace.Root = "" },
+		"workspace.cleanup requires agent.workdir":         func(c *Config) { c.Agent.Workdir = "/work/shared" },
+		"workspace.branch is required":                     func(c *Config) { c.Workspace.Branch = "" },
+		"workspace.hook_timeout must be positive":          func(c *Config) { c.Workspace.HookTimeout = 0 },
+		"workspace.hooks.before_run: the command is empty": func(c *Config) { c.Workspace.Hooks.BeforeRun = []string{"", "x"} },
+		"workspace.hooks.after_create: agent.launcher systemd requires the command to be an absolute path": func(c *Config) {
+			c.Agent.Launcher, c.Agent.Command, c.Agent.RunDir = "systemd", "/usr/local/bin/claude", "/work/runs"
+		},
+	} {
+		cfg := base()
+		change(cfg)
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("expected %q in %v", want, err)
+		}
+	}
+}
+
 func TestAgentEnvValidation(t *testing.T) {
 	p := writeYAML(t, `
 agent:

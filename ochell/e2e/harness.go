@@ -521,6 +521,27 @@ func (o *Ochell) JiraAssigned(key, summary string) Response {
 	})
 }
 
+// JiraResolved sends a signed Jira system webhook: the ticket was resolved.
+func (o *Ochell) JiraResolved(key string) Response {
+	o.t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"timestamp":    time.Now().UnixMilli(),
+		"webhookEvent": "jira:issue_updated",
+		"issue":        map[string]any{"id": "10042", "key": key},
+		"changelog": map[string]any{"items": []map[string]string{
+			{"field": "status", "fieldId": "status", "from": "3", "to": "10001"},
+			{"field": "resolution", "fieldId": "resolution", "to": "10000", "toString": "Done"},
+		}},
+	})
+	if err != nil {
+		o.t.Fatal(err)
+	}
+	return o.Post(o.Config.Sources.JiraWebhook.Path, body, map[string]string{
+		"X-Hub-Signature":                "sha256=" + auth.SignHex(JiraSecret, body),
+		"X-Atlassian-Webhook-Identifier": nextDelivery(),
+	})
+}
+
 // JiraAutomation sends a Jira Automation "Send web request" call.
 func (o *Ochell) JiraAutomation(key, summary string) Response {
 	o.t.Helper()

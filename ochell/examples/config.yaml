@@ -33,6 +33,26 @@ repos:
   - {source: jira, project: DEV, repo: "git@github.com:example/backend.git"}
   - {source: linear, project: ENG, repo: "git@github.com:example/engine.git"}
 
+# The working directory of a ticket (agent.workdir): where it may be, how it
+# is prepared, and when it is removed. The hooks are commands that ochell
+# runs in the working directory, as the same OS user as the agent. They get
+# ORCH_TASK_REPO and ORCH_TASK_BRANCH in their environment.
+workspace:
+  # Every working directory must be inside this directory.
+  root: /work
+  branch: "bot/{{.Key}}"
+  hooks:
+    # Once, before the first run in a new working directory.
+    after_create: [/bin/sh, -c, 'git clone "$ORCH_TASK_REPO" . && git checkout -b "$ORCH_TASK_BRANCH"']
+    # Before every run.
+    before_run: [/bin/sh, -c, 'git fetch origin']
+    # after_run: []       after every run in which the agent was started
+    # before_remove: []   before the working directory is removed
+  hook_timeout: 10m
+  # Remove a ticket's working directory when Jira or Linear reports the
+  # ticket as closed. Needs root, and {{.Key}} in agent.workdir.
+  cleanup: true
+
 agent:
   # One agent process is started per ticket; it manages any sub-agents itself.
   command: claude

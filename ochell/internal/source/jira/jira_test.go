@@ -127,6 +127,27 @@ func TestLabels(t *testing.T) {
 	}
 }
 
+func TestParseClosed(t *testing.T) {
+	for name, c := range map[string]struct {
+		body string
+		key  string
+	}{
+		"resolved":     {`{"webhookEvent":"jira:issue_updated","issue":{"key":"DEV-1"},"changelog":{"items":[{"field":"status","to":"10001"},{"field":"resolution","fieldId":"resolution","from":null,"to":"10000","toString":"Done"}]}}`, "DEV-1"},
+		"deleted":      {`{"webhookEvent":"jira:issue_deleted","issue":{"key":"DEV-2"}}`, "DEV-2"},
+		"reopened":     {`{"webhookEvent":"jira:issue_updated","issue":{"key":"DEV-3"},"changelog":{"items":[{"field":"resolution","from":"10000","fromString":"Done","to":null,"toString":null}]}}`, ""},
+		"status only":  {`{"webhookEvent":"jira:issue_updated","issue":{"key":"DEV-4"},"changelog":{"items":[{"field":"status","to":"3"}]}}`, ""},
+		"assigned":     {`{"webhookEvent":"jira:issue_updated","issue":{"key":"DEV-5"},"changelog":{"items":[{"field":"assignee","to":"bot"}]}}`, ""},
+		"no changelog": {`{"webhookEvent":"jira:issue_updated","issue":{"key":"DEV-6"}}`, ""},
+		"comment":      {`{"webhookEvent":"comment_created","issue":{"key":"DEV-7"}}`, ""},
+		"no issue":     {`{"webhookEvent":"jira:issue_deleted"}`, ""},
+		"not json":     {`closed`, ""},
+	} {
+		if key, ok := ParseClosed([]byte(c.body)); key != c.key || ok != (c.key != "") {
+			t.Errorf("%s: %q, %v; want %q", name, key, ok, c.key)
+		}
+	}
+}
+
 func TestCheckTimestamp(t *testing.T) {
 	now := time.UnixMilli(1760152365200)
 	body := func(ts string) []byte { return []byte(`{"timestamp":` + ts + `,"webhookEvent":"jira:issue_updated"}`) }
