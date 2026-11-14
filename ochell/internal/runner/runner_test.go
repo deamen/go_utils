@@ -46,8 +46,8 @@ func TestHelperAgent(t *testing.T) {
 	case "sleep":
 		time.Sleep(10 * time.Second)
 	case "chatty":
-		// Works for a second, and says something all along.
-		for range 10 {
+		// Works for a few seconds, and says something all along.
+		for range 30 {
 			fmt.Println("still working")
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -682,10 +682,17 @@ func TestStallDetection(t *testing.T) {
 		t.Errorf("the stalled agent was stopped after %s", d)
 	}
 
+	// The agent works for longer than the limit, but is never silent for
+	// that long. The limit also covers its start, which is slow under the
+	// race detector.
 	cfg = agentCfg(t, "chatty")
-	cfg.StallTimeout = 300 * time.Millisecond
+	cfg.StallTimeout = 2 * time.Second
 	r, _ = New(cfg, logger(), testStore(t))
+	start = time.Now()
 	if res := r.Run(context.Background(), newTask()); res.Outcome != task.OutcomeFinished {
 		t.Errorf("an agent that keeps writing: %+v, want finished", res)
+	}
+	if d := time.Since(start); d < cfg.StallTimeout {
+		t.Errorf("the agent ran for %s, not longer than the limit of %s: the test shows nothing", d, cfg.StallTimeout)
 	}
 }

@@ -1344,7 +1344,7 @@ func TestStalledAgentIsKilled(t *testing.T) {
 	o := Start(t, Options{
 		Script: spawning(Step{Spawn: &Spawn{Count: 1}}),
 		Configure: func(c *config.Config) {
-			c.Agent.StallTimeout = time.Second
+			c.Agent.StallTimeout = 2 * time.Second
 			c.Agent.StopGrace = time.Second
 			c.Agent.MaxAttempts = 2
 			c.Agent.Retry.Backoff, c.Agent.Retry.MaxBackoff = 100*time.Millisecond, 100*time.Millisecond
@@ -1357,7 +1357,7 @@ func TestStalledAgentIsKilled(t *testing.T) {
 	defer st.Close()
 	first := o.LinearCreated("ENG-63", "session-stall", "").TaskID(t)
 	run := o.WaitRun(first, 15*time.Second)
-	if !strings.Contains(run.Footer, "outcome=stalled") || !strings.Contains(run.Footer, "wrote no output for 1s") {
+	if !strings.Contains(run.Footer, "outcome=stalled") || !strings.Contains(run.Footer, "wrote no output for 2s") {
 		t.Errorf("first run: %s", run.Footer)
 	}
 	// Picked up, the second attempt announced, then the error.
