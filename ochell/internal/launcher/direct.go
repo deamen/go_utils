@@ -66,6 +66,12 @@ func (d Direct) Start(spec Spec) (Process, error) {
 	return p, nil
 }
 
+// Reap does nothing: a new ochell process does not know the process group
+// of a run that an earlier one started. An agent that outlived a killed
+// ochell runs on until it ends by itself. The systemd launcher has no such
+// gap.
+func (Direct) Reap(string) error { return nil }
+
 type directProcess struct {
 	cmd    *exec.Cmd
 	grace  time.Duration

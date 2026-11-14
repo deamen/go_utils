@@ -194,7 +194,7 @@ func (fakeAdapter) Start(run agent.Run) (agent.Command, error) {
 func (fakeAdapter) Resume(run agent.Run, session string) (agent.Command, error) {
 	return agent.Command{Args: append(run.Args, "--resume", session)}, nil
 }
-func (fakeAdapter) Output() agent.Output { return &fakeOutput{} }
+func (fakeAdapter) Output(func(agent.Event)) agent.Output { return &fakeOutput{} }
 
 type fakeOutput struct{ n int }
 
@@ -506,9 +506,12 @@ func TestShutdownDrains(t *testing.T) {
 }
 
 // A run that was in progress when ochell died is closed at the next start,
-// and its ticket is told. It is not started again.
-func TestStartClosesInterruptedRuns(t *testing.T) {
+// and its ticket is told. Another run takes its place, with the recovery
+// note in its prompt.
+func TestStartResumesInterruptedRuns(t *testing.T) {
 	cfg := agentCfg(t, "echo")
+	cfg.PromptTemplate = "Fix {{.Key}}\n{{.RunContext}}"
+	cfg.MaxAttempts = 5
 	path := filepath.Join(t.TempDir(), "ochell.db")
 	st := openStore(t, path)
 	if err := st.Enqueue(newTask(), store.Limits{}); err != nil {
@@ -519,6 +522,50 @@ func TestStartClosesInterruptedRuns(t *testing.T) {
 	}
 	// ochell is killed here: the run stays "running" in the store.
 
+	st2 := openStore(t, path)
+	r, _ := New(cfg, logger(), st2)
+	f := &finished{done: make(chan string, 2)}
+	r.SetNotifier(f)
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// Two reports: the interrupted run, and the run that took its place.
+	f.wait(t, "DEV-1")
+	f.wait(t, "DEV-1")
+	r.Shutdown(context.Background())
+	if got := f.attempt("DEV-1"); got != 2 {
+		t.Errorf("the run after the restart was attempt %d, want 2", got)
+	}
+	if res := f.result("DEV-1"); res.Outcome != task.OutcomeFinished {
+		t.Errorf("the run after the restart: %+v, want finished", res)
+	}
+	if old, _ := st2.Run("t1"); old == nil || old.Result.Outcome != task.OutcomeInterrupted {
+		t.Errorf("the interrupted run = %+v", old)
+	}
+	logs, _ := filepath.Glob(filepath.Join(cfg.LogDir, "*.log"))
+	if len(logs) != 1 {
+		t.Fatalf("log files = %v, want that of the new run only", logs)
+	}
+	raw, _ := os.ReadFile(logs[0])
+	if !strings.Contains(string(raw), "The orchestrator was restarted while you were working on this ticket") {
+		t.Errorf("the prompt of the new run has no recovery note:\n%s", raw)
+	}
+}
+
+// A ticket that has used up its attempts is not started again after a
+// restart: it waits, and is told that its run was cut off.
+func TestStartDoesNotResumeAtTheAttemptCap(t *testing.T) {
+	cfg := agentCfg(t, "echo")
+	cfg.MaxAttempts = 1
+	path := filepath.Join(t.TempDir(), "ochell.db")
+	st := openStore(t, path)
+	if err := st.Enqueue(newTask(), store.Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if tk, err := st.Claim(); err != nil || tk == nil {
+		t.Fatalf("Claim = %v, %v", tk, err)
+	}
+
 	r, _ := New(cfg, logger(), openStore(t, path))
 	f := &finished{done: make(chan string, 1)}
 	r.SetNotifier(f)
@@ -527,14 +574,11 @@ func TestStartClosesInterruptedRuns(t *testing.T) {
 	}
 	f.wait(t, "DEV-1")
 	res := f.result("DEV-1")
-	if res.Outcome != task.OutcomeInterrupted || res.Err == nil {
-		t.Errorf("result = %+v, want interrupted with an error", res)
+	if res.Outcome != task.OutcomeInterrupted || res.Err == nil || res.Next != "" {
+		t.Errorf("result = %+v, want interrupted, with an error and no next run", res)
 	}
 	if f.attempt("DEV-1") != 0 {
 		t.Error("the interrupted run was started again")
-	}
-	if err := r.Submit(&task.Task{ID: "t2", Source: "jira", Key: "DEV-1"}); err != nil {
-		t.Errorf("a new run of the interrupted ticket: %v", err)
 	}
 	r.Shutdown(context.Background())
 }

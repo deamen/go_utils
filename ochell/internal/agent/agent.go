@@ -52,6 +52,13 @@ type Usage struct {
 	CacheWriteTokens int64
 }
 
+// Event is something an adapter read from the output while the agent is
+// still running.
+type Event struct {
+	// SessionID is the agent's session, as soon as the output names it.
+	SessionID string
+}
+
 // Output receives everything the agent writes to stdout and stderr during
 // one run. Report may be called once the agent has exited, also after a run
 // that failed or was stopped.
@@ -67,8 +74,10 @@ type Adapter interface {
 	// Resume builds the command that continues the session of an earlier
 	// run, or returns ErrNoResume.
 	Resume(run Run, sessionID string) (Command, error)
-	// Output returns the reader for the output of one run.
-	Output() Output
+	// Output returns the reader for the output of one run. on, when not
+	// nil, is called for what the adapter learns while the agent runs; it
+	// is called from Write and must not call the Output.
+	Output(on func(Event)) Output
 }
 
 // New returns the adapter selected by agent.adapter.

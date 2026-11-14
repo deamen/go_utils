@@ -56,6 +56,11 @@ type Launcher interface {
 	// Start starts the agent. An error that wraps ErrNotStarted means the
 	// command could not be executed.
 	Start(spec Spec) (Process, error)
+	// Reap ends what an earlier ochell process may have left running for
+	// the run with this task id: ochell was killed, and the agent was not.
+	// It returns when nothing of that run is left, as far as the launcher
+	// can tell, and it is not an error when nothing was.
+	Reap(taskID string) error
 }
 
 // Process is one started agent run.

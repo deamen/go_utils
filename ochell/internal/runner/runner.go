@@ -223,25 +223,41 @@ func (r *Runner) wakeWorker() {
 // woken. It only matters after a store error.
 const idlePoll = 30 * time.Second
 
+// again describes the run that takes the place of t.
+func (r *Runner) again(t *task.Task, cause task.Cause) store.Again {
+	return store.Again{ID: task.NewID(time.Now(), t.Source, t.Key), Cause: cause, MaxAttempts: r.cfg.MaxAttempts}
+}
+
 // Start launches the worker pool. Shutdown ends it. Tasks that were queued
-// before a restart are run; runs that the restart cut short are closed and
-// their tickets told.
+// before a restart are run. A run that the restart cut short is closed, and
+// another run of its ticket is queued in its place, with a note for the
+// agent that it may have done part of the work (runContext). A ticket that
+// has used up its attempts waits for a human instead.
 func (r *Runner) Start() error {
-	interrupted, err := r.store.Recover()
+	interrupted, err := r.store.Recover(func(t *task.Task) store.Again { return r.again(t, task.CauseRecovery) })
 	if err != nil {
 		return fmt.Errorf("recover the task store: %w", err)
 	}
-	for _, t := range interrupted {
-		r.log.Warn("run was interrupted: ochell stopped while the agent was running", "task", t.ID, "source", t.Source, "key", t.Key)
+	for _, in := range interrupted {
+		t := in.Task
+		r.log.Warn("run was interrupted: ochell stopped while the agent was running", "task", t.ID, "source", t.Source, "key", t.Key, "queued_again", in.Requeued)
+		// An agent that outlived the ochell that started it must not go on
+		// working next to the run that takes its place.
+		if err := r.launcher.Reap(unsafeName.ReplaceAllString(t.ID, "_")); err != nil {
+			r.log.Warn("cannot make sure that the interrupted run has ended; its agent may still be running", "task", t.ID, "err", err)
+		}
 	}
 	if len(interrupted) > 0 && r.notify != nil {
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
-			for _, t := range interrupted {
+			for _, in := range interrupted {
 				res := task.Result{Outcome: task.OutcomeInterrupted, ExitCode: -1, Err: store.ErrInterrupted}
-				if err := r.notify.Finished(context.Background(), t, res); err != nil {
-					r.log.Warn("finish notification failed", "task", t.ID, "err", err)
+				if in.Requeued {
+					res.Next = task.CauseRecovery
+				}
+				if err := r.notify.Finished(context.Background(), in.Task, res); err != nil {
+					r.log.Warn("finish notification failed", "task", in.Task.ID, "err", err)
 				}
 			}
 		}()
@@ -291,7 +307,8 @@ func (r *Runner) Start() error {
 // When ctx is done first, it stops them and waits for that. Tasks that were
 // queued but not started stay in the store and are run after a restart.
 //
-// Runs that a shutdown interrupts are not resumed after a restart.
+// A run that the shutdown stops is queued again, and runs after the restart
+// with the recovery note.
 func (r *Runner) Shutdown(ctx context.Context) {
 	r.mu.Lock()
 	already := r.stopped
@@ -355,7 +372,18 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	}
 	// Record the end before telling the ticket, so the ticket is free for
 	// a new run by the time someone reads the answer.
-	if err := r.store.Finish(t.ID, res); err != nil {
+	var err error
+	if res.Outcome == task.OutcomeStopped {
+		// ochell is shutting down, and cut the run short. Its ticket is
+		// queued again, for after the restart.
+		var queued bool
+		if queued, err = r.store.FinishAndQueue(t.ID, res, r.again(t, task.CauseRecovery)); queued {
+			res.Next = task.CauseRecovery
+		}
+	} else {
+		err = r.store.Finish(t.ID, res)
+	}
+	if err != nil {
 		log.Error("cannot record the end of the run", "err", err)
 	}
 	if r.notify != nil {
@@ -510,7 +538,17 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	}
 	fmt.Fprintf(lf, "# ---- agent output ----\n")
 
-	out := r.adapter.Output()
+	// The session is recorded as soon as the agent names it, not only at
+	// the end: if ochell does not live to see the end of this run, the run
+	// that takes its place continues in the same session.
+	out := r.adapter.Output(func(ev agent.Event) {
+		if ev.SessionID == "" {
+			return
+		}
+		if err := r.store.NoteSession(t.Source, t.Key, ev.SessionID, dir); err != nil {
+			r.log.Warn("cannot record the agent session of the running task", "task", t.ID, "err", err)
+		}
+	})
 	spec := launcher.Spec{
 		TaskID:    runName,
 		Command:   r.cfg.Command,

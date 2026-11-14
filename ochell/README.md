@@ -33,10 +33,15 @@ Behaviour common to all sources:
 - **A stop ends the whole agent**, not only its top process: sub-agents, MCP servers and git children too. ochell sends SIGTERM, and SIGKILL after `agent.stop_grace` (10s). This happens at `agent.timeout` and on shutdown.
   - With the `systemd` launcher ochell stops the unit, and systemd signals every process in it.
   - With the `direct` launcher the agent runs in its own process group and ochell signals the group. A child that leaves the group (`setsid`) is not reached; use the `systemd` launcher where that matters. When the agent exits by itself, what it left running in its group is killed as well.
-- **Shutdown** (SIGTERM or Ctrl-C): ochell stops accepting webhooks and waits up to `agent.drain_timeout` (30s) for running agents to finish. Then it stops the ones still running; their tickets get an error that says so. A second signal ends the wait at once. Tasks that were queued but not started stay in the store and run after the next start.
+- **Shutdown** (SIGTERM or Ctrl-C): ochell stops accepting webhooks and waits up to `agent.drain_timeout` (30s) for running agents to finish. Then it stops the ones still running. A second signal ends the wait at once. Tasks that were queued but not started stay in the store and run after the next start.
   - If ochell runs as a systemd service, set the service's `TimeoutStopSec` above `drain_timeout` plus `stop_grace`, or systemd kills ochell first.
-  - Interrupted runs are not resumed after a restart.
-- **After a crash** (ochell was killed, or the host went down): at the next start, queued tasks run as usual. A run that was in progress is closed as `interrupted`, its ticket gets an error that says so, and it is not started again. ochell does not look for an agent that such a run may have left behind.
+- **After a crash** (ochell was killed, or the host went down): at the next start, queued tasks run as usual, and a run that was in progress is closed as `interrupted`.
+- **A run that ochell cut short or did not see the end of is started again** after the restart, as a new attempt of its ticket. That holds for a run that a shutdown stopped and for one that a crash interrupted.
+  - The new attempt runs in the same working directory and, when the agent adapter has sessions (`claude`), in the same agent session. ochell stores the session as soon as the agent names it, not only at the end of a run.
+  - Its prompt has the **recovery note** in the run context: the agent may have done part of the work, and must check git, the pull request and the ticket's comments before it repeats anything with an effect outside the working directory.
+  - The ticket is told that the run was cut off and is queued again: a `thought` in a Linear session, a comment on a Jira ticket.
+  - It counts as an attempt. A ticket that has used up `agent.max_attempts` is not started again: it waits for a human with the reason `interrupted`, and gets an error that says so.
+  - **What the crash left running:** with the `systemd` launcher the unit of the interrupted run may still be there, so ochell stops it by its task id before the new attempt starts. With the `direct` launcher ochell cannot find the old agent; it runs on until it ends by itself, next to the new attempt. That is one more reason to deploy with `systemd`.
 
 ## Build
 ```
@@ -233,7 +238,7 @@ Every ticket ochell has seen is in one of these states. They are defined, with t
 
 A ticket that is `queued` or `running` takes no second run. From every other state a new assignment queues it again.
 
-Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation` (the agent was not sure or out of scope, or the ticket used up its attempts), and `interrupted` (ochell itself stopped during the run).
+Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation` (the agent was not sure or out of scope, or the ticket used up its attempts), and `interrupted` (ochell itself stopped during the run, and the ticket had no attempt left to start it again).
 
 What a run leads to:
 
@@ -245,7 +250,7 @@ What a run leads to:
 | `finished` | `low_confidence`, `out_of_scope` | `waiting`, reason `escalation` |
 | `finished` | missing or invalid | `waiting`, reason `no_result` |
 | `failed`, `timed_out`, `not_started` | not looked at | `failed` |
-| `stopped`, `interrupted` | not looked at | `waiting`, reason `interrupted` |
+| `stopped`, `interrupted` | not looked at | `queued` again, for a new attempt with the recovery note; `waiting`, reason `interrupted`, when the attempts are used up |
 
 Several states and reasons are not reached yet: they belong to features that come later (the plan gate, stop from the ticket, handoff). Pausing is not a state: it holds the queue, and queued tickets stay queued.
 
@@ -307,9 +312,9 @@ Then set `agent.launcher: systemd` and check the result with `scripts/check-laun
 | `finished` | the agent exited by itself with status 0 |
 | `failed` | the agent exited by itself with another status |
 | `timed_out` | ochell stopped it at `agent.timeout` |
-| `stopped` | ochell stopped it because it is shutting down |
+| `stopped` | ochell stopped it because it is shutting down. The ticket is queued again |
 | `not_started` | the agent never ran: the command could not be executed, or the launch was refused. With the systemd launcher these are exit codes from 200 (250: refused by the launch script; 203: systemd could not execute the command) |
-| `interrupted` | ochell itself was killed during the run, and found it unfinished at the next start. This one is only in the store and in ochell's log, not in the run log |
+| `interrupted` | ochell itself was killed during the run, and found it unfinished at the next start. The ticket is queued again. This one is only in the store and in ochell's log, not in the run log |
 
 ochell sets the outcome from what it asked for, never from the exit code alone: a unit that systemd stopped exits with 0.
 
@@ -318,8 +323,9 @@ The prompt is rendered from `agent.prompt_template` and written to the agent's *
 
 The template sees the task (`.Source`, `.Key`, `.Title`, `.URL`, `.Repo`, `.Context`, `.Comment`, `.ID`, `.Attempt`) and what ochell adds: `.RunContext`, `.ResultInstructions` and `.ResultFile`. **A template must include `{{.RunContext}}` and `{{.ResultInstructions}}`**; ochell refuses to start without them. See [The result file](#the-result-file).
 
-**The run context** is what only ochell knows about a run. The agent still reads the ticket itself. It is empty for a first attempt that no comment asked for; otherwise it says:
+**The run context** is what only ochell knows about a run. The agent still reads the ticket itself. It is empty for a plain first attempt; otherwise it says:
 - which attempt this is, and whether it continues the agent session of the earlier attempt or starts a new one. In a new session the agent is told to look at the branch, the pull request and the ticket's comments before it repeats work;
+- the recovery note, when the run takes the place of one that ochell cut short or did not see the end of (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down));
 - the branch and the pull request that earlier attempts reported in their result files, with the instruction to continue there;
 - the comment that started the run, when someone asked for it in one. Today that is a mention of the agent in a Linear comment. The comment is quoted as a message from a person on the ticket, with the note that it does not change what the agent may do.
 

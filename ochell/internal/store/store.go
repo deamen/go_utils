@@ -123,6 +123,9 @@ var migrations = []string{
 		key   TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	);`,
+
+	// Version 9: why a run was queued, when it was not a plain assignment.
+	`ALTER TABLE runs ADD COLUMN cause TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is safe for concurrent use.
@@ -282,9 +285,9 @@ func (s *Store) Enqueue(t *task.Task, lim Limits) error {
 		if err := s.move(tx, t.Source, t.Key, ticket.Queued, ""); err != nil {
 			return err
 		}
-		_, err = tx.Exec(`INSERT INTO runs (id, source, key, status, context, comment, tracker_session, delivery_id, received_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			t.ID, t.Source, t.Key, runQueued, t.Context, t.Comment, t.TrackerSession, t.DeliveryID, ms(t.Received))
+		_, err = tx.Exec(`INSERT INTO runs (id, source, key, status, context, comment, tracker_session, delivery_id, received_at, cause)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			t.ID, t.Source, t.Key, runQueued, t.Context, t.Comment, t.TrackerSession, t.DeliveryID, ms(t.Received), t.Cause)
 		return err
 	})
 }
@@ -320,13 +323,13 @@ func (s *Store) Hold(t *task.Task, reason ticket.Reason) error {
 }
 
 const taskColumns = `r.id, r.source, r.key, t.title, t.url, r.context, r.tracker_session, r.delivery_id, r.received_at, r.attempt,
-	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo, t.prepared_workspace`
+	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo, t.prepared_workspace, r.cause`
 
 func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 	var t task.Task
 	var received int64
 	if err := row.Scan(&t.ID, &t.Source, &t.Key, &t.Title, &t.URL, &t.Context, &t.TrackerSession, &t.DeliveryID, &received, &t.Attempt,
-		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo, &t.PreparedWorkspace); err != nil {
+		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo, &t.PreparedWorkspace, &t.Cause); err != nil {
 		return nil, err
 	}
 	t.Received = time.UnixMilli(received).UTC()
@@ -425,10 +428,62 @@ func (s *Store) Claim() (*task.Task, error) {
 // Finish records how a run ended, and moves the ticket to the state that
 // follows from it (ticket.AfterRun). The ticket is then free for a new run.
 func (s *Store) Finish(id string, res task.Result) error {
-	return s.tx(func(tx *sql.Tx) error { return s.finish(tx, id, res) })
+	return s.tx(func(tx *sql.Tx) error {
+		_, err := s.finish(tx, id, res, nil)
+		return err
+	})
 }
 
-func (s *Store) finish(tx *sql.Tx, id string, res task.Result) error {
+// Again describes the run that takes the place of one that has ended.
+type Again struct {
+	// ID is the id of the new run.
+	ID    string
+	Cause task.Cause
+	// MaxAttempts is how many runs the ticket may have had; 0: no limit.
+	MaxAttempts int
+}
+
+// FinishAndQueue records how a run ended, like Finish, and queues another
+// run of the same ticket in its place: the ticket goes back to queued. The
+// new run has the context, the comment and the tracker session of the one
+// that ended.
+//
+// When the ticket has used up its attempts, nothing is queued, the ticket
+// moves as Finish would move it, and queued is false.
+func (s *Store) FinishAndQueue(id string, res task.Result, again Again) (queued bool, err error) {
+	err = s.tx(func(tx *sql.Tx) error {
+		queued, err = s.finish(tx, id, res, &again)
+		return err
+	})
+	return queued, err
+}
+
+func (s *Store) finish(tx *sql.Tx, id string, res task.Result, again *Again) (queued bool, err error) {
+	if err := s.end(tx, id, res); err != nil {
+		return false, err
+	}
+	var source, key string
+	var attempts int
+	if err := tx.QueryRow(`SELECT r.source, r.key, t.attempts FROM runs r JOIN tickets t USING (source, key) WHERE r.id = ?`, id).
+		Scan(&source, &key, &attempts); err != nil {
+		return false, err
+	}
+	if again == nil || (again.MaxAttempts > 0 && attempts >= again.MaxAttempts) {
+		to, reason := ticket.AfterRun(res.Outcome, res.Signal)
+		return false, s.move(tx, source, key, to, reason)
+	}
+	if err := s.move(tx, source, key, ticket.Queued, ""); err != nil {
+		return false, err
+	}
+	_, err = tx.Exec(`INSERT INTO runs (id, source, key, status, context, comment, tracker_session, received_at, cause)
+		SELECT ?, source, key, ?, context, comment, tracker_session, ?, ? FROM runs WHERE id = ?`,
+		again.ID, runQueued, ms(s.now()), again.Cause, id)
+	return err == nil, err
+}
+
+// end records how a run ended, and what the ticket keeps from it. It does
+// not move the ticket.
+func (s *Store) end(tx *sql.Tx, id string, res task.Result) error {
 	now := ms(s.now())
 	var exit any
 	if res.ExitCode >= 0 {
@@ -455,10 +510,6 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result) error {
 	}
 	var source, key string
 	if err := tx.QueryRow(`SELECT source, key FROM runs WHERE id = ?`, id).Scan(&source, &key); err != nil {
-		return err
-	}
-	to, reason := ticket.AfterRun(res.Outcome, res.Signal)
-	if err := s.move(tx, source, key, to, reason); err != nil {
 		return err
 	}
 	if res.Workdir != "" {
@@ -488,14 +539,25 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result) error {
 }
 
 // ErrInterrupted is the error recorded for a run that Recover closes.
-var ErrInterrupted = errors.New("ochell stopped while the agent was running, and the run was not resumed")
+var ErrInterrupted = errors.New("ochell stopped while the agent was running")
+
+// Interrupted is a run that Recover closed.
+type Interrupted struct {
+	Task *task.Task
+	// Requeued says that another run of the ticket was queued in its place.
+	Requeued bool
+}
 
 // Recover is called once at start, before any run is claimed. Runs that
 // were running when ochell stopped cannot be running any more as far as
 // ochell knows: they are closed as interrupted and returned, so their
 // tickets can be told. Queued runs stay queued.
-func (s *Store) Recover() ([]*task.Task, error) {
+//
+// again, when not nil, is asked for the run that takes the place of each
+// interrupted one (FinishAndQueue). Without it the tickets wait for a human.
+func (s *Store) Recover(again func(*task.Task) Again) ([]Interrupted, error) {
 	var tasks []*task.Task
+	var out []Interrupted
 	err := s.tx(func(tx *sql.Tx) error {
 		rows, err := tx.Query(`SELECT `+taskColumns+` FROM runs r JOIN tickets t USING (source, key)
 			WHERE r.status = ? ORDER BY r.started_at, r.rowid`, runRunning)
@@ -515,13 +577,29 @@ func (s *Store) Recover() ([]*task.Task, error) {
 		}
 		for _, t := range tasks {
 			res := task.Result{Outcome: task.OutcomeInterrupted, ExitCode: -1, Err: ErrInterrupted}
-			if err := s.finish(tx, t.ID, res); err != nil {
+			var next *Again
+			if again != nil {
+				a := again(t)
+				next = &a
+			}
+			queued, err := s.finish(tx, t.ID, res, next)
+			if err != nil {
 				return err
 			}
+			out = append(out, Interrupted{Task: t, Requeued: queued})
 		}
 		return nil
 	})
-	return tasks, err
+	return out, err
+}
+
+// NoteSession records, while a run is still going, the agent session it
+// opened and the working directory it runs in. A run that ochell does not
+// see the end of can then be continued in the same session.
+func (s *Store) NoteSession(source, key, session, workdir string) error {
+	_, err := s.db.Exec(`UPDATE tickets SET agent_session = ?, workspace = ? WHERE source = ? AND key = ?`,
+		session, workdir, source, key)
+	return err
 }
 
 // Active returns the number of runs that are queued or running.

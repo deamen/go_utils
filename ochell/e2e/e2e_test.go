@@ -363,10 +363,10 @@ func TestShutdownLeavesNoProcessBehind(t *testing.T) {
 		t.Errorf("run: %s", run.Footer)
 	}
 	expectAllGone(t, rec, 3)
-	// The ticket is told that the run was cut short.
+	// The ticket is told that the run was cut short and goes on later.
 	acts := o.Linear.Activities("session-shutdown")
-	if len(acts) != 2 || acts[1].Type != "error" || !strings.Contains(acts[1].Body, "shutting down") {
-		t.Errorf("activities = %+v, want an error that names the shutdown", acts)
+	if len(acts) != 2 || acts[1].Type != "thought" || !strings.Contains(acts[1].Body, "queued again") {
+		t.Errorf("activities = %+v, want a thought that says the run is queued again", acts)
 	}
 }
 
@@ -956,13 +956,14 @@ func TestQueueSurvivesRestart(t *testing.T) {
 	if run := o.WaitRun(queued, 20*time.Second); !strings.Contains(run.Footer, "outcome=finished") || !strings.Contains(run.Log, "all done") {
 		t.Errorf("queued task after the restart: %s\n%s", run.Footer, run.Log)
 	}
-	// The run that was cut short is not started again, and its ticket is told.
-	acts := o.WaitActivities("session-running", 2, 10*time.Second)
-	if acts[1].Type != "error" || !strings.Contains(acts[1].Body, "ochell stopped while the agent was running") {
+	// The ticket of the run that was cut short is told, and the run is
+	// started again (TestKilledRunIsResumedWithTheRecoveryNote).
+	acts := o.WaitActivities("session-running", 3, 20*time.Second)
+	if acts[1].Type != "thought" || !strings.Contains(acts[1].Body, "queued again") || acts[2].Type == "error" {
 		t.Errorf("activities of the interrupted run = %+v", acts)
 	}
-	if n := len(o.Records()); n != 2 {
-		t.Errorf("the agent was started %d times in all, want 2: the interrupted run must not start again", n)
+	if n := len(o.Records()); n != 3 {
+		t.Errorf("the agent was started %d times in all, want 3: the two tickets, and the interrupted run again", n)
 	}
 	if _, err := os.Stat(o.LogFile(running)); err != nil {
 		t.Errorf("log of the interrupted run: %v", err)
@@ -971,10 +972,75 @@ func TestQueueSurvivesRestart(t *testing.T) {
 	if r := o.Replay(); r.Status != 200 || r.Body != "duplicate delivery" {
 		t.Errorf("replayed delivery after the restart: %d %q, want duplicate delivery", r.Status, r.Body)
 	}
-	// The interrupted ticket can be delegated again.
-	again := o.LinearCreated("ENG-40", "session-again", "").TaskID(t)
-	if run := o.WaitRun(again, 20*time.Second); !strings.Contains(run.Footer, "outcome=finished") {
-		t.Errorf("new run of the interrupted ticket: %s", run.Footer)
+}
+
+// The done-when of the recovery note: ochell is killed during a run. After
+// the restart a new attempt starts in the same agent session and working
+// directory, and its prompt has the recovery note.
+func TestKilledRunIsResumedWithTheRecoveryNote(t *testing.T) {
+	const session = "7f3c1a52-0a4e-4d0b-9f65-2f1f0a6b9c11"
+	o := Start(t, Options{
+		Script: []Step{
+			{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`},
+			{Sleep: "2s"},
+			{Print: `{"type":"result","subtype":"success","is_error":false,"result":"Opened PR #9.","session_id":"` + session + `"}`},
+			Report("done", "Opened PR #9."),
+		},
+		Configure: func(c *config.Config) { c.Agent.Adapter = "claude" },
+	})
+	first := o.LinearCreated("ENG-51", "session-recovery", "").TaskID(t)
+	rec := o.WaitRecords(1, 10*time.Second)[0]
+	if strings.Contains(rec.Stdin, "restarted") {
+		t.Fatalf("the first run got the recovery note:\n%s", rec.Stdin)
+	}
+	// The session is in the store before the run has ended.
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	o.waitFor(5*time.Second, "the session of the running agent to be stored", func() bool {
+		tk, _ := st.Ticket("linear", "ENG-51")
+		return tk != nil && tk.AgentSession == session
+	})
+
+	o.Kill()
+	// With the direct launcher a killed ochell leaves its agent behind.
+	syscall.Kill(-rec.PID, syscall.SIGKILL)
+	o.Restart()
+
+	recs := o.WaitRecords(2, 15*time.Second)
+	var second Record
+	for _, r := range recs {
+		if r.PID != rec.PID {
+			second = r
+		}
+	}
+	if !slices.Contains(second.Args, "--resume") || !slices.Contains(second.Args, session) {
+		t.Errorf("arguments of the new attempt = %q, want --resume %s", second.Args, session)
+	}
+	if second.Dir != rec.Dir {
+		t.Errorf("working directory of the new attempt = %q, want %q", second.Dir, rec.Dir)
+	}
+	for _, want := range []string{"This is attempt 2 on this ticket. It continues the agent session", "The orchestrator was restarted while you were working on this ticket", "before you repeat anything that has an effect outside the working directory"} {
+		if !strings.Contains(second.Stdin, want) {
+			t.Errorf("the prompt of the new attempt lacks %q:\n%s", want, second.Stdin)
+		}
+	}
+	// The ticket: picked up, cut off and queued again, then the result.
+	acts := o.WaitActivities("session-recovery", 3, 20*time.Second)
+	if acts[1].Type != "thought" || !strings.Contains(acts[1].Body, "orchestrator was restarted") {
+		t.Errorf("second activity = %+v, want the note that the run was cut off", acts[1])
+	}
+	if acts[2].Type != "response" || acts[2].Body != "Opened PR #9." {
+		t.Errorf("third activity = %+v, want the result", acts[2])
+	}
+	if run, _ := st.Run(first); run == nil || run.Result.Outcome != "interrupted" {
+		t.Errorf("the first run = %+v, want interrupted", run)
+	}
+	tk, _ := st.Ticket("linear", "ENG-51")
+	if tk == nil || tk.State != "in_review" || tk.Attempts != 2 {
+		t.Errorf("ticket = %+v, want in_review after two attempts", tk)
 	}
 }
 

@@ -244,7 +244,7 @@ var validKey = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 func (s *Server) newTask(source, key, title, url, ctxText, delivery string) *task.Task {
 	now := s.now().UTC()
 	return &task.Task{
-		ID:         fmt.Sprintf("%s-%s-%s", now.Format("20060102T150405.000Z"), source, key),
+		ID:         task.NewID(now, source, key),
 		Source:     source,
 		Key:        key,
 		Title:      title,
@@ -648,6 +648,10 @@ func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) er
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	if res.Next != "" {
+		// Not the end for the ticket: a thought keeps the session open.
+		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityThought, queuedAgainText(res))
+	}
 	if res.Err != nil {
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityError,
 			strings.TrimSpace(failureText(res)+"\n\n"+codeBlock(lastN(res.Message, replyMax))))
@@ -686,6 +690,12 @@ func signalActivity(res task.Result) (kind, msg string) {
 		return linear.ActivityElicitation, note
 	}
 	return linear.ActivityElicitation, said + "\n\n" + note
+}
+
+// queuedAgainText is what a ticket is told when its run ended and ochell
+// has queued another one in its place (res.Next).
+func queuedAgainText(res task.Result) string {
+	return "The run was cut off because the orchestrator was restarted. It is queued again; the agent goes on where it stopped and checks first what it has already done."
 }
 
 // failureText says why a run did not succeed. It goes by the outcome: the

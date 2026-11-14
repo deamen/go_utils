@@ -93,13 +93,25 @@ func (p *systemdProcess) Wait() (int, error) {
 
 // Stop stops the unit. ochell cannot signal the launch process, which runs
 // as root; it ends by itself when the unit has stopped.
-func (p *systemdProcess) Stop() error {
-	ctx, cancel := context.WithTimeout(context.Background(), p.s.StopGrace+stopMargin)
+func (p *systemdProcess) Stop() error { return p.s.stop(p.taskID) }
+
+// Reap stops the unit of a run that an earlier ochell process started. A
+// unit outlives the ochell that started it. The stop script succeeds when
+// there is no such unit.
+func (s *Systemd) Reap(taskID string) error {
+	if len(s.StopCommand) == 0 {
+		return errors.New("systemd launcher: stop_command is required")
+	}
+	return s.stop(taskID)
+}
+
+func (s *Systemd) stop(taskID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.StopGrace+stopMargin)
 	defer cancel()
-	args := append(append([]string{}, p.s.StopCommand[1:]...), p.taskID)
-	out, err := exec.CommandContext(ctx, p.s.StopCommand[0], args...).CombinedOutput()
+	args := append(append([]string{}, s.StopCommand[1:]...), taskID)
+	out, err := exec.CommandContext(ctx, s.StopCommand[0], args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s: %w: %s", p.s.StopCommand[0], err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s: %w: %s", s.StopCommand[0], err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

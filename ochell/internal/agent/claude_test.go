@@ -87,7 +87,7 @@ func TestClaudeOutput(t *testing.T) {
 	}
 	// However the stream is cut into writes, the report is the same.
 	for _, chunk := range []int{len(raw), 1, 7, 4096} {
-		out := Claude{}.Output()
+		out := Claude{}.Output(nil)
 		for rest := raw; len(rest) > 0; {
 			n := min(chunk, len(rest))
 			out.Write(rest[:n])
@@ -102,7 +102,7 @@ func TestClaudeOutput(t *testing.T) {
 func TestClaudeOutputWithoutResult(t *testing.T) {
 	// Stopped in the middle: the session is known, the message is the last
 	// thing the agent said.
-	out := Claude{}.Output()
+	out := Claude{}.Output(nil)
 	io.WriteString(out, `{"type":"system","subtype":"init","session_id":"sess-1"}`+"\n")
 	io.WriteString(out, `{"type":"assistant","message":{"content":[{"type":"text","text":"Working on it."}]},"session_id":"sess-1"}`+"\n")
 	io.WriteString(out, `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]},"session_id":"sess-1"}`)
@@ -111,14 +111,14 @@ func TestClaudeOutputWithoutResult(t *testing.T) {
 	}
 
 	// Claude Code could not start a session: what it printed is the message.
-	out = Claude{}.Output()
+	out = Claude{}.Output(nil)
 	io.WriteString(out, "No conversation found with session ID: sess-9\n")
 	if got := out.Report(); got.SessionID != "" || got.Message != "No conversation found with session ID: sess-9" {
 		t.Errorf("failed start: %+v", got)
 	}
 
 	// An error result: its text is the message.
-	out = Claude{}.Output()
+	out = Claude{}.Output(nil)
 	io.WriteString(out, `{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","session_id":"sess-2","total_cost_usd":1.5}`+"\n")
 	io.WriteString(out, "Error: reached the turn limit\n")
 	if got := out.Report(); got.SessionID != "sess-2" || got.CostUSD != 1.5 || got.Message != "Error: reached the turn limit" {
@@ -126,7 +126,7 @@ func TestClaudeOutputWithoutResult(t *testing.T) {
 	}
 
 	// A session id that is not one is not taken over.
-	out = Claude{}.Output()
+	out = Claude{}.Output(nil)
 	io.WriteString(out, `{"type":"system","subtype":"init","session_id":"${HOME}"}`+"\n")
 	if got := out.Report(); got.SessionID != "" {
 		t.Errorf("session id %q was accepted", got.SessionID)
@@ -134,7 +134,7 @@ func TestClaudeOutputWithoutResult(t *testing.T) {
 }
 
 func TestClaudeOutputSkipsHugeLines(t *testing.T) {
-	out := Claude{}.Output()
+	out := Claude{}.Output(nil)
 	io.WriteString(out, `{"type":"system","subtype":"init","session_id":"sess-1"}`+"\n")
 	big := strings.Repeat("x", 1<<20)
 	io.WriteString(out, `{"type":"user","message":"`)
