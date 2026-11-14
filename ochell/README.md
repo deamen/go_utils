@@ -33,7 +33,7 @@ Behaviour common to all sources:
   - **Only tickets that ochell holds:** a ticket it has worked on that waits for a human, is in review, or failed. A comment on a ticket that ochell never worked on, that is done or that was released is ignored: people talk to each other there. A comment on a ticket whose issue is assigned to someone else is ignored as well.
   - **Every comment of a person on such a ticket starts a run,** also one that was meant for a colleague. Jira has no way to address the agent only.
   - A comment that arrives while the ticket has a run is kept (see below).
-  - Who wrote the comment is checked against `allowed_assigners`.
+  - Who wrote the comment is checked against `allowed_follow_ups` (see [Guards and the admin channel](#guards-and-the-admin-channel)).
   - **Jira Automation stays a start-only trigger.** It cannot sign requests and has no delivery id, so follow-ups work with the system webhook only.
   - A comment whose first line is `/stop` starts nothing; stopping a run from the ticket is not handled yet.
 - **Messages during a run:** a comment or reply that arrives while a ticket has a queued or running run is kept in the store, and **delivered with the ticket's next run**, which ochell queues itself as soon as the current one has ended. Several messages are delivered together, oldest first, each in its own `<comment>` block of the run context.
@@ -48,7 +48,7 @@ Behaviour common to all sources:
   - The session gets a `thought` at once, and the result of the run when it ends, like a first run.
   - A message that arrives while the ticket has a run is kept (see below), and the session is told so.
   - A reply in a session of a ticket that ochell has never worked on is taken as a new assignment.
-  - Who wrote the reply is checked against `allowed_assigners`, like an assignment. Whether the payload names the author of a prompt was not checked against Linear; without one, the creator of the session counts.
+  - Who wrote the reply is checked against `allowed_follow_ups` (see [Guards and the admin channel](#guards-and-the-admin-channel)). Whether the payload names the author of a prompt was not checked against Linear; without one, the creator of the session counts.
   - The `stop` signal is not handled yet.
 
 ### Retry and stall detection
@@ -209,7 +209,7 @@ repos:
 - With no `repos` at all, every ticket runs, without a repository.
 
 ### Guards and the admin channel
-Three limits on what starts a run, and one way to talk to the running ochell.
+Limits on what starts a run, and one way to talk to the running ochell.
 
 - **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). **A message from a person (a reply in the ticket's Linear session, a comment on the Jira ticket) starts the count again**: the cap is there to stop what runs without anyone looking, and here someone looked. The attempt number in the prompt still counts every run. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear> <KEY>` sets the count back to zero; then assign the ticket again.
 - **Pause:** `ochell pause` holds the queue. No new run starts; running agents go on; webhooks are still accepted and queued. `ochell resume` ends it, and the queued tasks run. Both take effect at once, without a restart, and a pause is kept across a restart. `ochell status` says which it is, and how many tasks are queued and running.
@@ -220,6 +220,19 @@ Three limits on what starts a run, and one way to talk to the running ochell.
   | Jira system webhook | `user.accountId` of the event: the user who made the change | 403 |
   | Jira Automation | `initiatorAccountId` in the request body: add `"initiatorAccountId": "{{initiator.accountId}}"` to the rule's body. A request without it is rejected with 400 | 403 |
   | Linear | the id or the email address of `agentSession.creator` (or `creatorId`). If the payload has neither, the assignment is rejected. Those fields were not checked against Linear | 200, and an `error` activity in the session |
+
+- **Follow-up allowlist:** `allowed_follow_ups` of `jira_webhook` and of `linear` says who may send the agent a follow-up (a comment on the Jira ticket, a reply in the Linear session).
+
+  | Entry | Who it allows |
+  |---|---|
+  | a Jira accountId; a Linear user id or email address | that person, on every ticket |
+  | `assigner` | who assigned this ticket to the bot. ochell records that with each assignment: the same person `allowed_assigners` checks |
+  | `reporter` | the reporter of the Jira issue, when the comment's payload names one. Linear has no such field in its payload |
+
+  - **Empty (the default): the people of `allowed_assigners`** may follow up, and everyone when that is empty too.
+  - **A message from anyone else is not passed on.** It starts no run and is not kept for a later one. Its author is told why: an `error` activity in the Linear session, a comment on the Jira ticket. That happens once per author and ticket in 24 hours, not after every message.
+  - A ticket whose assigner ochell does not know (a Jira Automation rule that sends no initiator) has no `assigner`.
+  - Message text is never a way in: what a comment says does not change who may send one, or what the agent may do.
 
 **The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The four commands above find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
 - Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port: the agent runs on the same host and can reach any local port. With the `systemd` launcher the agent is another user and cannot open the socket; with the `direct` launcher it is the same user and can.

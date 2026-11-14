@@ -48,6 +48,7 @@ type User struct {
 type Fields struct {
 	Summary    string   `json:"summary"`
 	Assignee   *User    `json:"assignee"`
+	Reporter   *User    `json:"reporter"`
 	Labels     []string `json:"labels"`
 	Components []struct {
 		Name string `json:"name"`
@@ -191,9 +192,10 @@ type Comment struct {
 	// display name.
 	Author     string
 	AuthorName string
-	// Assignee is the accountId of the issue's assignee, as far as the
-	// payload has it.
+	// Assignee and Reporter are the accountIds of the issue's assignee and
+	// reporter, as far as the payload has them.
 	Assignee string
+	Reporter string
 }
 
 // ParseComment returns the comment of a "comment_created" webhook, and
@@ -229,6 +231,9 @@ func ParseComment(body []byte) (*Comment, error) {
 	}
 	if a := ev.Issue.Fields.Assignee; a != nil {
 		c.Assignee = a.AccountID
+	}
+	if r := ev.Issue.Fields.Reporter; r != nil {
+		c.Reporter = r.AccountID
 	}
 	return c, nil
 }

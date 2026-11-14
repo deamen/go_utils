@@ -193,6 +193,17 @@ func (r *Runner) FollowUp(t *task.Task, addressed bool) (later bool, err error) 
 	return later, nil
 }
 
+// Assigner returns who last assigned a ticket to the bot, as the source
+// named them, or "" when the source did not say. known is false for a
+// ticket that ochell has never seen.
+func (r *Runner) Assigner(source, key string) (assigner string, known bool, err error) {
+	tk, err := r.store.Ticket(source, key)
+	if err != nil || tk == nil {
+		return "", false, err
+	}
+	return tk.Assigner, true, nil
+}
+
 // TicketOfSession returns the key of the ticket that reports to a tracker
 // session, or "" when ochell knows none.
 func (r *Runner) TicketOfSession(source, session string) (string, error) {

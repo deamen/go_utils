@@ -176,6 +176,11 @@ sources:
     # Optional: the Jira accountIds of the people who may assign work. An
     # assignment by anyone else is rejected with 403. Empty: everyone.
     allowed_assigners: []
+    # Optional: who may send follow-ups and stops in comments on a ticket.
+    # Jira accountIds, and the words "assigner" (who assigned this ticket to
+    # the bot) and "reporter" (the ticket's reporter). Empty: the same
+    # people as allowed_assigners.
+    allowed_follow_ups: []      # e.g. [assigner, reporter]
     # A payload whose "timestamp" is further than this from now is rejected,
     # so a captured request cannot be replayed later. Jira retries a failed
     # delivery up to five times, 5 to 15 minutes apart, and a retry may carry
@@ -224,6 +229,10 @@ sources:
     # Optional: the Linear user ids or email addresses of the people who may
     # delegate work. Empty: everyone.
     allowed_assigners: []
+    # Optional: who may send follow-ups and stops in an agent session.
+    # Linear user ids or email addresses, and the word "assigner" (who
+    # delegated this issue). Empty: the same people as allowed_assigners.
+    allowed_follow_ups: []      # e.g. [assigner]
     organization_id: ""     # optional: only accept installs into this workspace
     external_url: ""        # optional: e.g. https://runs.example.com/{{.ID}}
 

@@ -51,6 +51,9 @@ type Submitter interface {
 	// person wrote to the agent itself, not only on the ticket. later: the
 	// ticket is in progress, and the message is kept for its next run.
 	FollowUp(t *task.Task, addressed bool) (later bool, err error)
+	// Assigner returns who last assigned a ticket to the bot, as the
+	// source named them, or "". known: ochell has seen the ticket.
+	Assigner(source, key string) (assigner string, known bool, err error)
 	// TicketOfSession returns the key of the ticket that reports to a
 	// tracker session, or "".
 	TicketOfSession(source, session string) (string, error)
@@ -351,6 +354,55 @@ func mayAssign(allowed []string, ids ...string) bool {
 	return false
 }
 
+// Words in allowed_follow_ups that stand for a person of the ticket.
+const (
+	followerAssigner = "assigner"
+	followerReporter = "reporter"
+)
+
+// mayFollowUp reports whether the author of a message, named by ids, may
+// send follow-ups and stops on a ticket.
+//
+// followers is allowed_follow_ups of the source. When it is empty, the
+// people who may assign work may also follow up (assigners; empty:
+// everyone). Otherwise the author must be on it: by id or email address, as
+// the person who assigned this ticket ("assigner"), or as its reporter
+// ("reporter", when the source names one).
+func (s *Server) mayFollowUp(source, key string, followers, assigners []string, reporter string, ids ...string) bool {
+	if len(followers) == 0 {
+		return mayAssign(assigners, ids...)
+	}
+	var allowed []string
+	for _, f := range followers {
+		switch strings.ToLower(strings.TrimSpace(f)) {
+		case followerAssigner:
+			a, _, err := s.runner.Assigner(source, key)
+			if err != nil {
+				s.log.Error("cannot look up who assigned the ticket", "source", source, "key", key, "err", err)
+			}
+			allowed = append(allowed, a)
+		case followerReporter:
+			allowed = append(allowed, reporter)
+		default:
+			allowed = append(allowed, f)
+		}
+	}
+	for _, id := range ids {
+		if id != "" && slices.ContainsFunc(allowed, func(a string) bool { return a != "" && strings.EqualFold(a, id) }) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstRefusal reports whether this is the first message of an author that
+// was refused on a ticket in the last day, so that they are told once and
+// not after every comment.
+func (s *Server) firstRefusal(source, key, author string) bool {
+	isNew, err := s.seen.AddDelivery("refused:"+source+":"+key+":"+strings.ToLower(author), dedupTTL)
+	return err == nil && isNew
+}
+
 // submit queues t and writes the HTTP response. labels are the ticket's
 // labels, for the repository mapping.
 func (s *Server) submit(w http.ResponseWriter, t *task.Task, labels []string, log *slog.Logger) submitResult {
@@ -474,7 +526,9 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	if s.firstDelivery(w, keys, log) != deliveryNew {
 		return
 	}
-	res := s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery), t.Labels, log)
+	tk := s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery)
+	tk.Actor = t.Actor
+	res := s.submit(w, tk, t.Labels, log)
 	if res == submitFailed {
 		s.forgetDelivery(keys, log)
 	}
@@ -523,12 +577,22 @@ func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error
 		log.Warn("rejecting invalid ticket key", "key", c.Key)
 		reply(w, http.StatusBadRequest, "invalid ticket key")
 		return
-	case !mayAssign(cfg.AllowedAssigners, c.Author):
-		log.Warn("ignored: the author of the comment is not on the allowlist", "key", c.Key, "author", c.Author)
-		reply(w, http.StatusOK, "ignored: the author is not allowed")
-		return
 	}
 	if s.firstDelivery(w, keys, log) != deliveryNew {
+		return
+	}
+	if !s.mayFollowUp("jira", c.Key, cfg.AllowedFollowUps, cfg.AllowedAssigners, c.Reporter, c.Author) {
+		// Comment text never widens who may direct the agent. The author
+		// is told once, and only on a ticket that ochell knows.
+		log.Warn("ignored: the author of the comment may not send follow-ups", "key", c.Key, "author", c.Author)
+		if _, known, _ := s.runner.Assigner("jira", c.Key); known && s.firstRefusal("jira", c.Key, c.Author) {
+			who := c.AuthorName
+			if who == "" {
+				who = "its author"
+			}
+			s.jiraComment(c.Key, "The last comment was not passed on to the digital employee: "+who+" is not on the list of people who may send it messages on this ticket.", log)
+		}
+		reply(w, http.StatusOK, "ignored: the author is not allowed")
 		return
 	}
 	t := s.newTask("jira", c.Key, c.Summary, c.URL, "", delivery)
@@ -603,7 +667,9 @@ func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 	}
 	// Automation has no delivery id; the runner's per-ticket in-flight guard
 	// prevents duplicate concurrent runs.
-	s.jiraNotStarted(s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", ""), t.Labels, log), t.Key, log)
+	tk := s.newTask("jira", t.Key, t.Summary, t.URL, "", "")
+	tk.Actor = t.Actor
+	s.jiraNotStarted(s.submit(w, tk, t.Labels, log), t.Key, log)
 }
 
 func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
@@ -638,6 +704,10 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 	if s.firstDelivery(w, keys, log) != deliveryNew {
 		return
 	}
+	if sess.Prompted {
+		s.linearPrompted(w, sess, keys, delivery, log)
+		return
+	}
 	if !mayAssign(cfg.AllowedAssigners, sess.Actor, sess.ActorEmail) {
 		// The delivery stays handled, and the session gets an answer: it
 		// must not look unanswered, and a retry must not post twice.
@@ -647,14 +717,20 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusOK, "the assigner is not allowed to assign work")
 		return
 	}
-	if sess.Prompted {
-		s.linearPrompted(w, sess, keys, delivery, log)
-		return
-	}
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, sess.Context, delivery)
 	t.TrackerSession = sess.SessionID
 	t.Comment = sess.Comment
+	t.Actor = linearActor(sess)
 	s.linearSubmit(w, t, sess, keys, log)
+}
+
+// linearActor is how a Linear user is remembered as the assigner of a
+// ticket: by id, or by email address when the payload has no id.
+func linearActor(sess *linear.Session) string {
+	if sess.Actor != "" {
+		return sess.Actor
+	}
+	return sess.ActorEmail
 }
 
 // linearPrompted handles a message that a person wrote to the agent in a
@@ -696,6 +772,18 @@ func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, key
 		reply(w, http.StatusBadRequest, "invalid ticket key")
 		return
 	}
+	cfg := s.cfg.Sources.Linear
+	if !s.mayFollowUp("linear", sess.Key, cfg.AllowedFollowUps, cfg.AllowedAssigners, "", sess.Actor, sess.ActorEmail) {
+		// Message text never widens who may direct the agent. The author
+		// is told once.
+		log.Warn("ignored: the author of the message may not send follow-ups", "key", sess.Key, "author", sess.Actor, "email", sess.ActorEmail)
+		if s.firstRefusal("linear", sess.Key, linearActor(sess)) {
+			s.linearActivity(sess.SessionID, linear.ActivityError,
+				"This message was not passed on to the digital employee: you are not on the list of people who may send it messages on "+sess.Key+".", log)
+		}
+		reply(w, http.StatusOK, "ignored: the author is not allowed")
+		return
+	}
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, "", delivery)
 	t.TrackerSession = sess.SessionID
 	t.Comment = text
@@ -711,7 +799,15 @@ func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, key
 		reply(w, http.StatusOK, "queued "+t.ID)
 	case errors.Is(err, store.ErrUnknown):
 		// ochell has never worked on this ticket: the message is its
-		// assignment.
+		// assignment, if its author may assign work.
+		if !mayAssign(cfg.AllowedAssigners, sess.Actor, sess.ActorEmail) {
+			log.Warn("rejected: the assigner is not on the allowlist", "key", sess.Key, "assigner", sess.Actor, "email", sess.ActorEmail)
+			s.linearActivity(sess.SessionID, linear.ActivityError,
+				"The digital employee did not start work on "+sess.Key+": you are not on the list of people who may delegate work to it.", log)
+			reply(w, http.StatusOK, "the assigner is not allowed to assign work")
+			return
+		}
+		t.Actor = linearActor(sess)
 		s.linearSubmit(w, t, sess, keys, log)
 	default:
 		// 503 makes Linear retry later.
