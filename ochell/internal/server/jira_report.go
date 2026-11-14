@@ -51,9 +51,14 @@ func jiraStarted(t *task.Task) string {
 	return "The digital employee started work on this ticket."
 }
 
+// replyHint tells the people on a Jira ticket how to answer the agent.
+const replyHint = "Reply in a comment on this ticket, and the digital employee goes on from there."
+
 // jiraFinished is the comment for the end of a run. It says the same as
-// the activity that a Linear session gets.
-func jiraFinished(res task.Result) string {
+// the activity that a Linear session gets. canReply: a comment on the
+// ticket reaches ochell, so a run that waits for a person says how to
+// answer.
+func jiraFinished(res task.Result, canReply bool) string {
 	if res.Next != "" {
 		return queuedAgainText(res)
 	}
@@ -66,6 +71,8 @@ func jiraFinished(res task.Result) string {
 		if res.PRURL != "" {
 			msg += "\n\nPull request: " + res.PRURL
 		}
+	} else if canReply {
+		msg += "\n\n" + replyHint
 	}
 	return msg
 }
@@ -89,7 +96,8 @@ func (s *Server) jiraRunStarted(ctx context.Context, t *task.Task) error {
 func (s *Server) jiraRunFinished(ctx context.Context, t *task.Task, res task.Result) error {
 	ctx, cancel := context.WithTimeout(ctx, 2*jiraCallBy)
 	defer cancel()
-	if err := s.jira.Comment(ctx, t.Key, jiraFinished(res)); err != nil {
+	// Comments reach ochell through the system webhook only.
+	if err := s.jira.Comment(ctx, t.Key, jiraFinished(res, s.cfg.Sources.JiraWebhook.Enabled)); err != nil {
 		return err
 	}
 	// Only finished work is handed to the reviewers.

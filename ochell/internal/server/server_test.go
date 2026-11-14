@@ -38,6 +38,8 @@ type fakeRunner struct {
 	// closed are the tickets that were reported as closed, as source:key.
 	closed []string
 	err    error
+	// addressed is what the last FollowUp was called with.
+	addressed bool
 	// submitErr is returned by Submit only, followErr by FollowUp only.
 	submitErr error
 	followErr error
@@ -47,7 +49,7 @@ type fakeRunner struct {
 
 // FollowUp accepts a message for the tickets in known, and for every ticket
 // when known is nil.
-func (f *fakeRunner) FollowUp(t *task.Task) error {
+func (f *fakeRunner) FollowUp(t *task.Task, addressed bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
@@ -57,6 +59,7 @@ func (f *fakeRunner) FollowUp(t *task.Task) error {
 		return f.followErr
 	}
 	t.Cause = task.CauseFollowUp
+	f.addressed = addressed
 	f.tasks = append(f.tasks, t)
 	return nil
 }
@@ -703,7 +706,7 @@ func TestJiraBackChannel(t *testing.T) {
 
 	// A question is asked on the ticket, and the ticket is not moved.
 	got = run("DEV-2", 2, task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput, SignalMessage: "Which login page?"})
-	if got[0] != "The digital employee is working on this ticket again (attempt 2)." || got[1] != "Which login page?" {
+	if got[0] != "The digital employee is working on this ticket again (attempt 2)." || got[1] != "Which login page?\n\n"+replyHint {
 		t.Errorf("comments = %q", got)
 	}
 	if st := jira.Status("DEV-2"); st != "" {
@@ -851,5 +854,111 @@ func TestLinearFollowUp(t *testing.T) {
 	body, hdr = linearPrompt("session-1", "ENG-7", "do it")
 	if w := do(s2, "/webhooks/linear", body, hdr); w.Code != 200 || len(fr2.tasks) != 0 {
 		t.Errorf("a follow-up from outside the allowlist: %d %s, %d tasks", w.Code, w.Body, len(fr2.tasks))
+	}
+}
+
+// jiraComment builds a signed "comment_created" event of the Jira system
+// webhook.
+func jiraComment(key, author, assignee, text string) (string, map[string]string) {
+	fields := map[string]any{"summary": "Summary of " + key}
+	if assignee != "" {
+		fields["assignee"] = map[string]string{"accountId": assignee}
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"timestamp":    time.Now().UnixMilli(),
+		"webhookEvent": "comment_created",
+		"comment":      map[string]any{"id": "10001", "body": text, "author": map[string]string{"accountId": author, "displayName": "A Person"}},
+		"issue":        map[string]any{"id": "10042", "key": key, "self": "https://example.atlassian.net/rest/api/2/issue/10042", "fields": fields},
+	})
+	return string(raw), map[string]string{"X-Hub-Signature": "sha256=" + auth.SignHex("jira-secret", raw)}
+}
+
+// A comment of a person on a Jira ticket that ochell holds starts a run
+// with the comment. A comment by the bot account never does.
+func TestJiraCommentFollowUp(t *testing.T) {
+	fr := &fakeRunner{}
+	s := newServer(t, testConfig(), fr)
+	post := func(key, author, assignee, text string) *httptest.ResponseRecorder {
+		body, hdr := jiraComment(key, author, assignee, text)
+		return do(s, "/webhooks/jira", body, hdr)
+	}
+
+	w := post("DEV-42", "557058:human", bot, "  Use the second login page.\nThanks!  ")
+	if w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued ") {
+		t.Fatalf("a human comment: %d %s", w.Code, w.Body)
+	}
+	if len(fr.tasks) != 1 {
+		t.Fatalf("tasks = %d", len(fr.tasks))
+	}
+	tk := fr.tasks[0]
+	if tk.Source != "jira" || tk.Key != "DEV-42" || tk.Comment != "Use the second login page.\nThanks!" || tk.Cause != task.CauseFollowUp ||
+		tk.Title != "Summary of DEV-42" || tk.URL != "https://example.atlassian.net/browse/DEV-42" {
+		t.Errorf("task = %+v", tk)
+	}
+	// A comment is on the ticket, not addressed to the agent: it counts
+	// only while ochell holds the ticket.
+	if fr.addressed {
+		t.Error("a Jira comment was passed on as addressed to the agent")
+	}
+
+	for name, c := range map[string]struct {
+		author, assignee, text string
+		want                   string
+	}{
+		// The loop guard.
+		"by the bot":                 {bot, bot, "The digital employee started work on this ticket.", "ignored: comment by the bot"},
+		"no author":                  {"", bot, "hello", "ignored"},
+		"ticket of someone else":     {"557058:human", "557058:other", "hello", "ignored"},
+		"no text":                    {"557058:human", bot, "  \n ", "ignored"},
+		"the stop command, not yet":  {"557058:human", bot, "/stop\nplease", "ignored"},
+		"without the assignee field": {"557058:human", "", "and add a test", "queued "},
+	} {
+		before := len(fr.tasks)
+		w := post("DEV-42", c.author, c.assignee, c.text)
+		if w.Code != 200 || !strings.HasPrefix(w.Body.String(), c.want) {
+			t.Errorf("%s: %d %q, want %q", name, w.Code, w.Body.String(), c.want)
+		}
+		if queued := len(fr.tasks) > before; queued != (c.want == "queued ") {
+			t.Errorf("%s: queued = %v", name, queued)
+		}
+	}
+
+	// What the runner says about the ticket.
+	for name, c := range map[string]struct {
+		err  error
+		code int
+		want string
+	}{
+		"a ticket ochell never worked on": {store.ErrUnknown, 200, "ignored"},
+		"a ticket that is done":           {store.ErrReleased, 200, "ignored"},
+		"a ticket in progress":            {runner.ErrBusy, 200, "already in progress"},
+		"the store fails":                 {errors.New("disk full"), 503, "cannot queue task"},
+	} {
+		fr.followErr = c.err
+		if w := post("DEV-43", "557058:human", bot, "comment: "+name); w.Code != c.code || !strings.HasPrefix(w.Body.String(), c.want) {
+			t.Errorf("%s: %d %q, want %d %q", name, w.Code, w.Body.String(), c.code, c.want)
+		}
+	}
+	// After the 503 Jira sends the delivery again, and it is taken.
+	fr.followErr = nil
+	body, hdr := jiraComment("DEV-44", "557058:human", bot, "again")
+	fr.followErr = errors.New("disk full")
+	do(s, "/webhooks/jira", body, hdr)
+	fr.followErr = nil
+	if w := do(s, "/webhooks/jira", body, hdr); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued ") {
+		t.Errorf("the retried delivery: %d %s", w.Code, w.Body)
+	}
+	if w := do(s, "/webhooks/jira", body, hdr); !strings.Contains(w.Body.String(), "duplicate") {
+		t.Errorf("the same delivery a third time: %d %s", w.Code, w.Body)
+	}
+
+	// The allowlist of assigners covers comments.
+	cfg := testConfig()
+	cfg.Sources.JiraWebhook.AllowedAssigners = []string{"557058:lead"}
+	fr2 := &fakeRunner{}
+	s2 := newServer(t, cfg, fr2)
+	body, hdr = jiraComment("DEV-42", "557058:human", bot, "do it")
+	if w := do(s2, "/webhooks/jira", body, hdr); w.Code != 200 || len(fr2.tasks) != 0 {
+		t.Errorf("a comment from outside the allowlist: %d %s, %d tasks", w.Code, w.Body, len(fr2.tasks))
 	}
 }

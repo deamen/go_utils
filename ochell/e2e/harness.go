@@ -586,6 +586,39 @@ func (o *Ochell) JiraResolved(key string) Response {
 	})
 }
 
+// JiraCommented sends a signed Jira system webhook: someone added a comment
+// to a ticket that is assigned to the digital employee. An empty author is
+// the person who assigns the tickets; BotAccountID is the bot itself.
+func (o *Ochell) JiraCommented(key, author, text string) Response {
+	o.t.Helper()
+	if author == "" {
+		author = o.actor()
+	}
+	body, err := json.Marshal(map[string]any{
+		"timestamp":    time.Now().UnixMilli(),
+		"webhookEvent": "comment_created",
+		"comment": map[string]any{
+			"id": "20001", "body": text,
+			"author": map[string]string{"accountId": author, "displayName": "Someone"},
+		},
+		"issue": map[string]any{
+			"id": "10042", "key": key,
+			"self": "https://example.atlassian.net/rest/api/2/issue/10042",
+			"fields": map[string]any{
+				"summary":  "Summary of " + key,
+				"assignee": map[string]string{"accountId": BotAccountID},
+			},
+		},
+	})
+	if err != nil {
+		o.t.Fatal(err)
+	}
+	return o.Post(o.Config.Sources.JiraWebhook.Path, body, map[string]string{
+		"X-Hub-Signature":                "sha256=" + auth.SignHex(JiraSecret, body),
+		"X-Atlassian-Webhook-Identifier": nextDelivery(),
+	})
+}
+
 // JiraAutomation sends a Jira Automation "Send web request" call.
 func (o *Ochell) JiraAutomation(key, summary string) Response {
 	o.t.Helper()

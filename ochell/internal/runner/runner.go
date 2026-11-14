@@ -166,20 +166,24 @@ func (r *Runner) Submit(t *task.Task) error {
 }
 
 // FollowUp queues a run of a ticket that ochell already knows, for a
-// message that a person wrote to the agent (t.Comment). It never blocks. It
-// returns store.ErrUnknown for a ticket that ochell has never seen, ErrBusy
-// when the ticket already has a queued or running task, and ErrQueueFull.
+// message from a person (t.Comment). It never blocks. It returns
+// store.ErrUnknown for a ticket that ochell has never seen, ErrBusy when the
+// ticket already has a queued or running task, and ErrQueueFull.
+//
+// addressed says that the person wrote to the agent itself (a Linear agent
+// session). A comment on the ticket (Jira) is not addressed: it counts only
+// while ochell holds the ticket, and gets store.ErrReleased otherwise.
 //
 // The attempt cap does not stop it: a person asked for this run, and the
 // ticket's attempts count from here again.
-func (r *Runner) FollowUp(t *task.Task) error {
+func (r *Runner) FollowUp(t *task.Task, addressed bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.stopped {
 		return ErrStopped
 	}
 	t.Cause = task.CauseFollowUp
-	if err := r.store.FollowUp(t, store.Limits{MaxQueued: max(r.cfg.QueueSize, 1)}); err != nil {
+	if err := r.store.FollowUp(t, addressed, store.Limits{MaxQueued: max(r.cfg.QueueSize, 1)}); err != nil {
 		return err
 	}
 	r.wakeWorker()

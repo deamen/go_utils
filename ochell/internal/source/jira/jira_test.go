@@ -178,3 +178,36 @@ func TestCheckTimestamp(t *testing.T) {
 		}
 	}
 }
+
+func TestParseComment(t *testing.T) {
+	body := `{"timestamp":1760152365200,"webhookEvent":"comment_created",
+		"comment":{"id":"10001","body":"Use the second page.","author":{"accountId":"557058:human","displayName":"A Person"}},
+		"issue":{"id":"10042","key":"DEV-42","self":"https://example.atlassian.net/rest/api/2/issue/10042",
+			"fields":{"summary":"Fix the login page","assignee":{"accountId":"712020:bot"}}}}`
+	c, err := ParseComment([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Comment{Key: "DEV-42", Summary: "Fix the login page", URL: "https://example.atlassian.net/browse/DEV-42",
+		Body: "Use the second page.", Author: "557058:human", AuthorName: "A Person", Assignee: "712020:bot"}
+	if *c != want {
+		t.Errorf("comment = %+v\nwant %+v", *c, want)
+	}
+	// Other events are not comments.
+	for _, ev := range []string{"jira:issue_updated", "comment_updated", "comment_deleted"} {
+		if _, err := ParseComment([]byte(`{"webhookEvent":"` + ev + `","issue":{"key":"DEV-1"},"comment":{"body":"x"}}`)); !errors.Is(err, ErrIgnored) {
+			t.Errorf("%s: %v, want ErrIgnored", ev, err)
+		}
+	}
+	// A comment event that holds no issue or no comment is a bad payload.
+	for _, bad := range []string{`{"webhookEvent":"comment_created"}`, `{"webhookEvent":"comment_created","issue":{"key":"DEV-1"}}`, `{`} {
+		if _, err := ParseComment([]byte(bad)); err == nil || errors.Is(err, ErrIgnored) {
+			t.Errorf("%s: %v, want an error", bad, err)
+		}
+	}
+	// A body that is not text, and a comment without an author.
+	c, err = ParseComment([]byte(`{"webhookEvent":"comment_created","issue":{"key":"DEV-1"},"comment":{"body":{"type":"doc","content":[]}}}`))
+	if err != nil || c.Body != "" || c.Author != "" || c.Assignee != "" {
+		t.Errorf("comment = %+v, %v", c, err)
+	}
+}
