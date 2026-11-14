@@ -129,6 +129,11 @@ var migrations = []string{
 
 	// Version 10: a queued run that must wait, for the backoff of a retry.
 	`ALTER TABLE runs ADD COLUMN not_before INTEGER NOT NULL DEFAULT 0;`,
+
+	// Version 11: the attempt count at the last message from a person. The
+	// attempt cap counts from there.
+	`ALTER TABLE tickets ADD COLUMN attempts_base INTEGER NOT NULL DEFAULT 0;
+	CREATE INDEX runs_by_session ON runs (source, tracker_session);`,
 }
 
 // Store is safe for concurrent use.
@@ -246,8 +251,42 @@ func (s *Store) move(tx *sql.Tx, source, key string, to ticket.State, reason tic
 type Limits struct {
 	// MaxQueued is how many runs may wait in the queue.
 	MaxQueued int
-	// MaxAttempts is how many runs one ticket may have had.
+	// MaxAttempts is how many runs one ticket may have had since a person
+	// last wrote to the agent (FollowUp) or the count was reset.
 	MaxAttempts int
+}
+
+// attemptsLeft reports whether a ticket may have another run under the
+// attempt cap max (0: no cap). The cap is there to stop what ochell starts
+// by itself, so it counts the runs since the last message from a person.
+func attemptsLeft(tx *sql.Tx, source, key string, max int) (bool, error) {
+	if max <= 0 {
+		return true, nil
+	}
+	var used int
+	err := tx.QueryRow(`SELECT attempts - attempts_base FROM tickets WHERE source = ? AND key = ?`, source, key).Scan(&used)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	return used < max, err
+}
+
+// queueFull reports whether max runs (0: no limit) are already waiting.
+func queueFull(tx *sql.Tx, max int) (bool, error) {
+	if max <= 0 {
+		return false, nil
+	}
+	var n int
+	err := tx.QueryRow(`SELECT COUNT(*) FROM runs WHERE status = ?`, runQueued).Scan(&n)
+	return n >= max, err
+}
+
+// insertRun adds the queued run of t.
+func insertRun(tx *sql.Tx, t *task.Task) error {
+	_, err := tx.Exec(`INSERT INTO runs (id, source, key, status, context, comment, tracker_session, delivery_id, received_at, cause)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Source, t.Key, runQueued, t.Context, t.Comment, t.TrackerSession, t.DeliveryID, ms(t.Received), t.Cause)
+	return err
 }
 
 // Enqueue records t as a queued run of its ticket. It returns ErrBusy when
@@ -264,23 +303,15 @@ func (s *Store) Enqueue(t *task.Task, lim Limits) error {
 		if from.Active() {
 			return ErrBusy
 		}
-		if lim.MaxAttempts > 0 && from != ticket.None {
-			var attempts int
-			if err := tx.QueryRow(`SELECT attempts FROM tickets WHERE source = ? AND key = ?`, t.Source, t.Key).Scan(&attempts); err != nil {
-				return err
-			}
-			if attempts >= lim.MaxAttempts {
-				return ErrAttempts
-			}
+		if ok, err := attemptsLeft(tx, t.Source, t.Key, lim.MaxAttempts); err != nil {
+			return err
+		} else if !ok {
+			return ErrAttempts
 		}
-		if lim.MaxQueued > 0 {
-			var n int
-			if err := tx.QueryRow(`SELECT COUNT(*) FROM runs WHERE status = ?`, runQueued).Scan(&n); err != nil {
-				return err
-			}
-			if n >= lim.MaxQueued {
-				return ErrQueueFull
-			}
+		if full, err := queueFull(tx, lim.MaxQueued); err != nil {
+			return err
+		} else if full {
+			return ErrQueueFull
 		}
 		if err := s.upsert(tx, t, now); err != nil {
 			return err
@@ -288,11 +319,61 @@ func (s *Store) Enqueue(t *task.Task, lim Limits) error {
 		if err := s.move(tx, t.Source, t.Key, ticket.Queued, ""); err != nil {
 			return err
 		}
-		_, err = tx.Exec(`INSERT INTO runs (id, source, key, status, context, comment, tracker_session, delivery_id, received_at, cause)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			t.ID, t.Source, t.Key, runQueued, t.Context, t.Comment, t.TrackerSession, t.DeliveryID, ms(t.Received), t.Cause)
-		return err
+		return insertRun(tx, t)
 	})
+}
+
+// FollowUp queues a run of a ticket that ochell already knows, for a
+// message that a person wrote to the agent (t.Comment). The ticket keeps
+// its repository, and its title and URL where t has none.
+//
+// A person has looked at the ticket, so its attempts count from here again.
+//
+// It returns ErrUnknown for a ticket that ochell has never seen, ErrBusy
+// when the ticket has a queued or running run, and ErrQueueFull.
+func (s *Store) FollowUp(t *task.Task, lim Limits) error {
+	return s.tx(func(tx *sql.Tx) error {
+		from, err := state(tx, t.Source, t.Key)
+		if err != nil {
+			return err
+		}
+		switch {
+		case from == ticket.None:
+			return ErrUnknown
+		case from.Active():
+			return ErrBusy
+		}
+		if full, err := queueFull(tx, lim.MaxQueued); err != nil {
+			return err
+		} else if full {
+			return ErrQueueFull
+		}
+		if _, err := tx.Exec(`UPDATE tickets SET attempts_base = attempts,
+				title = CASE WHEN ? != '' THEN ? ELSE title END,
+				url = CASE WHEN ? != '' THEN ? ELSE url END
+			WHERE source = ? AND key = ?`, t.Title, t.Title, t.URL, t.URL, t.Source, t.Key); err != nil {
+			return err
+		}
+		if err := s.move(tx, t.Source, t.Key, ticket.Queued, ""); err != nil {
+			return err
+		}
+		return insertRun(tx, t)
+	})
+}
+
+// TicketOfSession returns the key of the ticket whose run reported to this
+// tracker session (a Linear agent session), or "" when there is none.
+func (s *Store) TicketOfSession(source, session string) (string, error) {
+	if session == "" {
+		return "", nil
+	}
+	var key string
+	err := s.db.QueryRow(`SELECT key FROM runs WHERE source = ? AND tracker_session = ? ORDER BY received_at DESC, rowid DESC LIMIT 1`,
+		source, session).Scan(&key)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return key, err
 }
 
 // upsert records the ticket of t, or brings its title, URL and repository
@@ -377,7 +458,7 @@ func (s *Store) Counts() (queued, running int, err error) {
 // ticket that reached its limit can be started again. It returns ErrUnknown
 // for a ticket that ochell has never seen.
 func (s *Store) ResetAttempts(source, key string) error {
-	r, err := s.db.Exec(`UPDATE tickets SET attempts = 0 WHERE source = ? AND key = ?`, source, key)
+	r, err := s.db.Exec(`UPDATE tickets SET attempts = 0, attempts_base = 0 WHERE source = ? AND key = ?`, source, key)
 	if err != nil {
 		return err
 	}
@@ -469,12 +550,17 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result, again *Again) (qu
 		return false, err
 	}
 	var source, key string
-	var attempts int
-	if err := tx.QueryRow(`SELECT r.source, r.key, t.attempts FROM runs r JOIN tickets t USING (source, key) WHERE r.id = ?`, id).
-		Scan(&source, &key, &attempts); err != nil {
+	if err := tx.QueryRow(`SELECT source, key FROM runs WHERE id = ?`, id).Scan(&source, &key); err != nil {
 		return false, err
 	}
-	if again == nil || (again.MaxAttempts > 0 && attempts >= again.MaxAttempts) {
+	left := again != nil
+	if left {
+		var err error
+		if left, err = attemptsLeft(tx, source, key, again.MaxAttempts); err != nil {
+			return false, err
+		}
+	}
+	if !left {
 		to, reason := ticket.AfterRun(res.Outcome, res.Signal)
 		return false, s.move(tx, source, key, to, reason)
 	}

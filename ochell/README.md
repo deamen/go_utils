@@ -27,7 +27,13 @@ Behaviour common to all sources:
 - **One run per ticket:** a ticket that is already queued or running is not started again. The request is answered with 200 `already in progress`. A new Linear session on such a ticket gets a `response` activity that says so, which closes that session; the result is posted in the first session.
 - **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the run ends it posts what the agent reported in its result file (see [The result file](#the-result-file)): a `response` for finished work, an `elicitation` for anything that needs a human. A run that failed, timed out or was stopped gets an `error`.
 - **Jira ticket updates:** with the Jira API configured (see [Jira API access](#jira-api-access)), ochell comments on a Jira ticket when a run starts, and again when it ends, with the same text a Linear session gets: the agent's message and its pull request, its question, or why the run failed. A ticket that was accepted but not started (no repository, attempts used up) gets a comment that says so. With `review_status` the ticket is also moved to that status when the agent reports its work as done. Without the API a Jira ticket gets no answer.
-- **Linear follow-ups:** `prompted` events are logged but not yet delivered to an agent. So a reply to an `elicitation` does not start a run yet; delegate the ticket again.
+- **Linear follow-ups:** a reply in a Linear agent session (the `prompted` event) starts a new run of the ticket with that message, for example the answer to a question the agent asked.
+  - The run continues the **same agent session** as the ticket's earlier run when the adapter has sessions (`claude`), in the same working directory. The message is in the run context of the prompt, marked as a message from a person that does not change what the agent may do.
+  - The session gets a `thought` at once, and the result of the run when it ends, like a first run.
+  - A message that arrives while the agent is running is not delivered yet: the session is told to send it again later.
+  - A reply in a session of a ticket that ochell has never worked on is taken as a new assignment.
+  - Who wrote the reply is checked against `allowed_assigners`, like an assignment. Whether the payload names the author of a prompt was not checked against Linear; without one, the creator of the session counts.
+  - The `stop` signal is not handled yet.
 
 ### Retry and stall detection
 ochell starts a ticket again by itself in two cases. Both count as an attempt, so `agent.max_attempts` bounds them.
@@ -189,7 +195,7 @@ repos:
 ### Guards and the admin channel
 Three limits on what starts a run, and one way to talk to the running ochell.
 
-- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear> <KEY>` sets the count back to zero; then assign the ticket again.
+- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). **A message from a person in the ticket's Linear session starts the count again**: the cap is there to stop what runs without anyone looking, and here someone looked. The attempt number in the prompt still counts every run. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear> <KEY>` sets the count back to zero; then assign the ticket again.
 - **Pause:** `ochell pause` holds the queue. No new run starts; running agents go on; webhooks are still accepted and queued. `ochell resume` ends it, and the queued tasks run. Both take effect at once, without a restart, and a pause is kept across a restart. `ochell status` says which it is, and how many tasks are queued and running.
 - **Assigner allowlist:** `allowed_assigners` of a source, when it is not empty, lists who may assign work. Anyone else is rejected, and the rejection is logged with the ticket and the assigner. Nothing is stored for a rejected assignment.
 
@@ -345,7 +351,7 @@ The template sees the task (`.Source`, `.Key`, `.Title`, `.URL`, `.Repo`, `.Cont
 - that the earlier attempt was cut off by a temporary error, or was stopped as stalled, when ochell retries by itself (see [Retry and stall detection](#retry-and-stall-detection));
 - the recovery note, when the run takes the place of one that ochell cut short or did not see the end of (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down));
 - the branch and the pull request that earlier attempts reported in their result files, with the instruction to continue there;
-- the comment that started the run, when someone asked for it in one. Today that is a mention of the agent in a Linear comment. The comment is quoted as a message from a person on the ticket, with the note that it does not change what the agent may do.
+- the comment that started the run, when someone asked for it in one: a mention of the agent in a Linear comment, or a reply in the Linear agent session. The comment is quoted as a message from a person on the ticket, with the note that it does not change what the agent may do.
 
 ```
 Run context from the orchestrator:

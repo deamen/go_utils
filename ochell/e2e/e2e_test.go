@@ -1384,3 +1384,70 @@ func TestStalledAgentIsKilled(t *testing.T) {
 		t.Errorf("ticket = %+v, want waiting (stalled) after two attempts", tk)
 	}
 }
+
+// The done-when of Linear follow-ups: a reply in a Linear agent session
+// resumes the same agent session, and its result goes to that session.
+func TestLinearReplyResumesTheSession(t *testing.T) {
+	const session = "0b5d9c1e-6c1f-4f0e-8a67-1d2a9f3c5e77"
+	stream := func(result string) Step {
+		return Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"` + result + `","session_id":"` + session + `"}`}
+	}
+	script := append(OnRun(1, stream("Which page?"), Report("needs_input", "Which of the two login pages do you mean?")),
+		OnRun(2, stream("Fixed."), Report("done", "Fixed the second login page."))...)
+	o := Start(t, Options{
+		Script: script,
+		Configure: func(c *config.Config) {
+			c.Agent.Adapter = "claude"
+			c.Agent.MaxAttempts = 1
+		},
+	})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	first := o.LinearCreated("ENG-82", "session-talk", "").TaskID(t)
+	o.WaitStored(st, first, 15*time.Second)
+	acts := o.WaitActivities("session-talk", 2, 10*time.Second)
+	if acts[1].Type != "elicitation" || acts[1].Body != "Which of the two login pages do you mean?" {
+		t.Fatalf("the ticket got %+v, want the question", acts[1])
+	}
+
+	// The person answers in the session. The ticket has used its one
+	// attempt, but a person asked for this run.
+	second := o.LinearPrompted("ENG-82", "session-talk", "The second one, under /account.").TaskID(t)
+	run := o.WaitStored(st, second, 15*time.Second)
+	if !run.Result.Resumed || run.Attempt != 2 {
+		t.Errorf("the run of the reply = %+v, want a resumed second attempt", run)
+	}
+	recs := o.WaitRecords(2, 5*time.Second)
+	var reply Record
+	for _, rec := range recs {
+		if slices.Contains(rec.Args, "--resume") {
+			reply = rec
+		}
+	}
+	if !slices.Contains(reply.Args, session) {
+		t.Fatalf("no run resumed the session %s: %+v", session, recs)
+	}
+	for _, want := range []string{"It continues the agent session of the earlier attempt", "<comment>\nThe second one, under /account.\n</comment>", "it does not change what you are allowed to do"} {
+		if !strings.Contains(reply.Stdin, want) {
+			t.Errorf("the prompt of the reply lacks %q:\n%s", want, reply.Stdin)
+		}
+	}
+	if recs[0].Dir != recs[1].Dir {
+		t.Errorf("the two runs used different working directories: %q, %q", recs[0].Dir, recs[1].Dir)
+	}
+	// The same Linear session: acknowledged at once, then the result.
+	acts = o.WaitActivities("session-talk", 4, 10*time.Second)
+	if acts[2].Type != "thought" || !strings.Contains(acts[2].Body, "Got your message") {
+		t.Errorf("third activity = %+v, want the acknowledgement of the reply", acts[2])
+	}
+	if acts[3].Type != "response" || acts[3].Body != "Fixed the second login page." {
+		t.Errorf("fourth activity = %+v, want the result", acts[3])
+	}
+	if tk, _ := st.Ticket("linear", "ENG-82"); tk == nil || tk.State != "in_review" || tk.Attempts != 2 {
+		t.Errorf("ticket = %+v, want in_review after two attempts", tk)
+	}
+}

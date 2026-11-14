@@ -46,6 +46,13 @@ const (
 type Submitter interface {
 	// Submit queues a task.
 	Submit(*task.Task) error
+	// FollowUp queues a task for a message that a person wrote to the
+	// agent, on a ticket that ochell already knows (store.ErrUnknown
+	// otherwise).
+	FollowUp(*task.Task) error
+	// TicketOfSession returns the key of the ticket that reports to a
+	// tracker session, or "".
+	TicketOfSession(source, session string) (string, error)
 	// Hold records a ticket as waiting for a human, without a task.
 	Hold(*task.Task, ticket.Reason) error
 	// Closed is called when the tracker reports a ticket as closed.
@@ -542,13 +549,7 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 			s.closed(w, "linear", key, log)
 			return
 		}
-		if ev != nil && ev.Type == "AgentSessionEvent" && ev.Action == "prompted" {
-			// Follow-up messages are not delivered to a running agent yet.
-			log.Info("follow-up prompt received but not supported yet",
-				"session", ev.AgentSession.ID, "chars", len(ev.PromptText()))
-		} else {
-			log.Debug("ignored", "reason", err)
-		}
+		log.Debug("ignored", "reason", err)
 		reply(w, http.StatusOK, "ignored")
 		return
 	}
@@ -570,9 +571,85 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusOK, "the assigner is not allowed to assign work")
 		return
 	}
+	if sess.Prompted {
+		s.linearPrompted(w, sess, keys, delivery, log)
+		return
+	}
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, sess.Context, delivery)
 	t.TrackerSession = sess.SessionID
 	t.Comment = sess.Comment
+	s.linearSubmit(w, t, sess, keys, log)
+}
+
+// linearPrompted handles a message that a person wrote to the agent in a
+// session that exists. It starts a run of the ticket with the message; the
+// run continues the agent session of the ticket's earlier run, and reports
+// to the Linear session that the message came in.
+func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, keys []string, delivery string, log *slog.Logger) {
+	if sess.Key == "" {
+		// The payload does not name the issue: find it by the session.
+		key, err := s.runner.TicketOfSession("linear", sess.SessionID)
+		if err != nil {
+			log.Error("cannot look up the ticket of the session", "session", sess.SessionID, "err", err)
+			s.forgetDelivery(keys, log)
+			reply(w, http.StatusServiceUnavailable, "cannot look up the session")
+			return
+		}
+		sess.Key = key
+	}
+	text := strings.TrimSpace(sess.Prompt)
+	switch {
+	case sess.Stop:
+		// Stopping a run from the ticket is not supported yet.
+		log.Info("stop signal received but not supported yet", "session", sess.SessionID, "key", sess.Key)
+		reply(w, http.StatusOK, "ignored")
+		return
+	case sess.Key == "":
+		log.Warn("a message in a session that ochell does not know", "session", sess.SessionID)
+		s.linearActivity(sess.SessionID, linear.ActivityError,
+			"The digital employee does not know this session, so it cannot continue it. Delegate the issue again.", log)
+		reply(w, http.StatusOK, "unknown session")
+		return
+	case text == "":
+		log.Debug("ignored: a prompt without text", "session", sess.SessionID)
+		reply(w, http.StatusOK, "ignored")
+		return
+	}
+	if !validKey.MatchString(sess.Key) {
+		log.Warn("rejecting invalid ticket key", "key", sess.Key)
+		reply(w, http.StatusBadRequest, "invalid ticket key")
+		return
+	}
+	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, "", delivery)
+	t.TrackerSession = sess.SessionID
+	t.Comment = text
+	switch err := s.runner.FollowUp(t); {
+	case err == nil:
+		log.Info("follow-up queued", "task", t.ID, "key", t.Key, "session", sess.SessionID, "chars", len(text))
+		s.linearActivity(sess.SessionID, linear.ActivityThought,
+			"Got your message. The digital employee continues work on "+sess.Key+".", log)
+		reply(w, http.StatusOK, "queued "+t.ID)
+	case errors.Is(err, store.ErrUnknown):
+		// ochell has never worked on this ticket: the message is its
+		// assignment.
+		s.linearSubmit(w, t, sess, keys, log)
+	case errors.Is(err, runner.ErrBusy):
+		// Messages to a running agent are not queued yet.
+		log.Info("follow-up not delivered: the ticket is in progress", "key", t.Key)
+		s.linearActivity(sess.SessionID, linear.ActivityThought,
+			"The digital employee is still working on "+sess.Key+", and a message cannot reach it while it runs. Send your message again when this run has ended.", log)
+		reply(w, http.StatusOK, "already in progress")
+	default:
+		// 503 makes Linear retry later.
+		log.Error("cannot queue the follow-up", "key", t.Key, "err", err)
+		s.forgetDelivery(keys, log)
+		reply(w, http.StatusServiceUnavailable, "cannot queue task")
+	}
+}
+
+// linearSubmit queues t as a new assignment from a Linear session, writes
+// the HTTP response and answers the session.
+func (s *Server) linearSubmit(w http.ResponseWriter, t *task.Task, sess *linear.Session, keys []string, log *slog.Logger) {
 	// Linear marks a session unresponsive unless it sees an activity within
 	// ~10s of "created", so answer now rather than when the agent starts.
 	switch s.submit(w, t, sess.Labels, log) {

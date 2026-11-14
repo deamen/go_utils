@@ -38,8 +38,33 @@ type fakeRunner struct {
 	// closed are the tickets that were reported as closed, as source:key.
 	closed []string
 	err    error
-	// submitErr is returned by Submit only.
+	// submitErr is returned by Submit only, followErr by FollowUp only.
 	submitErr error
+	followErr error
+	// sessions maps a tracker session to its ticket key.
+	sessions map[string]string
+}
+
+// FollowUp accepts a message for the tickets in known, and for every ticket
+// when known is nil.
+func (f *fakeRunner) FollowUp(t *task.Task) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if f.followErr != nil {
+		return f.followErr
+	}
+	t.Cause = task.CauseFollowUp
+	f.tasks = append(f.tasks, t)
+	return nil
+}
+
+func (f *fakeRunner) TicketOfSession(source, session string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessions[session], f.err
 }
 
 func (f *fakeRunner) Closed(source, key string) error {
@@ -731,5 +756,100 @@ func TestJiraNotStartedIsCommented(t *testing.T) {
 	got := jira.Comments("DEV-42")
 	if len(got) != 1 || !strings.Contains(got[0], "no repository is configured") {
 		t.Errorf("comments = %q", got)
+	}
+}
+
+// linearPrompt builds a signed "prompted" event.
+func linearPrompt(session, issue, text string) (string, map[string]string) {
+	sess := map[string]any{"id": session, "creator": map[string]string{"id": "u-1", "email": "human@example.com"}}
+	if issue != "" {
+		sess["issue"] = map[string]string{"identifier": issue, "title": "Title of " + issue, "url": "https://linear.app/x/issue/" + issue}
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"type": "AgentSessionEvent", "action": "prompted", "agentSession": sess,
+		"agentActivity":    map[string]any{"content": map[string]string{"type": "prompt", "body": text}},
+		"webhookTimestamp": time.Now().UnixMilli(),
+	})
+	return string(raw), map[string]string{"Linear-Signature": auth.SignHex("linear-secret", raw)}
+}
+
+// A reply in a Linear agent session starts a run of the ticket with the
+// reply, which reports to that session.
+func TestLinearFollowUp(t *testing.T) {
+	fr := &fakeRunner{sessions: map[string]string{"session-known": "ENG-9"}}
+	s := newServer(t, testConfig(), fr)
+
+	body, hdr := linearPrompt("session-1", "ENG-7", "  use the second login page  ")
+	w := do(s, "/webhooks/linear", body, hdr)
+	if w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued ") {
+		t.Fatalf("follow-up: %d %s", w.Code, w.Body)
+	}
+	if len(fr.tasks) != 1 {
+		t.Fatalf("tasks = %d", len(fr.tasks))
+	}
+	tk := fr.tasks[0]
+	if tk.Source != "linear" || tk.Key != "ENG-7" || tk.Comment != "use the second login page" || tk.TrackerSession != "session-1" || tk.Cause != task.CauseFollowUp {
+		t.Errorf("task = %+v", tk)
+	}
+	// The same delivery again starts nothing.
+	if w := do(s, "/webhooks/linear", body, hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "duplicate") {
+		t.Errorf("repeated: %d %s", w.Code, w.Body)
+	}
+
+	// A payload that does not name the issue: the session says which ticket.
+	body, hdr = linearPrompt("session-known", "", "and add a test")
+	if w := do(s, "/webhooks/linear", body, hdr); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued ") {
+		t.Fatalf("follow-up by session: %d %s", w.Code, w.Body)
+	}
+	if tk := fr.tasks[1]; tk.Key != "ENG-9" || tk.Comment != "and add a test" {
+		t.Errorf("task = %+v", tk)
+	}
+	// A session that ochell does not know, and a prompt without text.
+	body, hdr = linearPrompt("session-unknown", "", "hello?")
+	if w := do(s, "/webhooks/linear", body, hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "unknown session") {
+		t.Errorf("unknown session: %d %s", w.Code, w.Body)
+	}
+	body, hdr = linearPrompt("session-1", "ENG-7", "   ")
+	if w := do(s, "/webhooks/linear", body, hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "ignored") {
+		t.Errorf("empty prompt: %d %s", w.Code, w.Body)
+	}
+	if len(fr.tasks) != 2 {
+		t.Errorf("tasks = %d, want 2", len(fr.tasks))
+	}
+
+	// The ticket is in progress: nothing is queued, and Linear does not retry.
+	fr.followErr = runner.ErrBusy
+	body, hdr = linearPrompt("session-1", "ENG-7", "are you there?")
+	if w := do(s, "/webhooks/linear", body, hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "already in progress") {
+		t.Errorf("busy: %d %s", w.Code, w.Body)
+	}
+	// A ticket that ochell never worked on: the message is its assignment.
+	fr.followErr = store.ErrUnknown
+	body, hdr = linearPrompt("session-new", "ENG-8", "please do this")
+	if w := do(s, "/webhooks/linear", body, hdr); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued ") {
+		t.Errorf("unknown ticket: %d %s", w.Code, w.Body)
+	}
+	if tk := fr.tasks[len(fr.tasks)-1]; tk.Key != "ENG-8" || tk.Comment != "please do this" || tk.Title != "Title of ENG-8" {
+		t.Errorf("task = %+v", tk)
+	}
+	// The store fails: 503, and the delivery may come again.
+	fr.followErr = errors.New("disk full")
+	body, hdr = linearPrompt("session-1", "ENG-7", "one more thing")
+	if w := do(s, "/webhooks/linear", body, hdr); w.Code != 503 {
+		t.Errorf("store error: %d %s", w.Code, w.Body)
+	}
+	fr.followErr = nil
+	if w := do(s, "/webhooks/linear", body, hdr); w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued ") {
+		t.Errorf("the retried delivery: %d %s", w.Code, w.Body)
+	}
+
+	// The allowlist of assigners covers follow-ups.
+	cfg := testConfig()
+	cfg.Sources.Linear.AllowedAssigners = []string{"someone-else"}
+	fr2 := &fakeRunner{}
+	s2 := newServer(t, cfg, fr2)
+	body, hdr = linearPrompt("session-1", "ENG-7", "do it")
+	if w := do(s2, "/webhooks/linear", body, hdr); w.Code != 200 || len(fr2.tasks) != 0 {
+		t.Errorf("a follow-up from outside the allowlist: %d %s, %d tasks", w.Code, w.Body, len(fr2.tasks))
 	}
 }

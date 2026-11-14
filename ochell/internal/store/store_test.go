@@ -607,3 +607,83 @@ func TestNotBefore(t *testing.T) {
 		t.Fatalf("Claim at the time = %+v, %v; want run-2", got, err)
 	}
 }
+
+// A message from a person queues a run of a ticket that ochell knows, and
+// the ticket's attempts count from there again.
+func TestFollowUp(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 14, 9, 0, 0, 0, time.UTC)
+	lim := Limits{MaxAttempts: 2, MaxQueued: 10}
+	follow := func(id, comment string) *task.Task {
+		return &task.Task{ID: id, Source: "linear", Key: "ENG-1", Comment: comment, TrackerSession: "session-reply", Cause: task.CauseFollowUp, Received: t0}
+	}
+	if err := s.FollowUp(follow("f0", "hello"), lim); !errors.Is(err, ErrUnknown) {
+		t.Fatalf("a follow-up on an unknown ticket: %v, want ErrUnknown", err)
+	}
+
+	first := newTask("run-1", "ENG-1", t0)
+	first.Repo = "git@example.com:repo.git"
+	if err := s.Enqueue(first, lim); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FollowUp(follow("f1", "hello"), lim); !errors.Is(err, ErrBusy) {
+		t.Errorf("a follow-up on a queued ticket: %v, want ErrBusy", err)
+	}
+	run := func(id string) {
+		t.Helper()
+		if got, err := s.Claim(); err != nil || got == nil || got.ID != id {
+			t.Fatalf("Claim = %+v, %v; want %s", got, err, id)
+		}
+		if err := s.Finish(id, task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput, SessionID: "agent-session", Workdir: "/work/ENG-1"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("run-1")
+	second := newTask("run-2", "ENG-1", t0)
+	second.Repo = first.Repo
+	if err := s.Enqueue(second, lim); err != nil {
+		t.Fatal(err)
+	}
+	run("run-2")
+	// The ticket has used its two attempts.
+	if err := s.Enqueue(newTask("run-3", "ENG-1", t0), lim); !errors.Is(err, ErrAttempts) {
+		t.Fatalf("a third assignment: %v, want ErrAttempts", err)
+	}
+	// A person answers: that run is not stopped by the cap.
+	if err := s.FollowUp(follow("f2", "use the second page"), lim); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Claim()
+	if err != nil || got == nil {
+		t.Fatalf("Claim = %+v, %v", got, err)
+	}
+	if got.ID != "f2" || got.Cause != task.CauseFollowUp || got.Comment != "use the second page" || got.TrackerSession != "session-reply" ||
+		got.Attempt != 3 || got.AgentSession != "agent-session" || got.Workspace != "/work/ENG-1" {
+		t.Errorf("the follow-up run = %+v", got)
+	}
+	// The ticket kept what the follow-up did not bring.
+	if got.Title != first.Title || got.URL != first.URL || got.Repo != first.Repo {
+		t.Errorf("the ticket lost its title, URL or repository: %+v", got)
+	}
+	if err := s.Finish("f2", task.Result{Outcome: task.OutcomeFinished, Signal: result.Done}); err != nil {
+		t.Fatal(err)
+	}
+	// Two more runs are allowed from there, and no third.
+	if err := s.Enqueue(newTask("run-4", "ENG-1", t0), lim); err != nil {
+		t.Errorf("an assignment after the follow-up: %v", err)
+	}
+	run("run-4")
+	if err := s.Enqueue(newTask("run-5", "ENG-1", t0), lim); !errors.Is(err, ErrAttempts) {
+		t.Errorf("the cap after the follow-up: %v, want ErrAttempts", err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.Attempts != 4 {
+		t.Errorf("attempts = %d, want 4: the number still counts every run", tk.Attempts)
+	}
+
+	if key, err := s.TicketOfSession("linear", "session-reply"); err != nil || key != "ENG-1" {
+		t.Errorf("TicketOfSession = %q, %v", key, err)
+	}
+	if key, _ := s.TicketOfSession("linear", "no-such-session"); key != "" {
+		t.Errorf("TicketOfSession of an unknown session = %q", key)
+	}
+}

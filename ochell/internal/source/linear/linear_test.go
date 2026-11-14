@@ -44,13 +44,50 @@ func TestParse(t *testing.T) {
 	if s.SessionID != "session-0000" || s.Key != "ENG-123" || !strings.Contains(s.Context, "ENG-123") || ev.OrganizationID != "org-0000" {
 		t.Errorf("unexpected session %+v", s)
 	}
-	prompted := `{"type":"AgentSessionEvent","action":"prompted","agentSession":{"id":"s1"},"agentActivity":{"content":{"type":"prompt","body":"please also add tests"}}}`
-	ev, _, err = Parse([]byte(prompted))
-	if !errors.Is(err, ErrIgnored) || ev.PromptText() != "please also add tests" {
-		t.Errorf("prompted: err=%v text=%q", err, ev.PromptText())
-	}
 	if _, _, err := Parse([]byte(`{"type":"Issue","action":"update"}`)); !errors.Is(err, ErrIgnored) {
 		t.Errorf("issue event should be ignored, got %v", err)
+	}
+	if _, _, err := Parse([]byte(`{"type":"AgentSessionEvent","action":"updated","agentSession":{"id":"s1"}}`)); !errors.Is(err, ErrIgnored) {
+		t.Errorf("another action should be ignored, got %v", err)
+	}
+}
+
+// A "prompted" event is a message from a person in a session that exists.
+func TestParsePrompted(t *testing.T) {
+	// The least a payload can hold: the session and the text.
+	_, s, err := Parse([]byte(`{"type":"AgentSessionEvent","action":"prompted","agentSession":{"id":"s1"},"agentActivity":{"content":{"type":"prompt","body":"please also add tests"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Prompted || s.Prompt != "please also add tests" || s.SessionID != "s1" || s.Stop {
+		t.Errorf("session = %+v", s)
+	}
+	// No issue in the payload: the caller finds the ticket by the session.
+	if s.Key != "" {
+		t.Errorf("key = %q, want none", s.Key)
+	}
+
+	// With the issue, and with the author of the prompt, who counts rather
+	// than the creator of the session.
+	_, s, err = Parse([]byte(`{"type":"AgentSessionEvent","action":"prompted",
+		"agentSession":{"id":"s2","creator":{"id":"u-creator","email":"creator@example.com"},
+			"issue":{"identifier":"ENG-7","title":"T","url":"https://linear.app/x/issue/ENG-7"}},
+		"agentActivity":{"body":"use the second page","user":{"id":"u-author","email":"author@example.com"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Key != "ENG-7" || s.Prompt != "use the second page" || s.Actor != "u-author" || s.ActorEmail != "author@example.com" {
+		t.Errorf("session = %+v", s)
+	}
+	_, s, _ = Parse([]byte(`{"type":"AgentSessionEvent","action":"prompted","agentSession":{"id":"s3","creator":{"id":"u-creator","email":"creator@example.com"}},"agentActivity":{"body":"x"}}`))
+	if s.Actor != "u-creator" || s.ActorEmail != "creator@example.com" {
+		t.Errorf("without an author the creator counts: %+v", s)
+	}
+
+	// The stop signal.
+	_, s, err = Parse([]byte(`{"type":"AgentSessionEvent","action":"prompted","agentSession":{"id":"s4"},"agentActivity":{"signal":"stop","content":{"type":"prompt","body":"stop"}}}`))
+	if err != nil || !s.Stop {
+		t.Errorf("stop signal: %+v, %v", s, err)
 	}
 }
 

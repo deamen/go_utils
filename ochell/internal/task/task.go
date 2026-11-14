@@ -22,6 +22,9 @@ const (
 	// CauseStalled: the earlier run was stopped because the agent was
 	// silent for too long.
 	CauseStalled Cause = "stalled"
+	// CauseFollowUp: a person wrote to the agent on a ticket that ochell
+	// already knows. The message is in Comment.
+	CauseFollowUp Cause = "follow_up"
 )
 
 // NewID returns the id of a task that is received now. It is unique per
@@ -45,7 +48,8 @@ type Task struct {
 	// Context is optional extra text from the source (e.g. Linear promptContext).
 	Context string
 	// Comment is the comment that triggered this run, when a person asked
-	// for it in one (a mention in Linear). Empty for a plain assignment.
+	// for it in one: a mention in Linear, or a follow-up message. Empty for
+	// a plain assignment.
 	Comment string
 	// Cause says why the run was queued; empty for a plain assignment.
 	Cause Cause
