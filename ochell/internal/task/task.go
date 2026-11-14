@@ -1,10 +1,7 @@
 // Package task defines the source-independent unit of work handed to the agent.
 package task
 
-import (
-	"context"
-	"time"
-)
+import "time"
 
 type Task struct {
 	// ID is unique per task and used for log file names.
@@ -17,16 +14,18 @@ type Task struct {
 	URL   string
 	// Context is optional extra text from the source (e.g. Linear promptContext).
 	Context string
+	// TrackerSession is where the source wants progress reported: the id of
+	// the Linear agent session. Empty when there is no such place.
+	TrackerSession string
 	// DeliveryID identifies the webhook delivery for de-duplication.
 	DeliveryID string
 	Received   time.Time
 
+	// Attempt says which run of the ticket this is, counting from 1. The
+	// store sets it when the run starts.
+	Attempt int
 	// Prompt is rendered by the runner from the prompt template.
 	Prompt string
-
-	// Optional callbacks to report progress back to the source.
-	OnStart  func(ctx context.Context, t *Task) error
-	OnFinish func(ctx context.Context, t *Task, result Result) error
 }
 
 // Outcome says why a run ended. ochell sets it from its own record of what
@@ -46,6 +45,9 @@ const (
 	OutcomeStopped Outcome = "stopped"
 	// OutcomeNotStarted: the agent never ran.
 	OutcomeNotStarted Outcome = "not_started"
+	// OutcomeInterrupted: ochell itself stopped while the agent was running,
+	// and found the run unfinished when it started again.
+	OutcomeInterrupted Outcome = "interrupted"
 )
 
 type Result struct {
@@ -54,8 +56,10 @@ type Result struct {
 	// Outcome first.
 	ExitCode int
 	// Err is nil only when Outcome is OutcomeFinished.
-	Err      error
-	LogFile  string
+	Err     error
+	LogFile string
+	// Workdir is the working directory the agent ran in.
+	Workdir  string
 	Duration time.Duration
 	// Tail holds the last part of the agent output.
 	Tail string

@@ -22,7 +22,6 @@ import (
 
 	"ochell/internal/auth"
 	"ochell/internal/config"
-	"ochell/internal/dedup"
 	"ochell/internal/ipsync"
 	"ochell/internal/runner"
 	"ochell/internal/source/jira"
@@ -42,11 +41,19 @@ type Submitter interface {
 	Submit(*task.Task) error
 }
 
+// Deliveries remembers the webhook deliveries that were handled. It is
+// implemented by *store.Store, so they are not forgotten by a restart.
+type Deliveries interface {
+	// AddDelivery records key for ttl and reports whether it is new.
+	AddDelivery(key string, ttl time.Duration) (bool, error)
+	RemoveDelivery(key string) error
+}
+
 type Server struct {
 	cfg     *config.Config
 	log     *slog.Logger
 	runner  Submitter
-	seen    *dedup.Set
+	seen    Deliveries
 	linear  *linear.Client
 	extURL  *template.Template
 	handler http.Handler
@@ -57,8 +64,8 @@ type Server struct {
 	linearIPs    *ipsync.Allowlist
 }
 
-func New(cfg *config.Config, log *slog.Logger, r Submitter) (*Server, error) {
-	s := &Server{cfg: cfg, log: log, runner: r, seen: dedup.New(dedupTTL), now: time.Now}
+func New(cfg *config.Config, log *slog.Logger, r Submitter, seen Deliveries) (*Server, error) {
+	s := &Server{cfg: cfg, log: log, runner: r, seen: seen, now: time.Now}
 	lc := cfg.Sources.Linear
 	if lc.Enabled && lc.ClientID != "" {
 		s.linear = linear.NewClient(lc.ClientID, lc.ClientSecret, lc.TokenFile)
@@ -248,20 +255,42 @@ func deliveryKeys(source, delivery string, body []byte) []string {
 	return keys
 }
 
-// firstDelivery records keys and reports whether none of them was seen before.
-func (s *Server) firstDelivery(keys []string) bool {
+// deliveryState is what firstDelivery found.
+type deliveryState int
+
+const (
+	deliveryNew deliveryState = iota
+	deliveryDuplicate
+	// deliveryUnknown: the store could not be read or written.
+	deliveryUnknown
+)
+
+// firstDelivery records keys and reports whether none of them was seen
+// before. It writes the HTTP response unless the delivery is new.
+func (s *Server) firstDelivery(w http.ResponseWriter, keys []string, log *slog.Logger) deliveryState {
 	for _, k := range keys {
-		if !s.seen.Add(k) {
-			return false
+		isNew, err := s.seen.AddDelivery(k, dedupTTL)
+		if err != nil {
+			// 503 makes Jira and Linear retry later.
+			log.Error("cannot record the delivery", "err", err)
+			s.forgetDelivery(keys, log)
+			reply(w, http.StatusServiceUnavailable, "cannot record the delivery")
+			return deliveryUnknown
+		}
+		if !isNew {
+			reply(w, http.StatusOK, "duplicate delivery")
+			return deliveryDuplicate
 		}
 	}
-	return true
+	return deliveryNew
 }
 
 // forgetDelivery lets the sender retry a delivery that was not handled.
-func (s *Server) forgetDelivery(keys []string) {
+func (s *Server) forgetDelivery(keys []string, log *slog.Logger) {
 	for _, k := range keys {
-		s.seen.Remove(k)
+		if err := s.seen.RemoveDelivery(k); err != nil {
+			log.Error("cannot forget the delivery", "err", err)
+		}
 	}
 }
 
@@ -334,12 +363,11 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keys := deliveryKeys("jira", delivery, body)
-	if !s.firstDelivery(keys) {
-		reply(w, http.StatusOK, "duplicate delivery")
+	if s.firstDelivery(w, keys, log) != deliveryNew {
 		return
 	}
 	if s.submit(w, s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery), log) == submitFailed {
-		s.forgetDelivery(keys)
+		s.forgetDelivery(keys, log)
 	}
 }
 
@@ -407,12 +435,11 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keys := deliveryKeys("linear", delivery, body)
-	if !s.firstDelivery(keys) {
-		reply(w, http.StatusOK, "duplicate delivery")
+	if s.firstDelivery(w, keys, log) != deliveryNew {
 		return
 	}
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, sess.Context, delivery)
-	s.attachLinearCallbacks(t, sess.SessionID, log)
+	t.TrackerSession = sess.SessionID
 	// Linear marks a session unresponsive unless it sees an activity within
 	// ~10s of "created", so answer now rather than when the agent starts.
 	switch s.submit(w, t, log) {
@@ -426,7 +453,7 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		s.linearActivity(sess.SessionID, linear.ActivityResponse,
 			sess.Key+" is already being worked on by the digital employee in an earlier session, so this request did not start a new run. The result will be posted in that session. Messages to a running agent are not supported yet.", log)
 	default:
-		s.forgetDelivery(keys)
+		s.forgetDelivery(keys, log)
 	}
 }
 
@@ -446,40 +473,52 @@ func (s *Server) linearActivity(sessionID, kind, body string, log *slog.Logger) 
 	}()
 }
 
-func (s *Server) attachLinearCallbacks(t *task.Task, sessionID string, log *slog.Logger) {
-	if s.linear == nil {
-		return
+// reportsToLinear says whether the run of t is reported to a Linear agent
+// session. The session id is stored with the task, so this also works for a
+// task that was queued before a restart.
+func (s *Server) reportsToLinear(t *task.Task) bool {
+	return s.linear != nil && t.Source == "linear" && t.TrackerSession != ""
+}
+
+// Started tells the source of t that its run begins. It implements
+// runner.Notifier.
+func (s *Server) Started(ctx context.Context, t *task.Task) error {
+	if !s.reportsToLinear(t) || s.extURL == nil {
+		return nil
 	}
-	t.OnStart = func(ctx context.Context, t *task.Task) error {
-		if s.extURL == nil {
-			return nil
-		}
-		var b strings.Builder
-		if err := s.extURL.Execute(&b, t); err != nil {
-			return err
-		}
-		return s.linear.SetExternalURL(ctx, sessionID, "Agent run", b.String())
+	var b strings.Builder
+	if err := s.extURL.Execute(&b, t); err != nil {
+		return err
 	}
-	t.OnFinish = func(ctx context.Context, t *task.Task, res task.Result) error {
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		if res.Err != nil {
-			return s.linear.CreateActivity(ctx, sessionID, linear.ActivityError,
-				failureText(res)+"\n\n"+codeBlock(lastN(res.Tail, replyMax)))
-		}
-		msg := strings.TrimSpace(lastN(res.Tail, replyMax))
-		if msg == "" {
-			msg = "The agent finished."
-		}
-		return s.linear.CreateActivity(ctx, sessionID, linear.ActivityResponse, msg)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return s.linear.SetExternalURL(ctx, t.TrackerSession, "Agent run", b.String())
+}
+
+// Finished tells the source of t how its run ended. It implements
+// runner.Notifier.
+func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) error {
+	if !s.reportsToLinear(t) {
+		return nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if res.Err != nil {
+		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityError,
+			strings.TrimSpace(failureText(res)+"\n\n"+codeBlock(lastN(res.Tail, replyMax))))
+	}
+	msg := strings.TrimSpace(lastN(res.Tail, replyMax))
+	if msg == "" {
+		msg = "The agent finished."
+	}
+	return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityResponse, msg)
 }
 
 // failureText says why a run did not succeed. It goes by the outcome: the
 // exit code of a run that ochell stopped means nothing.
 func failureText(res task.Result) string {
 	switch res.Outcome {
-	case task.OutcomeTimedOut, task.OutcomeStopped:
+	case task.OutcomeTimedOut, task.OutcomeStopped, task.OutcomeInterrupted:
 		return fmt.Sprintf("The run is incomplete: %v.", res.Err)
 	case task.OutcomeNotStarted:
 		return fmt.Sprintf("The run did not start: %v.", res.Err)

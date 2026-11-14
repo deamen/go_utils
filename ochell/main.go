@@ -26,6 +26,7 @@ import (
 	"ochell/internal/runner"
 	"ochell/internal/server"
 	"ochell/internal/source/linear"
+	"ochell/internal/store"
 )
 
 var version = "dev"
@@ -116,19 +117,27 @@ func serve(args []string) error {
 		close(hurry)
 	}()
 
-	r, err := runner.New(cfg.Agent, log)
+	st, err := store.Open(cfg.Store.Path)
 	if err != nil {
 		return err
 	}
-	srv, err := server.New(cfg, log, r)
+	defer st.Close()
+	r, err := runner.New(cfg.Agent, log, st)
 	if err != nil {
 		return err
 	}
+	srv, err := server.New(cfg, log, r, st)
+	if err != nil {
+		return err
+	}
+	r.SetNotifier(srv)
 	if cfg.NgrokSync.Enabled {
 		go ipsync.RunSync(ctx, cfg.NgrokSync, ipsync.NewFetcher(), log)
 	}
 
-	r.Start()
+	if err := r.Start(); err != nil {
+		return err
+	}
 	err = srv.Run(ctx)
 	cancel()
 
