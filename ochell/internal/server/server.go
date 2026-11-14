@@ -93,6 +93,11 @@ type Server struct {
 	handler http.Handler
 	now     func() time.Time
 
+	// tools holds, by Linear session, when tool use was last shown there
+	// and how much was left out since.
+	toolMu sync.Mutex
+	tools  map[string]*toolProgress
+
 	// pollRefused are the tickets that the poller found and did not start
 	// because of who assigned them, so that it says so once.
 	pollMu      sync.Mutex
@@ -1002,9 +1007,65 @@ func (s *Server) Started(ctx context.Context, t *task.Task) error {
 	return s.linear.SetExternalURL(ctx, t.TrackerSession, "Agent run", b.String())
 }
 
+// toolProgress is what was shown of the tool use of one run.
+type toolProgress struct {
+	last time.Time
+	// skipped counts the tool uses since last that were not shown.
+	skipped int
+}
+
+// ToolUsed shows in the Linear session of t that the agent uses a tool. It
+// implements runner.ProgressNotifier.
+//
+// Not every use is shown: at most one per tool_activity_interval, and the
+// next one says how many were left out. Each is ephemeral, so the session
+// shows the latest and not a list. A Jira ticket has no place for this.
+func (s *Server) ToolUsed(t *task.Task, tool, param string) {
+	every := s.cfg.Sources.Linear.ToolActivityInterval
+	if every <= 0 || !s.reportsToLinear(t) {
+		return
+	}
+	now := s.now()
+	s.toolMu.Lock()
+	if s.tools == nil {
+		s.tools = map[string]*toolProgress{}
+	}
+	p := s.tools[t.TrackerSession]
+	if p == nil {
+		p = &toolProgress{}
+		s.tools[t.TrackerSession] = p
+	}
+	if !p.last.IsZero() && now.Sub(p.last) < every {
+		p.skipped++
+		s.toolMu.Unlock()
+		return
+	}
+	skipped := p.skipped
+	p.last, p.skipped = now, 0
+	s.toolMu.Unlock()
+
+	if skipped > 0 {
+		param = strings.TrimSpace(fmt.Sprintf("%s (and %d more tool calls before it)", param, skipped))
+	}
+	session, log := t.TrackerSession, s.log.With("source", "linear", "key", t.Key)
+	// The caller is reading the agent's output: do not hold it up.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), linearAckBy)
+		defer cancel()
+		if err := s.linear.CreateAction(ctx, session, tool, param, true); err != nil {
+			log.Warn("linear tool activity failed", "session", session, "err", err)
+		}
+	}()
+}
+
 // Finished tells the source of t how its run ended. It implements
 // runner.Notifier.
 func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) error {
+	if t.TrackerSession != "" {
+		s.toolMu.Lock()
+		delete(s.tools, t.TrackerSession)
+		s.toolMu.Unlock()
+	}
 	if s.reportsToJira(t) {
 		return s.jiraRunFinished(ctx, t, res)
 	}

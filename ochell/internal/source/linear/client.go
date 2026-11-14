@@ -276,6 +276,22 @@ func (c *Client) CreateActivity(ctx context.Context, sessionID, kind, body strin
 	}, nil)
 }
 
+// ActivityAction says what the agent is doing: a tool it uses.
+const ActivityAction = "action"
+
+// CreateAction posts what the agent is doing to an agent session: the
+// action, such as the name of a tool, and its parameter, such as a file. An
+// ephemeral action is replaced by the next activity of the session.
+func (c *Client) CreateAction(ctx context.Context, sessionID, action, parameter string, ephemeral bool) error {
+	return c.Do(ctx, activityMutation, map[string]any{
+		"input": map[string]any{
+			"agentSessionId": sessionID,
+			"ephemeral":      ephemeral,
+			"content":        map[string]any{"type": ActivityAction, "action": action, "parameter": parameter},
+		},
+	}, nil)
+}
+
 const sessionUpdateMutation = `mutation AgentSessionUpdate($id: String!, $input: AgentSessionUpdateInput!) {
   agentSessionUpdate(id: $id, input: $input) { success }
 }`

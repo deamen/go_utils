@@ -341,6 +341,9 @@ func Start(t *testing.T, opts Options) *Ochell {
 	cfg.Sources.Linear.TokenFile = filepath.Join(dir, "linear-token.json")
 	cfg.Sources.Linear.APIURL = o.Linear.URL
 	cfg.Sources.Linear.TokenURL = o.Linear.URL + "/oauth/token"
+	// Off, so that a test counts only the activities it is about. The
+	// test of the tool activities turns them on.
+	cfg.Sources.Linear.ToolActivityInterval = 0
 	if opts.Configure != nil {
 		opts.Configure(cfg)
 	}

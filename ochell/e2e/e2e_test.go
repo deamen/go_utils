@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -2111,4 +2112,85 @@ func TestPollerLeavesKnownTicketsAlone(t *testing.T) {
 	o.JiraAssigned(queued, "Assigned again").TaskID(t)
 	o.WaitRecords(3, 10*time.Second)
 	o.Admin("stop", "jira", queued)
+}
+
+// The done-when of the tool activities: a run with the Claude Code adapter
+// shows its tool use in the Linear session while it runs, and a run that
+// uses a hundred tools does not post a hundred activities.
+func TestToolUseIsShownInTheLinearSession(t *testing.T) {
+	const session = "9e1b7c44-2d3a-4b5c-8f60-7a1c2d3e4f50"
+	tool := func(name, input string) Step {
+		return Step{Print: `{"type":"assistant","session_id":"` + session + `","message":{"content":[{"type":"tool_use","name":"` + name + `","input":` + input + `}]}}`}
+	}
+	script := []Step{{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`}}
+	// A hundred tool uses in three bursts, with a pause after each.
+	for burst := range 3 {
+		for i := range 33 {
+			script = append(script, tool("Read", `{"file_path":"src/file-`+strconv.Itoa(burst*33+i)+`.go"}`))
+		}
+		script = append(script, tool("Bash", `{"command":"go test ./... -run 'secret=hunter2'"}`), Step{Sleep: "700ms"})
+	}
+	script = append(script,
+		Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"All done.","session_id":"` + session + `"}`},
+		Report("done", "All done."))
+	o := Start(t, Options{
+		Script: script,
+		Configure: func(c *config.Config) {
+			c.Agent.Adapter = "claude"
+			c.Sources.Linear.ToolActivityInterval = 500 * time.Millisecond
+		},
+	})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-101"})
+	id := o.LinearCreated("ENG-101", "session-tools", "").TaskID(t)
+
+	// While the agent is still running, the session already shows a tool.
+	acts := o.WaitActivities("session-tools", 2, 10*time.Second)
+	if a := acts[1]; a.Type != "action" || a.Action != "Read" || a.Parameter != "src/file-0.go" || !a.Ephemeral {
+		t.Errorf("second activity = %+v, want the first tool use as an ephemeral action", a)
+	}
+	if _, err := os.Stat(o.LogFile(id)); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(o.LogFile(id)); footer.Match(raw) {
+		t.Error("the first tool activity came only after the run had ended")
+	}
+
+	o.WaitRun(id, 20*time.Second)
+	o.waitFor(10*time.Second, "the result in the session", func() bool {
+		acts = o.Linear.Activities("session-tools")
+		return acts[len(acts)-1].Type == "response"
+	})
+	var actions []Activity
+	for _, a := range acts {
+		if a.Type == "action" {
+			actions = append(actions, a)
+		}
+	}
+	// 102 tool uses in about two seconds, one activity per half second.
+	if len(actions) < 2 || len(actions) > 8 {
+		t.Errorf("%d tool activities for 102 tool uses, want a few", len(actions))
+	}
+	var leftOut bool
+	for _, a := range actions {
+		leftOut = leftOut || strings.Contains(a.Parameter, "more tool calls before it")
+		// Only the program of a command is shown, never its arguments.
+		if strings.Contains(a.Parameter, "hunter2") || strings.Contains(a.Parameter, "secret") {
+			t.Errorf("a tool activity shows the arguments of a command: %+v", a)
+		}
+	}
+	if !leftOut {
+		t.Errorf("no activity says how many tool uses were left out: %+v", actions)
+	}
+	if last := acts[len(acts)-1]; last.Body != "All done." {
+		t.Errorf("last activity = %+v, want the result", last)
+	}
+
+	// A Jira ticket has no place for this: only the start and the result.
+	jid := o.JiraAssigned("DEV-101", "The same work").TaskID(t)
+	o.WaitRun(jid, 20*time.Second)
+	comments := o.WaitJiraComments("DEV-101", 2, 10*time.Second)
+	time.Sleep(200 * time.Millisecond)
+	if n := len(o.Jira.Comments("DEV-101")); n != 2 {
+		t.Errorf("the Jira ticket got %d comments, want 2: %q", n, comments)
+	}
 }

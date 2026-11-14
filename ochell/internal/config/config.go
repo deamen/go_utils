@@ -188,6 +188,10 @@ type Linear struct {
 	// the word "assigner" (who delegated the issue). Empty: the same
 	// people as AllowedAssigners.
 	AllowedFollowUps []string `yaml:"allowed_follow_ups"`
+	// ToolActivityInterval is the least time between two "action"
+	// activities that show the agent's tool use in a session while it
+	// runs. 0: none are posted.
+	ToolActivityInterval time.Duration `yaml:"tool_activity_interval"`
 	// Optional: only accept an OAuth install for this workspace.
 	OrganizationID string `yaml:"organization_id"`
 	// Optional: link shown on the agent session, templated with the task.
@@ -424,10 +428,11 @@ func Default() *Config {
 			JiraWebhook:    JiraWebhook{Path: "/webhooks/jira", MaxSkew: 2 * time.Hour},
 			JiraAutomation: JiraAutomation{Path: "/webhooks/jira-automation", Header: "Authorization"},
 			Linear: Linear{
-				Path:         "/webhooks/linear",
-				MaxSkew:      60 * time.Second,
-				CallbackPath: "/oauth/linear/callback",
-				TokenFile:    "linear-token.json",
+				Path:                 "/webhooks/linear",
+				MaxSkew:              60 * time.Second,
+				ToolActivityInterval: 30 * time.Second,
+				CallbackPath:         "/oauth/linear/callback",
+				TokenFile:            "linear-token.json",
 			},
 		},
 		IPAllowlist: IPAllowlist{AtlassianFeed: true, LinearFeed: true, Refresh: time.Hour},
@@ -787,6 +792,9 @@ func (c *Config) Validate() error {
 	}
 	if err := s.JiraAPI.Validate(); err != nil {
 		errs = append(errs, err)
+	}
+	if s.Linear.ToolActivityInterval < 0 {
+		errs = append(errs, errors.New("sources.linear.tool_activity_interval must not be negative; 0s posts no tool use"))
 	}
 	if s.Linear.Enabled && s.Linear.Secret == "" {
 		errs = append(errs, errors.New("sources.linear.secret is required"))

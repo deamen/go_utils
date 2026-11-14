@@ -242,6 +242,11 @@ sources:
     # Linear user ids or email addresses, and the word "assigner" (who
     # delegated this issue). Empty: the same people as allowed_assigners.
     allowed_follow_ups: []      # e.g. [assigner]
+    # While the agent runs (claude adapter), its tool use is shown in the
+    # session as "action" activities: at most one per this interval. Only
+    # the tool's name and the file, pattern, host or program it works on
+    # are shown. 0s: none.
+    tool_activity_interval: 30s
     organization_id: ""     # optional: only accept installs into this workspace
     external_url: ""        # optional: e.g. https://runs.example.com/{{.ID}}
 

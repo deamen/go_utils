@@ -49,11 +49,21 @@ type Notifier interface {
 	Finished(ctx context.Context, t *task.Task, res task.Result) error
 }
 
+// ProgressNotifier is a Notifier that also wants to hear what the agent
+// does while it runs.
+type ProgressNotifier interface {
+	// ToolUsed is called when the agent starts to use a tool. It is
+	// called while the agent's output is being read, and must not block.
+	ToolUsed(t *task.Task, tool, param string)
+}
+
 type Runner struct {
-	cfg      config.Agent
-	log      *slog.Logger
-	store    *store.Store
-	notify   Notifier
+	cfg    config.Agent
+	log    *slog.Logger
+	store  *store.Store
+	notify Notifier
+	// progress is notify when it is a ProgressNotifier.
+	progress ProgressNotifier
 	adapter  agent.Adapter
 	launcher launcher.Launcher
 	prompt   *template.Template
@@ -141,7 +151,10 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 }
 
 // SetNotifier sets who is told about the runs. Call it before Start.
-func (r *Runner) SetNotifier(n Notifier) { r.notify = n }
+func (r *Runner) SetNotifier(n Notifier) {
+	r.notify = n
+	r.progress, _ = n.(ProgressNotifier)
+}
 
 func parse(name, text string) (*template.Template, error) {
 	t, err := template.New(name).Option("missingkey=error").Parse(text)
@@ -789,6 +802,9 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	// the end: if ochell does not live to see the end of this run, the run
 	// that takes its place continues in the same session.
 	out := r.adapter.Output(func(ev agent.Event) {
+		if ev.Tool != "" && r.progress != nil {
+			r.progress.ToolUsed(t, ev.Tool, ev.Param)
+		}
 		if ev.SessionID == "" {
 			return
 		}
