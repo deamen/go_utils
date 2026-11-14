@@ -318,6 +318,33 @@ type promptView struct {
 	ResultFile string
 	// ResultInstructions tells the agent to write it, and how.
 	ResultInstructions string
+	// RunContext says what only ochell knows about this run (runContext).
+	// It is empty when there is nothing to say.
+	RunContext string
+}
+
+// command renders the prompt and the arguments of a run, and asks the
+// adapter for the command. With resume it continues the ticket's session,
+// and the prompt says so; the adapter may answer agent.ErrNoResume.
+func (r *Runner) command(t *task.Task, view promptView, resume bool) (agent.Command, error) {
+	view.RunContext = runContext(t, resume)
+	var err error
+	if t.Prompt, err = render(r.prompt, view); err != nil {
+		return agent.Command{}, fmt.Errorf("render prompt: %w", err)
+	}
+	args := make([]string, 0, len(r.args))
+	for _, a := range r.args {
+		s, err := render(a, r.argData(t))
+		if err != nil {
+			return agent.Command{}, fmt.Errorf("render args: %w", err)
+		}
+		args = append(args, s)
+	}
+	run := agent.Run{Args: args, Prompt: t.Prompt}
+	if resume {
+		return r.adapter.Resume(run, t.AgentSession)
+	}
+	return r.adapter.Start(run)
 }
 
 // stopWait is how long Run waits for an agent to exit after asking the
@@ -343,21 +370,6 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	runDir := filepath.Join(r.runDir, runName)
 	resultFile := filepath.Join(runDir, result.FileName)
 
-	var err error
-	view := promptView{Task: t, ResultFile: resultFile, ResultInstructions: result.Instructions}
-	if t.Prompt, err = render(r.prompt, view); err != nil {
-		res.Err = fmt.Errorf("render prompt: %w", err)
-		return res
-	}
-	args := make([]string, 0, len(r.args))
-	for _, a := range r.args {
-		s, err := render(a, r.argData(t))
-		if err != nil {
-			res.Err = fmt.Errorf("render args: %w", err)
-			return res
-		}
-		args = append(args, s)
-	}
 	dir, err := render(r.workdir, r.argData(t))
 	if err != nil {
 		res.Err = fmt.Errorf("render workdir: %w", err)
@@ -367,16 +379,17 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 
 	// The adapter says how this agent is called and reads what it prints;
 	// the launcher runs it. A ticket that ran before, in the same working
-	// directory, continues its session if the agent can do that.
-	run := agent.Run{Args: args, Prompt: t.Prompt}
+	// directory, continues its session if the agent can do that. The
+	// prompt tells the agent which of the two this is.
+	view := promptView{Task: t, ResultFile: resultFile, ResultInstructions: result.Instructions}
 	var cmd agent.Command
 	err = agent.ErrNoResume
 	if t.AgentSession != "" && t.Workspace == dir {
-		cmd, err = r.adapter.Resume(run, t.AgentSession)
+		cmd, err = r.command(t, view, true)
 		res.Resumed = err == nil
 	}
 	if errors.Is(err, agent.ErrNoResume) {
-		cmd, err = r.adapter.Start(run)
+		cmd, err = r.command(t, view, false)
 	}
 	if err != nil {
 		res.Err = fmt.Errorf("build the agent command: %w", err)

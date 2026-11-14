@@ -19,6 +19,9 @@ type Task struct {
 	URL   string
 	// Context is optional extra text from the source (e.g. Linear promptContext).
 	Context string
+	// Comment is the comment that triggered this run, when a person asked
+	// for it in one (a mention in Linear). Empty for a plain assignment.
+	Comment string
 	// TrackerSession is where the source wants progress reported: the id of
 	// the Linear agent session. Empty when there is no such place.
 	TrackerSession string
@@ -35,6 +38,10 @@ type Task struct {
 	// the session if the agent can.
 	AgentSession string
 	Workspace    string
+	// PRURL and Branch are the pull request and the branch that earlier
+	// runs of the ticket reported, if any. The store sets them too.
+	PRURL  string
+	Branch string
 	// Prompt is rendered by the runner from the prompt template.
 	Prompt string
 }

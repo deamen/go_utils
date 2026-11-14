@@ -28,7 +28,7 @@ func open(t *testing.T, path string) *Store {
 func newTask(id, key string, received time.Time) *task.Task {
 	return &task.Task{
 		ID: id, Source: "linear", Key: key, Title: "Title of " + key, URL: "https://example.test/" + key,
-		Context: "context of " + id, TrackerSession: "session-" + id, DeliveryID: "delivery-" + id, Received: received,
+		Context: "context of " + id, Comment: "comment of " + id, TrackerSession: "session-" + id, DeliveryID: "delivery-" + id, Received: received,
 	}
 }
 
@@ -196,6 +196,10 @@ func TestAgentSession(t *testing.T) {
 	second := run("r2", task.Result{Outcome: task.OutcomeTimedOut, ExitCode: -1, Err: errors.New("agent timed out"), Resumed: true})
 	if second.AgentSession != "sess-1" || second.Workspace != "/work/ENG-1" || second.Attempt != 2 {
 		t.Errorf("second run = %+v, want session sess-1 in /work/ENG-1", second)
+	}
+	// It also learns what the first run left behind, for its prompt.
+	if second.PRURL != "https://github.com/x/y/pull/7" || second.Branch != "bot/ENG-1" {
+		t.Errorf("second run = %+v, want the pull request and the branch of the first", second)
 	}
 	if stored, _ := s.Run("r2"); !stored.Result.Resumed || stored.Result.Err == nil || stored.Result.Err.Error() != "agent timed out" {
 		t.Errorf("stored second run = %+v", stored.Result)

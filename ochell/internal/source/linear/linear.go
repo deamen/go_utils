@@ -95,6 +95,9 @@ type Session struct {
 	Title          string
 	URL            string
 	Context        string
+	// Comment is the comment the session was started from, when the agent
+	// was mentioned in one.
+	Comment string
 }
 
 // Parse returns a Session for AgentSessionEvent "created" events. "prompted"
@@ -117,6 +120,9 @@ func Parse(body []byte) (*Event, *Session, error) {
 		SessionID:      ev.AgentSession.ID,
 		OrganizationID: ev.OrganizationID,
 		Context:        ev.PromptContext,
+	}
+	if c := ev.AgentSession.Comment; c != nil {
+		s.Comment = c.Body
 	}
 	if is := ev.AgentSession.Issue; is != nil {
 		s.Key, s.Title, s.URL = is.Identifier, is.Title, is.URL

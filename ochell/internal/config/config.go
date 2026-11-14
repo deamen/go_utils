@@ -172,6 +172,10 @@ Use twg to retrieve the full ticket details, complete the task, and open a pull 
 Context provided by {{.Source}}:
 {{.Context}}
 {{- end}}
+{{- if .RunContext}}
+
+{{.RunContext}}
+{{- end}}
 
 {{.ResultInstructions}}
 `
@@ -398,6 +402,11 @@ func (c *Config) Validate() error {
 	// run would end as "no result".
 	if !strings.Contains(c.Agent.PromptTemplate, ".ResultInstructions") {
 		errs = append(errs, errors.New("agent.prompt_template must include {{.ResultInstructions}}: it tells the agent how to report the result of its run"))
+	}
+	// Without the run context a later attempt does not know about the
+	// earlier ones, or about the comment that asked for it.
+	if !strings.Contains(c.Agent.PromptTemplate, ".RunContext") {
+		errs = append(errs, errors.New("agent.prompt_template must include {{.RunContext}}: it tells the agent which attempt this is, what earlier attempts left, and which comment asked for the run"))
 	}
 	if c.Agent.RunDir == "" {
 		errs = append(errs, errors.New("agent.run_dir is required"))
