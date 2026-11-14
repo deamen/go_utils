@@ -29,6 +29,8 @@ import (
 	"ochell/internal/server"
 	"ochell/internal/source/linear"
 	"ochell/internal/store"
+	"ochell/internal/tracker"
+	"ochell/internal/tracker/jiraapi"
 )
 
 var version = "dev"
@@ -38,6 +40,7 @@ var availCmds = [][2]string{
 	{"serve", "run the webhook server (default)"},
 	{"ngrok-sync", "sync Atlassian/Linear IP ranges into ngrok IP policies"},
 	{"linear-install", "print the Linear agent app install URL"},
+	{"jira-check", "check the Jira API access: list the bot's open tickets, and comment on one with --comment-on"},
 	{"pause", "hold the queue of the running ochell: no new run starts"},
 	{"resume", "end a pause"},
 	{"status", "say whether the running ochell is paused, and what is queued and running"},
@@ -80,6 +83,8 @@ func main() {
 		err = ngrokSync(args)
 	case "linear-install":
 		err = linearInstall(args)
+	case "jira-check":
+		err = jiraCheck(args)
 	case "pause", "resume", "status", "reset":
 		err = adminCommand(cmd, args)
 	case "version":
@@ -233,6 +238,50 @@ func ngrokSync(args []string) error {
 		return nil
 	}
 	return ipsync.SyncPolicies(ctx, cfg.NgrokSync, ipsync.NewFetcher(), log, dryRun)
+}
+
+// jiraCheck shows that the Jira API access works: it lists the tickets
+// that ochell takes for the bot's open tickets, and on request adds a
+// comment to one of them.
+func jiraCheck(args []string) error {
+	var commentOn, text string
+	cfg, err := config.Load("jira-check", args, func(fs *flag.FlagSet) {
+		fs.StringVar(&commentOn, "comment-on", "", "also add a comment to this ticket")
+		fs.StringVar(&text, "text", "Test comment from ochell: the Jira API access works.", "the comment for --comment-on")
+	})
+	if err != nil {
+		return err
+	}
+	api := cfg.Sources.JiraAPI
+	if !api.Enabled() {
+		return errors.New("sources.jira_api is not configured")
+	}
+	if err := api.Validate(); err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	var jira tracker.Client = jiraapi.New(api)
+	issues, err := jira.Assigned(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%d open ticket(s) assigned to the bot on %s\n", len(issues), api.BaseURL)
+	tw := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	for _, is := range issues {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", is.Key, is.Title, strings.Join(is.Labels, ","))
+	}
+	tw.Flush()
+	if commentOn == "" {
+		return nil
+	}
+	if err := jira.Comment(ctx, commentOn, text); err != nil {
+		return err
+	}
+	fmt.Println("comment added to", commentOn)
+	return nil
 }
 
 func linearInstall(args []string) error {

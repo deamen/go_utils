@@ -175,6 +175,16 @@ sources:
     # "initiatorAccountId": "{{initiator.accountId}}".
     allowed_assigners: []
 
+  # ochell's own access to the Jira REST API, as the digital employee's
+  # account. Leave base_url out to run without it. Check it with
+  # "ochell jira-check".
+  jira_api:
+    base_url: https://example.atlassian.net
+    email: digital.employee@example.com
+    token: ${JIRA_API_TOKEN}
+    # Which tickets are the bot's open tickets. This is the default.
+    jql: "assignee = currentUser() AND statusCategory != Done"
+
   # Linear agent app (OAuth app installed with actor=app).
   linear:
     enabled: true

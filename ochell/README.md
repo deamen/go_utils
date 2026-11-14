@@ -45,7 +45,7 @@ go build -o ochell .
 ```
 
 ### End-to-end tests
-`go test ./e2e/` (part of `make test`) starts a real `ochell` process and sends it signed webhooks. The agent is [e2e/fakeagent](e2e/fakeagent/main.go), a scripted stand-in that records its arguments, environment, stdin and working directory, and Linear is a fake API that records the activities ochell posts. No real agent or tracker is involved.
+`go test ./e2e/` (part of `make test`) starts a real `ochell` process and sends it signed webhooks. The agent is [e2e/fakeagent](e2e/fakeagent/main.go), a scripted stand-in that records its arguments, environment, stdin and working directory, Linear is a fake API that records the activities ochell posts, and Jira is a fake site ([jiratest](internal/tracker/jiraapi/jiratest/jiratest.go)) with tickets and comments. No real agent or tracker is involved.
 
 A test uses the harness in [e2e/harness.go](e2e/harness.go):
 ```go
@@ -76,6 +76,7 @@ CI has no systemd, so what only real systemd can show runs on the VM. Set up the
 ochell serve --config config.yaml                 # default command
 ochell ngrok-sync --config config.yaml [--dry-run] [--loop]
 ochell linear-install --config config.yaml        # prints the agent install URL
+ochell jira-check --config config.yaml [--comment-on KEY]   # check the Jira API access
 ochell version
 
 # commands to the running ochell, over its admin socket (see "Guards and the admin channel")
@@ -126,6 +127,25 @@ ochell keeps its durable state in one SQLite file, `store.path` (default `ochell
 So a restart loses no queued task, and a retried or replayed delivery from before the restart is still recognised. SQLite keeps two more files next to it while ochell runs (`-wal` and `-shm`); copy all three, or stop ochell first, when you back it up.
 
 Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user.
+
+### Jira API access
+The webhooks only bring events in. For what ochell does on its own in Jira (finding the bot's tickets, commenting on one, changing a status) it needs the Jira REST API, with the API token of the digital employee's account:
+
+```yaml
+sources:
+  jira_api:
+    base_url: https://example.atlassian.net
+    email: digital.employee@example.com
+    token: ${JIRA_API_TOKEN}
+```
+
+- **Use the same Jira account as the agent's `twg`.** What ochell writes then comes from the bot account, like what the agent writes.
+- **`jql`** selects the bot's open tickets. The default is `assignee = currentUser() AND statusCategory != Done`: the account that owns the token, so no account id is needed.
+- **Check it** with `ochell jira-check --config config.yaml`. It lists the tickets that the JQL selects; with `--comment-on KEY` it also adds a test comment to that ticket.
+- The token is ochell's own. It is not passed to the agent.
+- Without `base_url` ochell runs as before, and nothing that needs the API happens.
+
+Only [internal/tracker/jiraapi](internal/tracker/jiraapi/jiraapi.go) calls the Jira API. The rest of ochell uses the small interface in [internal/tracker](internal/tracker/tracker.go) (`Assigned`, `Comment`, `SetStatus`), so another way to reach Jira, such as `twg`, can be added behind it.
 
 ### Repositories
 `repos` says which repository a ticket belongs to. ochell needs it to prepare a workspace; the agent is told the repository in its prompt and in `ORCH_TASK_REPO`.

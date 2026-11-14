@@ -14,6 +14,7 @@ import (
 
 	"ochell/internal/config"
 	"ochell/internal/store"
+	"ochell/internal/tracker/jiraapi/jiratest"
 )
 
 func TestMain(m *testing.M) {
@@ -1084,4 +1085,40 @@ func TestSystemdLauncherShutdownOnVM(t *testing.T) {
 		t.Errorf("run: %s", run.Footer)
 	}
 	expectAllGone(t, rec, 3)
+}
+
+// ochell reaches Jira through its API client: it lists the tickets assigned
+// to the bot and comments on one.
+func TestJiraAPIAccess(t *testing.T) {
+	o := Start(t, Options{})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-1", Summary: "Add retry to the payment client", Labels: []string{"backend"}})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-2", Summary: "Fix the login page"})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-3", Summary: "Update the docs"})
+
+	out, code := o.Admin("jira-check")
+	if code != 0 {
+		t.Fatalf("jira-check: exit %d: %s", code, out)
+	}
+	for _, want := range []string{"3 open ticket(s)", "DEV-1", "Add retry to the payment client", "backend", "DEV-2", "DEV-3"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("jira-check output missing %q:\n%s", want, out)
+		}
+	}
+	if got := o.Jira.Comments("DEV-2"); len(got) != 0 {
+		t.Errorf("jira-check without --comment-on wrote %q", got)
+	}
+
+	out, code = o.Admin("jira-check", "--comment-on", "DEV-2", "--text", "hello from ochell")
+	if code != 0 {
+		t.Fatalf("jira-check --comment-on: exit %d: %s", code, out)
+	}
+	if got := o.Jira.Comments("DEV-2"); !slices.Equal(got, []string{"hello from ochell"}) {
+		t.Errorf("comments on DEV-2 = %q", got)
+	}
+
+	// A failure of the API is reported, not hidden.
+	o.Jira.Fail(503)
+	if out, code = o.Admin("jira-check"); code == 0 || !strings.Contains(out, "HTTP 503") {
+		t.Errorf("jira-check against a failing site: exit %d: %s", code, out)
+	}
 }
