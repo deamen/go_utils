@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"os/user"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -45,6 +46,7 @@ var availCmds = [][2]string{
 	{"resume", "end a pause"},
 	{"status", "say whether the running ochell is paused, and what is queued and running"},
 	{"reset", "reset the attempts of a ticket: ochell reset <jira|linear> <KEY>"},
+	{"stop", "stop the run of a ticket and release the ticket: ochell stop <jira|linear> <KEY>"},
 	{"version", "print the version"},
 }
 
@@ -85,7 +87,7 @@ func main() {
 		err = linearInstall(args)
 	case "jira-check":
 		err = jiraCheck(args)
-	case "pause", "resume", "status", "reset":
+	case "pause", "resume", "status", "reset", "stop":
 		err = adminCommand(cmd, args)
 	case "version":
 		fmt.Printf("%s-%s\n", version, build)
@@ -190,7 +192,8 @@ func serve(args []string) error {
 // The socket is found in the same configuration that the server uses.
 func adminCommand(cmd string, args []string) error {
 	var rest []string
-	// The ticket of "reset" comes before the flags: ochell reset jira DEV-1 --config …
+	// The ticket of "reset" and "stop" comes before the flags:
+	// ochell reset jira DEV-1 --config …
 	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		rest, args = append(rest, args[0]), args[1:]
 	}
@@ -202,13 +205,19 @@ func adminCommand(cmd string, args []string) error {
 	switch cmd {
 	case "status":
 		method = "GET"
-	case "reset":
+	case "reset", "stop":
 		if len(rest) != 2 || (rest[0] != "jira" && rest[0] != "linear") {
-			return errors.New("usage: ochell reset <jira|linear> <KEY> [flags]")
+			return fmt.Errorf("usage: ochell %s <jira|linear> <KEY> [flags]", cmd)
 		}
 		query.Set("source", rest[0])
 		query.Set("key", rest[1])
 		rest = nil
+		if cmd == "stop" {
+			// For the note on the ticket.
+			if u, err := user.Current(); err == nil {
+				query.Set("user", u.Username)
+			}
+		}
 	}
 	if len(rest) > 0 {
 		return fmt.Errorf("unexpected arguments: %v", rest)

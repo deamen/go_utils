@@ -298,7 +298,7 @@ func (h Hooks) All() []struct {
 // Admin configures the local admin channel.
 type Admin struct {
 	// Socket is the unix socket on which a running ochell takes commands
-	// (ochell pause, resume, status, reset). Only ochell's own OS user can
+	// (ochell pause, resume, status, reset, stop). Only ochell's own OS user can
 	// open it. Empty: no admin channel.
 	Socket string `yaml:"socket"`
 }
@@ -530,7 +530,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.HTTPS.CertFile, "tls-cert", c.HTTPS.CertFile, "TLS certificate file (PEM)")
 	fs.StringVar(&c.HTTPS.KeyFile, "tls-key", c.HTTPS.KeyFile, "TLS private key file (PEM)")
 
-	fs.StringVar(&c.Admin.Socket, "admin-socket", c.Admin.Socket, "unix socket of the admin channel (ochell pause, resume, status, reset)")
+	fs.StringVar(&c.Admin.Socket, "admin-socket", c.Admin.Socket, "unix socket of the admin channel (ochell pause, resume, status, reset, stop)")
 	fs.StringVar(&c.Store.Path, "store-path", c.Store.Path, "file that holds the tickets, the task queue and the handled deliveries")
 
 	fs.StringVar(&c.Agent.Command, "agent-cmd", c.Agent.Command, "agent CLI command")

@@ -142,6 +142,7 @@ ochell status --config config.yaml                # paused or running; what is q
 ochell pause  --config config.yaml                # hold the queue: no new run starts
 ochell resume --config config.yaml
 ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts of a ticket
+ochell stop  <jira|linear> <KEY> --config config.yaml   # stop the run of a ticket and release it
 ```
 
 ## Configuration
@@ -237,6 +238,10 @@ Limits on what starts a run, and one way to talk to the running ochell.
   | Jira Automation | `initiatorAccountId` in the request body: add `"initiatorAccountId": "{{initiator.accountId}}"` to the rule's body. A request without it is rejected with 400 | 403 |
   | Linear | the id or the email address of `agentSession.creator` (or `creatorId`). If the payload has neither, the assignment is rejected. Those fields were not checked against Linear | 200, and an `error` activity in the session |
 
+- **Manual stop:** `ochell stop <jira|linear> <KEY>` stops and releases a ticket from the host, for when the tracker's event never arrived: a network error, or Jira not sending the unassign event.
+  - It does what a stop from the ticket does (see *Stopping from the ticket*): the running agent is stopped with all its processes, a queued run is taken out of the queue, and a ticket that only waited is released. The ticket becomes `cancelled` and is not started again, by a comment or by anything ochell does itself, until it is assigned again.
+  - **The ticket is told** that it was stopped with `ochell stop`, and by which OS user: a comment on a Jira ticket, a `response` in the Linear session of its last run. ochell's log has the same.
+  - The command exits with an error when ochell knows no such ticket, or when the ticket is already done or released.
 - **Follow-up allowlist:** `allowed_follow_ups` of `jira_webhook` and of `linear` says who may send the agent a follow-up (a comment on the Jira ticket, a reply in the Linear session).
 
   | Entry | Who it allows |
@@ -250,7 +255,7 @@ Limits on what starts a run, and one way to talk to the running ochell.
   - A ticket whose assigner ochell does not know (a Jira Automation rule that sends no initiator) has no `assigner`.
   - Message text is never a way in: what a comment says does not change who may send one, or what the agent may do.
 
-**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The four commands above find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
+**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
 - Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port: the agent runs on the same host and can reach any local port. With the `systemd` launcher the agent is another user and cannot open the socket; with the `direct` launcher it is the same user and can.
 - Keep the socket in a directory that the agent user cannot write to.
 

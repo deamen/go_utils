@@ -1832,3 +1832,75 @@ func TestStopFromTheTicket(t *testing.T) {
 		}
 	})
 }
+
+// The done-when of the manual stop: "ochell stop" stops a running ticket
+// and releases a queued one, and the ticket shows that it was stopped by
+// hand.
+func TestManualStop(t *testing.T) {
+	o := Start(t, Options{
+		Script:    spawning(Step{Spawn: &Spawn{Count: 2}}),
+		Configure: func(c *config.Config) { c.Agent.StopGrace = time.Second },
+	})
+	for _, key := range []string{"DEV-96", "DEV-97"} {
+		o.Jira.Add(jiratest.Issue{Key: key})
+	}
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	running := o.JiraAssigned("DEV-96", "Runs").TaskID(t)
+	rec := waitChildren(t, o, 2)
+	queued := o.JiraAssigned("DEV-97", "Waits for the worker").TaskID(t)
+
+	// The queued ticket first: the worker is still busy with the other.
+	out, code := o.Admin("stop", "jira", "DEV-97")
+	if code != 0 || !strings.Contains(out, "the queued run of jira DEV-97 was removed") {
+		t.Fatalf("ochell stop of the queued ticket: exit %d: %s", code, out)
+	}
+	if run := o.WaitStored(st, queued, 5*time.Second); run.Result.Outcome != "cancelled" {
+		t.Errorf("the queued run = %+v, want cancelled", run.Result)
+	}
+	out, code = o.Admin("stop", "jira", "DEV-96")
+	if code != 0 || !strings.Contains(out, "the agent of jira DEV-96 is being stopped") {
+		t.Fatalf("ochell stop of the running ticket: exit %d: %s", code, out)
+	}
+	if run := o.WaitStored(st, running, 15*time.Second); run.Result.Outcome != "cancelled" {
+		t.Errorf("the running run = %+v, want cancelled", run.Result)
+	}
+	expectAllGone(t, rec, 2)
+
+	// Both tickets are released, show who stopped them, and stay stopped.
+	for key, n := range map[string]int{"DEV-96": 2, "DEV-97": 1} {
+		if tk, _ := st.Ticket("jira", key); tk == nil || tk.State != "cancelled" {
+			t.Errorf("%s = %+v, want cancelled", key, tk)
+		}
+		comments := o.WaitJiraComments(key, n, 10*time.Second)
+		last := comments[len(comments)-1]
+		if !strings.Contains(last, "The run was stopped by the operator ") || !strings.Contains(last, `with "ochell stop" on the host`) {
+			t.Errorf("%s got %q, want that it was stopped by hand, and by whom", key, last)
+		}
+	}
+	if !strings.Contains(o.Output(), `msg="ticket stopped"`) || !strings.Contains(o.Output(), "by=\"the operator ") {
+		t.Error("ochell's log does not record the stop and who ran it")
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := len(o.Records()); n != 1 {
+		t.Errorf("the agent was started %d times, want 1: the released queued ticket must not start", n)
+	}
+
+	// What the command says when there is nothing to stop.
+	if out, code := o.Admin("stop", "jira", "DEV-96"); code == 0 || !strings.Contains(out, "nothing to stop") {
+		t.Errorf("a second stop: exit %d: %s", code, out)
+	}
+	if out, code := o.Admin("stop", "jira", "DEV-404"); code == 0 || !strings.Contains(out, "knows no jira ticket DEV-404") {
+		t.Errorf("stop of an unknown ticket: exit %d: %s", code, out)
+	}
+	if out, code := o.Admin("stop", "DEV-96"); code == 0 || !strings.Contains(out, "usage: ochell stop") {
+		t.Errorf("stop without a source: exit %d: %s", code, out)
+	}
+	// Assigned again, a released ticket runs again.
+	o.JiraAssigned("DEV-97", "Waits for the worker").TaskID(t)
+	o.WaitRecords(2, 10*time.Second)
+	o.Admin("stop", "jira", "DEV-97")
+}

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -16,13 +17,29 @@ import (
 )
 
 type fakeControl struct {
-	st    runner.Status
-	reset []string
+	st      runner.Status
+	reset   []string
+	stopped []string
 }
 
 func (f *fakeControl) Pause() error                   { f.st.Paused = true; return nil }
 func (f *fakeControl) Resume() error                  { f.st.Paused = false; return nil }
 func (f *fakeControl) Status() (runner.Status, error) { return f.st, nil }
+func (f *fakeControl) Stop(source, key, by string) (runner.Stopped, error) {
+	f.stopped = append(f.stopped, source+":"+key+" by "+by)
+	switch key {
+	case "NOPE-1":
+		return 0, store.ErrUnknown
+	case "DONE-1":
+		return 0, store.ErrReleased
+	case "QUEUED-1":
+		return runner.StoppedQueued, nil
+	case "WAITS-1":
+		return runner.Released, nil
+	}
+	return runner.StoppedRun, nil
+}
+
 func (f *fakeControl) ResetAttempts(source, key string) error {
 	if key == "NOPE-1" {
 		return store.ErrUnknown
@@ -76,6 +93,32 @@ func TestCommands(t *testing.T) {
 	}
 	if _, err := Call(path, "POST", "reset", url.Values{"source": {"jira"}, "key": {"NOPE-1"}}); err == nil || !strings.Contains(err.Error(), "knows no jira ticket NOPE-1") {
 		t.Errorf("reset of an unknown ticket: %v", err)
+	}
+	// stop: what was done, and who asked, for the note on the ticket.
+	for key, want := range map[string]string{
+		"DEV-1":    "the agent of jira DEV-1 is being stopped",
+		"QUEUED-1": "the queued run of jira QUEUED-1 was removed",
+		"WAITS-1":  "jira WAITS-1 had no run; the ticket is released",
+	} {
+		got, err := Call(path, "POST", "stop", url.Values{"source": {"jira"}, "key": {key}, "user": {"anna"}})
+		if err != nil || !strings.Contains(got, want) || !strings.Contains(got, "not started again until it is assigned again") {
+			t.Errorf("stop %s = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	if want := `jira:DEV-1 by the operator anna, with "ochell stop" on the host`; !slices.Contains(c.stopped, want) {
+		t.Errorf("stops = %q, want %q", c.stopped, want)
+	}
+	if _, err := Call(path, "POST", "stop", url.Values{"source": {"jira"}, "key": {"NOPE-1"}}); err == nil || !strings.Contains(err.Error(), "knows no jira ticket NOPE-1") {
+		t.Errorf("stop of an unknown ticket: %v", err)
+	}
+	if _, err := Call(path, "POST", "stop", url.Values{"source": {"jira"}, "key": {"DONE-1"}}); err == nil || !strings.Contains(err.Error(), "nothing to stop") {
+		t.Errorf("stop of a ticket that is done: %v", err)
+	}
+	if n := len(c.stopped); n != 5 || !strings.Contains(c.stopped[n-1], "by an operator, with") {
+		t.Errorf("stops = %q", c.stopped)
+	}
+	if _, err := Call(path, "GET", "stop", url.Values{"source": {"jira"}, "key": {"DEV-1"}}); err == nil || len(c.stopped) != 5 {
+		t.Errorf("GET stop: %v, %d stops", err, len(c.stopped))
 	}
 	// A command is not triggered by a plain GET.
 	if _, err := Call(path, "GET", "pause", nil); err == nil || c.st.Paused {
