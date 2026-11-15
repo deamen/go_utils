@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"time"
 
 	"ochell/internal/source/linear"
@@ -134,6 +135,13 @@ func (s *Server) pollStart(ctx context.Context, p polled, is tracker.Issue, log 
 	if err != nil {
 		log.Warn("poller: cannot find out who assigned the ticket", "key", is.Key, "err", err)
 		who = nil
+	}
+	// The bot account cannot give itself work, through the poller either.
+	if (p.source == "jira" && slices.ContainsFunc(who, s.jiraBot)) || (p.source == "linear" && s.linearBot("", who...)) {
+		if s.refusedOnce(p.source, is.Key) {
+			log.Warn("poller: ticket not started: the bot account assigned it to itself", "key", is.Key)
+		}
+		return false
 	}
 	if !mayAssign(p.assigners, who...) {
 		if s.refusedOnce(p.source, is.Key) {

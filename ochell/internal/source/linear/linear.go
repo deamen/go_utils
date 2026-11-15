@@ -113,6 +113,11 @@ type Event struct {
 			Name string `json:"name"`
 		} `json:"labels"`
 	} `json:"data"`
+	// Actor is who made the change that a data event such as "Issue"
+	// reports, when the payload has it.
+	Actor *struct {
+		ID string `json:"id"`
+	} `json:"actor"`
 	// UpdatedFrom holds the earlier values of what an "update" changed.
 	UpdatedFrom      map[string]any `json:"updatedFrom"`
 	Guidance         any            `json:"guidance"`
@@ -243,6 +248,15 @@ func (e *Event) Undelegated() (key string, ok bool) {
 		return "", false
 	}
 	return e.Data.Identifier, true
+}
+
+// ActorID returns the id of who made the change that a data event
+// reports, or "" when the payload does not say.
+func (e *Event) ActorID() string {
+	if e.Actor == nil {
+		return ""
+	}
+	return e.Actor.ID
 }
 
 // Updated reports whether the event is an "Issue" update, and returns the

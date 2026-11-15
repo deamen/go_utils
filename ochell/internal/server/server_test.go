@@ -1927,3 +1927,120 @@ func TestPlanText(t *testing.T) {
 		t.Error("a long plan is not cut cleanly")
 	}
 }
+
+// Gate integrity: nothing that the bot account does on a ticket starts
+// work, lets it go on, approves a plan, or counts as an acceptance.
+func TestBotAccountPassesNoGate(t *testing.T) {
+	pol, err := policy.Parse([]byte("tiers: [{name: low}, {name: high, plan_gate: required, labels: [risk-high]}]\ndefault_tier: low"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.Sources.JiraAutomation.BotAccountID = bot
+	cfg.Sources.Linear.BotUserIDs = []string{"u-twg"}
+	fr := &fakeRunner{
+		tiers:  map[string]string{"DEV-1": "low", "ENG-1": "low"},
+		plans:  map[string]bool{"DEV-1": true, "ENG-1": true},
+		states: map[string]ticket.State{"jira:DEV-1": ticket.Waiting, "linear:ENG-1": ticket.Waiting},
+	}
+	s := newServer(t, cfg, fr)
+	s.UsePolicy(pol)
+	jiraPost := func(body string) *httptest.ResponseRecorder {
+		return do(s, "/webhooks/jira", body, map[string]string{"X-Hub-Signature": "sha256=" + auth.SignHex("jira-secret", []byte(body))})
+	}
+	now := strconv.FormatInt(time.Now().UnixMilli(), 10)
+
+	// An assignment that the bot made itself.
+	body := strings.Replace(jiraBody(t, time.Now()), `"user": { "accountId": "557058:human-reporter"`, `"user": { "accountId": "`+bot+`"`, 1)
+	if w := jiraPost(body); w.Code != 403 || !strings.Contains(w.Body.String(), "cannot assign work to itself") || len(fr.tasks) != 0 {
+		t.Errorf("an assignment by the bot: %d %s, %d tasks", w.Code, w.Body, len(fr.tasks))
+	}
+	w := do(s, "/webhooks/jira-automation", `{"issueKey":"DEV-5","summary":"s","assigneeAccountId":"`+bot+`","initiatorAccountId":"`+bot+`"}`, map[string]string{"Authorization": "Bearer auto-token"})
+	if w.Code != 403 || len(fr.tasks) != 0 {
+		t.Errorf("an Automation rule triggered by the bot: %d %s", w.Code, w.Body)
+	}
+	// An approval by the bot: its comments are dropped.
+	cbody, hdr := jiraComment("DEV-1", bot, bot, "/approve")
+	if w := do(s, "/webhooks/jira", cbody, hdr); w.Code != 200 || len(fr.approved) != 0 {
+		t.Errorf("an approval by the bot: %d %s, approved %v", w.Code, w.Body, fr.approved)
+	}
+	// A close by the bot is no acceptance; a person's is.
+	closed := func(by string) string {
+		return `{"timestamp":` + now + `,"webhookEvent":"jira:issue_updated","user":{"accountId":"` + by + `"},"issue":{"key":"DEV-1"},"changelog":{"items":[{"field":"resolution","fieldId":"resolution","to":"10000","toString":"Done"}]}}`
+	}
+	if w := jiraPost(closed(bot)); w.Code != 200 || !strings.Contains(w.Body.String(), "closed by the bot") || len(fr.closed) != 0 {
+		t.Errorf("a close by the bot: %d %s, closed %v", w.Code, w.Body, fr.closed)
+	}
+	// A change of labels by the bot moves no tier, up or down.
+	labels := func(by, list string) string {
+		return `{"timestamp":` + now + `,"webhookEvent":"jira:issue_updated","user":{"accountId":"` + by + `"},"issue":{"key":"DEV-1","fields":{"labels":[` + list + `]}},"changelog":{"items":[{"field":"labels"}]}}`
+	}
+	if w := jiraPost(labels(bot, `"risk-high"`)); w.Code != 200 || !strings.Contains(w.Body.String(), "changed by the bot") || len(fr.raised) != 0 {
+		t.Errorf("a label change by the bot: %d %s, raised %v", w.Code, w.Body, fr.raised)
+	}
+	if w := jiraPost(labels("557058:dev", `"risk-high"`)); w.Code != 200 || len(fr.raised) != 1 {
+		t.Errorf("a label change by a person: %d %s, raised %v", w.Code, w.Body, fr.raised)
+	}
+	// A label that would lower the tier is ignored, whoever removes it.
+	if w := jiraPost(labels("557058:dev", ``)); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "ignored" || len(fr.raised) != 1 || fr.tiers["DEV-1"] != "high" {
+		t.Errorf("a label removed by a person: %d %s, raised %v, tier %s", w.Code, w.Body, fr.raised, fr.tiers["DEV-1"])
+	}
+	if w := jiraPost(closed("557058:dev")); w.Code != 200 || len(fr.closed) != 1 {
+		t.Errorf("a close by a person: %d %s, closed %v", w.Code, w.Body, fr.closed)
+	}
+
+	// Linear: a message in a session by the app's own user, or by the
+	// account its ticket tool uses, is no reply and no approval.
+	prompted := func(user, text string) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(map[string]any{
+			"type": "AgentSessionEvent", "action": "prompted", "appUserId": "u-app",
+			"agentSession":     map[string]any{"id": "s-1", "issue": map[string]string{"identifier": "ENG-1"}},
+			"agentActivity":    map[string]any{"content": map[string]string{"type": "prompt", "body": text}, "user": map[string]string{"id": user}},
+			"webhookTimestamp": time.Now().UnixMilli(),
+		})
+		return do(s, "/webhooks/linear", string(raw), map[string]string{"Linear-Signature": auth.SignHex("linear-secret", raw)})
+	}
+	for _, user := range []string{"u-app", "u-twg"} {
+		for _, text := range []string{"/approve", "Go on."} {
+			if w := prompted(user, text); w.Code != 200 || !strings.Contains(w.Body.String(), "message by the bot") {
+				t.Errorf("%q by %s: %d %s", text, user, w.Code, w.Body)
+			}
+		}
+	}
+	if len(fr.approved) != 0 || len(fr.tasks) != 0 {
+		t.Errorf("the bot's messages did something: approved %v, %d tasks", fr.approved, len(fr.tasks))
+	}
+	if w := prompted("u-human", "/approve"); w.Code != 200 || len(fr.approved) != 1 {
+		t.Errorf("an approval by a person: %d %s, approved %v", w.Code, w.Body, fr.approved)
+	}
+	// An issue that the app's own user completes or relabels.
+	issue := func(actor, extra string) *httptest.ResponseRecorder {
+		body := `{"type":"Issue","action":"update","appUserId":"u-app","actor":{"id":"` + actor + `"},"data":{"identifier":"ENG-1"` + extra + `},"updatedFrom":{},"webhookTimestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `}`
+		return do(s, "/webhooks/linear", body, map[string]string{"Linear-Signature": auth.SignHex("linear-secret", []byte(body))})
+	}
+	if w := issue("u-app", `,"state":{"type":"completed"}`); w.Code != 200 || !strings.Contains(w.Body.String(), "closed by the bot") || len(fr.closed) != 1 {
+		t.Errorf("a Linear close by the bot: %d %s, closed %v", w.Code, w.Body, fr.closed)
+	}
+	if w := issue("u-twg", `,"labels":[{"name":"risk-high"}]`); w.Code != 200 || !strings.Contains(w.Body.String(), "changed by the bot") || len(fr.raised) != 1 {
+		t.Errorf("a Linear label change by the bot: %d %s, raised %v", w.Code, w.Body, fr.raised)
+	}
+	if w := issue("u-human", `,"state":{"type":"completed"}`); w.Code != 200 || len(fr.closed) != 2 {
+		t.Errorf("a Linear close by a person: %d %s, closed %v", w.Code, w.Body, fr.closed)
+	}
+}
+
+// The poller does not start a ticket that the bot account assigned to
+// itself.
+func TestPollIgnoresTheBotsOwnAssignments(t *testing.T) {
+	fr := &fakeRunner{}
+	jira := &tracker.Fake{
+		Issues:    []tracker.Issue{{Key: "DEV-1", Title: "a"}, {Key: "DEV-2", Title: "b"}},
+		Assigners: map[string][]string{"DEV-1": {bot}, "DEV-2": {"557058:dev"}},
+	}
+	s := newServer(t, testConfig(), fr)
+	s.UseJira(jira)
+	s.Poll(context.Background())
+	if len(fr.tasks) != 1 || fr.tasks[0].Key != "DEV-2" {
+		t.Errorf("started %+v, want DEV-2 only", fr.tasks)
+	}
+}

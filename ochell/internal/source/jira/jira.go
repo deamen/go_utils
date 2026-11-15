@@ -171,6 +171,16 @@ func actor(u *User) string {
 	return u.AccountID
 }
 
+// ActorOf returns the accountId of the user who made the change that a
+// webhook payload reports, or "" when the payload does not say.
+func ActorOf(body []byte) string {
+	var ev WebhookEvent
+	if json.Unmarshal(body, &ev) != nil {
+		return ""
+	}
+	return actor(ev.User)
+}
+
 // ParseUpdated returns the issue of a jira:issue_updated event, with the
 // labels and the issue type it has now. Such an event can mean that the
 // ticket belongs in another tier.

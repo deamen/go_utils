@@ -3025,3 +3025,103 @@ func TestPlanGateOnJira(t *testing.T) {
 		t.Errorf("ticket = %+v, want the approval recorded", tk)
 	}
 }
+
+// Gate integrity: an approval, a label change or a status change made by
+// the bot account passes no gate, and a label that would lower the tier is
+// ignored.
+func TestBotAccountPassesNoGate(t *testing.T) {
+	const session = "2b3c4d5e-6f70-4812-9abc-0123456789ab"
+	script := []Step{{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`}}
+	script = append(script, OnRun(1, Report("plan", "Change the limit."))...)
+	script = append(script, OnRun(2, Report("plan", "Change the limit, as before."))...)
+	script = append(script, OnRun(3, Report("done", "Changed."))...)
+	script = append(script, OnRun(4, Report("done", "Done."))...)
+	o := Start(t, Options{Script: script, Policy: gatePolicy, Configure: claudeAdapter})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-110"})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	waits := func(when string) {
+		t.Helper()
+		time.Sleep(300 * time.Millisecond)
+		tk, _ := st.Ticket("jira", "DEV-110")
+		if tk == nil || tk.State != "waiting" || tk.Reason != "plan_approval" || tk.Tier != "high" || tk.PlanApproved {
+			t.Fatalf("%s: ticket = %+v, want still waiting for the approval in the tier high", when, tk)
+		}
+		if n := len(o.Records()); n != 1 {
+			t.Fatalf("%s: the agent was started %d times, want 1", when, n)
+		}
+	}
+
+	// A person assigns a high-tier ticket; the agent posts its plan.
+	o.Labels = []string{"risk-high"}
+	o.WaitStored(st, o.JiraAssigned("DEV-110", "Change a limit").TaskID(t), 15*time.Second)
+	o.WaitJiraComments("DEV-110", 2, 10*time.Second)
+	waits("after the plan")
+
+	// Everything from here to the next comment is done by the bot account,
+	// as the agent could do it with its ticket tool.
+	o.Actor = BotAccountID
+	if r := o.JiraCommented("DEV-110", BotAccountID, "/approve"); r.Status != 200 || !strings.Contains(r.Body, "comment by the bot") {
+		t.Errorf("an approval by the bot: %d %q", r.Status, r.Body)
+	}
+	waits("after the bot approved its own plan")
+	// It takes the label off, to get out of the tier with the gate.
+	o.Labels = nil
+	if r := o.JiraUpdated("DEV-110"); r.Status != 200 || r.Body != "ignored: changed by the bot" {
+		t.Errorf("a label change by the bot: %d %q", r.Status, r.Body)
+	}
+	waits("after the bot removed the label")
+	// It assigns the ticket to itself again, to get a new run.
+	if r := o.JiraAssigned("DEV-110", "Change a limit"); r.Status != 403 || r.Body != "the bot account cannot assign work to itself" {
+		t.Errorf("an assignment by the bot: %d %q", r.Status, r.Body)
+	}
+	if r := o.JiraAutomation("DEV-110", "Change a limit"); r.Status != 403 {
+		t.Errorf("an Automation rule triggered by the bot: %d %q", r.Status, r.Body)
+	}
+	waits("after the bot assigned the ticket to itself")
+	// It resolves the ticket, as if the work had been accepted.
+	if r := o.JiraResolved("DEV-110"); r.Status != 200 || r.Body != "ignored: closed by the bot" {
+		t.Errorf("a close by the bot: %d %q", r.Status, r.Body)
+	}
+	waits("after the bot closed the ticket")
+	// In Linear, a message in a session by the app's own user.
+	o.Actor = LinearAppUserID
+	if r := o.LinearPrompted("DEV-110", "session-any", "/approve"); r.Status != 200 || r.Body != "ignored: message by the bot" {
+		t.Errorf("a Linear message by the app's user: %d %q", r.Status, r.Body)
+	}
+	if !strings.Contains(o.Output(), "the bot account closed its own ticket; that is not taken as an acceptance") ||
+		!strings.Contains(o.Output(), "the bot account assigned the ticket to itself") {
+		t.Error("ochell's log does not show what the bot account tried")
+	}
+
+	// A person takes the label off: a label that would lower the tier is
+	// ignored. The correction that follows still gets a plan run.
+	o.Actor = ""
+	if r := o.JiraUpdated("DEV-110"); r.Status != 200 || r.Body != "ignored" {
+		t.Errorf("a label removed by a person: %d %q", r.Status, r.Body)
+	}
+	waits("after a person removed the label")
+	second := o.JiraCommented("DEV-110", "", "Please confirm the plan once more.").TaskID(t)
+	if run := o.WaitStored(st, second, 15*time.Second); run.Tier != "high" || run.Result.Phase != "plan" {
+		t.Errorf("the run after the label was removed: tier %q, %+v; want a plan run in high", run.Tier, run.Result)
+	}
+
+	// The person's approval is the one that counts.
+	r := o.JiraCommented("DEV-110", "", "/approve")
+	if r.Status != 200 || !strings.HasPrefix(r.Body, "approved; queued ") {
+		t.Fatalf("the approval by a person: %d %q", r.Status, r.Body)
+	}
+	if run := o.WaitStored(st, strings.TrimPrefix(r.Body, "approved; queued "), 15*time.Second); run.Result.Phase != "" || run.Result.Signal != "done" {
+		t.Errorf("the run after the approval: %+v", run.Result)
+	}
+	if tk, _ := st.Ticket("jira", "DEV-110"); tk.State != "in_review" || !tk.PlanApproved || tk.PlanApprovedBy != "Someone" {
+		t.Errorf("ticket = %+v, want in_review with the person's approval", tk)
+	}
+	// A person's close is an acceptance.
+	if r := o.JiraResolved("DEV-110"); r.Status != 200 || r.Body != "closed DEV-110" {
+		t.Errorf("a close by a person: %d %q", r.Status, r.Body)
+	}
+}

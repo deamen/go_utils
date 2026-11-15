@@ -188,6 +188,11 @@ type Linear struct {
 	// the word "assigner" (who delegated the issue). Empty: the same
 	// people as AllowedAssigners.
 	AllowedFollowUps []string `yaml:"allowed_follow_ups"`
+	// BotUserIDs are Linear user ids that the agent itself writes as, when
+	// its ticket tool uses another account than the app. What these users
+	// and the app's own user do on an issue is never taken as a person's
+	// word: it starts, continues, approves and closes nothing.
+	BotUserIDs []string `yaml:"bot_user_ids"`
 	// ToolActivityInterval is the least time between two "action"
 	// activities that show the agent's tool use in a session while it
 	// runs. 0: none are posted.

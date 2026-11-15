@@ -397,6 +397,33 @@ func mayAssign(allowed []string, ids ...string) bool {
 	return false
 }
 
+// Gate integrity. The agent has write access to its tickets through its
+// own tool, as the bot account. Whatever would let work start, go on or
+// count as accepted (an assignment, a message, an approval, a change of
+// labels or status) is therefore taken only from someone else. What the
+// bot account does on a ticket is not a person's word.
+
+// jiraBot reports whether a Jira accountId is the bot account's.
+func (s *Server) jiraBot(accountID string) bool {
+	src := s.cfg.Sources
+	return accountID != "" && (accountID == src.JiraWebhook.BotAccountID || accountID == src.JiraAutomation.BotAccountID)
+}
+
+// linearBot reports whether one of ids is a Linear user that the agent
+// writes as: the app's own user, as the signed payload names it, or one
+// of sources.linear.bot_user_ids.
+func (s *Server) linearBot(appUserID string, ids ...string) bool {
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if id == appUserID || slices.Contains(s.cfg.Sources.Linear.BotUserIDs, id) {
+			return true
+		}
+	}
+	return false
+}
+
 // Words in allowed_follow_ups that stand for a person of the ticket.
 const (
 	followerAssigner = "assigner"
@@ -667,7 +694,17 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	t, err := jira.ParseWebhook(body, cfg.BotAccountID)
 	if errors.Is(err, jira.ErrIgnored) {
+		// What the bot account itself did to the ticket is no signal: a
+		// close by it is not an acceptance of the work, and its changes of
+		// labels move no tier. Taking the ticket away from itself, below,
+		// only stops work, and stays allowed.
+		byBot := s.jiraBot(jira.ActorOf(body))
 		if key, ok := jira.ParseClosed(body); ok {
+			if byBot {
+				log.Warn("ignored: the bot account closed its own ticket; that is not taken as an acceptance", "key", key)
+				reply(w, http.StatusOK, "ignored: closed by the bot")
+				return
+			}
 			s.closed(w, "jira", key, log)
 			return
 		}
@@ -689,6 +726,11 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if u, ok := jira.ParseUpdated(body); ok {
+			if byBot {
+				log.Debug("ignored: a change of the ticket by the bot account", "key", u.Key)
+				reply(w, http.StatusOK, "ignored: changed by the bot")
+				return
+			}
 			s.updated(w, "jira", u.Key, attrs{labels: u.Labels, issueType: u.IssueType}, log)
 			return
 		}
@@ -699,6 +741,13 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Warn("bad payload", "err", err)
 		reply(w, http.StatusBadRequest, "bad payload")
+		return
+	}
+	if s.jiraBot(t.Actor) {
+		// The agent must not be able to give itself work, or to start a
+		// ticket again that waits for a person.
+		log.Warn("rejected: the bot account assigned the ticket to itself", "key", t.Key)
+		reply(w, http.StatusForbidden, "the bot account cannot assign work to itself")
 		return
 	}
 	if !mayAssign(cfg.AllowedAssigners, t.Actor) {
@@ -921,6 +970,11 @@ func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusBadRequest, "bad payload")
 		return
 	}
+	if s.jiraBot(t.Actor) {
+		log.Warn("rejected: the bot account triggered the rule that assigns the ticket to it", "key", t.Key)
+		reply(w, http.StatusForbidden, "the bot account cannot assign work to itself")
+		return
+	}
 	if len(cfg.AllowedAssigners) > 0 && t.Actor == "" {
 		log.Warn("rejected: the payload does not say who triggered the rule; check the rule's request body", "key", t.Key)
 		reply(w, http.StatusBadRequest, "no initiator in the payload: send initiatorAccountId")
@@ -953,7 +1007,15 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 	}
 	ev, sess, err := linear.Parse(body)
 	if errors.Is(err, linear.ErrIgnored) {
+		// As for Jira: a close or a change by the agent's own user is no
+		// signal. Taking the issue away from itself stays allowed.
+		byBot := s.linearBot(ev.AppUserID, ev.ActorID())
 		if key, ok := ev.Closed(); ok {
+			if byBot {
+				log.Warn("ignored: the agent's own user closed its issue; that is not taken as an acceptance", "key", key)
+				reply(w, http.StatusOK, "ignored: closed by the bot")
+				return
+			}
 			s.closed(w, "linear", key, log)
 			return
 		}
@@ -962,6 +1024,11 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if key, labels, ok := ev.Updated(); ok {
+			if byBot {
+				log.Debug("ignored: a change of the issue by the agent's own user", "key", key)
+				reply(w, http.StatusOK, "ignored: changed by the bot")
+				return
+			}
 			s.updated(w, "linear", key, attrs{labels: labels}, log)
 			return
 		}
@@ -979,12 +1046,19 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sess.Prompted {
+		if s.linearBot(ev.AppUserID, sess.Actor) {
+			// The loop guard, and more: a message that the agent's own user
+			// writes into a session is no reply, no approval and no stop.
+			log.Warn("ignored: a message in a session by the agent's own user", "session", sess.SessionID, "key", sess.Key)
+			reply(w, http.StatusOK, "ignored: message by the bot")
+			return
+		}
 		s.linearPrompted(w, sess, keys, delivery, log)
 		return
 	}
 	// A session that ochell created itself, for a ticket that its poller
 	// found, comes back as a "created" event. It is no new assignment.
-	own := ev.AppUserID != "" && sess.Actor == ev.AppUserID
+	own := s.linearBot(ev.AppUserID, sess.Actor)
 	if key, err := s.runner.TicketOfSession("linear", sess.SessionID); err == nil && key != "" {
 		own = true
 	}
