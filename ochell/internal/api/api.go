@@ -3,6 +3,7 @@
 //
 //	GET /api/v1/state         what is queued, running and waiting
 //	GET /api/v1/tasks/<key>   one ticket with its runs
+//	GET /api/v1/inbox         the tickets that wait for a person, and why
 //
 // A request gets JSON, or a plain HTML page when it asks for one (a
 // browser). Every request needs the API token, as "Authorization: Bearer".
@@ -68,6 +69,7 @@ func New(cfg config.API, st Store, r Runner, log *slog.Logger) *API {
 	a := &API{cfg: cfg, store: st, runner: r, log: log, mux: http.NewServeMux()}
 	a.mux.HandleFunc("GET "+Prefix+"state", a.authed(a.state))
 	a.mux.HandleFunc("GET "+Prefix+"tasks/{key}", a.task)
+	a.mux.HandleFunc("GET "+Prefix+"inbox", a.authed(a.inbox))
 	return a
 }
 
@@ -294,6 +296,72 @@ func (a *API) task(w http.ResponseWriter, r *http.Request) {
 	}{out})
 }
 
+// reasons says, for each reason a ticket can wait for, what a person is
+// asked to do.
+var reasons = map[ticket.Reason]string{
+	ticket.ReasonInput:         "The agent asked a question. Answer it on the ticket.",
+	ticket.ReasonPlanApproval:  "The agent's plan waits for an approval: /approve on the ticket, or say what to change.",
+	ticket.ReasonBlocked:       "The agent is blocked by something outside the ticket. Remove the obstacle, then reply on the ticket.",
+	ticket.ReasonStalled:       "The agent stopped producing output and was stopped, and the ticket has no attempt left. Look at the run log, then reply on the ticket.",
+	ticket.ReasonNoResult:      "The run ended without saying how. Look at what it did, then reply on the ticket.",
+	ticket.ReasonNoRepoMapping: "No repository is configured for the ticket. Add one to repos, then assign the ticket again.",
+	ticket.ReasonEscalation:    "A limit or the agent itself stopped the work. Decide whether it goes on: reply on the ticket, change it, or stop it.",
+	ticket.ReasonInterrupted:   "ochell stopped during the run and the ticket has no attempt left. Reply on the ticket to let it go on.",
+}
+
+// Item is one entry of the inbox: a ticket that waits for a person.
+type Item struct {
+	Ticket
+	// Why says what the reason means and what a person is asked to do.
+	Why string `json:"why"`
+	// Since is when the ticket began to wait.
+	Since time.Time `json:"since"`
+	// Message is what the agent said last for the people on the ticket:
+	// its question, its plan, or why it stopped.
+	Message string `json:"message,omitempty"`
+	// Entry is the address of the ticket's entry in this API.
+	Entry string `json:"entry"`
+}
+
+// Inbox is the answer of /api/v1/inbox.
+type Inbox struct {
+	// Items are the tickets that wait for a person, the one that has
+	// waited longest first.
+	Items []Item `json:"items"`
+}
+
+// inbox lists exactly the tickets that wait for a person: the ones in the
+// state "waiting", each with its reason. A ticket in any other state is
+// not here: one in review is in the review queue of its pull request, and
+// a failed one is in the state page.
+func (a *API) inbox(w http.ResponseWriter, r *http.Request) {
+	list, err := a.store.Tickets(maxListed, ticket.Waiting)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	out := Inbox{Items: []Item{}}
+	// The store gives the ticket that changed last first; the inbox starts
+	// with the one that has waited longest.
+	for i := len(list) - 1; i >= 0; i-- {
+		t := list[i]
+		item := Item{Ticket: ticketOf(t), Why: reasons[t.Reason], Since: t.Updated,
+			Entry: Prefix + "tasks/" + url.PathEscape(t.Key) + "?source=" + url.QueryEscape(t.Source)}
+		runs, err := a.store.Runs(t.Source, t.Key)
+		if err != nil {
+			a.fail(w, err)
+			return
+		}
+		for j := len(runs) - 1; j >= 0 && item.Message == ""; j-- {
+			if runs[j].Status == "ended" {
+				item.Message = runOf(runs[j]).Message
+			}
+		}
+		out.Items = append(out.Items, item)
+	}
+	a.answer(w, r, inboxPage, out)
+}
+
 func (a *API) fail(w http.ResponseWriter, err error) {
 	a.log.Error("status API: cannot read the store", "err", err)
 	http.Error(w, "cannot read the state", http.StatusInternalServerError)
@@ -368,3 +436,11 @@ var taskPage = template.Must(template.New("task").Funcs(funcs).Parse(`<!doctype 
 <td>{{.Outcome}}{{if .Result}} / {{.Result}}{{end}}{{if .Escalation}} / escalation: {{.Escalation}}{{end}}{{if .Error}}<br><span class="dim">{{.Error}}</span>{{end}}</td><td>{{usd .CostUSD}}</td><td><pre>{{.Message}}</pre></td></tr>
 {{end}}</table>{{else}}<p class="dim">No run yet.</p>{{end}}
 {{end}}</body></html>`))
+
+var inboxPage = template.Must(template.New("inbox").Funcs(funcs).Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>ochell: inbox</title>` + style + `</head><body>
+<h1>Waiting for a person</h1>
+{{if .Items}}<table><tr><th>Ticket</th><th>Reason</th><th>Since</th><th>What the agent said</th></tr>
+{{range .Items}}<tr><td>{{.Source}} {{.Key}}<br>{{.Title}}{{if .URL}}<br><span class="dim">{{.URL}}</span>{{end}}</td>
+<td><b>{{.Reason}}</b><br>{{.Why}}</td><td>{{when .Since}}</td><td><pre>{{.Message}}</pre></td></tr>
+{{end}}</table>{{else}}<p class="dim">Nothing waits for a person.</p>{{end}}
+</body></html>`))

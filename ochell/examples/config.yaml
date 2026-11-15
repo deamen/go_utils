@@ -30,7 +30,8 @@ store:
   path: /var/lib/ochell/ochell.db
 
 # The status API: read-only pages about what ochell is doing, on the same
-# listener as the webhooks (GET /api/v1/state, /api/v1/tasks/<key>). Every
+# listener as the webhooks (GET /api/v1/state, /api/v1/inbox for the tickets
+# that wait for a person, /api/v1/tasks/<key>). Every
 # request needs the token. With public_url, the Linear session of a ticket
 # links to the ticket's entry.
 api:

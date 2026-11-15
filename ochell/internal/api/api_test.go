@@ -118,3 +118,37 @@ func TestTokenAndSignedLink(t *testing.T) {
 		t.Errorf("link without public_url = %q", got)
 	}
 }
+
+// Every reason a ticket can wait for has a line that says what to do.
+func TestEveryReasonIsExplained(t *testing.T) {
+	for _, r := range []ticket.Reason{ticket.ReasonInput, ticket.ReasonPlanApproval, ticket.ReasonBlocked, ticket.ReasonStalled,
+		ticket.ReasonNoResult, ticket.ReasonNoRepoMapping, ticket.ReasonEscalation, ticket.ReasonInterrupted} {
+		if reasons[r] == "" {
+			t.Errorf("the inbox has no text for the reason %s", r)
+		}
+		if err := ticket.Move(ticket.Running, ticket.Waiting, r); err != nil {
+			t.Errorf("%s is not a reason of the state machine: %v", r, err)
+		}
+	}
+}
+
+func TestInbox(t *testing.T) {
+	const token = "0123456789abcdef"
+	a := newAPI(config.API{Enabled: true, Token: token})
+	if w := get(a, "/api/v1/inbox", "", ""); w.Code != 401 {
+		t.Errorf("the inbox without the token: %d", w.Code)
+	}
+	w := get(a, "/api/v1/inbox", token, "")
+	// Only the waiting ticket, not the running one with the same key.
+	if body := w.Body.String(); w.Code != 200 || strings.Count(body, `"key": "DEV-1"`) != 1 || !strings.Contains(body, `"reason": "input"`) ||
+		!strings.Contains(body, `"why": "The agent asked a question. Answer it on the ticket."`) || !strings.Contains(body, `"entry": "/api/v1/tasks/DEV-1?source=jira"`) {
+		t.Errorf("inbox: %d %s", w.Code, body)
+	}
+	if w := get(a, "/api/v1/inbox", token, "text/html"); w.Code != 200 || !strings.Contains(w.Body.String(), "<b>input</b>") || strings.Contains(w.Body.String(), "<script>") {
+		t.Errorf("inbox page: %d %s", w.Code, w.Body)
+	}
+	empty := New(config.API{Enabled: true, Token: token}, fakeStore{}, fakeRunner{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if w := get(empty, "/api/v1/inbox", token, ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"items": []`) {
+		t.Errorf("an empty inbox: %d %s", w.Code, w.Body)
+	}
+}
