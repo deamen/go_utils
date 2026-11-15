@@ -25,6 +25,9 @@ const (
 	// CauseFollowUp: a person wrote to the agent on a ticket that ochell
 	// already knows. The message is in Comment.
 	CauseFollowUp Cause = "follow_up"
+	// CauseChecks: the checks of the ticket's pull request failed, and
+	// this run is to fix them. What failed is in Comment.
+	CauseChecks Cause = "checks_failed"
 	// CauseApproved: a person approved the agent's plan for the ticket.
 	// ApprovedBy on the task names them.
 	CauseApproved Cause = "plan_approved"
@@ -212,6 +215,9 @@ type Result struct {
 	Branch        string
 	// Phase is the phase the run was for.
 	Phase Phase
+	// AwaitChecks says that the work was handed over with a pull request
+	// whose checks ochell follows: the ticket is not in review yet.
+	AwaitChecks bool
 	// Escalation is set when a trigger stopped the ticket: it now waits
 	// for a human, whatever the outcome says. TierBefore and TierAfter are
 	// set when the escalation moved the ticket to a higher tier.

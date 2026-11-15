@@ -172,6 +172,7 @@ func serve(args []string) error {
 	if err := r.UsePolicy(pol); err != nil {
 		return fmt.Errorf("invalid policy:\n%w", err)
 	}
+	r.FollowChecks(cfg.GitHub.Enabled())
 	r.SetNotifier(srv)
 	if err := r.UseWorkspace(cfg.Workspace); err != nil {
 		return err

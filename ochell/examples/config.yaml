@@ -48,6 +48,11 @@ github:
   token: ${GITHUB_READ_TOKEN}
   poll_interval: 2m
   bot_login: ""             # the digital employee's GitHub login: a merge by it is no acceptance
+  # ochell also reads the checks and the comments of these pull requests.
+  # A ticket is in review when the checks have passed; failed checks and
+  # review comments wake the agent.
+  checks_grace: 2m          # a pull request with no check after this long has none
+  allowed_reviewers: []     # GitHub logins whose comments reach the agent; empty: owners, members and collaborators
   # api_url: https://ghe.example.com/api/v3
 
 # The policy file: the risk tiers, and which tier a ticket runs under (see

@@ -5,6 +5,8 @@
 //	                 ┌──────────────── new run (assigned again, a reply, a retry) ───────────────┐
 //	                 ▼                                                                            │
 //	(new) ──► queued ──► running ──┬──► in_review ──► done ───────────────────────────────────────┤
+//	   │         │                 ├──► checking ──► in_review (the checks of the pull request passed)
+//	   │         │                 │        └──► queued (they failed: the agent looks at them)
 //	   │         │                 ├──► waiting (with a reason) ───────────────────────────────────┤
 //	   │         │                 ├──► failed ───────────────────────────────────────────────────┤
 //	   │         └──► cancelled ◄──┴── (also from waiting, in_review and failed) ──────────────────┘
@@ -33,6 +35,9 @@ const (
 	Running State = "running"
 	// Waiting: nothing happens until a human acts. It always has a Reason.
 	Waiting State = "waiting"
+	// Checking: the agent handed its work over, and ochell waits for the
+	// checks of its pull request before a human is asked to review it.
+	Checking State = "checking"
 	// InReview: the agent handed its work over, and a human reviews it.
 	InReview State = "in_review"
 	// Done: the work was accepted, or the ticket was closed.
@@ -83,7 +88,10 @@ var moves = map[State][]State{
 	None:   {Queued, Waiting},
 	Queued: {Running, Cancelled},
 	// Back to queued: a retry, or a run that is resumed after a restart.
-	Running: {Waiting, InReview, Done, Failed, Cancelled, Queued},
+	Running: {Waiting, Checking, InReview, Done, Failed, Cancelled, Queued},
+	// The checks passed, or the agent could not fix them: review. They
+	// failed, or a person wrote: a new run.
+	Checking: {InReview, Queued, Done, Cancelled, Waiting},
 	// A human acted: a new run, or the ticket was closed. Waiting again:
 	// the reason changed.
 	Waiting:  {Queued, Cancelled, Done, Waiting},

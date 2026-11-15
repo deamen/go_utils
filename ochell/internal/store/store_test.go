@@ -1408,3 +1408,102 @@ func TestPullRequests(t *testing.T) {
 		t.Errorf("open pull requests = %+v, want none", open)
 	}
 }
+
+// A ticket whose run handed over a pull request waits for its checks
+// before it is in review; failed checks queue it again.
+func TestWaitingForChecks(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
+	state := func(want ticket.State) {
+		t.Helper()
+		if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != want {
+			t.Fatalf("ticket = %s, want %s", tk.State, want)
+		}
+	}
+	done := task.Result{Outcome: task.OutcomeFinished, Signal: result.Done, AwaitChecks: true}
+
+	// Without a pull request there is nothing to wait for.
+	if err := s.Enqueue(newTask("r1", "ENG-1", t0), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	s.Claim()
+	if err := s.Finish("r1", done); err != nil {
+		t.Fatal(err)
+	}
+	state(ticket.InReview)
+	if err := s.ToReview("linear", "ENG-1"); !errors.Is(err, ErrNotChecking) {
+		t.Errorf("ToReview of a ticket in review: %v", err)
+	}
+	if err := s.WakeForChecks(newTask("w0", "ENG-1", t0), Limits{}); !errors.Is(err, ErrNotChecking) {
+		t.Errorf("WakeForChecks of a ticket in review: %v", err)
+	}
+
+	// With one, the ticket waits for the checks.
+	if _, err := s.FollowUp(newTask("r2", "ENG-1", t0.Add(time.Minute)), true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	s.Claim()
+	withPR := done
+	withPR.PRURL = "https://example.test/pr/1"
+	if err := s.Finish("r2", withPR); err != nil {
+		t.Fatal(err)
+	}
+	state(ticket.Checking)
+
+	// They fail: a run with the failure, which counts as an attempt.
+	wake := newTask("w1", "ENG-1", t0.Add(2*time.Minute))
+	wake.Cause, wake.Comment = task.CauseChecks, "Check \"test\": failure"
+	if err := s.WakeForChecks(wake, Limits{MaxAttempts: 1}); !errors.Is(err, ErrAttempts) {
+		t.Errorf("WakeForChecks without an attempt left: %v", err)
+	}
+	if err := s.WakeForChecks(wake, Limits{MaxAttempts: 5}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Claim()
+	if err != nil || got.ID != "w1" || got.Cause != task.CauseChecks || got.Comment != "Check \"test\": failure" || got.PRURL != "https://example.test/pr/1" {
+		t.Fatalf("claimed %+v, %v", got, err)
+	}
+	if err := s.Finish("w1", done); err != nil {
+		t.Fatal(err)
+	}
+	state(ticket.Checking)
+
+	// How far the pull request was followed.
+	seen := t0.Add(3 * time.Minute)
+	if err := s.NotePullRequest("linear", "ENG-1", withPR.PRURL, "sha-1", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.NotePullRequest("linear", "ENG-1", withPR.PRURL, "", seen); err != nil {
+		t.Fatal(err)
+	}
+	if prs, _ := s.PullRequests("linear", "ENG-1"); len(prs) != 1 || prs[0].CheckedSHA != "sha-1" || !prs[0].SeenComment.Equal(seen) {
+		t.Errorf("pull request = %+v", prs)
+	}
+
+	// They pass: review. A message from a person also ends the wait.
+	if err := s.ToReview("linear", "ENG-1"); err != nil {
+		t.Fatal(err)
+	}
+	state(ticket.InReview)
+	if _, err := s.FollowUp(newTask("r3", "ENG-1", t0.Add(4*time.Minute)), true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	s.Claim()
+	if err := s.Finish("r3", done); err != nil {
+		t.Fatal(err)
+	}
+	state(ticket.Checking)
+	if later, err := s.FollowUp(newTask("r4", "ENG-1", t0.Add(5*time.Minute)), false, Limits{}); err != nil || later {
+		t.Fatalf("a comment on a ticket that waits for its checks: later %v, %v", later, err)
+	}
+	state(ticket.Queued)
+	// A pull request that is no longer open is nothing to wait for.
+	s.Claim()
+	if err := s.SetPullRequest("linear", "ENG-1", withPR.PRURL, PRRejected, "", "another branch"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish("r4", done); err != nil {
+		t.Fatal(err)
+	}
+	state(ticket.InReview)
+}

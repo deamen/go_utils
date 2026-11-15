@@ -270,7 +270,26 @@ The agent opens a pull request and hands the ticket over; a person reviews and m
 - **Only the ticket's own pull request counts.** The address comes from the agent, so ochell follows it only when it is a pull request on the configured GitHub, from the branch that the ticket is worked on (`workspace.branch`, `bot/<KEY>` by default). Anything else is recorded as `rejected`, with the reason, and is not asked about again. Otherwise an agent could name someone else's merged pull request and have its ticket done.
 - **A question that GitHub does not answer changes nothing**; ochell asks again at the next interval.
 - **Without `github.token`** nothing is followed: a ticket in review becomes `done` when it is closed in the tracker, as before.
-- Review comments and checks on the pull request are not read yet.
+**Checks and review comments.** With `github.token`, ochell also reads the checks and the comments of the pull requests it follows.
+
+- **A ticket is in review only when the checks are through.** A run that hands over a pull request leaves its ticket in the state `checking`. The ticket is told that the checks are running; the Jira `review_status` is not set yet.
+
+  | The checks of the pull request's head commit | What ochell does |
+  |---|---|
+  | still running | waits |
+  | all passed | the ticket is `in_review`, is told so, and gets its Jira `review_status` |
+  | none at all, `github.checks_grace` (2m) after the hand-over | the same |
+  | at least one failed, and all have finished | **wakes the ticket with the failure**: a new run, in the agent's session, whose prompt has the name of each failed check, what the check says about itself (title and summary), and its address |
+
+- **The agent fixes the failure and pushes**; the new commit is checked again. Three ways lead to review with failing checks, each with a note on the ticket:
+  - the agent reports `blocked` in a run for failed checks: its word that it cannot fix them;
+  - the agent hands over again without a new commit: it did not change the pull request;
+  - the ticket has no attempt left (`agent.max_attempts`).
+- **Checks** are GitHub's check runs (Actions and other apps) and commit statuses. ochell does not read build logs; a check's own summary is what the agent gets. The text is marked in the prompt as output of tools, not an instruction.
+- **A review comment wakes the ticket as a follow-up.** What a reviewer writes on the pull request (in the conversation, on a line of the diff, or as the text of a review) reaches the agent like a comment on the ticket, with the author, the place and the pull request. Each comment is passed on once.
+  - **Whose comments count:** `github.allowed_reviewers` (GitHub logins); without that list, the people whom GitHub calls owner, member or collaborator of the repository. Never the digital employee's own account (`bot_login`).
+  - ochell looks at the first hundred comments of each kind on a pull request.
+- All of this is by polling, every `github.poll_interval`; ochell needs no webhook from GitHub.
 
 ### The status API
 Read-only pages about what ochell is doing, on the same listener as the webhooks.
@@ -630,6 +649,7 @@ Every ticket ochell has seen is in one of these states. They are defined, with t
 |---|---|---|
 | `queued` | a run waits for a free worker | `running`, `cancelled` |
 | `running` | an agent is working on the ticket | any state below, or `queued` again (a retry) |
+| `checking` | the agent handed its work over, and ochell waits for the checks of the pull request (see [Handoff](#handoff-review-merge-done)) | `in_review`, `queued`, `done`, `cancelled` |
 | `waiting` | nothing happens until a human acts; always with a reason | `queued`, `done`, `cancelled` |
 | `in_review` | the agent handed its work over and a human reviews it | `queued`, `done`, `waiting`, `cancelled` |
 | `done` | the work was accepted, or the ticket was closed in the tracker | `queued` |
@@ -644,7 +664,7 @@ What a run leads to:
 
 | Run outcome | Agent's result file | Ticket state |
 |---|---|---|
-| `finished` | `done` | `in_review` |
+| `finished` | `done` | `in_review`; `checking` first, when ochell follows the ticket's pull request on GitHub |
 | `finished` | `needs_input` | `waiting`, reason `input` |
 | `finished` | `blocked` | `waiting`, reason `blocked` |
 | `finished` | `low_confidence`, `out_of_scope` | `waiting`, reason `escalation` |
