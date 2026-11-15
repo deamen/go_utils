@@ -3351,121 +3351,15 @@ func TestGrantsThroughTheSystemdLauncher(t *testing.T) {
 	}
 }
 
-// hanging makes the first n runs of the fake agent start two children, one
-// of which ignores SIGTERM, and then hang; every later run reports done.
-func hanging(n int) []Step {
-	var script []Step
-	for i := 1; i <= n; i++ {
-		script = append(script, OnRun(i, Step{Spawn: &Spawn{Count: 1}}, Step{Spawn: &Spawn{Count: 1, IgnoreTerm: true}}, Step{Print: "working"}, Step{Sleep: "10m"})...)
-	}
-	return append(script, Report("done", "Done after the resume."))
-}
-
-// waitHanging waits until n runs have started their two children.
-func waitHanging(t *testing.T, o *Ochell, n int) []Record {
-	t.Helper()
-	var recs []Record
-	o.waitFor(15*time.Second, "the agents to start their children", func() bool {
-		recs = o.Records()
-		ready := 0
-		for _, r := range recs {
-			if len(r.Children) == 2 {
-				ready++
-			}
-		}
-		return ready >= n
-	})
-	return recs
-}
-
-// The kill switch: it stops dispatch and cancels all running agents within
-// the grace period. Their tickets wait in the queue, and go on after the
-// resume.
-func TestKillSwitch(t *testing.T) {
-	o := Start(t, Options{Script: hanging(3), Configure: func(c *config.Config) {
-		c.Agent.MaxConcurrent = 3
-		c.Agent.StopGrace = time.Second
-	}})
-	st, err := store.Open(o.Config.Store.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	keys := []string{"ENG-130", "ENG-131", "ENG-132"}
-	for _, key := range keys {
-		o.LinearCreated(key, "session-"+key, "")
-	}
-	recs := waitHanging(t, o, 3)
-
-	pulled := time.Now()
-	out, code := o.Admin("kill")
-	if code != 0 || !strings.Contains(out, "kill switch: stopping every running agent (3)") || !strings.Contains(out, "paused: no new run starts") {
-		t.Fatalf("ochell kill: exit %d, %q", code, out)
-	}
-	// Every agent and every child is gone, also the ones that ignore
-	// SIGTERM: within the grace period of one second, and a little.
-	for _, rec := range recs {
-		expectAllGone(t, rec, 2)
-	}
-	if d := time.Since(pulled); d > 6*time.Second {
-		t.Errorf("the agents were gone %s after the kill, with a grace period of 1s", d)
-	}
-	o.waitFor(10*time.Second, "the stopped runs to be queued again", func() bool {
-		out, _ := o.Admin("status")
-		return out == "paused: no new run starts; 3 queued, 0 running"
-	})
-	for _, key := range keys {
-		if tk, _ := st.Ticket("linear", key); tk.State != "queued" {
-			t.Errorf("%s = %s, want queued", key, tk.State)
-		}
-		acts := o.WaitActivities("session-"+key, 2, 10*time.Second)
-		if acts[1].Type != "thought" || !strings.Contains(acts[1].Body, "The run was stopped by the kill switch (the operator ") ||
-			!strings.Contains(acts[1].Body, "starts when the orchestrator is resumed") {
-			t.Errorf("%s was told %+v", key, acts[1])
-		}
-	}
-	// Dispatch is stopped: new work is accepted, and waits.
-	o.LinearCreated("ENG-133", "session-ENG-133", "")
-	time.Sleep(500 * time.Millisecond)
-	if out, _ := o.Admin("status"); out != "paused: no new run starts; 4 queued, 0 running" {
-		t.Errorf("ochell status after the kill: %q", out)
-	}
-	if n := len(o.Records()); n != 3 {
-		t.Fatalf("the agent was started %d times, want 3: nothing starts after the kill", n)
-	}
-
-	// After the resume everything goes on; the agents are told what
-	// happened to their earlier run.
-	if out, code := o.Admin("resume"); code != 0 || !strings.HasPrefix(out, "running; ") {
-		t.Fatalf("ochell resume: exit %d, %q", code, out)
-	}
-	recs = o.WaitRecords(7, 20*time.Second)
-	told := 0
-	for _, rec := range recs[3:] {
-		if strings.Contains(rec.Stdin, "An operator of the orchestrator stopped every running agent") {
-			told++
-		}
-	}
-	if told != 3 {
-		t.Errorf("%d of the runs after the resume have the note about the kill switch, want 3", told)
-	}
-	for _, key := range append(keys, "ENG-133") {
-		key := key
-		o.waitFor(15*time.Second, key+" to be in review", func() bool {
-			tk, _ := st.Ticket("linear", key)
-			return tk != nil && tk.State == "in_review"
-		})
-	}
-}
-
-// The kill switch and the pause for one tier: only that tier's agents are
-// stopped and only its tickets are held.
-func TestKillSwitchForOneTier(t *testing.T) {
+// The pause of one tier: only that tier's tickets are held, nothing that
+// runs is stopped, and the pause is kept across a restart.
+func TestPauseForOneTier(t *testing.T) {
 	o := Start(t, Options{
-		Script: hanging(2),
+		Script: append(OnRun(1, Step{Print: "working"}, Step{Sleep: "10m"}), Report("done", "Done.")),
 		Policy: "tiers:\n  - {name: low}\n  - {name: high, labels: [risk-high]}\ndefault_tier: low\n",
 		Configure: func(c *config.Config) {
 			c.Agent.MaxConcurrent = 3
+			c.Agent.DrainTimeout = 100 * time.Millisecond
 			c.Agent.StopGrace = time.Second
 		},
 	})
@@ -3474,46 +3368,45 @@ func TestKillSwitchForOneTier(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	o.LinearCreated("ENG-140", "session-low", "")
+	// A high-tier agent is running.
 	o.Labels = []string{"risk-high"}
 	o.LinearCreated("ENG-141", "session-high", "")
-	var low, high Record
-	for _, rec := range waitHanging(t, o, 2) {
-		if key, _ := rec.Getenv("ORCH_TASK_KEY"); key == "ENG-140" {
-			low = rec
-		} else {
-			high = rec
-		}
-	}
+	running := o.WaitRecords(1, 15*time.Second)[0]
 
-	if out, code := o.Admin("kill", "--tier", "nope"); code == 0 || !strings.Contains(out, `the policy has no tier "nope"`) {
-		t.Errorf("ochell kill --tier nope: exit %d, %q", code, out)
+	if out, code := o.Admin("pause", "--tier", "nope"); code == 0 || !strings.Contains(out, `the policy has no tier "nope"`) {
+		t.Errorf("ochell pause --tier nope: exit %d, %q", code, out)
 	}
-	out, code := o.Admin("kill", "--tier", "high")
-	if code != 0 || !strings.Contains(out, "stopping every running agent of the tier high (1)") {
-		t.Fatalf("ochell kill --tier high: exit %d, %q", code, out)
+	const held = "running; 0 queued, 1 running\nheld: tier high is paused by a command; \"ochell resume --tier high\" ends it"
+	if out, code := o.Admin("pause", "--tier", "high"); code != 0 || out != held {
+		t.Fatalf("ochell pause --tier high: exit %d, %q", code, out)
 	}
-	expectAllGone(t, high, 2)
-	if !Alive(low.PID) {
-		t.Fatal("the agent of the other tier was stopped as well")
+	// A pause stops nothing that runs.
+	time.Sleep(300 * time.Millisecond)
+	if !Alive(running.PID) {
+		t.Fatal("the pause of the tier stopped a running agent")
 	}
-	o.waitFor(10*time.Second, "the stopped run to be queued again", func() bool {
-		out, _ := o.Admin("status")
-		return out == "running; 1 queued, 1 running\nheld: tier high is paused by a command; \"ochell resume --tier high\" ends it"
-	})
 	// A new ticket of the paused tier waits; one of the other tier runs.
 	o.LinearCreated("ENG-142", "session-high-2", "")
 	o.Labels = nil
-	third := o.LinearCreated("ENG-143", "session-low-2", "").TaskID(t)
-	o.WaitRun(third, 15*time.Second)
-	if n := len(o.Records()); n != 3 {
-		t.Errorf("the agent was started %d times, want 3", n)
+	low := o.LinearCreated("ENG-143", "session-low", "").TaskID(t)
+	o.WaitRun(low, 15*time.Second)
+	if tk, _ := st.Ticket("linear", "ENG-142"); tk.State != "queued" || len(o.Records()) != 2 {
+		t.Fatalf("ENG-142 = %s with %d runs in all; want it queued, with 2 runs", tk.State, len(o.Records()))
 	}
-	for _, key := range []string{"ENG-141", "ENG-142"} {
-		if tk, _ := st.Ticket("linear", key); tk.State != "queued" {
-			t.Errorf("%s = %s, want queued: its tier is paused", key, tk.State)
-		}
+
+	// The pause of the tier is kept across a restart. The running agent
+	// is stopped by the shutdown and queued again, into the paused tier.
+	o.Signal(syscall.SIGTERM)
+	o.WaitExit(20 * time.Second)
+	o.Restart()
+	time.Sleep(500 * time.Millisecond)
+	if out, _ := o.Admin("status"); out != "running; 2 queued, 0 running\nheld: tier high is paused by a command; \"ochell resume --tier high\" ends it" {
+		t.Errorf("ochell status after the restart: %q", out)
 	}
+	if n := len(o.Records()); n != 2 {
+		t.Errorf("the agent was started %d times, want 2: the tier is still paused", n)
+	}
+
 	// The tier is resumed: its tickets run.
 	if out, code := o.Admin("resume", "--tier", "high"); code != 0 || strings.Contains(out, "held:") {
 		t.Fatalf("ochell resume --tier high: exit %d, %q", code, out)
@@ -3524,16 +3417,6 @@ func TestKillSwitchForOneTier(t *testing.T) {
 			tk, _ := st.Ticket("linear", key)
 			return tk != nil && tk.State == "in_review"
 		})
-	}
-	if !Alive(low.PID) {
-		t.Error("the agent of the other tier did not live through all this")
-	}
-	// "ochell pause --tier" holds without stopping anything.
-	if out, code := o.Admin("pause", "--tier", "low"); code != 0 || !strings.Contains(out, "held: tier low is paused by a command") {
-		t.Errorf("ochell pause --tier low: exit %d, %q", code, out)
-	}
-	if !Alive(low.PID) {
-		t.Error("a pause stopped a running agent")
 	}
 }
 

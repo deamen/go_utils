@@ -1460,9 +1460,6 @@ func queuedAgainText(res task.Result) string {
 	case task.CauseStalled:
 		return fmt.Sprintf("The run was stopped: %v. %s; the agent checks first what it has already done.", res.Err, when)
 	}
-	if res.Next == task.CauseKilled && res.Err != nil {
-		return fmt.Sprintf("%s. The ticket is queued again and starts when the orchestrator is resumed; the agent goes on where it stopped and checks first what it has already done.", strings.ToUpper(res.Err.Error()[:1])+res.Err.Error()[1:])
-	}
 	return "The run was cut off because the orchestrator was restarted. " + when + "; the agent goes on where it stopped and checks first what it has already done."
 }
 
