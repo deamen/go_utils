@@ -45,6 +45,13 @@ func (s *Server) jiraComment(key, body string, log *slog.Logger) {
 
 // jiraStarted is the comment for the start of a run.
 func jiraStarted(t *task.Task) string {
+	if t.Cause == task.CauseApproved {
+		by := t.ApprovedBy
+		if by == "" {
+			by = "a person"
+		}
+		return fmt.Sprintf("The plan was approved by %s. The digital employee carries it out now (attempt %d).", by, t.Attempt)
+	}
 	if t.Attempt > 1 {
 		return fmt.Sprintf("The digital employee is working on this ticket again (attempt %d).", t.Attempt)
 	}
@@ -70,6 +77,13 @@ func jiraFinished(t *task.Task, res task.Result, canReply bool) string {
 	}
 	if res.Err != nil {
 		return strings.TrimSpace(failureText(res) + "\n\n" + noFormat(lastN(res.Message, replyMax)))
+	}
+	if res.Signal == result.Plan {
+		msg := planText(res, "comment")
+		if !canReply {
+			msg += "\n\nComments reach the digital employee only through the Jira system webhook, which is not enabled here; until it is, a plan cannot be approved."
+		}
+		return msg
 	}
 	_, msg := signalActivity(res)
 	if res.Signal == result.Done {

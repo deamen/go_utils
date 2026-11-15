@@ -66,6 +66,25 @@ type Tier struct {
 	// configuration), which is checked first. Empty: everyone whom the
 	// source allows.
 	AllowedAssigners []string `yaml:"allowed_assigners"`
+	// Approvers, when not empty, are the people who may approve a plan of
+	// this tier: Jira accountIds, Linear user ids or email addresses.
+	// Empty: everyone who may send the agent a follow-up on the ticket.
+	Approvers []string `yaml:"approvers"`
+}
+
+// MayApprove reports whether one of ids names someone who may approve a
+// plan of this tier, as far as the tier itself says: without a list, the
+// rules for follow-ups decide alone.
+func (t Tier) MayApprove(ids ...string) bool {
+	if len(t.Approvers) == 0 {
+		return true
+	}
+	for _, id := range ids {
+		if id != "" && slices.ContainsFunc(t.Approvers, func(a string) bool { return strings.EqualFold(strings.TrimSpace(a), id) }) {
+			return true
+		}
+	}
+	return false
 }
 
 // MayAssign reports whether one of ids, the ways a source names the person
@@ -236,6 +255,11 @@ func (p *Policy) Validate() error {
 				errs = append(errs, fmt.Errorf("%s: an empty entry in allowed_assigners", at))
 			}
 		}
+		for _, a := range t.Approvers {
+			if strings.TrimSpace(a) == "" {
+				errs = append(errs, fmt.Errorf("%s: an empty entry in approvers", at))
+			}
+		}
 	}
 	switch {
 	case p.DefaultTier == "":
@@ -396,6 +420,9 @@ func (p *Policy) Describe() []string {
 		}
 		if n := len(t.AllowedAssigners); n > 0 {
 			line += fmt.Sprintf(" allowed_assigners=%d", n)
+		}
+		if n := len(t.Approvers); n > 0 {
+			line += fmt.Sprintf(" approvers=%d", n)
 		}
 		if t.Name == p.DefaultTier {
 			line += " (default)"

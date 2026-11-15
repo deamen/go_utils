@@ -170,6 +170,12 @@ var migrations = []string{
 	// run, whenever that starts.
 	`ALTER TABLE runs ADD COLUMN escalation TEXT NOT NULL DEFAULT '';
 	ALTER TABLE followups ADD COLUMN held INTEGER NOT NULL DEFAULT 0;`,
+
+	// Version 17: the plan gate. Whether a person approved the agent's plan
+	// for a ticket and who, and the phase each run was for.
+	`ALTER TABLE tickets ADD COLUMN plan_approved INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE tickets ADD COLUMN plan_approved_by TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN phase TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is safe for concurrent use.
@@ -436,6 +442,46 @@ func (s *Store) FollowUp(t *task.Task, addressed bool, lim Limits) (later bool, 
 	return later, err
 }
 
+// ErrNoPlan is returned for an approval of a ticket that does not wait for
+// one.
+var ErrNoPlan = errors.New("the ticket has no plan that waits for an approval")
+
+// Approve records that a person, named in by, approved the agent's plan
+// for the ticket of t, and queues the run that carries the plan out. What
+// the person wrote besides the approval is t.Comment.
+//
+// It returns ErrNoPlan unless the ticket waits for a plan approval,
+// ErrUnknown for a ticket that ochell has never seen, and ErrQueueFull.
+func (s *Store) Approve(t *task.Task, by string, lim Limits) error {
+	return s.tx(func(tx *sql.Tx) error {
+		var st ticket.State
+		var reason ticket.Reason
+		err := tx.QueryRow(`SELECT state, reason FROM tickets WHERE source = ? AND key = ?`, t.Source, t.Key).Scan(&st, &reason)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return ErrUnknown
+		case err != nil:
+			return err
+		case st != ticket.Waiting || reason != ticket.ReasonPlanApproval:
+			return ErrNoPlan
+		}
+		if full, err := queueFull(tx, lim.MaxQueued); err != nil {
+			return err
+		} else if full {
+			return ErrQueueFull
+		}
+		// A person has looked at the ticket: its attempts count from here.
+		if _, err := tx.Exec(`UPDATE tickets SET plan_approved = 1, plan_approved_by = ?, attempts_base = attempts WHERE source = ? AND key = ?`,
+			by, t.Source, t.Key); err != nil {
+			return err
+		}
+		if err := s.move(tx, t.Source, t.Key, ticket.Queued, ""); err != nil {
+			return err
+		}
+		return insertRun(tx, t)
+	})
+}
+
 // maxWaitingMessages is how many messages may wait for the next run of one
 // ticket.
 const maxWaitingMessages = 50
@@ -496,12 +542,16 @@ func (s *Store) TicketOfSession(source, session string) (string, error) {
 // upsert records the ticket of t, or brings its title, URL and repository
 // up to date, and its tier and who assigned it when t says so. A new ticket
 // is created in the state "none", and then moved like any other.
+//
+// It is called for a new assignment, which is new work: an approval that an
+// earlier plan of the ticket got does not carry over.
 func (s *Store) upsert(tx *sql.Tx, t *task.Task, now int64) error {
 	_, err := tx.Exec(`INSERT INTO tickets (source, key, title, url, repo, assigner, tier, state, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (source, key) DO UPDATE SET title = excluded.title, url = excluded.url, repo = excluded.repo,
 			assigner = CASE WHEN excluded.assigner != '' THEN excluded.assigner ELSE assigner END,
-			tier = CASE WHEN excluded.tier != '' THEN excluded.tier ELSE tier END`,
+			tier = CASE WHEN excluded.tier != '' THEN excluded.tier ELSE tier END,
+			plan_approved = 0, plan_approved_by = ''`,
 		t.Source, t.Key, t.Title, t.URL, t.Repo, t.Actor, t.Tier, ticket.None, now, now)
 	return err
 }
@@ -526,13 +576,13 @@ func (s *Store) Hold(t *task.Task, reason ticket.Reason) error {
 }
 
 const taskColumns = `r.id, r.source, r.key, t.title, t.url, r.context, r.tracker_session, r.delivery_id, r.received_at, r.attempt,
-	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo, t.prepared_workspace, r.cause, t.tier`
+	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo, t.prepared_workspace, r.cause, t.tier, t.plan_approved, t.plan_approved_by`
 
 func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 	var t task.Task
 	var received int64
 	if err := row.Scan(&t.ID, &t.Source, &t.Key, &t.Title, &t.URL, &t.Context, &t.TrackerSession, &t.DeliveryID, &received, &t.Attempt,
-		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo, &t.PreparedWorkspace, &t.Cause, &t.Tier); err != nil {
+		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo, &t.PreparedWorkspace, &t.Cause, &t.Tier, &t.PlanApproved, &t.ApprovedBy); err != nil {
 		return nil, err
 	}
 	t.Received = time.UnixMilli(received).UTC()
@@ -937,11 +987,11 @@ func (s *Store) end(tx *sql.Tx, id string, res task.Result) error {
 	r, err := tx.Exec(`UPDATE runs SET status = ?, ended_at = ?, outcome = ?, exit_code = ?, error = ?, log_file = ?,
 			workdir = ?, resumed = ?, agent_session = ?, message = ?, cost_usd = ?,
 			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
-			signal = ?, signal_message = ?, pr_url = ?, branch = ?, session_cost_usd = ?, escalation = ?
+			signal = ?, signal_message = ?, pr_url = ?, branch = ?, session_cost_usd = ?, escalation = ?, phase = ?
 		WHERE id = ? AND status != ?`, runEnded, now, string(res.Outcome), exit, msg, res.LogFile,
 		res.Workdir, res.Resumed, res.SessionID, res.Message, res.CostUSD,
 		res.Usage.InputTokens, res.Usage.OutputTokens, res.Usage.CacheReadTokens, res.Usage.CacheWriteTokens,
-		res.Signal, res.SignalMessage, res.PRURL, res.Branch, res.SessionCostUSD, res.Escalation,
+		res.Signal, res.SignalMessage, res.PRURL, res.Branch, res.SessionCostUSD, res.Escalation, res.Phase,
 		id, runEnded)
 	if err != nil {
 		return err
@@ -1142,6 +1192,10 @@ type Ticket struct {
 	// Assigner is who last assigned the ticket to the bot, as the source
 	// named them; empty when it did not.
 	Assigner string
+	// PlanApproved says that a person approved the agent's plan since the
+	// ticket was last assigned, and PlanApprovedBy who.
+	PlanApproved   bool
+	PlanApprovedBy string
 	// Attempts is the number of runs that were started.
 	Attempts  int
 	Workspace string
@@ -1163,9 +1217,9 @@ type Ticket struct {
 func (s *Store) Ticket(source, key string) (*Ticket, error) {
 	t := Ticket{Source: source, Key: key}
 	var created, updated int64
-	err := s.db.QueryRow(`SELECT title, url, repo, tier, assigner, state, reason, attempts, workspace, prepared_workspace, agent_session, pr_url, branch, created_at, updated_at
+	err := s.db.QueryRow(`SELECT title, url, repo, tier, assigner, plan_approved, plan_approved_by, state, reason, attempts, workspace, prepared_workspace, agent_session, pr_url, branch, created_at, updated_at
 		FROM tickets WHERE source = ? AND key = ?`, source, key).
-		Scan(&t.Title, &t.URL, &t.Repo, &t.Tier, &t.Assigner, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
+		Scan(&t.Title, &t.URL, &t.Repo, &t.Tier, &t.Assigner, &t.PlanApproved, &t.PlanApprovedBy, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1251,12 +1305,12 @@ func (s *Store) Run(id string) (*Run, error) {
 	res := &r.Result
 	err := s.db.QueryRow(`SELECT source, key, status, attempt, tier, policy_version, outcome, exit_code, error, log_file,
 			workdir, resumed, agent_session, message, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			signal, signal_message, pr_url, branch, session_cost_usd, escalation
+			signal, signal_message, pr_url, branch, session_cost_usd, escalation, phase
 		FROM runs WHERE id = ?`, id).
 		Scan(&r.Source, &r.Key, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &outcome, &exit, &msg, &res.LogFile,
 			&res.Workdir, &res.Resumed, &res.SessionID, &res.Message, &res.CostUSD,
 			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
-			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD, &res.Escalation)
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD, &res.Escalation, &res.Phase)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

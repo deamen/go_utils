@@ -52,6 +52,10 @@ type Submitter interface {
 	// person wrote to the agent itself, not only on the ticket. later: the
 	// ticket is in progress, and the message is kept for its next run.
 	FollowUp(t *task.Task, addressed bool) (later bool, err error)
+	// Approve records that a person, named in by, approved the agent's
+	// plan for the ticket of t, and queues the run that carries it out.
+	// store.ErrNoPlan says that the ticket does not wait for an approval.
+	Approve(t *task.Task, by string) error
 	// Stop ends the work on a ticket for a person, named in by: it stops
 	// the agent, takes the queued run out of the queue, or releases a
 	// ticket that waited. store.ErrUnknown and store.ErrReleased say that
@@ -719,6 +723,58 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 // work on the ticket.
 const stopCommand = "/stop"
 
+// approveCommand, as the first line of a comment on a Jira ticket or of a
+// reply in a Linear session, approves the plan that the agent posted. An
+// approval is this command and nothing else: ochell does not read consent
+// out of what a message says.
+const approveCommand = "/approve"
+
+// firstLine splits a message into its first line and the rest.
+func firstLine(text string) (first, rest string) {
+	first, rest, _ = strings.Cut(strings.TrimSpace(text), "\n")
+	return strings.TrimSpace(first), strings.TrimSpace(rest)
+}
+
+// approve handles the approval of a plan by a person who may send
+// follow-ups on the ticket, and writes the HTTP response. t is the run
+// that carries the plan out; its Comment is what the person wrote besides
+// the command. who names the person for the record and for the agent, and
+// ids are the ways the source names them, for the tier's own list of
+// approvers. tell posts a text on the ticket; failed says that it reports
+// a refusal.
+func (s *Server) approve(w http.ResponseWriter, t *task.Task, who string, ids []string, keys []string, tell func(text string, failed bool), log *slog.Logger) {
+	tier, err := s.runner.Tier(t.Source, t.Key)
+	if err != nil {
+		log.Error("cannot read the tier of the ticket", "key", t.Key, "err", err)
+		s.forgetDelivery(keys, log)
+		reply(w, http.StatusServiceUnavailable, "cannot read the ticket")
+		return
+	}
+	if !s.policy.Tier(tier).MayApprove(ids...) {
+		log.Warn("ignored: the author may not approve plans of this tier", "key", t.Key, "tier", tier, "author", ids)
+		if s.firstRefusal(t.Source, t.Key, "approve:"+strings.Join(ids, ",")) {
+			tell(fmt.Sprintf("The plan was not approved: %s is not on the list of people who may approve plans of the risk tier %q, which %s is in.", who, tier, t.Key), true)
+		}
+		reply(w, http.StatusOK, "ignored: the author may not approve plans of the tier "+tier)
+		return
+	}
+	switch err := s.runner.Approve(t, who); {
+	case err == nil:
+		log.Info("plan approved", "task", t.ID, "key", t.Key, "by", who, "tier", tier)
+		tell(fmt.Sprintf("The plan for %s was approved by %s. The digital employee carries it out now.", t.Key, who), false)
+		reply(w, http.StatusOK, "approved; queued "+t.ID)
+	case errors.Is(err, store.ErrNoPlan), errors.Is(err, store.ErrUnknown):
+		log.Info("an approval for a ticket that has no plan waiting", "key", t.Key, "by", who)
+		tell(fmt.Sprintf("%s has no plan that waits for an approval, so %s did nothing.", t.Key, approveCommand), true)
+		reply(w, http.StatusOK, "nothing to approve")
+	default:
+		// 503 makes the tracker send the message again.
+		log.Error("cannot record the approval", "key", t.Key, "err", err)
+		s.forgetDelivery(keys, log)
+		reply(w, http.StatusServiceUnavailable, "cannot queue task")
+	}
+}
+
 // jiraCommented handles a comment that someone added to a Jira ticket. A
 // comment of a person on a ticket that ochell holds starts a run of the
 // ticket with the comment; the run continues the agent session of the
@@ -731,9 +787,10 @@ func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error
 		return
 	}
 	text := strings.TrimSpace(c.Body)
-	first, _, _ := strings.Cut(text, "\n")
-	// A comment whose first line is the command stops the ticket.
-	isStop := strings.TrimSpace(first) == stopCommand
+	first, rest := firstLine(text)
+	// A comment whose first line is a command stops the ticket, or approves
+	// its plan.
+	isStop, isApprove := first == stopCommand, first == approveCommand
 	switch {
 	case c.Author == cfg.BotAccountID:
 		// The loop guard: what the bot account writes (ochell's own
@@ -785,6 +842,20 @@ func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error
 		return
 	}
 	t := s.newTask("jira", c.Key, c.Summary, c.URL, "", delivery)
+	if isApprove {
+		who := c.AuthorName
+		if who == "" {
+			who = c.Author
+		}
+		t.Comment = rest
+		s.approve(w, t, who, []string{c.Author}, keys, func(text string, failed bool) {
+			// The start of the run is commented anyway.
+			if failed {
+				s.jiraComment(c.Key, text, log)
+			}
+		}, log)
+		return
+	}
 	t.Comment = text
 	switch later, err := s.runner.FollowUp(t, false); {
 	case err == nil && later:
@@ -1010,6 +1081,21 @@ func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, key
 	}
 	t := s.newTask("linear", sess.Key, sess.Title, sess.URL, "", delivery)
 	t.TrackerSession = sess.SessionID
+	if first, rest := firstLine(text); first == approveCommand {
+		who := sess.ActorEmail
+		if who == "" {
+			who = sess.Actor
+		}
+		t.Comment = rest
+		s.approve(w, t, who, []string{sess.Actor, sess.ActorEmail}, keys, func(text string, failed bool) {
+			kind := linear.ActivityThought
+			if failed {
+				kind = linear.ActivityError
+			}
+			s.linearActivity(sess.SessionID, kind, text, log)
+		}, log)
+		return
+	}
 	t.Comment = text
 	switch later, err := s.runner.FollowUp(t, true); {
 	case err == nil && later:
@@ -1242,6 +1328,8 @@ func signalActivity(res task.Result) (kind, msg string) {
 		said = strings.TrimSpace(lastN(res.Message, replyMax))
 	}
 	switch res.Signal {
+	case result.Plan:
+		return linear.ActivityElicitation, planText(res, "reply")
 	case result.Done:
 		if said == "" {
 			said = "The agent finished."
@@ -1261,6 +1349,28 @@ func signalActivity(res task.Result) (kind, msg string) {
 		return linear.ActivityElicitation, note
 	}
 	return linear.ActivityElicitation, said + "\n\n" + note
+}
+
+// planMax is how much of a plan is shown on the ticket.
+const planMax = 20000
+
+// planText is what a ticket is told when the agent hands over its plan and
+// waits for an approval: the plan as the agent wrote it, and how to
+// approve or correct it. how is the way people answer on this ticket:
+// "reply" or "comment".
+func planText(res task.Result, how string) string {
+	plan := strings.TrimSpace(res.SignalMessage)
+	if plan == "" {
+		plan = strings.TrimSpace(res.Message)
+	}
+	if len(plan) > planMax {
+		plan = strings.ToValidUTF8(plan[:planMax], "") + "\n\n[The plan is longer; this is its beginning.]"
+	}
+	if plan == "" {
+		plan = "(The agent reported a plan without any text.)"
+	}
+	return fmt.Sprintf("The digital employee has made a plan and has changed nothing yet. It waits for an approval.\n\n%s\n\nTo approve the plan, %s with %s as the first line. To have it changed, %s with what to change; the digital employee then posts a new plan.",
+		plan, how, approveCommand, how)
 }
 
 // queuedAgainText is what a ticket is told when its run ended and ochell

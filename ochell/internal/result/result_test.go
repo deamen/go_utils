@@ -20,7 +20,7 @@ func TestParse(t *testing.T) {
 	if f, err := Parse([]byte(`{"status":"done"}`)); err != nil || f.Status != Done {
 		t.Errorf("done needs no message: %v, %v", f, err)
 	}
-	for _, s := range []Status{NeedsInput, Blocked, LowConfidence, OutOfScope} {
+	for _, s := range []Status{NeedsInput, Blocked, LowConfidence, OutOfScope, Plan} {
 		if f, err := Parse([]byte(`{"status":"` + string(s) + `","message":"why"}`)); err != nil || f.Status != s {
 			t.Errorf("%s: %v, %v", s, f, err)
 		}
@@ -47,7 +47,7 @@ func TestParse(t *testing.T) {
 
 // The prompt names what Parse accepts.
 func TestInstructionsNameEveryStatus(t *testing.T) {
-	for _, s := range []Status{Done, NeedsInput, Blocked, LowConfidence, OutOfScope} {
+	for _, s := range []Status{Done, NeedsInput, Blocked, LowConfidence, OutOfScope, Plan} {
 		if !strings.Contains(Instructions, "  "+string(s)+" ") {
 			t.Errorf("the instructions do not explain %q", s)
 		}

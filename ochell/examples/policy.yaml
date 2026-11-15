@@ -24,6 +24,8 @@ owners:
 #   max_turns:  how many turns one run may take; 0 or left out: no limit.
 #               It needs agent.adapter claude
 #   labels:     a ticket with one of these labels gets at least this tier
+#   approvers:  who may approve a plan of this tier, with "/approve" on the
+#               ticket. Left out: everyone who may send follow-ups
 #   allowed_assigners: who may assign work of this tier (Jira accountIds,
 #               Linear user ids or email addresses); it narrows the
 #               allowed_assigners of the source. Left out: everyone whom

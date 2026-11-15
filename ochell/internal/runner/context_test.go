@@ -78,3 +78,17 @@ func TestRunContext(t *testing.T) {
 		t.Errorf("a long comment was not cut: %d bytes", len(got))
 	}
 }
+
+func TestRunContextOfThePlanGate(t *testing.T) {
+	plan := runContext(&task.Task{Attempt: 1, Phase: task.PhasePlan}, false)
+	if !strings.Contains(plan, "This run is for the plan only.") || !strings.Contains(plan, `status "plan"`) {
+		t.Errorf("context of a plan run:\n%s", plan)
+	}
+	work := runContext(&task.Task{Attempt: 2, Cause: task.CauseApproved, ApprovedBy: "Jane\nDoe", Comment: "keep it small"}, true)
+	if strings.Contains(work, "for the plan only") || !strings.Contains(work, "Your plan for this ticket was approved by Jane Doe. Carry it out now") || !strings.Contains(work, "keep it small") {
+		t.Errorf("context of the run after the approval:\n%s", work)
+	}
+	if got := runContext(&task.Task{Attempt: 2, Cause: task.CauseApproved}, true); !strings.Contains(got, "approved by a person") {
+		t.Errorf("context without a name:\n%s", got)
+	}
+}

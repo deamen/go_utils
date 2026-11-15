@@ -242,6 +242,27 @@ func (r *Runner) FollowUp(t *task.Task, addressed bool) (later bool, err error) 
 	return later, nil
 }
 
+// Approve records that a person, named in by, approved the agent's plan
+// for the ticket of t, and queues the run that carries it out, in the same
+// agent session. Whether that person may approve is the caller's matter.
+//
+// It returns store.ErrNoPlan unless the ticket waits for a plan approval,
+// store.ErrUnknown, and ErrQueueFull.
+func (r *Runner) Approve(t *task.Task, by string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return ErrStopped
+	}
+	t.Cause = task.CauseApproved
+	if err := r.store.Approve(t, by, store.Limits{MaxQueued: max(r.cfg.QueueSize, 1)}); err != nil {
+		return err
+	}
+	r.log.Info("plan approved", "source", t.Source, "key", t.Key, "by", by, "task", t.ID)
+	r.wakeWorker()
+	return nil
+}
+
 // Assigner returns who last assigned a ticket to the bot, as the source
 // named them, or "" when the source did not say. known is false for a
 // ticket that ochell has never seen.
@@ -754,6 +775,11 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	}
 	r.mu.Unlock()
 
+	// A ticket whose tier requires an approved plan, and has none, gets a
+	// run that only plans.
+	if r.policy.Tier(t.Tier).PlanGate == policy.PlanGateRequired && !t.PlanApproved {
+		t.Phase = task.PhasePlan
+	}
 	// A ticket that has used up the budget of its tier is not started, by
 	// whatever asked for this run. Otherwise the run gets what is left.
 	var res task.Result
@@ -823,6 +849,14 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 			log.Warn("cannot record that the ticket was closed", "err", err)
 		}
 	}
+}
+
+// phaseName is how the log names the phase of a run.
+func phaseName(p task.Phase) string {
+	if p == task.PhaseWork {
+		return "work"
+	}
+	return string(p)
 }
 
 // usd writes an amount of money for a person.
@@ -974,6 +1008,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	start := time.Now()
 	res.ExitCode = -1
 	res.Outcome = task.OutcomeNotStarted
+	res.Phase = t.Phase
 	defer func() { res.Duration = time.Since(start) }()
 
 	// Each run has a directory of its own for its result file, so a file
@@ -1027,8 +1062,8 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	if res.Resumed {
 		session = "resumed " + t.AgentSession
 	}
-	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s tier=%s\n# command=%s (%d args) workdir=%s session=%s\n# prompt:\n%s\n",
-		t.ID, t.Source, t.Key, t.URL, t.Tier, r.cfg.Command, len(cmd.Args), dir, session, t.Prompt)
+	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s tier=%s phase=%s\n# command=%s (%d args) workdir=%s session=%s\n# prompt:\n%s\n",
+		t.ID, t.Source, t.Key, t.URL, t.Tier, phaseName(t.Phase), r.cfg.Command, len(cmd.Args), dir, session, t.Prompt)
 	// signal is what the footer of the log says about the result file.
 	signal := "none"
 	defer func() {
@@ -1105,6 +1140,11 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	if f, err := result.Read(r.runDir, runName); err == nil {
 		res.Signal, res.SignalMessage, res.PRURL, res.Branch = f.Status, f.Message, f.PRURL, f.Branch
 		signal = string(f.Status)
+		if t.Phase == task.PhasePlan && res.Signal == result.Done {
+			// The run was for a plan only. Whatever the agent calls it,
+			// what it handed over waits for an approval.
+			res.Signal = result.Plan
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		signal = "invalid"
 		r.log.Warn("the agent's result file cannot be used", "task", t.ID, "file", resultFile, "err", err)
