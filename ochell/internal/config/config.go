@@ -340,6 +340,25 @@ type API struct {
 	PublicURL string `yaml:"public_url"`
 }
 
+// GitHub is ochell's own, read-only access to GitHub: it asks what became
+// of the pull requests that its tickets opened. It is used when Token is
+// set. The token needs read access to pull requests and nothing else; it
+// is not the agent's.
+type GitHub struct {
+	Token string `yaml:"token"`
+	// APIURL is the address of the API. Empty: github.com. For GitHub
+	// Enterprise Server, https://<host>/api/v3.
+	APIURL string `yaml:"api_url"`
+	// PollInterval is how often ochell asks about the open pull requests.
+	PollInterval time.Duration `yaml:"poll_interval"`
+	// BotLogin is the GitHub login of the digital employee. A pull request
+	// that this account merged itself is not taken as accepted work.
+	BotLogin string `yaml:"bot_login"`
+}
+
+// Enabled reports whether the GitHub access is configured.
+func (g GitHub) Enabled() bool { return g.Token != "" }
+
 // Poller configures the safety net behind the webhooks: ochell asks each
 // tracker for the bot's open tickets, at start and then at this interval.
 type Poller struct {
@@ -355,6 +374,7 @@ type Config struct {
 	Store    Store    `yaml:"store"`
 	Policy   Policy   `yaml:"policy"`
 	API      API      `yaml:"api"`
+	GitHub   GitHub   `yaml:"github"`
 	// Repos says which repository a ticket belongs to. The first entry
 	// that matches wins. When the list is not empty, a ticket that no
 	// entry matches is not started and waits for a human. When it is
@@ -432,6 +452,7 @@ func Default() *Config {
 		Store:     Store{Path: "ochell.db"},
 		Workspace: Workspace{Branch: "bot/{{.Key}}", HookTimeout: 10 * time.Minute},
 		Poller:    Poller{Interval: 5 * time.Minute},
+		GitHub:    GitHub{PollInterval: 2 * time.Minute},
 		Agent: Agent{
 			Command:        "claude",
 			Args:           []string{"-p"},
@@ -718,6 +739,18 @@ func (c *Config) Validate() error {
 		if c.Agent.Launcher == "systemd" && !strings.HasPrefix(h.Command[0], "/") {
 			errs = append(errs, fmt.Errorf("workspace.hooks.%s: agent.launcher systemd requires the command to be an absolute path", h.Name))
 		}
+	}
+	if g := c.GitHub; g.Enabled() {
+		if g.PollInterval <= 0 {
+			errs = append(errs, errors.New("github.poll_interval must be positive"))
+		}
+		if g.APIURL != "" {
+			if u, err := url.Parse(g.APIURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+				errs = append(errs, errors.New("github.api_url must be the address of the API, such as https://ghe.example.com/api/v3"))
+			}
+		}
+	} else if g.APIURL != "" || g.BotLogin != "" {
+		errs = append(errs, errors.New("github: api_url or bot_login is set but token is not"))
 	}
 	if c.Poller.Interval < 0 {
 		errs = append(errs, errors.New("poller.interval must not be negative; 0s turns the poller off"))

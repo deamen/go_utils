@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"ochell/internal/config"
+	"ochell/internal/github/githubtest"
 	"ochell/internal/source/linear/lineartest"
 	"ochell/internal/store"
 	"ochell/internal/tracker/jiraapi/jiratest"
@@ -3749,5 +3750,119 @@ func TestInbox(t *testing.T) {
 	})
 	if got[0].Key != "ENG-171" {
 		t.Errorf("the inbox after the answer = %+v", got)
+	}
+}
+
+// withGitHub gives ochell read access to a fake GitHub, and makes it ask
+// about the open pull requests often.
+func withGitHub(gh *githubtest.Server) func(*config.Config) {
+	return func(c *config.Config) {
+		c.GitHub = config.GitHub{Token: githubtest.Token, APIURL: gh.URL, PollInterval: 200 * time.Millisecond, BotLogin: "digital-employee"}
+	}
+}
+
+// The handoff: a finished run with a pull request moves the ticket to In
+// Review and records the pull request; merging or closing it moves the
+// ticket to done. A pull request that is not the ticket's, and a merge by
+// the digital employee's own account, do not.
+func TestHandoff(t *testing.T) {
+	gh := githubtest.New(t)
+	open := func(n int, branch string) string {
+		return gh.Open(githubtest.PullRequest{Owner: "example", Repo: "web", Number: n, HeadRef: branch, Author: "digital-employee"})
+	}
+	prs := []string{open(7, "bot/DEV-180"), open(8, "bot/ENG-180"), open(9, "bot/DEV-181"), open(10, "feature/of-someone-else")}
+	var script []Step
+	for i, pr := range prs {
+		script = append(script, OnRun(i+1, Report("done", "Opened a pull request.", "pr_url", pr))...)
+	}
+	o := Start(t, Options{Script: script, Configure: func(c *config.Config) {
+		withGitHub(gh)(c)
+		c.Sources.JiraAPI.ReviewStatus = "In Review"
+	}})
+	for _, key := range []string{"DEV-180", "DEV-181", "DEV-182"} {
+		o.Jira.Add(jiratest.Issue{Key: key, Status: "In Progress", Statuses: []string{"In Review"}})
+	}
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	state := func(source, key string) string {
+		t.Helper()
+		tk, err := st.Ticket(source, key)
+		if err != nil || tk == nil {
+			t.Fatalf("ticket %s %s: %v, %v", source, key, tk, err)
+		}
+		return string(tk.State)
+	}
+	becomes := func(source, key, want string) {
+		t.Helper()
+		o.waitFor(10*time.Second, key+" to be "+want, func() bool { return state(source, key) == want })
+	}
+	pull := func(source, key string) store.PullRequest {
+		t.Helper()
+		list, err := st.PullRequests(source, key)
+		if err != nil || len(list) != 1 {
+			t.Fatalf("pull requests of %s = %+v, %v", key, list, err)
+		}
+		return list[0]
+	}
+
+	// The agent opens a pull request: the ticket is in review, in ochell
+	// and in Jira, and the pull request is recorded.
+	o.WaitStored(st, o.JiraAssigned("DEV-180", "Add a field").TaskID(t), 15*time.Second)
+	if state("jira", "DEV-180") != "in_review" || pull("jira", "DEV-180").URL != prs[0] || pull("jira", "DEV-180").State != "open" {
+		t.Errorf("DEV-180 = %s with %+v", state("jira", "DEV-180"), pull("jira", "DEV-180"))
+	}
+	o.waitFor(10*time.Second, "the Jira ticket to be In Review", func() bool { return o.Jira.Status("DEV-180") == "In Review" })
+	// While the pull request is open, the ticket stays in review.
+	time.Sleep(600 * time.Millisecond)
+	if got := state("jira", "DEV-180"); got != "in_review" {
+		t.Fatalf("DEV-180 = %s while its pull request is open", got)
+	}
+	// A reviewer merges it: the ticket is done, and says so.
+	gh.Merge("example", "web", 7, "reviewer")
+	becomes("jira", "DEV-180", "done")
+	if pr := pull("jira", "DEV-180"); pr.State != "merged" || pr.ClosedBy != "reviewer" {
+		t.Errorf("the pull request of DEV-180 = %+v", pr)
+	}
+	comments := o.WaitJiraComments("DEV-180", 3, 10*time.Second)
+	if !strings.Contains(comments[2], prs[0]+" was merged by reviewer") || !strings.Contains(comments[2], "DEV-180 is done") {
+		t.Errorf("DEV-180 was told %q", comments[2])
+	}
+
+	// A pull request that is closed without a merge ends the work too.
+	o.WaitStored(st, o.LinearCreated("ENG-180", "session-handoff", "").TaskID(t), 15*time.Second)
+	gh.Close("example", "web", 8)
+	becomes("linear", "ENG-180", "done")
+	acts := o.WaitActivities("session-handoff", 3, 10*time.Second)
+	if acts[2].Type != "response" || !strings.Contains(acts[2].Body, "was closed without a merge") {
+		t.Errorf("ENG-180 was told %+v", acts[2])
+	}
+
+	// The digital employee's own account merges its pull request: that is
+	// no acceptance, and the ticket stays in review.
+	o.WaitStored(st, o.JiraAssigned("DEV-181", "Merged by the bot").TaskID(t), 15*time.Second)
+	gh.Merge("example", "web", 9, "digital-employee")
+	o.waitFor(10*time.Second, "the merge to be recorded", func() bool { return pull("jira", "DEV-181").State == "merged" })
+	time.Sleep(500 * time.Millisecond)
+	if got := state("jira", "DEV-181"); got != "in_review" {
+		t.Errorf("DEV-181 = %s after the bot merged its own pull request, want in_review", got)
+	}
+	if !strings.Contains(o.Output(), "was merged by the digital employee's own account; that is not taken as an acceptance") {
+		t.Error("the merge by the bot is not in ochell's log")
+	}
+
+	// The agent names a pull request that is not from its ticket's branch,
+	// and that someone merges: the ticket stays in review.
+	gh.Merge("example", "web", 10, "reviewer")
+	o.WaitStored(st, o.JiraAssigned("DEV-182", "Someone else's pull request").TaskID(t), 15*time.Second)
+	o.waitFor(10*time.Second, "the pull request to be put aside", func() bool { return pull("jira", "DEV-182").State == "rejected" })
+	time.Sleep(500 * time.Millisecond)
+	if got := state("jira", "DEV-182"); got != "in_review" {
+		t.Errorf("DEV-182 = %s after naming someone else's merged pull request, want in_review", got)
+	}
+	if pr := pull("jira", "DEV-182"); !strings.Contains(pr.Note, `from the branch "feature/of-someone-else", and the ticket is worked on "bot/DEV-182"`) {
+		t.Errorf("why the pull request was put aside: %q", pr.Note)
 	}
 }

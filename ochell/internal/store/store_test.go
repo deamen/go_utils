@@ -1359,3 +1359,52 @@ func TestHolds(t *testing.T) {
 		t.Fatalf("claimed %q after the pull request's ticket was closed, want WEB-2", got)
 	}
 }
+
+// Every pull request that a run names is tracked, until it is merged or
+// closed or its ticket is done.
+func TestPullRequests(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
+	run := func(id, key, pr string) {
+		t.Helper()
+		if err := s.Enqueue(newTask(id, key, t0), Limits{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Claim(); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Finish(id, task.Result{Outcome: task.OutcomeFinished, Signal: result.Done, PRURL: pr}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("r1", "ENG-1", "https://example.test/pr/1")
+	run("r2", "ENG-1", "https://example.test/pr/1")
+	run("r3", "ENG-1", "https://example.test/pr/2")
+	run("r4", "ENG-2", "https://example.test/pr/3")
+	run("r5", "ENG-3", "")
+
+	prs, err := s.PullRequests("linear", "ENG-1")
+	if err != nil || len(prs) != 2 || prs[0].URL != "https://example.test/pr/1" || prs[0].State != PROpen || prs[1].URL != "https://example.test/pr/2" {
+		t.Fatalf("pull requests of ENG-1 = %+v, %v", prs, err)
+	}
+	if open, _ := s.OpenPullRequests(); len(open) != 3 {
+		t.Errorf("%d open pull requests, want 3", len(open))
+	}
+	if err := s.SetPullRequest("linear", "ENG-1", "https://example.test/pr/1", PRMerged, "reviewer", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPullRequest("linear", "ENG-1", "https://example.test/pr/2", PRRejected, "", "another branch"); err != nil {
+		t.Fatal(err)
+	}
+	prs, _ = s.PullRequests("linear", "ENG-1")
+	if prs[0].State != PRMerged || prs[0].ClosedBy != "reviewer" || prs[1].State != PRRejected || prs[1].Note != "another branch" {
+		t.Errorf("pull requests of ENG-1 = %+v", prs)
+	}
+	// The pull request of a ticket that is done is not asked about again.
+	if _, err := s.CloseTicket("linear", "ENG-2"); err != nil {
+		t.Fatal(err)
+	}
+	if open, _ := s.OpenPullRequests(); len(open) != 0 {
+		t.Errorf("open pull requests = %+v, want none", open)
+	}
+}

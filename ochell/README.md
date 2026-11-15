@@ -249,6 +249,29 @@ repos:
 - **A ticket that no entry matches is not started.** It is recorded as `waiting` with the reason `no_repo_mapping`, the request is answered with 200 `not started: …`, ochell logs a warning, and a Linear session is told why. After the mapping is added, assign the ticket again.
 - With no `repos` at all, every ticket runs, without a repository.
 
+### Handoff: review, merge, done
+The agent opens a pull request and hands the ticket over; a person reviews and merges; then the ticket is done.
+
+1. **A run that reports `done` moves the ticket to `in_review`.** The pull request that it names in its [result file](#the-result-file) is recorded with the ticket. A ticket can have several; `GET /api/v1/tasks/<key>` lists them. With `jira_api.review_status`, the Jira ticket moves to that status too.
+2. **ochell follows the pull request**, with read-only access to GitHub:
+
+   ```yaml
+   github:
+     token: ${GITHUB_READ_TOKEN}     # read access to pull requests; not the agent's token
+     poll_interval: 2m
+     bot_login: digital-employee     # the GitHub login of the digital employee
+     # api_url: https://ghe.example.com/api/v3   # GitHub Enterprise Server
+   ```
+
+3. **When a person has merged or closed it, the ticket is `done`**, as when the ticket is closed in the tracker: its working directory can go (`workspace.cleanup`), and the ticket is told who merged, in a comment on the Jira ticket or in its Linear session. A ticket with several pull requests is done when none of them is open any more.
+
+- **The digital employee never merges or deploys.** ochell cannot enforce that; GitHub does. Give the digital employee's GitHub account no right to merge: protect the branches that it opens pull requests against (a required review by someone else, and no bypass for the account), and give it no deploy rights. ochell's own token only reads.
+- **A merge by the digital employee's own account is not an acceptance.** With `bot_login` set, ochell records such a merge, logs an error that names the repository's branch protection, and leaves the ticket in review.
+- **Only the ticket's own pull request counts.** The address comes from the agent, so ochell follows it only when it is a pull request on the configured GitHub, from the branch that the ticket is worked on (`workspace.branch`, `bot/<KEY>` by default). Anything else is recorded as `rejected`, with the reason, and is not asked about again. Otherwise an agent could name someone else's merged pull request and have its ticket done.
+- **A question that GitHub does not answer changes nothing**; ochell asks again at the next interval.
+- **Without `github.token`** nothing is followed: a ticket in review becomes `done` when it is closed in the tracker, as before.
+- Review comments and checks on the pull request are not read yet.
+
 ### The status API
 Read-only pages about what ochell is doing, on the same listener as the webhooks.
 

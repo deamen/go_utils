@@ -176,6 +176,22 @@ var migrations = []string{
 	`ALTER TABLE tickets ADD COLUMN plan_approved INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE tickets ADD COLUMN plan_approved_by TEXT NOT NULL DEFAULT '';
 	ALTER TABLE runs ADD COLUMN phase TEXT NOT NULL DEFAULT '';`,
+
+	// Version 18: the pull requests of each ticket, and what became of
+	// them. Until now a ticket kept only the last one a run named.
+	`CREATE TABLE pull_requests (
+		source     TEXT NOT NULL,
+		key        TEXT NOT NULL,
+		url        TEXT NOT NULL,
+		state      TEXT NOT NULL DEFAULT 'open',
+		closed_by  TEXT NOT NULL DEFAULT '',
+		note       TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (source, key, url)
+	);
+	INSERT INTO pull_requests (source, key, url, created_at, updated_at)
+		SELECT source, key, pr_url, updated_at, updated_at FROM tickets WHERE pr_url != '';`,
 }
 
 // Store is safe for concurrent use.
@@ -1174,6 +1190,13 @@ func (s *Store) end(tx *sql.Tx, id string, res task.Result) error {
 			return err
 		}
 	}
+	// Every pull request that a run names is tracked.
+	if res.PRURL != "" {
+		if _, err := tx.Exec(`INSERT INTO pull_requests (source, key, url, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (source, key, url) DO NOTHING`, source, key, res.PRURL, now, now); err != nil {
+			return err
+		}
+	}
 	// The ticket keeps the last pull request and branch a run named.
 	if res.PRURL != "" || res.Branch != "" {
 		if _, err := tx.Exec(`UPDATE tickets SET
@@ -1500,6 +1523,70 @@ func (s *Store) Runs(source, key string) ([]RunInfo, error) {
 // has run for a ticket.
 func (s *Store) SetPrepared(source, key, dir string) error {
 	_, err := s.db.Exec(`UPDATE tickets SET prepared_workspace = ? WHERE source = ? AND key = ?`, dir, source, key)
+	return err
+}
+
+// States of a tracked pull request.
+const (
+	// PROpen: nobody has merged or closed it, as far as ochell knows.
+	PROpen = "open"
+	// PRMerged and PRClosed: the code host says so.
+	PRMerged = "merged"
+	PRClosed = "closed"
+	// PRRejected: it is not a pull request of the ticket (it is not from
+	// the ticket's branch), and ochell does not follow it.
+	PRRejected = "rejected"
+)
+
+// PullRequest is a pull request that a run of a ticket named.
+type PullRequest struct {
+	Source, Key string
+	URL         string
+	// State is PROpen, PRMerged, PRClosed or PRRejected.
+	State string
+	// ClosedBy is who merged or closed it, as the code host names them.
+	ClosedBy string
+	// Note says why a pull request was rejected.
+	Note    string
+	Created time.Time
+	Updated time.Time
+}
+
+func (s *Store) pullRequests(query string, args ...any) ([]PullRequest, error) {
+	rows, err := s.db.Query(`SELECT source, key, url, state, closed_by, note, created_at, updated_at FROM pull_requests `+query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PullRequest
+	for rows.Next() {
+		var p PullRequest
+		var created, updated int64
+		if err := rows.Scan(&p.Source, &p.Key, &p.URL, &p.State, &p.ClosedBy, &p.Note, &created, &updated); err != nil {
+			return nil, err
+		}
+		p.Created, p.Updated = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// OpenPullRequests returns the tracked pull requests that are open, of
+// tickets that are neither done nor cancelled, oldest first.
+func (s *Store) OpenPullRequests() ([]PullRequest, error) {
+	return s.pullRequests(`WHERE state = ? AND EXISTS (SELECT 1 FROM tickets t WHERE t.source = pull_requests.source AND t.key = pull_requests.key
+		AND t.state NOT IN (?, ?)) ORDER BY created_at, url`, PROpen, ticket.Done, ticket.Cancelled)
+}
+
+// PullRequests returns the pull requests of a ticket, oldest first.
+func (s *Store) PullRequests(source, key string) ([]PullRequest, error) {
+	return s.pullRequests(`WHERE source = ? AND key = ? ORDER BY created_at, url`, source, key)
+}
+
+// SetPullRequest records what became of a tracked pull request.
+func (s *Store) SetPullRequest(source, key, url, state, closedBy, note string) error {
+	_, err := s.db.Exec(`UPDATE pull_requests SET state = ?, closed_by = ?, note = ?, updated_at = ? WHERE source = ? AND key = ? AND url = ?`,
+		state, closedBy, note, ms(s.now()), source, key, url)
 	return err
 }
 

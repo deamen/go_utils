@@ -46,6 +46,7 @@ type Store interface {
 	Tickets(limit int, states ...ticket.State) ([]store.Ticket, error)
 	TicketsByKey(key string) ([]store.Ticket, error)
 	Runs(source, key string) ([]store.RunInfo, error)
+	PullRequests(source, key string) ([]store.PullRequest, error)
 }
 
 // Runner tells what ochell is doing right now. *runner.Runner implements
@@ -138,8 +139,19 @@ type Ticket struct {
 	Branch      string    `json:"branch,omitempty"`
 	Created     time.Time `json:"created"`
 	Updated     time.Time `json:"updated"`
-	// Runs are set in the entry of one ticket.
-	Runs []Run `json:"runs,omitempty"`
+	// PullRequests and Runs are set in the entry of one ticket.
+	PullRequests []PullRequest `json:"pull_requests,omitempty"`
+	Runs         []Run         `json:"runs,omitempty"`
+}
+
+// PullRequest is a pull request of a ticket, and what became of it.
+type PullRequest struct {
+	URL string `json:"url"`
+	// State is open, merged, closed, or rejected for one that is not the
+	// ticket's.
+	State    string `json:"state"`
+	ClosedBy string `json:"closed_by,omitempty"`
+	Note     string `json:"note,omitempty"`
 }
 
 // Run is one run of a ticket as the API shows it.
@@ -281,6 +293,14 @@ func (a *API) task(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		tk := ticketOf(t)
+		prs, err := a.store.PullRequests(t.Source, t.Key)
+		if err != nil {
+			a.fail(w, err)
+			return
+		}
+		for _, pr := range prs {
+			tk.PullRequests = append(tk.PullRequests, PullRequest{URL: pr.URL, State: pr.State, ClosedBy: pr.ClosedBy, Note: pr.Note})
+		}
 		for _, run := range runs {
 			tk.Runs = append(tk.Runs, runOf(run))
 		}
@@ -429,7 +449,7 @@ var statePage = template.Must(template.New("state").Funcs(funcs).Parse(`<!doctyp
 var taskPage = template.Must(template.New("task").Funcs(funcs).Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>ochell: ticket</title>` + style + `</head><body>
 {{range .Tickets}}<h1>{{.Source}} {{.Key}}: {{.Title}}</h1>
 <p>State: <b>{{.State}}</b>{{if .Reason}} ({{.Reason}}){{end}}{{if .Tier}} &nbsp; Tier: {{.Tier}}{{end}} &nbsp; Attempts: {{.Attempts}} &nbsp; Changed: {{when .Updated}}</p>
-<p class="dim">{{if .Repo}}Repository: {{.Repo}}<br>{{end}}{{if .Branch}}Branch: {{.Branch}}<br>{{end}}{{if .PullRequest}}Pull request: {{.PullRequest}}<br>{{end}}{{if .URL}}Ticket: {{.URL}}{{end}}</p>
+<p class="dim">{{if .Repo}}Repository: {{.Repo}}<br>{{end}}{{if .Branch}}Branch: {{.Branch}}<br>{{end}}{{range .PullRequests}}Pull request: {{.URL}} ({{.State}}{{if .ClosedBy}} by {{.ClosedBy}}{{end}}{{if .Note}}: {{.Note}}{{end}})<br>{{end}}{{if .URL}}Ticket: {{.URL}}{{end}}</p>
 <h2>Runs</h2>
 {{if .Runs}}<table><tr><th>#</th><th>Started</th><th>Ended</th><th>Status</th><th>Why</th><th>Outcome</th><th>Cost USD</th><th>What the agent said</th></tr>
 {{range .Runs}}<tr><td>{{.Attempt}}</td><td>{{when .Started}}</td><td>{{when .Ended}}</td><td>{{.Status}}</td><td>{{.Cause}}{{if .Phase}} {{.Phase}}{{end}}</td>

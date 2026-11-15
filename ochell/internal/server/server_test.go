@@ -19,6 +19,8 @@ import (
 
 	"ochell/internal/auth"
 	"ochell/internal/config"
+	"ochell/internal/github"
+	"ochell/internal/github/githubtest"
 	"ochell/internal/policy"
 	"ochell/internal/result"
 	"ochell/internal/runner"
@@ -64,10 +66,46 @@ type fakeRunner struct {
 	tiers map[string]string
 	// raised are the tier changes that were asked for, as "source:key to tier".
 	raised []string
+	// pulls are the tracked pull requests.
+	pulls []*store.PullRequest
 	// plans are the tickets that wait for a plan approval, by key, and
 	// approved the approvals that were recorded, as "source:key by who".
 	plans    map[string]bool
 	approved []string
+}
+
+func (f *fakeRunner) OpenPullRequests() ([]store.PullRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.PullRequest
+	for _, p := range f.pulls {
+		if p.State == store.PROpen {
+			out = append(out, *p)
+		}
+	}
+	return out, f.err
+}
+
+func (f *fakeRunner) SetPullRequest(source, key, url, state, closedBy, note string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.pulls {
+		if p.Source == source && p.Key == key && p.URL == url {
+			p.State, p.ClosedBy, p.Note = state, closedBy, note
+		}
+	}
+	return f.err
+}
+
+func (f *fakeRunner) Session(source, key string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for s, k := range f.sessions {
+		if k == key {
+			return s, nil
+		}
+	}
+	return "", nil
 }
 
 // Approve records the approval, for the tickets in plans.
@@ -2042,5 +2080,101 @@ func TestPollIgnoresTheBotsOwnAssignments(t *testing.T) {
 	s.Poll(context.Background())
 	if len(fr.tasks) != 1 || fr.tasks[0].Key != "DEV-2" {
 		t.Errorf("started %+v, want DEV-2 only", fr.tasks)
+	}
+}
+
+// The handoff: a ticket is done when a person has merged or closed its
+// pull request. A pull request that is not the ticket's, and a merge by
+// the bot account, do not count.
+func TestPullRequestsCloseTheirTickets(t *testing.T) {
+	gh := githubtest.New(t)
+	url := func(n int, branch string) string {
+		return gh.Open(githubtest.PullRequest{Owner: "example", Repo: "web", Number: n, HeadRef: branch, Author: "digital-employee"})
+	}
+	pull := func(source, key, u string) *store.PullRequest {
+		return &store.PullRequest{Source: source, Key: key, URL: u, State: store.PROpen}
+	}
+	fr := &fakeRunner{sessions: map[string]string{"s-eng-1": "ENG-1"}}
+	fr.pulls = []*store.PullRequest{
+		pull("jira", "DEV-1", url(1, "bot/DEV-1")),
+		pull("linear", "ENG-1", url(2, "bot/ENG-1")),
+		pull("jira", "DEV-2", url(3, "bot/DEV-2")),
+		pull("jira", "DEV-2", url(4, "bot/DEV-2")),
+		pull("jira", "DEV-3", url(5, "feature/of-someone-else")),
+		pull("jira", "DEV-4", "https://evil.example/example/web/pull/6"),
+		pull("jira", "DEV-5", gh.URL+"/example/web/pull/99"),
+		pull("jira", "DEV-6", url(7, "bot/DEV-6")),
+	}
+	jira := &tracker.Fake{}
+	cfg := testConfig()
+	cfg.GitHub.BotLogin = "Digital-Employee"
+	api := lineartest.New(t, "tok")
+	cfg.Sources.Linear.ClientID, cfg.Sources.Linear.ClientSecret, cfg.Sources.Linear.APIURL = "id", "secret", api.URL
+	cfg.Sources.Linear.TokenFile = filepath.Join(t.TempDir(), "token.json")
+	os.WriteFile(cfg.Sources.Linear.TokenFile, []byte(`{"access_token":"tok","token_type":"Bearer"}`), 0o600)
+	s := newServer(t, cfg, fr)
+	s.UseJira(jira)
+	s.UseGitHub(github.New(gh.URL, githubtest.Token))
+	state := func(i int) string { return fr.pulls[i].State }
+	wait := func(cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for !cond() && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// Everything is open: nothing is done. What is not the ticket's pull
+	// request is put aside at once, and not asked about again.
+	s.PollPullRequests(context.Background())
+	if len(fr.closed) != 0 {
+		t.Fatalf("tickets were closed while their pull requests are open: %v", fr.closed)
+	}
+	if state(4) != store.PRRejected || !strings.Contains(fr.pulls[4].Note, `from the branch "feature/of-someone-else"`) ||
+		state(5) != store.PRRejected || !strings.Contains(fr.pulls[5].Note, "is not on") || state(6) != store.PRRejected {
+		t.Errorf("pull requests that are not the ticket's: %+v %+v %+v", fr.pulls[4], fr.pulls[5], fr.pulls[6])
+	}
+	calls := gh.Calls()
+	gh.Merge("example", "web", 5, "reviewer")
+	s.PollPullRequests(context.Background())
+	if gh.Calls() != calls+5 || len(fr.closed) != 0 {
+		t.Errorf("after someone else's pull request was merged: %d calls, closed %v", gh.Calls()-calls, fr.closed)
+	}
+
+	// A person merges one, closes another, and merges one of two.
+	gh.Merge("example", "web", 1, "reviewer")
+	gh.Close("example", "web", 2)
+	gh.Merge("example", "web", 3, "reviewer")
+	// The digital employee's own account merges its pull request.
+	gh.Merge("example", "web", 7, "digital-employee")
+	s.PollPullRequests(context.Background())
+	slices.Sort(fr.closed)
+	if strings.Join(fr.closed, ",") != "jira:DEV-1,linear:ENG-1" {
+		t.Fatalf("closed = %v, want DEV-1 and ENG-1: DEV-2 has a pull request open, and DEV-6 was merged by the bot", fr.closed)
+	}
+	if state(0) != store.PRMerged || fr.pulls[0].ClosedBy != "reviewer" || state(1) != store.PRClosed || state(2) != store.PRMerged || state(3) != store.PROpen {
+		t.Errorf("states: %s %s %s %s", state(0), state(1), state(2), state(3))
+	}
+	if state(7) != store.PRMerged || fr.pulls[7].Note != "merged by the bot account itself" {
+		t.Errorf("the pull request that the bot merged: %+v", fr.pulls[7])
+	}
+	wait(func() bool { return len(jira.Comments("DEV-1")) == 1 && len(api.Activities("s-eng-1")) == 1 })
+	if got := jira.Comments("DEV-1"); len(got) != 1 || !strings.Contains(got[0], "/example/web/pull/1 was merged by reviewer") || !strings.Contains(got[0], "DEV-1 is done") {
+		t.Errorf("DEV-1 was told %q", got)
+	}
+	if acts := api.Activities("s-eng-1"); len(acts) != 1 || acts[0].Type != "response" || !strings.Contains(acts[0].Body, "was closed without a merge") {
+		t.Errorf("ENG-1 was told %+v", acts)
+	}
+	// The second pull request of DEV-2 is merged as well.
+	gh.Merge("example", "web", 4, "reviewer")
+	s.PollPullRequests(context.Background())
+	if len(fr.closed) != 3 || fr.closed[2] != "jira:DEV-2" {
+		t.Errorf("closed = %v, want DEV-2 as well", fr.closed)
+	}
+	// Nothing is left to ask about.
+	calls = gh.Calls()
+	s.PollPullRequests(context.Background())
+	if gh.Calls() != calls {
+		t.Errorf("%d more calls with no pull request open", gh.Calls()-calls)
 	}
 }

@@ -23,6 +23,7 @@ import (
 
 	"ochell/internal/auth"
 	"ochell/internal/config"
+	"ochell/internal/github"
 	"ochell/internal/ipsync"
 	"ochell/internal/policy"
 	"ochell/internal/result"
@@ -77,6 +78,12 @@ type Submitter interface {
 	// TicketOfSession returns the key of the ticket that reports to a
 	// tracker session, or "".
 	TicketOfSession(source, session string) (string, error)
+	// OpenPullRequests returns the tracked pull requests that are open,
+	// and SetPullRequest records what became of one. Session returns the
+	// tracker session that the last run of a ticket reported to, or "".
+	OpenPullRequests() ([]store.PullRequest, error)
+	SetPullRequest(source, key, url, state, closedBy, note string) error
+	Session(source, key string) (string, error)
 	// Hold records a ticket as waiting for a human, without a task.
 	Hold(*task.Task, ticket.Reason) error
 	// Closed is called when the tracker reports a ticket as closed.
@@ -99,6 +106,10 @@ type Server struct {
 	linear *linear.Client
 	// jira is ochell's access to the Jira API; nil without sources.jira_api.
 	jira tracker.Client
+	// github is ochell's read access to GitHub; nil without github.token.
+	github *github.Client
+	// branch is workspace.branch: the branch a ticket is worked on.
+	branch *template.Template
 	// policy holds the risk tiers; the built-in one without a policy file.
 	policy *policy.Policy
 	extURL *template.Template
@@ -140,6 +151,12 @@ func New(cfg *config.Config, log *slog.Logger, r Submitter, seen Deliveries) (*S
 	}
 	if api := cfg.Sources.JiraAPI; api.Enabled() {
 		s.jira = jiraapi.New(api)
+	}
+	if gh := cfg.GitHub; gh.Enabled() {
+		s.github = github.New(gh.APIURL, gh.Token)
+	}
+	if b, err := template.New("workspace.branch").Option("missingkey=error").Parse(cfg.Workspace.Branch); err == nil {
+		s.branch = b
 	}
 	if lc.ExternalURL != "" {
 		t, err := template.New("external_url").Parse(lc.ExternalURL)
@@ -235,6 +252,9 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	if s.cfg.Poller.Interval > 0 {
 		go s.runPoller(ctx)
+	}
+	if s.github != nil && s.cfg.GitHub.PollInterval > 0 {
+		go s.runPullRequestPoller(ctx)
 	}
 
 	var servers []*http.Server

@@ -39,6 +39,17 @@ api:
   token: ${OCHELL_API_TOKEN}
   public_url: ""            # e.g. https://ochell.example.com
 
+# ochell's own, read-only access to GitHub. With it, ochell follows the
+# pull requests that its tickets opened, and a ticket is done when a person
+# has merged or closed its pull request. The token needs read access to
+# pull requests only; it is not the agent's token. Leave "token" empty to
+# turn this off.
+github:
+  token: ${GITHUB_READ_TOKEN}
+  poll_interval: 2m
+  bot_login: ""             # the digital employee's GitHub login: a merge by it is no acceptance
+  # api_url: https://ghe.example.com/api/v3
+
 # The policy file: the risk tiers, and which tier a ticket runs under (see
 # examples/policy.yaml). It must not be writable by the agent's OS user.
 # Leave it out for one built-in tier that every ticket runs under.

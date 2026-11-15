@@ -526,3 +526,34 @@ func TestAPISettings(t *testing.T) {
 		}
 	}
 }
+
+func TestGitHubSettings(t *testing.T) {
+	base := func() *Config {
+		cfg := Default()
+		cfg.Sources.JiraAutomation.Enabled = true
+		cfg.Sources.JiraAutomation.Token = "t"
+		return cfg
+	}
+	cfg := base()
+	if cfg.GitHub.Enabled() || cfg.GitHub.PollInterval != 2*time.Minute {
+		t.Errorf("default = %+v", cfg.GitHub)
+	}
+	cfg.GitHub.Token, cfg.GitHub.APIURL, cfg.GitHub.BotLogin = "t", "https://ghe.example.com/api/v3", "bot"
+	if err := cfg.Validate(); err != nil || !cfg.GitHub.Enabled() {
+		t.Errorf("a valid GitHub access: %v", err)
+	}
+	for name, c := range map[string]struct {
+		gh   GitHub
+		want string
+	}{
+		"no interval":     {GitHub{Token: "t"}, "github.poll_interval must be positive"},
+		"bad address":     {GitHub{Token: "t", PollInterval: time.Minute, APIURL: "ghe.example.com"}, "github.api_url must be the address of the API"},
+		"login, no token": {GitHub{BotLogin: "bot", PollInterval: time.Minute}, "bot_login is set but token is not"},
+	} {
+		cfg := base()
+		cfg.GitHub = c.gh
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
+		}
+	}
+}
