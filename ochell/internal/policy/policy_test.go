@@ -236,3 +236,81 @@ func TestNextTierAndTurnLimit(t *testing.T) {
 		t.Errorf("a negative turn limit: %v", err)
 	}
 }
+
+func TestGrants(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string, mode os.FileMode) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), mode); err != nil {
+			t.Fatal(err)
+		}
+		os.Chmod(path, mode)
+		return path
+	}
+	mcp := write("mcp.json", `{"mcpServers":{}}`, 0o644)
+	creds := write("low.env", "# the tier's tokens\nTOKEN=abc=def\n\nOTHER=x y\n", 0o600)
+	mint := write("mint", "#!/bin/sh\n", 0o755)
+	policyFile := func(grants string) string {
+		return write("policy.yaml", "tiers:\n  - name: low\n    grants:\n"+grants+"default_tier: low\n", 0o600)
+	}
+
+	p, err := Load(policyFile("      mcp_config: " + mcp + "\n      env: {TOOLSET: low}\n      credentials_file: " + creds + "\n      mint: [" + mint + ", --scope, read]\n      revoke: [" + mint + "]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := p.Tier("low").Grants
+	if g.MCPConfig != mcp || g.Env["TOOLSET"] != "low" || len(g.Mint) != 3 || g.Empty() {
+		t.Errorf("grants = %+v", g)
+	}
+	if got := p.Describe()[0]; !strings.Contains(got, "grants=mcp_config+env+credentials_file+mint") {
+		t.Errorf("Describe = %q", got)
+	}
+	got, err := ReadCredentials(creds)
+	if err != nil || strings.Join(got, "|") != "TOKEN=abc=def|OTHER=x y" {
+		t.Errorf("ReadCredentials = %q, %v", got, err)
+	}
+	if !(Grants{}).Empty() {
+		t.Error("no grants are not empty")
+	}
+
+	// What Load refuses because of the files.
+	open := write("open.env", "TOKEN=abcdef\n", 0o640)
+	bad := write("bad.env", "TOKEN=abcdef\nthis is not a variable\n", 0o600)
+	noexec := write("noexec", "#!/bin/sh\n", 0o644)
+	for name, c := range map[string]struct{ grants, want string }{
+		"missing mcp":        {"      mcp_config: " + dir + "/none.json\n", "grants.mcp_config"},
+		"readable creds":     {"      credentials_file: " + open + "\n", "can be read or written by its group or by others"},
+		"missing creds":      {"      credentials_file: " + dir + "/none.env\n", "grants.credentials_file"},
+		"malformed creds":    {"      credentials_file: " + bad + "\n", "line 2 is not NAME=VALUE"},
+		"mint not a program": {"      mint: [" + noexec + "]\n", "is not a program that ochell can run"},
+	} {
+		if _, err := Load(policyFile(c.grants)); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
+		}
+	}
+	// A malformed line is reported without its content.
+	if _, err := ReadCredentials(bad); err == nil || strings.Contains(err.Error(), "this is not") {
+		t.Errorf("the error shows the line: %v", err)
+	}
+	// What Parse refuses without looking at any file.
+	for name, c := range map[string]struct{ grants, want string }{
+		"relative mcp":    {"mcp_config: mcp.json", "grants.mcp_config must be an absolute path"},
+		"relative creds":  {"credentials_file: low.env", "grants.credentials_file must be an absolute path"},
+		"bad env name":    {"env: {\"A B\": x}", "is not a variable name"},
+		"ochell's env":    {"env: {ORCH_TASK_KEY: x}", "are ochell's own"},
+		"relative mint":   {"mint: [mint-token]", "grants.mint: the command must be an absolute path"},
+		"revoke only":     {"revoke: [/bin/true]", "grants.revoke without grants.mint"},
+		"unknown setting": {"tokens: [x]", "field tokens not found"},
+	} {
+		_, err := Parse([]byte("tiers: [{name: a, grants: {" + c.grants + "}}]\ndefault_tier: a"))
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
+		}
+	}
+	for name, text := range map[string]string{"no value": "A=", "ochell's": "ORCH_X=abcdef", "control": "A=ab\tcd"} {
+		if _, err := ParseCredentials(text, "test"); err == nil {
+			t.Errorf("%s: %q was accepted", name, text)
+		}
+	}
+}

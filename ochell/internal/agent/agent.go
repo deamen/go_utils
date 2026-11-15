@@ -28,6 +28,9 @@ type Run struct {
 	// MaxTurns is how many turns this run may take at most; 0: no limit.
 	// It needs the same kind of adapter.
 	MaxTurns int
+	// MCPConfig, when set, is a file with the MCP servers that this run
+	// may use. The run gets those and no others.
+	MCPConfig string
 }
 
 // BudgetLimiter is an Adapter whose agent CLI can stop a run at a limit

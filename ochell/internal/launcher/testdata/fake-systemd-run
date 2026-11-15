@@ -14,14 +14,14 @@ set -euo pipefail
 unit=
 dir=
 env=()
-envfile=
+envfiles=()
 all=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --unit=*)              unit=${1#--unit=} ;;
     --working-directory=*) dir=${1#--working-directory=} ;;
     --setenv=*)            env+=("${1#--setenv=}") ;;
-    -p)                    shift; case "$1" in EnvironmentFile=*) envfile=${1#EnvironmentFile=} ;; esac ;;
+    -p)                    shift; case "$1" in EnvironmentFile=*) envfiles+=("${1#EnvironmentFile=}") ;; esac ;;
     --)                    shift; break ;;
     --*)                   ;;
     *)                     echo "fake-systemd-run: unexpected argument $1" >&2; exit 1 ;;
@@ -31,11 +31,11 @@ done
 [ -n "$unit" ] || { echo "fake-systemd-run: no --unit" >&2; exit 1; }
 printf '%s\n' "${all[@]}" > "$FAKE_SYSTEMD_DIR/$unit.args"
 
-if [ -n "$envfile" ]; then
+for envfile in ${envfiles[@]+"${envfiles[@]}"}; do
   while IFS= read -r line; do
     [ -z "$line" ] || env+=("$line")
   done < "$envfile"
-fi
+done
 
 lookup() {
   local e

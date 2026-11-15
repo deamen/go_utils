@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"time"
 
 	"ochell/internal/config"
@@ -42,6 +43,11 @@ type Spec struct {
 	// NAME=VALUE. Only the direct launcher uses it: a unit has the
 	// environment of the agent user instead.
 	Inherited []string
+	// Secrets are set for the agent as well, as NAME=VALUE, and must not
+	// become visible to other local users: the systemd launcher hands them
+	// over in a file that only ochell and root can read, not as part of
+	// the unit.
+	Secrets []string
 	// Stdin is written to the agent's stdin; nil means no input.
 	Stdin io.Reader
 	// Output receives the agent's stdout and stderr.
@@ -82,10 +88,20 @@ func New(cfg config.Agent) (Launcher, error) {
 	case "", "direct":
 		return Direct{StopGrace: cfg.StopGrace}, nil
 	case "systemd":
+		// The launch script takes the file with a run's credentials only by
+		// its full path.
+		secrets := cfg.SecretsDir
+		if secrets != "" {
+			var err error
+			if secrets, err = filepath.Abs(secrets); err != nil {
+				return nil, fmt.Errorf("agent.secrets_dir: %w", err)
+			}
+		}
 		return &Systemd{
 			LaunchCommand: cfg.Systemd.LaunchCommand,
 			StopCommand:   cfg.Systemd.StopCommand,
 			StopGrace:     cfg.StopGrace,
+			SecretsDir:    secrets,
 		}, nil
 	}
 	return nil, fmt.Errorf("agent.launcher: unknown launcher %q", cfg.Launcher)

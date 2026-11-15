@@ -37,7 +37,7 @@ func (d Direct) Start(spec Spec) (Process, error) {
 	cmd := exec.Command(spec.Command, spec.Args...)
 	cmd.Dir = spec.Dir
 	// Never ochell's own environment: it holds the webhook secrets.
-	cmd.Env = append(append([]string{}, spec.Inherited...), spec.Env...)
+	cmd.Env = append(append(append([]string{}, spec.Inherited...), spec.Env...), spec.Secrets...)
 	if spec.Stdin != nil {
 		cmd.Stdin = spec.Stdin
 	}
