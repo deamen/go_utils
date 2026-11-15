@@ -307,6 +307,15 @@ type Admin struct {
 	Socket string `yaml:"socket"`
 }
 
+// Policy points at the policy file: the risk tiers, and the rules that say
+// which tier a ticket runs under (package policy).
+type Policy struct {
+	// File is the policy file. It must not be writable by anyone but its
+	// owner, who is root or the user ochell runs as. Empty: the built-in
+	// policy, with one tier for every ticket.
+	File string `yaml:"file"`
+}
+
 // Poller configures the safety net behind the webhooks: ochell asks each
 // tracker for the bot's open tickets, at start and then at this interval.
 type Poller struct {
@@ -320,6 +329,7 @@ type Config struct {
 	HTTPS    Listener `yaml:"https"`
 	Admin    Admin    `yaml:"admin"`
 	Store    Store    `yaml:"store"`
+	Policy   Policy   `yaml:"policy"`
 	// Repos says which repository a ticket belongs to. The first entry
 	// that matches wins. When the list is not empty, a ticket that no
 	// entry matches is not started and waits for a human. When it is
@@ -546,6 +556,8 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 
 	fs.StringVar(&c.Admin.Socket, "admin-socket", c.Admin.Socket, "unix socket of the admin channel (ochell pause, resume, status, reset, stop)")
 	fs.StringVar(&c.Store.Path, "store-path", c.Store.Path, "file that holds the tickets, the task queue and the handled deliveries")
+
+	fs.StringVar(&c.Policy.File, "policy-file", c.Policy.File, "policy file with the risk tiers (empty: one built-in tier for every ticket)")
 
 	fs.DurationVar(&c.Poller.Interval, "poll-interval", c.Poller.Interval, "how often ochell asks the trackers for the bot's open tickets (0: never)")
 

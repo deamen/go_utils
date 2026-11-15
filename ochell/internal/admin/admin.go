@@ -32,6 +32,8 @@ type Control interface {
 	Resume() error
 	Status() (runner.Status, error)
 	ResetAttempts(source, key string) error
+	// SetTier puts a ticket under another risk tier.
+	SetTier(source, key, tier string) error
 	// Stop ends the work on a ticket for the operator named in by.
 	Stop(source, key, by string) (runner.Stopped, error)
 }
@@ -143,10 +145,28 @@ func routes(c Control, log *slog.Logger) http.Handler {
 		status(w, "")
 	})
 	mux.HandleFunc("POST /reset", func(w http.ResponseWriter, r *http.Request) {
-		source, key := r.URL.Query().Get("source"), r.URL.Query().Get("key")
+		source, key, tier := r.URL.Query().Get("source"), r.URL.Query().Get("key"), r.URL.Query().Get("tier")
+		note := ""
+		if tier != "" {
+			// First, so that a tier that does not exist resets nothing.
+			switch err := c.SetTier(source, key, tier); {
+			case err == nil:
+				note = fmt.Sprintf(" and its tier is now %s", tier)
+			case errors.Is(err, runner.ErrNoTier):
+				answer(w, http.StatusBadRequest, fmt.Sprintf("the policy has no tier %q; nothing was reset", tier))
+				return
+			case errors.Is(err, store.ErrUnknown):
+				answer(w, http.StatusNotFound, fmt.Sprintf("ochell knows no %s ticket %s", source, key))
+				return
+			default:
+				log.Error("admin: setting the tier failed", "err", err)
+				answer(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
 		switch err := c.ResetAttempts(source, key); {
 		case err == nil:
-			answer(w, http.StatusOK, fmt.Sprintf("the attempts of %s %s are reset; assign the ticket again to start it", source, key))
+			answer(w, http.StatusOK, fmt.Sprintf("the attempts of %s %s are reset%s; assign the ticket again to start it", source, key, note))
 		case errors.Is(err, store.ErrUnknown):
 			answer(w, http.StatusNotFound, fmt.Sprintf("ochell knows no %s ticket %s", source, key))
 		default:

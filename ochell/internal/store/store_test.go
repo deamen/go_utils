@@ -944,3 +944,63 @@ func TestStop(t *testing.T) {
 		t.Errorf("closing a cancelled ticket = %+v, %v", tk, err)
 	}
 }
+
+// A run records the tier its ticket has when it starts, and the version of
+// the policy in force.
+func TestRunsRecordTheirTier(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	s.SetPolicyVersion("2026-11")
+	t0 := time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
+
+	first := newTask("r1", "ENG-1", t0)
+	first.Tier = "low"
+	if err := s.Enqueue(first, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing is recorded for a run that has not started.
+	if run, _ := s.Run("r1"); run.Tier != "" || run.PolicyVersion != "" {
+		t.Errorf("queued run = %+v", run)
+	}
+	got, err := s.Claim()
+	if err != nil || got.Tier != "low" {
+		t.Fatalf("claimed %+v, %v", got, err)
+	}
+	if run, _ := s.Run("r1"); run.Tier != "low" || run.PolicyVersion != "2026-11" {
+		t.Errorf("started run: tier %q, policy %q", run.Tier, run.PolicyVersion)
+	}
+	if err := s.Finish("r1", task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A follow-up says nothing about the tier: the run has the ticket's.
+	// The policy has changed in the meantime.
+	s.SetPolicyVersion("2026-12")
+	if _, err := s.FollowUp(newTask("r2", "ENG-1", t0.Add(time.Minute)), true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Claim(); err != nil || got.Tier != "low" {
+		t.Fatalf("claimed %+v, %v", got, err)
+	}
+	if run, _ := s.Run("r2"); run.Tier != "low" || run.PolicyVersion != "2026-12" {
+		t.Errorf("follow-up run: tier %q, policy %q", run.Tier, run.PolicyVersion)
+	}
+	if err := s.Finish("r2", task.Result{Outcome: task.OutcomeFinished, Signal: result.Done}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A new assignment under another tier; the first run keeps its record.
+	third := newTask("r3", "ENG-1", t0.Add(2*time.Minute))
+	third.Tier = "high"
+	if err := s.Enqueue(third, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Claim(); err != nil || got.Tier != "high" {
+		t.Fatalf("claimed %+v, %v", got, err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.Tier != "high" {
+		t.Errorf("ticket tier = %q", tk.Tier)
+	}
+	if run, _ := s.Run("r1"); run.Tier != "low" || run.PolicyVersion != "2026-11" {
+		t.Errorf("the first run now says tier %q, policy %q", run.Tier, run.PolicyVersion)
+	}
+}

@@ -2194,3 +2194,178 @@ func TestToolUseIsShownInTheLinearSession(t *testing.T) {
 		t.Errorf("the Jira ticket got %d comments, want 2: %q", n, comments)
 	}
 }
+
+// tiersPolicy is a policy file with three tiers, for the tests of the tiers.
+const tiersPolicy = `
+version: e2e-1
+owners: [policy.owner@example.com]
+tiers:
+  - {name: low, budget_usd: 5}
+  - {name: normal, budget_usd: 20}
+  - {name: high, plan_gate: skip, budget_usd: 50, labels: [risk-high]}
+default_tier: normal
+rules:
+  - {source: jira, project: OPS, issue_type: Bug, tier: low}
+  - {source: linear, project: PAY, tier: high}
+`
+
+// Risk tiers: each run records the tier that its ticket matched in the
+// policy file; a ticket that no rule matches gets the default tier; a label
+// raises a tier and never lowers it.
+func TestRiskTiers(t *testing.T) {
+	o := Start(t, Options{Policy: tiersPolicy})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if !strings.Contains(o.Output(), "msg=policy file="+o.Config.Policy.File+" version=e2e-1 tiers=3 default_tier=normal rules=2") {
+		t.Error("the policy is not in ochell's log at start")
+	}
+
+	// tierOf waits for the run and returns the tier it recorded.
+	tierOf := func(id, source, key string) string {
+		t.Helper()
+		o.WaitRun(id, 15*time.Second)
+		run := o.WaitStored(st, id, 10*time.Second)
+		if run.PolicyVersion != "e2e-1" {
+			t.Errorf("%s: policy version %q, want e2e-1", key, run.PolicyVersion)
+		}
+		tk, _ := st.Ticket(source, key)
+		if tk == nil || tk.Tier != run.Tier {
+			t.Errorf("%s: the ticket says %+v, the run tier %q", key, tk, run.Tier)
+		}
+		// The agent is told its tier.
+		for _, rec := range o.Records() {
+			if got, _ := rec.Getenv("ORCH_TASK_ID"); got == id {
+				if tier, _ := rec.Getenv("ORCH_TASK_TIER"); tier != run.Tier {
+					t.Errorf("%s: ORCH_TASK_TIER = %q, the run recorded %q", key, tier, run.Tier)
+				}
+			}
+		}
+		return run.Tier
+	}
+
+	// No rule matches: the default tier.
+	if tier := tierOf(o.JiraAssigned("DEV-70", "No rule").TaskID(t), "jira", "DEV-70"); tier != "normal" {
+		t.Errorf("a ticket that no rule matches ran under %q, want the default tier normal", tier)
+	}
+	if tier := tierOf(o.LinearCreated("ENG-70", "session-default", "").TaskID(t), "linear", "ENG-70"); tier != "normal" {
+		t.Errorf("a Linear ticket that no rule matches ran under %q, want normal", tier)
+	}
+	// A rule by project and issue type, through each Jira source.
+	o.IssueType = "Bug"
+	if tier := tierOf(o.JiraAssigned("OPS-70", "A bug").TaskID(t), "jira", "OPS-70"); tier != "low" {
+		t.Errorf("OPS bug from the system webhook ran under %q, want low", tier)
+	}
+	if tier := tierOf(o.JiraAutomation("OPS-71", "A bug").TaskID(t), "jira", "OPS-71"); tier != "low" {
+		t.Errorf("OPS bug from Automation ran under %q, want low", tier)
+	}
+	o.IssueType = "Story"
+	if tier := tierOf(o.JiraAssigned("OPS-72", "A story").TaskID(t), "jira", "OPS-72"); tier != "normal" {
+		t.Errorf("OPS story ran under %q, want normal", tier)
+	}
+	// A rule by project, for Linear.
+	if tier := tierOf(o.LinearCreated("PAY-70", "session-pay", "").TaskID(t), "linear", "PAY-70"); tier != "high" {
+		t.Errorf("PAY ran under %q, want high", tier)
+	}
+	// A label raises the tier of a ticket whose rule says low.
+	o.IssueType, o.Labels = "Bug", []string{"ui", "Risk-High"}
+	if tier := tierOf(o.JiraAssigned("OPS-73", "A risky bug").TaskID(t), "jira", "OPS-73"); tier != "high" {
+		t.Errorf("OPS bug with the label ran under %q, want high", tier)
+	}
+	if tier := tierOf(o.LinearCreated("ENG-71", "session-label", "").TaskID(t), "linear", "ENG-71"); tier != "high" {
+		t.Errorf("Linear issue with the label ran under %q, want high", tier)
+	}
+	// The label is taken off and the ticket assigned again: the tier stays.
+	o.Labels = nil
+	if tier := tierOf(o.JiraAssigned("OPS-73", "A risky bug").TaskID(t), "jira", "OPS-73"); tier != "high" {
+		t.Errorf("after the label was removed the ticket ran under %q, want still high", tier)
+	}
+	if !strings.Contains(o.Output(), `tier=high tier_from="kept: the ticket had this tier, and a tier is not lowered"`) {
+		t.Error("ochell's log does not say why the tier was kept")
+	}
+	if !strings.Contains(o.Output(), "key=OPS-70 repo=\"\" tier=low tier_from=rules[0]") {
+		t.Error("ochell's log does not say which rule gave the tier")
+	}
+
+	// An operator is the one who can lower a tier.
+	if out, code := o.Admin("reset", "jira", "OPS-73", "--tier", "lowest"); code == 0 || !strings.Contains(out, `no tier "lowest"`) {
+		t.Errorf("ochell reset --tier with an unknown tier: exit %d, %q", code, out)
+	}
+	if out, code := o.Admin("reset", "jira", "OPS-73", "--tier", "low"); code != 0 || !strings.Contains(out, "its tier is now low") {
+		t.Fatalf("ochell reset --tier: exit %d, %q", code, out)
+	}
+	if tier := tierOf(o.JiraAssigned("OPS-73", "A bug again").TaskID(t), "jira", "OPS-73"); tier != "low" {
+		t.Errorf("after the operator lowered it the ticket ran under %q, want low", tier)
+	}
+}
+
+// An invalid policy file, and one that others could change, are rejected
+// at start: ochell does not run without a policy it can trust.
+func TestPolicyFileIsCheckedAtStart(t *testing.T) {
+	o := Start(t, Options{Policy: tiersPolicy})
+	if out, code := o.Admin("policy-check"); code != 0 || !strings.Contains(out, "policy.yaml is valid") ||
+		!strings.Contains(out, "high: plan_gate=skip pr_review=required auto_merge=never budget_usd=50 labels=risk-high") ||
+		!strings.Contains(out, "normal: plan_gate=skip pr_review=required auto_merge=never budget_usd=20 (default)") {
+		t.Errorf("ochell policy-check: exit %d, %q", code, out)
+	}
+	// "serve" reads the policy before it opens a port or the store, so a
+	// second ochell with a bad policy stops there.
+	serve := func(file string) (string, int) {
+		return o.Admin("serve", "--policy-file", file)
+	}
+	write := func(name, content string, mode os.FileMode) string {
+		t.Helper()
+		path := filepath.Join(o.Dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for name, c := range map[string]struct {
+		content string
+		mode    os.FileMode
+		want    string
+	}{
+		"unknown-tier.yaml":   {"tiers: [{name: low}]\ndefault_tier: normal\n", 0o600, `default_tier: there is no tier "normal"`},
+		"misspelt.yaml":       {"tiers: [{name: low, budget: 5}]\ndefault_tier: low\n", 0o600, "field budget not found"},
+		"bad-value.yaml":      {"tiers: [{name: low, plan_gate: sometimes}]\ndefault_tier: low\n", 0o600, "plan_gate must be skip or required"},
+		"group-writable.yaml": {tiersPolicy, 0o660, "writable by its group or by others"},
+		"world-writable.yaml": {tiersPolicy, 0o646, "writable by its group or by others"},
+	} {
+		out, code := serve(write(name, c.content, c.mode))
+		if code == 0 || !strings.Contains(out, "invalid policy") || !strings.Contains(out, c.want) {
+			t.Errorf("%s: serve exited with %d and said %q; want an error with %q", name, code, out, c.want)
+		}
+		if out, code := o.Admin("policy-check", "--policy-file", filepath.Join(o.Dir, name)); code == 0 || !strings.Contains(out, c.want) {
+			t.Errorf("%s: policy-check exited with %d and said %q", name, code, out)
+		}
+	}
+	if out, code := serve(filepath.Join(o.Dir, "missing.yaml")); code == 0 || !strings.Contains(out, "no such file") {
+		t.Errorf("a missing policy file: exit %d, %q", code, out)
+	}
+	// The running ochell was not disturbed.
+	o.WaitRun(o.JiraAssigned("DEV-71", "Still running").TaskID(t), 15*time.Second)
+}
+
+// Without a policy file there is one tier, and every ticket runs under it.
+func TestBuiltInPolicy(t *testing.T) {
+	o := Start(t, Options{})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	id := o.JiraAssigned("DEV-72", "No policy file").TaskID(t)
+	o.WaitRun(id, 15*time.Second)
+	if run := o.WaitStored(st, id, 10*time.Second); run.Tier != "normal" || run.PolicyVersion != "builtin" {
+		t.Errorf("run: tier %q, policy %q; want normal, builtin", run.Tier, run.PolicyVersion)
+	}
+	if out, code := o.Admin("policy-check"); code != 0 || !strings.Contains(out, "the built-in policy holds") {
+		t.Errorf("ochell policy-check: exit %d, %q", code, out)
+	}
+}

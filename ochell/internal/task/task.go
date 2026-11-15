@@ -52,6 +52,8 @@ type Task struct {
 	// Repo is the repository the ticket belongs to, from the repos setting.
 	// Empty when no mapping is configured.
 	Repo string
+	// Tier is the risk tier of the policy that the ticket runs under.
+	Tier string
 	// Context is optional extra text from the source (e.g. Linear promptContext).
 	Context string
 	// Comment is the comment that triggered this run, when a person asked

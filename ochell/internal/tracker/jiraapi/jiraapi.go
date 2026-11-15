@@ -140,6 +140,9 @@ type searchReply struct {
 			Components []struct {
 				Name string `json:"name"`
 			} `json:"components"`
+			IssueType struct {
+				Name string `json:"name"`
+			} `json:"issuetype"`
 		} `json:"fields"`
 	} `json:"issues"`
 	NextPageToken string `json:"nextPageToken"`
@@ -153,7 +156,7 @@ func (c *Client) Assigned(ctx context.Context) ([]tracker.Issue, error) {
 	for range maxPages {
 		in := map[string]any{
 			"jql":        c.JQL,
-			"fields":     []string{"summary", "labels", "components"},
+			"fields":     []string{"summary", "labels", "components", "issuetype"},
 			"maxResults": pageSize,
 		}
 		if token != "" {
@@ -178,6 +181,7 @@ func (c *Client) Assigned(ctx context.Context) ([]tracker.Issue, error) {
 				Title:  is.Fields.Summary,
 				URL:    c.BaseURL + "/browse/" + is.Key,
 				Labels: labels,
+				Type:   is.Fields.IssueType.Name,
 			})
 		}
 		if token = page.NextPageToken; token == "" {

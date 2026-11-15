@@ -20,6 +20,7 @@ type fakeControl struct {
 	st      runner.Status
 	reset   []string
 	stopped []string
+	tier    string
 }
 
 func (f *fakeControl) Pause() error                   { f.st.Paused = true; return nil }
@@ -38,6 +39,17 @@ func (f *fakeControl) Stop(source, key, by string) (runner.Stopped, error) {
 		return runner.Released, nil
 	}
 	return runner.StoppedRun, nil
+}
+
+func (f *fakeControl) SetTier(source, key, tier string) error {
+	if tier != "low" && tier != "high" {
+		return runner.ErrNoTier
+	}
+	if key != "DEV-1" {
+		return store.ErrUnknown
+	}
+	f.tier = tier
+	return nil
 }
 
 func (f *fakeControl) ResetAttempts(source, key string) error {
@@ -93,6 +105,18 @@ func TestCommands(t *testing.T) {
 	}
 	if _, err := Call(path, "POST", "reset", url.Values{"source": {"jira"}, "key": {"NOPE-1"}}); err == nil || !strings.Contains(err.Error(), "knows no jira ticket NOPE-1") {
 		t.Errorf("reset of an unknown ticket: %v", err)
+	}
+	// With a tier, the ticket is also put under it.
+	got, err = Call(path, "POST", "reset", url.Values{"source": {"jira"}, "key": {"DEV-1"}, "tier": {"low"}})
+	if err != nil || !strings.Contains(got, "attempts of jira DEV-1 are reset and its tier is now low") || c.tier != "low" || len(c.reset) != 2 {
+		t.Errorf("reset with a tier = %q, %v; tier %q, reset %v", got, err, c.tier, c.reset)
+	}
+	// A tier that the policy does not have changes nothing.
+	if _, err := Call(path, "POST", "reset", url.Values{"source": {"jira"}, "key": {"DEV-1"}, "tier": {"lowest"}}); err == nil || !strings.Contains(err.Error(), `no tier "lowest"; nothing was reset`) || len(c.reset) != 2 {
+		t.Errorf("reset with an unknown tier: %v; reset %v", err, c.reset)
+	}
+	if _, err := Call(path, "POST", "reset", url.Values{"source": {"jira"}, "key": {"NOPE-1"}, "tier": {"low"}}); err == nil || !strings.Contains(err.Error(), "knows no jira ticket NOPE-1") {
+		t.Errorf("reset with a tier of an unknown ticket: %v", err)
 	}
 	// stop: what was done, and who asked, for the note on the ticket.
 	for key, want := range map[string]string{

@@ -26,6 +26,7 @@ import (
 	"ochell/internal/admin"
 	"ochell/internal/config"
 	"ochell/internal/ipsync"
+	"ochell/internal/policy"
 	"ochell/internal/runner"
 	"ochell/internal/server"
 	"ochell/internal/source/linear"
@@ -42,10 +43,11 @@ var availCmds = [][2]string{
 	{"ngrok-sync", "sync Atlassian/Linear IP ranges into ngrok IP policies"},
 	{"linear-install", "print the Linear agent app install URL"},
 	{"jira-check", "check the Jira API access: list the bot's open tickets, and comment on one with --comment-on"},
+	{"policy-check", "check the policy file and print its tiers"},
 	{"pause", "hold the queue of the running ochell: no new run starts"},
 	{"resume", "end a pause"},
 	{"status", "say whether the running ochell is paused, and what is queued and running"},
-	{"reset", "reset the attempts of a ticket: ochell reset <jira|linear> <KEY>"},
+	{"reset", "reset the attempts of a ticket, and with --tier set its risk tier: ochell reset <jira|linear> <KEY> [--tier NAME]"},
 	{"stop", "stop the run of a ticket and release the ticket: ochell stop <jira|linear> <KEY>"},
 	{"version", "print the version"},
 }
@@ -87,6 +89,8 @@ func main() {
 		err = linearInstall(args)
 	case "jira-check":
 		err = jiraCheck(args)
+	case "policy-check":
+		err = policyCheck(args)
 	case "pause", "resume", "status", "reset", "stop":
 		err = adminCommand(cmd, args)
 	case "version":
@@ -132,11 +136,23 @@ func serve(args []string) error {
 		close(hurry)
 	}()
 
+	// The policy is read before anything is started: ochell does not run
+	// with a policy that it cannot read, or that the agent could change.
+	pol, err := loadPolicy(cfg)
+	if err != nil {
+		return err
+	}
+	log.Info("policy", "file", pol.File, "version", pol.Version, "tiers", len(pol.Tiers), "default_tier", pol.DefaultTier, "rules", len(pol.Rules))
+	if pol.File != "" && cfg.Agent.Launcher != "systemd" {
+		log.Warn("the agent runs as ochell's own OS user (agent.launcher direct) and can write whatever ochell can, the policy file included; use the systemd launcher where the policy has to hold against the agent")
+	}
+
 	st, err := store.Open(cfg.Store.Path)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	st.SetPolicyVersion(pol.Version)
 	r, err := runner.New(cfg.Agent, log, st)
 	if err != nil {
 		return err
@@ -145,6 +161,8 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+	srv.UsePolicy(pol)
+	r.UsePolicy(pol)
 	r.SetNotifier(srv)
 	if err := r.UseWorkspace(cfg.Workspace); err != nil {
 		return err
@@ -188,6 +206,42 @@ func serve(args []string) error {
 	return err
 }
 
+// loadPolicy reads the policy file of the configuration, or returns the
+// built-in policy when there is none.
+func loadPolicy(cfg *config.Config) (*policy.Policy, error) {
+	if cfg.Policy.File == "" {
+		return policy.Builtin(), nil
+	}
+	pol, err := policy.Load(cfg.Policy.File)
+	if err != nil {
+		return nil, fmt.Errorf("invalid policy:\n%w", err)
+	}
+	return pol, nil
+}
+
+// policyCheck reads the policy as "serve" would, and prints what it says.
+// It is what a review of a change to the policy file can run.
+func policyCheck(args []string) error {
+	cfg, err := config.Load("policy-check", args, nil)
+	if err != nil {
+		return err
+	}
+	pol, err := loadPolicy(cfg)
+	if err != nil {
+		return err
+	}
+	if pol.File == "" {
+		fmt.Println("no policy file is configured (policy.file): the built-in policy holds")
+	} else {
+		fmt.Printf("%s is valid\n", pol.File)
+	}
+	fmt.Printf("version %s, %d rule(s); tiers from the lowest to the highest:\n", pol.Version, len(pol.Rules))
+	for _, line := range pol.Describe() {
+		fmt.Println("  " + line)
+	}
+	return nil
+}
+
 // adminCommand sends a command to the running ochell over its admin socket.
 // The socket is found in the same configuration that the server uses.
 func adminCommand(cmd string, args []string) error {
@@ -197,7 +251,12 @@ func adminCommand(cmd string, args []string) error {
 	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		rest, args = append(rest, args[0]), args[1:]
 	}
-	cfg, err := config.Load(cmd, args, nil)
+	var tier string
+	cfg, err := config.Load(cmd, args, func(fs *flag.FlagSet) {
+		if cmd == "reset" {
+			fs.StringVar(&tier, "tier", "", "also put the ticket under this risk tier; the one way to lower a tier")
+		}
+	})
 	if err != nil {
 		return err
 	}
@@ -211,6 +270,9 @@ func adminCommand(cmd string, args []string) error {
 		}
 		query.Set("source", rest[0])
 		query.Set("key", rest[1])
+		if tier != "" {
+			query.Set("tier", tier)
+		}
 		rest = nil
 		if cmd == "stop" {
 			// For the note on the ticket.

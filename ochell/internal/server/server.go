@@ -24,6 +24,7 @@ import (
 	"ochell/internal/auth"
 	"ochell/internal/config"
 	"ochell/internal/ipsync"
+	"ochell/internal/policy"
 	"ochell/internal/result"
 	"ochell/internal/runner"
 	"ochell/internal/source/jira"
@@ -61,6 +62,8 @@ type Submitter interface {
 	// source that have a queued or running task.
 	State(source, key string) (ticket.State, error)
 	ActiveTickets(source string) ([]string, error)
+	// Tier returns the risk tier recorded for a ticket, or "".
+	Tier(source, key string) (string, error)
 	// Assigner returns who last assigned a ticket to the bot, as the
 	// source named them, or "". known: ochell has seen the ticket.
 	Assigner(source, key string) (assigner string, known bool, err error)
@@ -88,7 +91,9 @@ type Server struct {
 	seen   Deliveries
 	linear *linear.Client
 	// jira is ochell's access to the Jira API; nil without sources.jira_api.
-	jira    tracker.Client
+	jira tracker.Client
+	// policy holds the risk tiers; the built-in one without a policy file.
+	policy  *policy.Policy
 	extURL  *template.Template
 	handler http.Handler
 	now     func() time.Time
@@ -109,7 +114,7 @@ type Server struct {
 }
 
 func New(cfg *config.Config, log *slog.Logger, r Submitter, seen Deliveries) (*Server, error) {
-	s := &Server{cfg: cfg, log: log, runner: r, seen: seen, now: time.Now}
+	s := &Server{cfg: cfg, log: log, runner: r, seen: seen, now: time.Now, policy: policy.Builtin()}
 	lc := cfg.Sources.Linear
 	if lc.Enabled && lc.ClientID != "" {
 		s.linear = linear.NewClient(lc.ClientID, lc.ClientSecret, lc.TokenFile)
@@ -158,6 +163,11 @@ func (s *Server) buildAllowlists() error {
 	s.linearIPs = ipsync.NewAllowlist("linear", lin, extra)
 	return nil
 }
+
+// UsePolicy sets the policy that says which tier a ticket runs under. Call
+// it before the server handles requests. Without it the built-in policy
+// holds.
+func (s *Server) UsePolicy(p *policy.Policy) { s.policy = p }
 
 // Handler returns the HTTP handler (used by tests).
 func (s *Server) Handler() http.Handler { return s.handler }
@@ -426,22 +436,52 @@ func (s *Server) firstRefusal(source, key, author string) bool {
 	return err == nil && isNew
 }
 
-// submit queues t and writes the HTTP response. labels are the ticket's
-// labels, for the repository mapping.
-func (s *Server) submit(w http.ResponseWriter, t *task.Task, labels []string, log *slog.Logger) submitResult {
-	res, code, msg := s.admit(t, labels, log)
+// attrs is what a source said about a ticket besides its key and title:
+// what the repository mapping and the policy look at.
+type attrs struct {
+	// labels are the ticket's labels; for Jira also its components.
+	labels []string
+	// issueType is the Jira issue type, when the payload has it.
+	issueType string
+}
+
+// submit queues t and writes the HTTP response.
+func (s *Server) submit(w http.ResponseWriter, t *task.Task, a attrs, log *slog.Logger) submitResult {
+	res, code, msg := s.admit(t, a, log)
 	reply(w, code, msg)
 	return res
+}
+
+// tierFor returns the tier that the ticket of t runs under, and why.
+//
+// The policy decides from what the source says about the ticket now. A
+// ticket that ochell already knows keeps a higher tier that it had: within
+// ochell a tier only goes up, so that taking a label off a ticket, which
+// the agent can do as well, never lowers it. "ochell reset" is the way
+// down.
+func (s *Server) tierFor(t *task.Task, a attrs) (tier, why string, err error) {
+	tier, why = s.policy.Match(policy.Ticket{
+		Source: t.Source, Project: config.ProjectOf(t.Key), Repo: t.Repo, IssueType: a.issueType, Labels: a.labels,
+	})
+	had, err := s.runner.Tier(t.Source, t.Key)
+	if err != nil {
+		return "", "", err
+	}
+	if had != tier && s.policy.Has(had) && s.policy.Higher(tier, had) == had {
+		return had, "kept: the ticket had this tier, and a tier is not lowered", nil
+	}
+	return tier, why, nil
 }
 
 // admit queues t, or records its ticket as waiting when it cannot be
 // started as it is. It returns what happened, and the HTTP status and text
 // that say so to a webhook's sender.
-func (s *Server) admit(t *task.Task, labels []string, log *slog.Logger) (submitResult, int, string) {
+func (s *Server) admit(t *task.Task, a attrs, log *slog.Logger) (submitResult, int, string) {
 	if !validKey.MatchString(t.Key) {
 		log.Warn("rejecting invalid ticket key", "key", t.Key)
 		return submitFailed, http.StatusBadRequest, "invalid ticket key"
 	}
+	labels := a.labels
 	// With a repository mapping, a ticket that no entry matches is not
 	// started: nobody said where its work belongs.
 	held := false
@@ -449,7 +489,13 @@ func (s *Server) admit(t *task.Task, labels []string, log *slog.Logger) (submitR
 		repo, ok := s.cfg.RepoFor(t.Source, t.Key, labels)
 		t.Repo, held = repo, !ok
 	}
-	var err error
+	// Every ticket runs under a tier of the policy.
+	tier, why, err := s.tierFor(t, a)
+	if err != nil {
+		log.Error("cannot read the tier of the ticket", "key", t.Key, "err", err)
+		return submitFailed, http.StatusServiceUnavailable, "cannot queue task"
+	}
+	t.Tier = tier
 	if held {
 		err = s.runner.Hold(t, ticket.ReasonNoRepoMapping)
 	} else {
@@ -468,7 +514,7 @@ func (s *Server) admit(t *task.Task, labels []string, log *slog.Logger) (submitR
 		log.Warn("ticket not started: no repository is mapped to it", "key", t.Key, "project", config.ProjectOf(t.Key), "labels", labels)
 		return submitHeld, http.StatusOK, "not started: no repository is mapped to " + t.Key
 	case err == nil:
-		log.Info("task queued", "task", t.ID, "key", t.Key, "repo", t.Repo)
+		log.Info("task queued", "task", t.ID, "key", t.Key, "repo", t.Repo, "tier", t.Tier, "tier_from", why)
 		return submitQueued, http.StatusOK, "queued " + t.ID
 	case errors.Is(err, runner.ErrBusy):
 		log.Info("ticket already in progress", "key", t.Key)
@@ -591,7 +637,7 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	tk := s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery)
 	tk.Actor = t.Actor
-	res := s.submit(w, tk, t.Labels, log)
+	res := s.submit(w, tk, attrs{labels: t.Labels, issueType: t.IssueType}, log)
 	if res == submitFailed {
 		s.forgetDelivery(keys, log)
 	}
@@ -741,7 +787,7 @@ func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 	// prevents duplicate concurrent runs.
 	tk := s.newTask("jira", t.Key, t.Summary, t.URL, "", "")
 	tk.Actor = t.Actor
-	s.jiraNotStarted(s.submit(w, tk, t.Labels, log), t.Key, log)
+	s.jiraNotStarted(s.submit(w, tk, attrs{labels: t.Labels, issueType: t.IssueType}, log), t.Key, log)
 }
 
 func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
@@ -935,7 +981,7 @@ func waitsForRunText(key string) string {
 func (s *Server) linearSubmit(w http.ResponseWriter, t *task.Task, sess *linear.Session, keys []string, log *slog.Logger) {
 	// Linear marks a session unresponsive unless it sees an activity within
 	// ~10s of "created", so answer now rather than when the agent starts.
-	switch s.submit(w, t, sess.Labels, log) {
+	switch s.submit(w, t, attrs{labels: sess.Labels}, log) {
 	case submitQueued:
 		s.linearActivity(sess.SessionID, linear.ActivityThought, pickedUpText(sess.Key), log)
 	case submitBusy:

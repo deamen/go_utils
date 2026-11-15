@@ -155,13 +155,14 @@ ochell serve --config config.yaml                 # default command
 ochell ngrok-sync --config config.yaml [--dry-run] [--loop]
 ochell linear-install --config config.yaml        # prints the agent install URL
 ochell jira-check --config config.yaml [--comment-on KEY]   # check the Jira API access
+ochell policy-check --config config.yaml          # check the policy file and print its tiers
 ochell version
 
 # commands to the running ochell, over its admin socket (see "Guards and the admin channel")
 ochell status --config config.yaml                # paused or running; what is queued and running
 ochell pause  --config config.yaml                # hold the queue: no new run starts
 ochell resume --config config.yaml
-ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts of a ticket
+ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts of a ticket; --tier NAME also sets its risk tier
 ochell stop  <jira|linear> <KEY> --config config.yaml   # stop the run of a ticket and release it
 ```
 
@@ -176,6 +177,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--https`, `--https-addr`, `--https-port`, `--tls-cert`, `--tls-key` | Same for HTTPS (TLS 1.2+) |
 | `--admin-socket` | Unix socket of the admin channel (default `ochell.sock`); see [Guards and the admin channel](#guards-and-the-admin-channel) |
 | `--poll-interval` | How often ochell asks the trackers for the bot's open tickets (default `5m`; `0s`: never); see [The poller](#the-poller) |
+| `--policy-file` | Policy file with the risk tiers (default: none, one built-in tier); see [Policy and risk tiers](#policy-and-risk-tiers) |
 | `--store-path` | File that holds the tickets, the task queue and the handled deliveries (default `ochell.db`); see [The store](#the-store) |
 | `--agent-cmd` | Agent CLI executable (default `claude`) |
 | `--agent-arg` | Agent argument; repeatable; replaces the YAML `args` (default `-p`). Go template: `{{.Key}}`, `{{.Source}}`, `{{.ID}}`. Keep ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`, `{{.Prompt}}`) out of arguments; see [The prompt](#the-prompt) |
@@ -201,8 +203,8 @@ The agent runs without a shell, with its working directory set to `workdir` (ren
 
 ### The store
 ochell keeps its durable state in one SQLite file, `store.path` (default `ochell.db` in the working directory). It is created when missing, readable by its owner only, and updated in place when a newer ochell needs more tables. It holds:
-- the **tickets** ochell has worked on: state (see [Ticket states](#ticket-states)), number of attempts, working directory, and the agent's session id for a resume;
-- the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to, and what the agent adapter read from it (final message, session id, cost, token counts);
+- the **tickets** ochell has worked on: state (see [Ticket states](#ticket-states)), risk tier, number of attempts, working directory, and the agent's session id for a resume;
+- the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, the risk tier and the policy version it ran under, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to, and what the agent adapter read from it (final message, session id, cost, token counts);
 - the **webhook deliveries** handled in the last 24 hours.
 
 So a restart loses no queued task, and a retried or replayed delivery from before the restart is still recognised. SQLite keeps two more files next to it while ochell runs (`-wal` and `-shm`); copy all three, or stop ochell first, when you back it up.
@@ -245,6 +247,65 @@ repos:
 - **The first entry that matches wins**, so put the narrower entries first.
 - **A ticket that no entry matches is not started.** It is recorded as `waiting` with the reason `no_repo_mapping`, the request is answered with 200 `not started: …`, ochell logs a warning, and a Linear session is told why. After the mapping is added, assign the ticket again.
 - With no `repos` at all, every ticket runs, without a repository.
+
+### Policy and risk tiers
+Every ticket runs under a **risk tier**. A tier says how much autonomy a class of work gets; the **policy file** defines the tiers and says which tickets get which. People decide that ahead of time, in the review of a change to this file, instead of looking at every run.
+
+```yaml
+# config.yaml
+policy:
+  file: /etc/ochell/policy.yaml
+```
+
+```yaml
+# policy.yaml
+version: "2026-11"
+owners: [platform-team@example.com]
+tiers:                      # from the lowest to the highest
+  - {name: low,    plan_gate: skip,     pr_review: required, auto_merge: never, budget_usd: 5}
+  - {name: normal, plan_gate: skip,     pr_review: required, auto_merge: never, budget_usd: 20}
+  - {name: high,   plan_gate: required, pr_review: required, auto_merge: never, budget_usd: 50, labels: [risk-high]}
+default_tier: normal
+rules:                      # the first that matches wins
+  - {source: jira, project: OPS, issue_type: Bug, tier: low}
+  - {project: PAY, tier: high}
+```
+
+See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
+
+- **Which tier a ticket gets.**
+  1. The first entry of `rules` that matches it. A rule matches when every field it sets matches:
+
+     | Field | Matches |
+     |---|---|
+     | `source` | `jira` or `linear` |
+     | `project` | the Jira project key or the Linear team key: the part of the ticket key before the number |
+     | `repo` | the repository mapped to the ticket by [`repos`](#repositories) |
+     | `issue_type` | the Jira issue type, such as `Bug`. The system webhook has it; for Jira Automation add `"issueType": "{{issue.issueType.name}}"` to the request body. Linear has none |
+
+  2. `default_tier`, when no rule matches.
+  3. **A label can only raise it.** A ticket that carries one of a tier's `labels` (in Jira also: a component) gets at least that tier. No label lowers a tier.
+- **A tier only goes up while ochell knows the ticket.** When a ticket is assigned again and the policy now gives it a lower tier, for example because a label was taken off, it keeps the tier it had. The agent can edit labels too, so a label that is gone must not lower anything. The one way down is an operator's `ochell reset <jira|linear> <KEY> --tier <name>`.
+- **The order of `tiers` matters**: it is from the lowest to the highest, which is what "raise" and "higher" mean.
+- **Each run records its tier** and the version of the policy in force when it started (`version`, or a hash of the file when that is left out). The agent is told its tier in `ORCH_TASK_TIER`; the log line `task queued` names the tier and the rule it came from.
+- **What a tier sets:**
+
+  | Setting | Values | Default |
+  |---|---|---|
+  | `plan_gate` | `skip`, `required` | `skip` |
+  | `pr_review` | `required`, `sampled` | `required` |
+  | `auto_merge` | `never`, `after_ci` | `never` |
+  | `budget_usd` | what one ticket may cost; `0`: no limit | `0` |
+  | `labels` | labels that raise a ticket to this tier | none |
+
+  These four settings are checked and recorded now. What acts on them comes with the next parts of the policy work: the plan gate, the budget, and later the handoff and auto-merge.
+- **The file is checked at start**, and ochell does not start with one it cannot trust:
+  - it must be valid: a tier or a setting that ochell does not know is an error, so a misspelt limit never silently means no limit;
+  - it must belong to root or to the user ochell runs as, and must not be writable by its group or by others; its directory must not be writable by others.
+- **The agent must not be able to write it.** With the `systemd` launcher the agent is another OS user, and the checks above keep it out. With the `direct` launcher the agent runs as ochell's own user and can write whatever ochell can; ochell logs a warning at start.
+- **`ochell policy-check --config config.yaml`** reads the file as `serve` does and prints the tiers. Use it in the review of a change, or with `--policy-file` on a file that is not installed yet.
+- **A change takes effect at the next start** of ochell. Tickets keep the tier they have until they are assigned again.
+- **Without `policy.file`** there is one built-in tier, `normal`, with the defaults above, and every ticket runs under it.
 
 ### Guards and the admin channel
 Limits on what starts a run, and one way to talk to the running ochell.
@@ -472,7 +533,7 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 ### Agent environment
 The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:
 - the variables named in `agent.env_pass`, copied from ochell's environment when they are set. The default list is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), `SSL_CERT_FILE` and `SSL_CERT_DIR`;
-- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL`, `ORCH_TASK_BRANCH` and `ORCH_RESULT_FILE`, and `ORCH_TASK_REPO` when a repository is mapped to the ticket;
+- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL`, `ORCH_TASK_BRANCH`, `ORCH_TASK_TIER` (the ticket's [risk tier](#policy-and-risk-tiers)) and `ORCH_RESULT_FILE`, and `ORCH_TASK_REPO` when a repository is mapped to the ticket;
 - the variables set in `agent.env`.
 
 Setting `env_pass` (or `--agent-env-pass`) replaces the default list. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, add that name to `env_pass`. Never add a variable that holds one of ochell's own secrets.
@@ -584,6 +645,7 @@ Notes:
   - Ticket keys must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` before they are used in file names or templates.
   - Signatures and tokens are compared in constant time.
 - **Agent environment:** the agent gets an allowlisted environment, not ochell's own (see [Agent environment](#agent-environment)).
+- **Policy:** the tiers and limits are in a file of ochell's own, which the agent must not be able to write (see [Policy and risk tiers](#policy-and-risk-tiers)). Nothing in a ticket or a repository widens them.
 - **Agent OS user:** with the `direct` launcher the agent runs as the same OS user as ochell and can read ochell's files. Deploy with the `systemd` launcher (see [Launchers](#launchers)).
 - **Secrets:** never commit secrets or TLS keys. The repository's pre-commit hooks reject private keys.
 

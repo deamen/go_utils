@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -150,13 +151,25 @@ var migrations = []string{
 
 	// Version 13: who assigned a ticket to the bot.
 	`ALTER TABLE tickets ADD COLUMN assigner TEXT NOT NULL DEFAULT '';`,
+
+	// Version 14: the risk tier of a ticket, and for each run the tier and
+	// the version of the policy it ran under.
+	`ALTER TABLE tickets ADD COLUMN tier TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN tier TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN policy_version TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is safe for concurrent use.
 type Store struct {
 	db  *sql.DB
 	now func() time.Time
+	// policyVersion is recorded with every run that starts.
+	policyVersion atomic.Value
 }
+
+// SetPolicyVersion sets the version of the policy that is in force. It is
+// recorded with every run that starts from now on.
+func (s *Store) SetPolicyVersion(v string) { s.policyVersion.Store(v) }
 
 // Open opens the store at path and creates or updates its tables. A new
 // file is readable by its owner only: it holds ticket text.
@@ -453,14 +466,15 @@ func (s *Store) TicketOfSession(source, session string) (string, error) {
 }
 
 // upsert records the ticket of t, or brings its title, URL and repository
-// up to date, and who assigned it when t says so. A new ticket is created in the state "none", and then moved
-// like any other.
+// up to date, and its tier and who assigned it when t says so. A new ticket
+// is created in the state "none", and then moved like any other.
 func (s *Store) upsert(tx *sql.Tx, t *task.Task, now int64) error {
-	_, err := tx.Exec(`INSERT INTO tickets (source, key, title, url, repo, assigner, state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err := tx.Exec(`INSERT INTO tickets (source, key, title, url, repo, assigner, tier, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (source, key) DO UPDATE SET title = excluded.title, url = excluded.url, repo = excluded.repo,
-			assigner = CASE WHEN excluded.assigner != '' THEN excluded.assigner ELSE assigner END`,
-		t.Source, t.Key, t.Title, t.URL, t.Repo, t.Actor, ticket.None, now, now)
+			assigner = CASE WHEN excluded.assigner != '' THEN excluded.assigner ELSE assigner END,
+			tier = CASE WHEN excluded.tier != '' THEN excluded.tier ELSE tier END`,
+		t.Source, t.Key, t.Title, t.URL, t.Repo, t.Actor, t.Tier, ticket.None, now, now)
 	return err
 }
 
@@ -484,13 +498,13 @@ func (s *Store) Hold(t *task.Task, reason ticket.Reason) error {
 }
 
 const taskColumns = `r.id, r.source, r.key, t.title, t.url, r.context, r.tracker_session, r.delivery_id, r.received_at, r.attempt,
-	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo, t.prepared_workspace, r.cause`
+	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo, t.prepared_workspace, r.cause, t.tier`
 
 func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 	var t task.Task
 	var received int64
 	if err := row.Scan(&t.ID, &t.Source, &t.Key, &t.Title, &t.URL, &t.Context, &t.TrackerSession, &t.DeliveryID, &received, &t.Attempt,
-		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo, &t.PreparedWorkspace, &t.Cause); err != nil {
+		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo, &t.PreparedWorkspace, &t.Cause, &t.Tier); err != nil {
 		return nil, err
 	}
 	t.Received = time.UnixMilli(received).UTC()
@@ -545,12 +559,28 @@ func (s *Store) ResetAttempts(source, key string) error {
 	return nil
 }
 
+// SetTier sets the risk tier of a ticket. It returns ErrUnknown for a
+// ticket that ochell has never seen.
+func (s *Store) SetTier(source, key, tier string) error {
+	r, err := s.db.Exec(`UPDATE tickets SET tier = ? WHERE source = ? AND key = ?`, tier, source, key)
+	if err != nil {
+		return err
+	}
+	if n, _ := r.RowsAffected(); n == 0 {
+		return ErrUnknown
+	}
+	return nil
+}
+
 // Claim takes the oldest queued run that may start and marks it, and its
 // ticket, as running. It returns nil when nothing is queued or every queued
 // run still waits for its time (a retry with backoff), and while the pause
 // flag is set. The task's Attempt says
 // which run of the ticket this is, counting from 1; AgentSession, Workspace,
 // PRURL and Branch come from the ticket's earlier runs.
+//
+// The run records the tier that its ticket has now, and the version of the
+// policy in force.
 func (s *Store) Claim() (*task.Task, error) {
 	now := ms(s.now())
 	var t *task.Task
@@ -576,9 +606,11 @@ func (s *Store) Claim() (*task.Task, error) {
 		if _, err := tx.Exec(`UPDATE tickets SET attempts = attempts + 1 WHERE source = ? AND key = ?`, source, key); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE runs SET status = ?, started_at = ?,
-			attempt = (SELECT attempts FROM tickets t WHERE t.source = runs.source AND t.key = runs.key)
-			WHERE id = ?`, runRunning, now, id); err != nil {
+		version, _ := s.policyVersion.Load().(string)
+		if _, err := tx.Exec(`UPDATE runs SET status = ?, started_at = ?, policy_version = ?,
+			attempt = (SELECT attempts FROM tickets t WHERE t.source = runs.source AND t.key = runs.key),
+			tier = (SELECT tier FROM tickets t WHERE t.source = runs.source AND t.key = runs.key)
+			WHERE id = ?`, runRunning, now, version, id); err != nil {
 			return err
 		}
 		t, err = scanTask(tx.QueryRow(`SELECT `+taskColumns+` FROM runs r JOIN tickets t USING (source, key) WHERE r.id = ?`, id))
@@ -922,7 +954,10 @@ func (s *Store) Active() (int, error) {
 type Ticket struct {
 	Source, Key, Title, URL string
 	// Repo is the repository the ticket belongs to, if one is mapped.
-	Repo  string
+	Repo string
+	// Tier is the risk tier the ticket runs under. It is empty for a
+	// ticket that was recorded before there were tiers.
+	Tier  string
 	State ticket.State
 	// Reason is set when State is ticket.Waiting.
 	Reason ticket.Reason
@@ -950,9 +985,9 @@ type Ticket struct {
 func (s *Store) Ticket(source, key string) (*Ticket, error) {
 	t := Ticket{Source: source, Key: key}
 	var created, updated int64
-	err := s.db.QueryRow(`SELECT title, url, repo, assigner, state, reason, attempts, workspace, prepared_workspace, agent_session, pr_url, branch, created_at, updated_at
+	err := s.db.QueryRow(`SELECT title, url, repo, tier, assigner, state, reason, attempts, workspace, prepared_workspace, agent_session, pr_url, branch, created_at, updated_at
 		FROM tickets WHERE source = ? AND key = ?`, source, key).
-		Scan(&t.Title, &t.URL, &t.Repo, &t.Assigner, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
+		Scan(&t.Title, &t.URL, &t.Repo, &t.Tier, &t.Assigner, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1020,6 +1055,11 @@ type Run struct {
 	// Status is "queued", "running" or "ended".
 	Status  string
 	Attempt int
+	// Tier is the risk tier the run started under, and PolicyVersion the
+	// version of the policy that was in force then. Both are empty for a
+	// run that has not started.
+	Tier          string
+	PolicyVersion string
 	// Result holds what is known once the run has ended. Its Err is an
 	// error with the stored text, or nil.
 	Result task.Result
@@ -1031,11 +1071,11 @@ func (s *Store) Run(id string) (*Run, error) {
 	var exit sql.NullInt64
 	var outcome, msg string
 	res := &r.Result
-	err := s.db.QueryRow(`SELECT source, key, status, attempt, outcome, exit_code, error, log_file,
+	err := s.db.QueryRow(`SELECT source, key, status, attempt, tier, policy_version, outcome, exit_code, error, log_file,
 			workdir, resumed, agent_session, message, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
 			signal, signal_message, pr_url, branch
 		FROM runs WHERE id = ?`, id).
-		Scan(&r.Source, &r.Key, &r.Status, &r.Attempt, &outcome, &exit, &msg, &res.LogFile,
+		Scan(&r.Source, &r.Key, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &outcome, &exit, &msg, &res.LogFile,
 			&res.Workdir, &res.Resumed, &res.SessionID, &res.Message, &res.CostUSD,
 			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
 			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch)

@@ -29,6 +29,12 @@ admin:
 store:
   path: /var/lib/ochell/ochell.db
 
+# The policy file: the risk tiers, and which tier a ticket runs under (see
+# examples/policy.yaml). It must not be writable by the agent's OS user.
+# Leave it out for one built-in tier that every ticket runs under.
+policy:
+  file: /etc/ochell/policy.yaml
+
 # Which repository a ticket belongs to. "project" is the Jira project key or
 # the Linear team key (DEV in DEV-42); "*" matches every project. "label" is
 # optional. The first entry that matches wins. A ticket that no entry
