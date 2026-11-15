@@ -65,8 +65,8 @@ func jiraFinished(t *task.Task, res task.Result, canReply bool) string {
 	if res.Outcome == task.OutcomeCancelled {
 		return cancelledText(t, res)
 	}
-	if res.Outcome == task.OutcomeOverBudget {
-		return overBudgetText(t, res)
+	if res.Escalation != "" {
+		return escalationText(t, res)
 	}
 	if res.Err != nil {
 		return strings.TrimSpace(failureText(res) + "\n\n" + noFormat(lastN(res.Message, replyMax)))

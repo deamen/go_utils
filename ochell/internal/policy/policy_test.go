@@ -218,3 +218,21 @@ default_tier: low
 		t.Errorf("an empty entry: %v", err)
 	}
 }
+
+func TestNextTierAndTurnLimit(t *testing.T) {
+	p, err := Parse([]byte("tiers: [{name: low, max_turns: 30}, {name: normal}, {name: high}]\ndefault_tier: low"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for from, want := range map[string]string{"low": "normal", "normal": "high", "high": "high", "gone": "gone"} {
+		if got := p.Next(from); got != want {
+			t.Errorf("Next(%s) = %s, want %s", from, got, want)
+		}
+	}
+	if p.Tier("low").MaxTurns != 30 || p.Tier("normal").MaxTurns != 0 {
+		t.Errorf("max_turns: %+v", p.Tiers)
+	}
+	if _, err := Parse([]byte("tiers: [{name: a, max_turns: -1}]\ndefault_tier: a")); err == nil || !strings.Contains(err.Error(), "max_turns must not be negative") {
+		t.Errorf("a negative turn limit: %v", err)
+	}
+}

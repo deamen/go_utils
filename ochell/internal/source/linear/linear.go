@@ -108,6 +108,10 @@ type Event struct {
 			Type string `json:"type"`
 		} `json:"state"`
 		DelegateID string `json:"delegateId"`
+		// Labels is used when the payload has it.
+		Labels []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
 	} `json:"data"`
 	// UpdatedFrom holds the earlier values of what an "update" changed.
 	UpdatedFrom      map[string]any `json:"updatedFrom"`
@@ -239,6 +243,23 @@ func (e *Event) Undelegated() (key string, ok bool) {
 		return "", false
 	}
 	return e.Data.Identifier, true
+}
+
+// Updated reports whether the event is an "Issue" update, and returns the
+// issue's identifier and the labels it has now, as far as the payload has
+// them. Such an event can mean that the issue belongs in another tier.
+// Linear sends these only when the app's webhook is subscribed to issue
+// events.
+func (e *Event) Updated() (key string, labels []string, ok bool) {
+	if e.Type != "Issue" || e.Action != "update" || e.Data == nil || e.Data.Identifier == "" {
+		return "", nil, false
+	}
+	for _, l := range e.Data.Labels {
+		if l.Name != "" {
+			labels = append(labels, l.Name)
+		}
+	}
+	return e.Data.Identifier, labels, true
 }
 
 // PromptText returns the user's follow-up message of a "prompted" event.

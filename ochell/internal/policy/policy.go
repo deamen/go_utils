@@ -53,6 +53,9 @@ type Tier struct {
 	AutoMerge string `yaml:"auto_merge"`
 	// BudgetUSD is what a ticket of this tier may cost; 0: no limit.
 	BudgetUSD float64 `yaml:"budget_usd"`
+	// MaxTurns is how many turns one run of this tier may take; 0: no
+	// limit.
+	MaxTurns int `yaml:"max_turns"`
 	// Labels raise a ticket to this tier: a ticket that carries one of
 	// them runs under this tier, unless its rule already gives it a
 	// higher one. A label never lowers a tier.
@@ -214,6 +217,9 @@ func (p *Policy) Validate() error {
 		if t.BudgetUSD < 0 {
 			errs = append(errs, fmt.Errorf("%s: budget_usd must not be negative; 0 means no limit", at))
 		}
+		if t.MaxTurns < 0 {
+			errs = append(errs, fmt.Errorf("%s: max_turns must not be negative; 0 means no limit", at))
+		}
 		for _, l := range t.Labels {
 			key := strings.ToLower(strings.TrimSpace(l))
 			if key == "" {
@@ -312,6 +318,16 @@ func (p *Policy) Tier(name string) Tier {
 	return p.Tiers[p.rank(p.DefaultTier)]
 }
 
+// Next returns the tier one above the given one: where an escalation moves
+// a ticket. The highest tier, and a name that the policy does not have,
+// are returned as they are.
+func (p *Policy) Next(name string) string {
+	if i := p.rank(name); i >= 0 && i+1 < len(p.Tiers) {
+		return p.Tiers[i+1].Name
+	}
+	return name
+}
+
 // Higher returns the higher of two tiers. A name that the policy does not
 // have counts as lower than every tier.
 func (p *Policy) Higher(a, b string) string {
@@ -371,6 +387,9 @@ func (p *Policy) Describe() []string {
 		line := fmt.Sprintf("%s: plan_gate=%s pr_review=%s auto_merge=%s", t.Name, t.PlanGate, t.PRReview, t.AutoMerge)
 		if t.BudgetUSD > 0 {
 			line += fmt.Sprintf(" budget_usd=%g", t.BudgetUSD)
+		}
+		if t.MaxTurns > 0 {
+			line += fmt.Sprintf(" max_turns=%d", t.MaxTurns)
 		}
 		if len(t.Labels) > 0 {
 			line += " labels=" + strings.Join(t.Labels, ",")

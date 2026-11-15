@@ -62,6 +62,23 @@ type fakeRunner struct {
 	sessions map[string]string
 	// tiers maps a ticket key to the tier that ochell has recorded for it.
 	tiers map[string]string
+	// raised are the tier changes that were asked for, as "source:key to tier".
+	raised []string
+}
+
+// TierChanged records the new tier; a ticket that is running is stopped.
+func (f *fakeRunner) TierChanged(source, key, tier string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return false, f.err
+	}
+	if f.tiers == nil {
+		f.tiers = map[string]string{}
+	}
+	f.tiers[key] = tier
+	f.raised = append(f.raised, source+":"+key+" to "+tier)
+	return f.states[source+":"+key] == ticket.Running, nil
 }
 
 func (f *fakeRunner) Tier(source, key string) (string, error) {
@@ -1736,5 +1753,65 @@ func TestPollRespectsTheTierAssignerAllowlist(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if got := jira.Comments("PAY-1"); len(got) != 1 || !strings.Contains(got[0], `risk tier "high"`) {
 		t.Errorf("comments on PAY-1: %q", got)
+	}
+}
+
+// An update of a ticket that puts it in a higher tier is passed on; one
+// that would lower the tier, or that is about a ticket ochell does not
+// hold, changes nothing.
+func TestTierChangeFromAnUpdate(t *testing.T) {
+	pol, err := policy.Parse([]byte("tiers: [{name: low}, {name: high, labels: [risk-high]}]\ndefault_tier: low"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr := &fakeRunner{tiers: map[string]string{"DEV-1": "low", "DEV-2": "high", "ENG-1": "low"}, states: map[string]ticket.State{"jira:DEV-1": ticket.Running}}
+	s := newServer(t, testConfig(), fr)
+	s.UsePolicy(pol)
+	jiraUpdate := func(key, labels string) *httptest.ResponseRecorder {
+		body := `{"timestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `,"webhookEvent":"jira:issue_updated","issue":{"key":"` + key + `","fields":{"labels":[` + labels + `]}},"changelog":{"items":[{"field":"labels"}]}}`
+		return do(s, "/webhooks/jira", body, map[string]string{"X-Hub-Signature": "sha256=" + auth.SignHex("jira-secret", []byte(body))})
+	}
+	if w := jiraUpdate("DEV-1", `"ui"`); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "ignored" {
+		t.Errorf("an update without a tier change: %d %s", w.Code, w.Body)
+	}
+	if w := jiraUpdate("DEV-1", `"ui","Risk-High"`); w.Code != 200 || !strings.Contains(w.Body.String(), "tier of DEV-1 raised to high; its run is being stopped") {
+		t.Errorf("a running ticket that is raised: %d %s", w.Code, w.Body)
+	}
+	if w := jiraUpdate("DEV-2", ``); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "ignored" {
+		t.Errorf("an update that would lower the tier: %d %s", w.Code, w.Body)
+	}
+	if w := jiraUpdate("DEV-9", `"risk-high"`); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "ignored" {
+		t.Errorf("an update of an unknown ticket: %d %s", w.Code, w.Body)
+	}
+	body := `{"type":"Issue","action":"update","data":{"identifier":"ENG-1","labels":[{"name":"risk-high"}]},"updatedFrom":{"labelIds":[]},"webhookTimestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `}`
+	if w := do(s, "/webhooks/linear", body, map[string]string{"Linear-Signature": auth.SignHex("linear-secret", []byte(body))}); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "tier of ENG-1 raised to high" {
+		t.Errorf("a Linear ticket without a run that is raised: %d %s", w.Code, w.Body)
+	}
+	if got := strings.Join(fr.raised, "; "); got != "jira:DEV-1 to high; linear:ENG-1 to high" {
+		t.Errorf("tier changes = %q", got)
+	}
+}
+
+func TestEscalationText(t *testing.T) {
+	res := task.Result{Outcome: task.OutcomeOverBudget, Err: errors.New("the run was stopped: it used up its budget"), Escalation: task.EscalationBudget, TierBefore: "low", TierAfter: "normal"}
+	got := escalationText(&task.Task{Source: "jira", Key: "DEV-1"}, res)
+	for _, want := range []string{
+		"The run was stopped: it used up its budget.\n\nThis is an escalation (budget): DEV-1 now waits for a human.",
+		`It moved up from the risk tier "low" to "normal"`,
+		"- To let it go on where it stopped: comment on this ticket.",
+		"- To change what it should do: change the ticket",
+		"- To cancel: write /stop as the first line of a comment",
+		`"ochell reset jira DEV-1" starts the budget anew`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("text lacks %q:\n%s", want, got)
+		}
+	}
+	// The highest tier: nothing to move up to; the agent's own words.
+	res = task.Result{Outcome: task.OutcomeFinished, Signal: result.OutOfScope, SignalMessage: "It asks for a deploy.", Escalation: task.EscalationOutOfScope}
+	got = escalationText(&task.Task{Source: "linear", Key: "ENG-1"}, res)
+	if !strings.HasPrefix(got, "The agent did not do this, because it is out of its scope: It asks for a deploy.\n\nThis is an escalation (out_of_scope)") ||
+		strings.Contains(got, "moved up") || !strings.Contains(got, "reply here") || strings.Contains(got, "budget") {
+		t.Errorf("text of an agent's escalation:\n%s", got)
 	}
 }

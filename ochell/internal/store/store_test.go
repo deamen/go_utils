@@ -1084,3 +1084,73 @@ func TestCosts(t *testing.T) {
 		t.Errorf("TotalCost since later = %+v", later)
 	}
 }
+
+// A run that ends with an escalation leaves its ticket waiting, whatever
+// else would have followed: no other try, and no run for the messages that
+// arrived during it. Those go with the run that someone starts later.
+func TestEscalationHoldsTheTicket(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
+	if err := s.Enqueue(newTask("r1", "ENG-1", t0), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	during := newTask("m1", "ENG-1", t0.Add(time.Second))
+	during.Comment, during.TrackerSession = "written during the run", "session-m1"
+	if later, err := s.FollowUp(during, true, Limits{}); err != nil || !later {
+		t.Fatalf("FollowUp during the run = %v, %v", later, err)
+	}
+
+	res := task.Result{Outcome: task.OutcomeStopped, ExitCode: -1, Err: errors.New("stopped"), Escalation: task.EscalationTierChange}
+	next, err := s.FinishAndQueue("r1", res, &Again{ID: "r2", Cause: task.CauseRecovery})
+	if err != nil || next != "" {
+		t.Fatalf("FinishAndQueue = %q, %v; want nothing queued", next, err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.Waiting || tk.Reason != ticket.ReasonEscalation {
+		t.Errorf("ticket = %s (%s), want waiting (escalation)", tk.State, tk.Reason)
+	}
+	if run, _ := s.Run("r1"); run.Result.Escalation != task.EscalationTierChange {
+		t.Errorf("stored escalation = %q", run.Result.Escalation)
+	}
+	if got, _ := s.Claim(); got != nil {
+		t.Fatalf("a run was queued after the escalation: %+v", got)
+	}
+	if n, _ := s.Waiting("linear", "ENG-1"); n != 1 {
+		t.Fatalf("%d messages are kept, want 1", n)
+	}
+
+	// A person starts the ticket again: the kept message comes first.
+	reply := newTask("r3", "ENG-1", t0.Add(time.Minute))
+	reply.Comment, reply.TrackerSession = "go on", ""
+	if _, err := s.FollowUp(reply, true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Claim()
+	if err != nil || got == nil || got.Comment != "written during the run"+task.CommentSeparator+"go on" || got.TrackerSession != "session-m1" {
+		t.Fatalf("claimed %+v, %v", got, err)
+	}
+	if n, _ := s.Waiting("linear", "ENG-1"); n != 0 {
+		t.Errorf("%d messages still wait", n)
+	}
+
+	// A person's stop wins over an escalation.
+	res = task.Result{Outcome: task.OutcomeCancelled, ExitCode: -1, Err: errors.New("stopped by a person"), Escalation: task.EscalationBudget}
+	if err := s.Finish("r3", res); err != nil {
+		t.Fatal(err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.Cancelled {
+		t.Errorf("ticket = %s, want cancelled", tk.State)
+	}
+
+	// AttemptsLeft is what the runner asks before it calls a failed retry
+	// an escalation. The count starts anew at a message from a person, so
+	// one run counts here.
+	if left, err := s.AttemptsLeft("linear", "ENG-1", 1); err != nil || left {
+		t.Errorf("AttemptsLeft(1) after one run since the reply = %v, %v", left, err)
+	}
+	if left, _ := s.AttemptsLeft("linear", "ENG-1", 2); !left {
+		t.Error("AttemptsLeft(2) after one run since the reply = false")
+	}
+}

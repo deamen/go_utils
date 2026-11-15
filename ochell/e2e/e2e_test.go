@@ -1323,8 +1323,10 @@ func TestRetryStopsAtTheAttemptCap(t *testing.T) {
 	o.LinearCreated("ENG-62", "session-cap", "").TaskID(t)
 	// Picked up, two retries announced, then the error.
 	acts := o.WaitActivities("session-cap", 4, 20*time.Second)
-	if acts[1].Type != "thought" || acts[2].Type != "thought" || acts[3].Type != "error" {
-		t.Errorf("activities = %+v, want two announced retries and then an error", acts)
+	// The last failure is an escalation: the ticket waits for a human.
+	if acts[1].Type != "thought" || acts[2].Type != "thought" || acts[3].Type != "elicitation" ||
+		!strings.Contains(acts[3].Body, "looks temporary (exit status 1), and the ticket has used its 3 attempts") || !strings.Contains(acts[3].Body, "This is an escalation (retries)") {
+		t.Errorf("activities = %+v, want two announced retries and then an escalation", acts)
 	}
 	time.Sleep(300 * time.Millisecond)
 	if n := len(o.Records()); n != 3 {
@@ -1335,8 +1337,8 @@ func TestRetryStopsAtTheAttemptCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if tk, _ := st.Ticket("linear", "ENG-62"); tk == nil || tk.State != "failed" || tk.Attempts != 3 {
-		t.Errorf("ticket = %+v, want failed after three attempts", tk)
+	if tk, _ := st.Ticket("linear", "ENG-62"); tk == nil || tk.State != "waiting" || tk.Reason != "escalation" || tk.Attempts != 3 {
+		t.Errorf("ticket = %+v, want waiting (escalation) after three attempts", tk)
 	}
 }
 
@@ -2473,7 +2475,9 @@ func TestBudget(t *testing.T) {
 	script = append(script, OnRun(3, Step{Print: event("success", false, 1.25, 30, 40)}, Report("done", "Addressed the comments."))...)
 	o := Start(t, Options{
 		Script: script,
-		Policy: "tiers:\n  - {name: low, budget_usd: 1}\n  - {name: normal}\ndefault_tier: normal\nrules:\n  - {project: ENG, tier: low}\n",
+		// The tier with the budget is the highest: an escalation cannot move
+		// the ticket to a tier with more.
+		Policy: "tiers:\n  - {name: normal}\n  - {name: low, budget_usd: 1}\ndefault_tier: normal\nrules:\n  - {project: ENG, tier: low}\n",
 		Configure: func(c *config.Config) {
 			claudeAdapter(c)
 			c.Agent.MaxAttempts = 0
@@ -2543,7 +2547,8 @@ func TestBudget(t *testing.T) {
 		t.Errorf("third run: %+v", run.Result)
 	}
 	acts = o.WaitActivities("session-budget", 6, 10*time.Second)
-	if acts[5].Type != "elicitation" || !strings.Contains(acts[5].Body, "The run was not started: the ticket has cost 1.05 USD of its budget of 1.00 USD (tier low)") {
+	if acts[5].Type != "elicitation" || !strings.Contains(acts[5].Body, "The run was not started: the ticket has cost 1.05 USD of its budget of 1.00 USD (tier low)") ||
+		!strings.Contains(acts[5].Body, "This is an escalation (budget): ENG-90 now waits for a human.") {
 		t.Errorf("the session got %+v", acts[5])
 	}
 	fourth := o.LinearCreated("ENG-90", "session-again", "").TaskID(t)
@@ -2600,5 +2605,238 @@ func TestBudget(t *testing.T) {
 	o.WaitRecords(4, 15*time.Second)
 	if args := argsOf(plain); strings.Contains(args, "budget") {
 		t.Errorf("a run without a budget: arguments %q", args)
+	}
+}
+
+// escalationPolicy has a turn limit in its lowest tier, and a label that
+// raises a ticket to its highest.
+const escalationPolicy = `
+tiers:
+  - {name: low, max_turns: 3}
+  - {name: normal}
+  - {name: high, labels: [risk-high]}
+default_tier: low
+`
+
+// Escalation by a limit that ochell sets: a run that reaches the turn
+// limit of its tier is stopped, the ticket waits for a human with its
+// session kept, moves up one tier and records why; a human resumes it.
+func TestEscalationAtTheTurnLimit(t *testing.T) {
+	const session = "0b6a7c1e-2d3f-4a5b-8c9d-0e1f2a3b4c5d"
+	script := []Step{{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`}}
+	script = append(script, OnRun(1, Step{Print: `{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":4,"session_id":"` + session + `","total_cost_usd":0.2}`}, Exit(1))...)
+	script = append(script, OnRun(2, Report("done", "Finished after the question."))...)
+	o := Start(t, Options{Script: script, Policy: escalationPolicy, Configure: claudeAdapter})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	first := o.LinearCreated("ENG-95", "session-turns", "").TaskID(t)
+	run := o.WaitStored(st, first, 15*time.Second)
+	if run.Result.Outcome != "over_turns" || run.Result.Escalation != "turns" || run.Tier != "low" {
+		t.Errorf("first run: tier %q, %+v", run.Tier, run.Result)
+	}
+	if recs := o.WaitRecords(1, 5*time.Second); !strings.HasSuffix(strings.Join(recs[0].Args, " "), "--max-turns 3") {
+		t.Errorf("first run: arguments %q, want the turn limit of the tier", recs[0].Args)
+	}
+	tk, _ := st.Ticket("linear", "ENG-95")
+	if tk == nil || tk.State != "waiting" || tk.Reason != "escalation" || tk.AgentSession != session || tk.Tier != "normal" {
+		t.Errorf("ticket = %+v, want waiting (escalation), the session kept, and the tier normal", tk)
+	}
+	acts := o.WaitActivities("session-turns", 2, 10*time.Second)
+	for _, want := range []string{
+		"The run was stopped: it reached the limit of 3 turns of the tier low.",
+		"This is an escalation (turns): ENG-95 now waits for a human.",
+		`It moved up from the risk tier "low" to "normal"`,
+		"To let it go on where it stopped: reply here.",
+		"To cancel: send the stop signal",
+	} {
+		if acts[1].Type != "elicitation" || !strings.Contains(acts[1].Body, want) {
+			t.Errorf("the session got %s %q, want an elicitation with %q", acts[1].Type, acts[1].Body, want)
+		}
+	}
+	if !strings.Contains(o.Output(), `msg="escalation: the ticket now waits for a human"`) || !strings.Contains(o.Output(), "key=ENG-95 trigger=turns tier=low tier_now=normal session="+session) {
+		t.Error("the escalation is not in ochell's log")
+	}
+	// Nothing goes on by itself.
+	time.Sleep(300 * time.Millisecond)
+	if n := len(o.Records()); n != 1 {
+		t.Fatalf("the agent was started %d times after the escalation, want 1", n)
+	}
+
+	// A human lets it go on: the same session, now under the higher tier,
+	// which has no turn limit.
+	second := o.LinearPrompted("ENG-95", "session-turns", "Go on, that is fine.").TaskID(t)
+	run = o.WaitStored(st, second, 15*time.Second)
+	if !run.Result.Resumed || run.Tier != "normal" || run.Result.Escalation != "" {
+		t.Errorf("second run: tier %q, %+v", run.Tier, run.Result)
+	}
+	recs := o.WaitRecords(2, 5*time.Second)
+	if args := strings.Join(recs[1].Args, " "); !strings.HasSuffix(args, "--resume "+session) || strings.Contains(args, "--max-turns") {
+		t.Errorf("second run: arguments %q", args)
+	}
+	if tk, _ := st.Ticket("linear", "ENG-95"); tk.State != "in_review" {
+		t.Errorf("ticket = %s, want in_review", tk.State)
+	}
+}
+
+// Escalation declared by the agent: a result of low_confidence or
+// out_of_scope leaves the ticket waiting, one tier up, with the cause.
+func TestEscalationDeclaredByTheAgent(t *testing.T) {
+	script := append(OnRun(1, Report("low_confidence", "The tests pass, but I could not check the migration.")),
+		OnRun(2, Report("out_of_scope", "This asks for a production deploy."))...)
+	o := Start(t, Options{Script: script, Policy: escalationPolicy, Configure: claudeAdapter})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for i, c := range []struct{ key, session, cause, said, tier string }{
+		{"ENG-96", "session-unsure", "low_confidence", "is not sure of the result: The tests pass, but I could not check the migration.", "normal"},
+		{"ENG-97", "session-scope", "out_of_scope", "out of its scope: This asks for a production deploy.", "normal"},
+	} {
+		id := o.LinearCreated(c.key, c.session, "").TaskID(t)
+		run := o.WaitStored(st, id, 15*time.Second)
+		if run.Result.Outcome != "finished" || string(run.Result.Escalation) != c.cause || run.Tier != "low" {
+			t.Errorf("%s: tier %q, %+v", c.key, run.Tier, run.Result)
+		}
+		if tk, _ := st.Ticket("linear", c.key); tk.State != "waiting" || tk.Reason != "escalation" || tk.Tier != c.tier {
+			t.Errorf("%s = %s (%s) in tier %s, want waiting (escalation) in %s", c.key, tk.State, tk.Reason, tk.Tier, c.tier)
+		}
+		acts := o.WaitActivities(c.session, 2, 10*time.Second)
+		if acts[1].Type != "elicitation" || !strings.Contains(acts[1].Body, c.said) || !strings.Contains(acts[1].Body, "This is an escalation ("+c.cause+")") ||
+			!strings.Contains(acts[1].Body, `from the risk tier "low" to "normal"`) {
+			t.Errorf("%s: the session got %+v", c.key, acts[1])
+		}
+		o.WaitRecords(i+1, 5*time.Second)
+	}
+}
+
+// Escalation when the ticket changes tier part-way: a label that raises
+// the tier during a run stops the run before it gets any further. The
+// ticket waits with its session kept, in the new tier. Messages that came
+// in during the run start nothing; they go with the run that a human
+// starts.
+func TestEscalationWhenTheTierChangesDuringARun(t *testing.T) {
+	const session = "7e1d2c3b-4a59-4687-9a0b-1c2d3e4f5a6b"
+	script := []Step{{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`}}
+	// The first run would push after a while: the effect that must not
+	// happen.
+	script = append(script, OnRun(1, Step{Sleep: "30s"}, Step{WriteFile: &File{Path: "pushed.txt", Content: "pushed"}}, Report("done", "Pushed."))...)
+	script = append(script, OnRun(2, Report("done", "Done under review."))...)
+	script = append(script, OnRun(3, Step{Sleep: "30s"})...)
+	o := Start(t, Options{Script: script, Policy: escalationPolicy, Configure: claudeAdapter})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-95"})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	first := o.JiraAssigned("DEV-95", "Change the payment retry").TaskID(t)
+	rec := o.WaitRecords(1, 15*time.Second)[0]
+	o.waitFor(10*time.Second, "the agent session to be recorded", func() bool {
+		tk, _ := st.Ticket("jira", "DEV-95")
+		return tk != nil && tk.AgentSession == session
+	})
+	// A person writes during the run.
+	if r := o.JiraCommented("DEV-95", "", "Also keep the old log line."); r.Status != 200 || r.Body != "queued for the next run" {
+		t.Fatalf("comment during the run: %d %q", r.Status, r.Body)
+	}
+	// An update that changes nothing about the tier is ignored.
+	if r := o.JiraUpdated("DEV-95"); r.Status != 200 || r.Body != "ignored" {
+		t.Errorf("an update without a tier change: %d %q", r.Status, r.Body)
+	}
+	// Someone marks the ticket as high risk.
+	o.Labels = []string{"risk-high"}
+	if r := o.JiraUpdated("DEV-95"); r.Status != 200 || r.Body != "tier of DEV-95 raised to high; its run is being stopped" {
+		t.Fatalf("the update that raises the tier: %d %q", r.Status, r.Body)
+	}
+	run := o.WaitStored(st, first, 15*time.Second)
+	if run.Result.Escalation != "tier_change" || run.Tier != "low" || run.Result.SessionID != session {
+		t.Errorf("first run: tier %q, %+v", run.Tier, run.Result)
+	}
+	o.waitFor(10*time.Second, "the stopped agent to be gone", func() bool { return !Alive(rec.PID) })
+	if _, err := os.Stat(filepath.Join(rec.Dir, "pushed.txt")); err == nil {
+		t.Error("the run went on to its effect after the tier changed")
+	}
+	tk, _ := st.Ticket("jira", "DEV-95")
+	if tk.State != "waiting" || tk.Reason != "escalation" || tk.Tier != "high" || tk.AgentSession != session {
+		t.Errorf("ticket = %+v, want waiting (escalation) in the tier high with the session kept", tk)
+	}
+	comments := o.WaitJiraComments("DEV-95", 2, 10*time.Second)
+	for _, want := range []string{
+		"The run was stopped: the ticket moved from the risk tier low to high while the agent was working on it.",
+		"This is an escalation (tier_change): DEV-95 now waits for a human.",
+		`It moved up from the risk tier "low" to "high"`,
+		"To let it go on where it stopped: comment on this ticket.",
+		"To cancel: write /stop as the first line of a comment",
+	} {
+		if !strings.Contains(comments[1], want) {
+			t.Errorf("the ticket was told %q, want %q in it", comments[1], want)
+		}
+	}
+	// The message from during the run starts nothing by itself.
+	time.Sleep(500 * time.Millisecond)
+	if n := len(o.Records()); n != 1 {
+		t.Fatalf("the agent was started %d times after the escalation, want 1", n)
+	}
+	if n, _ := st.Waiting("jira", "DEV-95"); n != 1 {
+		t.Errorf("%d messages are kept for the next run, want 1", n)
+	}
+
+	// A human lets it go on: same session, the new tier, both messages.
+	second := o.JiraCommented("DEV-95", "", "Go on, I will review it.").TaskID(t)
+	run = o.WaitStored(st, second, 15*time.Second)
+	if !run.Result.Resumed || run.Tier != "high" {
+		t.Errorf("second run: tier %q, %+v", run.Tier, run.Result)
+	}
+	recs := o.WaitRecords(2, 5*time.Second)
+	var resumed Record
+	for _, r := range recs {
+		if slices.Contains(r.Args, "--resume") {
+			resumed = r
+		}
+	}
+	if !slices.Contains(resumed.Args, session) || !strings.Contains(resumed.Stdin, "Also keep the old log line.") || !strings.Contains(resumed.Stdin, "Go on, I will review it.") {
+		t.Errorf("the run after the escalation: args %q, prompt:\n%s", resumed.Args, resumed.Stdin)
+	}
+	if strings.Index(resumed.Stdin, "Also keep the old log line.") > strings.Index(resumed.Stdin, "Go on, I will review it.") {
+		t.Error("the kept message comes after the newer one in the prompt")
+	}
+
+	// A label on a ticket that has no run only sets the tier; and taking
+	// the label off again lowers nothing. Linear works the same way.
+	o.Labels = nil
+	third := o.LinearCreated("ENG-98", "session-label", "").TaskID(t)
+	third3 := o.WaitRecords(3, 15*time.Second)[2]
+	o.Labels = []string{"risk-high"}
+	if r := o.LinearUpdated("ENG-98"); r.Status != 200 || r.Body != "tier of ENG-98 raised to high; its run is being stopped" {
+		t.Fatalf("Linear update that raises the tier: %d %q", r.Status, r.Body)
+	}
+	if run := o.WaitStored(st, third, 15*time.Second); run.Result.Escalation != "tier_change" {
+		t.Errorf("Linear run: %+v", run.Result)
+	}
+	o.waitFor(10*time.Second, "the stopped agent to be gone", func() bool { return !Alive(third3.PID) })
+	acts := o.WaitActivities("session-label", 2, 10*time.Second)
+	if acts[1].Type != "elicitation" || !strings.Contains(acts[1].Body, "This is an escalation (tier_change)") {
+		t.Errorf("the Linear session got %+v", acts[1])
+	}
+	o.Labels = nil
+	if r := o.LinearUpdated("ENG-98"); r.Status != 200 || r.Body != "ignored" {
+		t.Errorf("an update that would lower the tier: %d %q", r.Status, r.Body)
+	}
+	if r := o.LinearUpdated("ENG-404"); r.Status != 200 || r.Body != "ignored" {
+		t.Errorf("an update of a ticket that ochell does not know: %d %q", r.Status, r.Body)
+	}
+	if tk, _ := st.Ticket("linear", "ENG-98"); tk.Tier != "high" || tk.State != "waiting" {
+		t.Errorf("ENG-98 = %s in tier %s, want waiting in high", tk.State, tk.Tier)
+	}
+	// DEV-95 is in review now, without a run: its tier is already high, so
+	// nothing changes; a ticket in a lower tier would only get the tier.
+	if tk, _ := st.Ticket("jira", "DEV-95"); tk.State != "in_review" || tk.Tier != "high" {
+		t.Errorf("DEV-95 = %s in tier %s, want in_review in high", tk.State, tk.Tier)
 	}
 }
