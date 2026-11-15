@@ -297,8 +297,16 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
   | `auto_merge` | `never`, `after_ci` | `never` |
   | `budget_usd` | what one ticket may cost; `0`: no limit | `0` |
   | `labels` | labels that raise a ticket to this tier | none |
+  | `allowed_assigners` | who may assign work of this tier | everyone whom the source allows |
 
-  These four settings are checked and recorded now. What acts on them comes with the next parts of the policy work: the plan gate, the budget, and later the handoff and auto-merge.
+  `plan_gate`, `pr_review`, `auto_merge` and `budget_usd` are checked and recorded now. What acts on them comes with the next parts of the policy work: the plan gate, the budget, and later the handoff and auto-merge.
+- **Who may assign work of a tier:** `allowed_assigners` of a tier lists Jira accountIds, and Linear user ids or email addresses.
+  - It **narrows** the `allowed_assigners` of the source (see [Guards and the admin channel](#guards-and-the-admin-channel)), which is checked first. A tier without a list takes everyone whom the source allows.
+  - It holds for the tier the ticket ends up in, so also for a ticket that a label raised into the tier.
+  - **A refused assignment starts nothing and stores nothing, and the ticket says why:** a comment on the Jira ticket (it needs [the Jira API](#jira-api-access); at most one a day per ticket), an `error` activity in the Linear session. The Jira sources answer 403, Linear gets 200. ochell logs the ticket, the tier and the assigner.
+  - An assignment that does not say who made it (a Jira Automation rule without `initiatorAccountId`) is refused for a tier that has a list.
+  - [The poller](#the-poller) follows the same list, with the assigner from the ticket's history.
+  - Nothing in a ticket widens this: the list is in the policy file, and the tier of a ticket only goes up.
 - **The file is checked at start**, and ochell does not start with one it cannot trust:
   - it must be valid: a tier or a setting that ochell does not know is an error, so a misspelt limit never silently means no limit;
   - it must belong to root or to the user ochell runs as, and must not be writable by its group or by others; its directory must not be writable by others.

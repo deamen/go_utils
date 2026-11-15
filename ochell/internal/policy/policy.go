@@ -57,6 +57,26 @@ type Tier struct {
 	// them runs under this tier, unless its rule already gives it a
 	// higher one. A label never lowers a tier.
 	Labels []string `yaml:"labels"`
+	// AllowedAssigners, when not empty, are the people who may assign work
+	// of this tier: Jira accountIds, Linear user ids or email addresses.
+	// It narrows the allowlist of the source (allowed_assigners in the
+	// configuration), which is checked first. Empty: everyone whom the
+	// source allows.
+	AllowedAssigners []string `yaml:"allowed_assigners"`
+}
+
+// MayAssign reports whether one of ids, the ways a source names the person
+// who assigned a ticket, is allowed to assign work of this tier.
+func (t Tier) MayAssign(ids ...string) bool {
+	if len(t.AllowedAssigners) == 0 {
+		return true
+	}
+	for _, id := range ids {
+		if id != "" && slices.ContainsFunc(t.AllowedAssigners, func(a string) bool { return strings.EqualFold(strings.TrimSpace(a), id) }) {
+			return true
+		}
+	}
+	return false
 }
 
 // Rule gives a tier to the tickets it matches. Every field that is set
@@ -205,6 +225,11 @@ func (p *Policy) Validate() error {
 			}
 			labels[key] = t.Name
 		}
+		for _, a := range t.AllowedAssigners {
+			if strings.TrimSpace(a) == "" {
+				errs = append(errs, fmt.Errorf("%s: an empty entry in allowed_assigners", at))
+			}
+		}
 	}
 	switch {
 	case p.DefaultTier == "":
@@ -349,6 +374,9 @@ func (p *Policy) Describe() []string {
 		}
 		if len(t.Labels) > 0 {
 			line += " labels=" + strings.Join(t.Labels, ",")
+		}
+		if n := len(t.AllowedAssigners); n > 0 {
+			line += fmt.Sprintf(" allowed_assigners=%d", n)
 		}
 		if t.Name == p.DefaultTier {
 			line += " (default)"
