@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"ochell/internal/agent"
 	"ochell/internal/runner"
 	"ochell/internal/store"
 )
@@ -39,6 +40,24 @@ func (f *fakeControl) Stop(source, key, by string) (runner.Stopped, error) {
 		return runner.Released, nil
 	}
 	return runner.StoppedRun, nil
+}
+
+func (f *fakeControl) Cost(source, key string) (*runner.CostReport, error) {
+	if key == "NOPE-1" {
+		return nil, store.ErrUnknown
+	}
+	tk := runner.TicketCost{BudgetUSD: 5}
+	tk.Source, tk.Key, tk.Tier, tk.State = "jira", "DEV-1", "low", "waiting"
+	tk.Cost = store.Cost{Runs: 2, CostUSD: 1.25, Usage: agent.Usage{InputTokens: 10, OutputTokens: 20, CacheReadTokens: 30, CacheWriteTokens: 40}}
+	tk.SinceResetUSD = 0.25
+	rep := &runner.CostReport{Total: store.Cost{Runs: 7, CostUSD: 3.5}, Today: store.Cost{Runs: 2, CostUSD: 1.25}, Tickets: []runner.TicketCost{tk}}
+	if key != "" {
+		rep.Runs = []store.RunCost{
+			{ID: "r1", Attempt: 1, Tier: "low", Outcome: "finished", Cost: store.Cost{CostUSD: 1, Usage: agent.Usage{InputTokens: 4}}},
+			{ID: "r2", Attempt: 2, Tier: "low", Cost: store.Cost{CostUSD: 0.25, Usage: agent.Usage{InputTokens: 6}}},
+		}
+	}
+	return rep, nil
 }
 
 func (f *fakeControl) SetTier(source, key, tier string) error {
@@ -100,15 +119,29 @@ func TestCommands(t *testing.T) {
 	}
 
 	got, err := Call(path, "POST", "reset", url.Values{"source": {"jira"}, "key": {"DEV-1"}})
-	if err != nil || !strings.Contains(got, "attempts of jira DEV-1 are reset") || len(c.reset) != 1 || c.reset[0] != "jira:DEV-1" {
+	if err != nil || !strings.Contains(got, "attempts and the budget of jira DEV-1 are reset") || len(c.reset) != 1 || c.reset[0] != "jira:DEV-1" {
 		t.Errorf("reset = %q, %v; reset %v", got, err, c.reset)
 	}
 	if _, err := Call(path, "POST", "reset", url.Values{"source": {"jira"}, "key": {"NOPE-1"}}); err == nil || !strings.Contains(err.Error(), "knows no jira ticket NOPE-1") {
 		t.Errorf("reset of an unknown ticket: %v", err)
 	}
+	// What the tickets have cost, and one ticket with its runs.
+	got, err = Call(path, "GET", "cost", nil)
+	if err != nil || !strings.Contains(got, "all runs: 7 run(s), 3.5000 USD; today (UTC): 2 run(s), 1.2500 USD") ||
+		!strings.Contains(got, "jira DEV-1  low   waiting  2     1.2500    0.2500 of 5.00  10     20      30          40") {
+		t.Errorf("cost = %v\n%s", err, got)
+	}
+	got, err = Call(path, "GET", "cost", url.Values{"source": {"jira"}, "key": {"DEV-1"}})
+	if err != nil || !strings.Contains(got, "jira DEV-1: tier low, waiting, 2 run(s), 1.2500 USD\nbudget: 0.2500 USD of 5.00 USD used since the last reset") ||
+		!strings.Contains(got, "r2     2        low   running   0.2500    6") || !strings.Contains(got, "1.2500    10     20      30          40") {
+		t.Errorf("cost of a ticket = %v\n%s", err, got)
+	}
+	if _, err := Call(path, "GET", "cost", url.Values{"source": {"jira"}, "key": {"NOPE-1"}}); err == nil || !strings.Contains(err.Error(), "knows no jira ticket NOPE-1") {
+		t.Errorf("cost of an unknown ticket: %v", err)
+	}
 	// With a tier, the ticket is also put under it.
 	got, err = Call(path, "POST", "reset", url.Values{"source": {"jira"}, "key": {"DEV-1"}, "tier": {"low"}})
-	if err != nil || !strings.Contains(got, "attempts of jira DEV-1 are reset and its tier is now low") || c.tier != "low" || len(c.reset) != 2 {
+	if err != nil || !strings.Contains(got, "attempts and the budget of jira DEV-1 are reset and its tier is now low") || c.tier != "low" || len(c.reset) != 2 {
 		t.Errorf("reset with a tier = %q, %v; tier %q, reset %v", got, err, c.tier, c.reset)
 	}
 	// A tier that the policy does not have changes nothing.

@@ -162,7 +162,8 @@ ochell version
 ochell status --config config.yaml                # paused or running; what is queued and running
 ochell pause  --config config.yaml                # hold the queue: no new run starts
 ochell resume --config config.yaml
-ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts of a ticket; --tier NAME also sets its risk tier
+ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts and the budget of a ticket; --tier NAME also sets its risk tier
+ochell cost [<jira|linear> <KEY>] --config config.yaml  # what the tickets have cost, or one ticket with its runs
 ochell stop  <jira|linear> <KEY> --config config.yaml   # stop the run of a ticket and release it
 ```
 
@@ -299,7 +300,7 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
   | `labels` | labels that raise a ticket to this tier | none |
   | `allowed_assigners` | who may assign work of this tier | everyone whom the source allows |
 
-  `plan_gate`, `pr_review`, `auto_merge` and `budget_usd` are checked and recorded now. What acts on them comes with the next parts of the policy work: the plan gate, the budget, and later the handoff and auto-merge.
+  `budget_usd` is enforced: see [Cost and budgets](#cost-and-budgets). `plan_gate`, `pr_review` and `auto_merge` are checked and recorded now; what acts on them comes with the next parts of the policy work.
 - **Who may assign work of a tier:** `allowed_assigners` of a tier lists Jira accountIds, and Linear user ids or email addresses.
   - It **narrows** the `allowed_assigners` of the source (see [Guards and the admin channel](#guards-and-the-admin-channel)), which is checked first. A tier without a list takes everyone whom the source allows.
   - It holds for the tier the ticket ends up in, so also for a ticket that a label raised into the tier.
@@ -315,10 +316,39 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
 - **A change takes effect at the next start** of ochell. Tickets keep the tier they have until they are assigned again.
 - **Without `policy.file`** there is one built-in tier, `normal`, with the defaults above, and every ticket runs under it.
 
+### Cost and budgets
+ochell records what each run cost, as far as the agent says, and stops a ticket that has used up the budget of its tier.
+
+- **What is recorded** with each run: the cost in USD and the tokens (input, output, cache read, cache write). The run log ends with the same numbers. The `plain` adapter reports neither.
+- **`ochell cost`** shows it:
+
+  ```
+  $ ochell cost linear ENG-90 --config config.yaml
+  linear ENG-90: tier low, waiting, 3 run(s), 1.0500 USD
+  budget: 1.0500 USD of 1.00 USD used since the last reset
+  RUN                                   ATTEMPT  TIER  OUTCOME      COST USD  INPUT  OUTPUT  CACHE READ  CACHE WRITE
+  20261115T093000.000Z-linear-ENG-90    1        low   finished     0.6000    10     20      100         10
+  20261115T094500.000Z-linear-ENG-90    2        low   over_budget  0.4500    0      0       100         10
+  20261115T095000.000Z-linear-ENG-90    3        low   over_budget  0.0000    0      0       0           0
+  total                                                             1.0500    10     20      200         20
+  ```
+
+  Without a ticket, `ochell cost` lists the 50 tickets that ochell touched last, and the total over all runs and over the runs that started today (UTC).
+- **The cost of a run is the run's own.** Claude Code reports, in a resumed run, what the whole session has cost so far. ochell takes off what the session had cost before the run. The tokens it reports are already those of the run alone. So the cost of a ticket is the sum over its runs.
+  - Checked against Claude Code 2.1.311 on 15 November 2026, with six runs in one session. It was not compared with the usage that the account shows.
+  - A run that ends without a result event (it was stopped, or timed out) reports no cost. What it spent shows up in the cost of the ticket's next run in the same session.
+- **The budget of a ticket** is `budget_usd` of its tier. What counts against it is what the ticket's runs have cost since the last reset.
+  - **Each run gets what is left as its limit** (`--max-budget-usd` of Claude Code, which counts the run alone). Claude Code stops the run when it reaches the limit. It looks after each call to the model, so a run ends a little above the limit, by at most one call.
+  - **A ticket with nothing left is not started**, whatever asks for the run: a new assignment, a reply, a retry, the poller.
+  - **In both cases the ticket waits for a human**, with the reason `escalation`, and is told why and what to do: an `elicitation` in the Linear session, a comment on the Jira ticket. The run's outcome is `over_budget`. The agent session is kept.
+  - **Only an operator gives a ticket a new budget:** `ochell reset <jira|linear> <KEY>`. The count starts at zero again, the record of what was spent stays, and a reply on the ticket (or a new assignment) then continues in the same session. A message on the ticket cannot raise a budget.
+  - **A budget needs the `claude` adapter.** With `plain`, ochell would know no cost and could stop nothing, so it refuses to start when the policy sets `budget_usd`.
+  - The budget is what the agent CLI reports as its cost. It is not the bill.
+
 ### Guards and the admin channel
 Limits on what starts a run, and one way to talk to the running ochell.
 
-- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). **A message from a person (a reply in the ticket's Linear session, a comment on the Jira ticket) starts the count again**: the cap is there to stop what runs without anyone looking, and here someone looked. The attempt number in the prompt still counts every run. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear> <KEY>` sets the count back to zero; then assign the ticket again.
+- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). **A message from a person (a reply in the ticket's Linear session, a comment on the Jira ticket) starts the count again**: the cap is there to stop what runs without anyone looking, and here someone looked. The attempt number in the prompt still counts every run. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear> <KEY>` sets the count back to zero (and starts the ticket's [budget](#cost-and-budgets) anew); then assign the ticket again.
 - **Pause:** `ochell pause` holds the queue. No new run starts; running agents go on; webhooks are still accepted and queued. `ochell resume` ends it, and the queued tasks run. Both take effect at once, without a restart, and a pause is kept across a restart. `ochell status` says which it is, and how many tasks are queued and running.
 - **Assigner allowlist:** `allowed_assigners` of a source, when it is not empty, lists who may assign work. Anyone else is rejected, and the rejection is logged with the ticket and the assigner. Nothing is stored for a rejected assignment.
 
@@ -345,7 +375,7 @@ Limits on what starts a run, and one way to talk to the running ochell.
   - A ticket whose assigner ochell does not know (a Jira Automation rule that sends no initiator) has no `assigner`.
   - Message text is never a way in: what a comment says does not change who may send one, or what the agent may do.
 
-**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
+**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `cost`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
 - Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port: the agent runs on the same host and can reach any local port. With the `systemd` launcher the agent is another user and cannot open the socket; with the `direct` launcher it is the same user and can.
 - Keep the socket in a directory that the agent user cannot write to.
 
@@ -399,7 +429,7 @@ Every ticket ochell has seen is in one of these states. They are defined, with t
 
 A ticket that is `queued` or `running` takes no second run. From every other state a new assignment queues it again.
 
-Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation` (the agent was not sure or out of scope, or the ticket used up its attempts), and `interrupted` (ochell itself stopped during the run, and the ticket had no attempt left to start it again).
+Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation` (the agent was not sure or out of scope, or the ticket used up its attempts or its budget), and `interrupted` (ochell itself stopped during the run, and the ticket had no attempt left to start it again).
 
 What a run leads to:
 
@@ -413,6 +443,7 @@ What a run leads to:
 | `failed`, `timed_out`, `not_started` | not looked at | `failed`. A `failed` run that matches a retry pattern: `queued` again while the ticket has an attempt left |
 | `stalled` | not looked at | `queued` again; `waiting`, reason `stalled`, when the attempts are used up |
 | `cancelled` | not looked at | `cancelled` |
+| `over_budget` | not looked at | `waiting`, reason `escalation` (see [Cost and budgets](#cost-and-budgets)) |
 | `stopped`, `interrupted` | not looked at | `queued` again, for a new attempt with the recovery note; `waiting`, reason `interrupted`, when the attempts are used up |
 
 Some reasons are not reached yet: they belong to features that come later (the plan gate). Pausing is not a state: it holds the queue, and queued tickets stay queued.
@@ -428,9 +459,10 @@ An adapter holds what differs between agent CLIs: how a run is started, how an e
 `plain` works with any CLI that takes a prompt and prints an answer.
 
 **The `claude` adapter** (checked against Claude Code 2.1.311):
-- **Settings:** `adapter: claude` needs `prompt_via: stdin`. Keep your own flags in `agent.args`, for example `--permission-mode` or `--model`. ochell refuses to start when `args` holds a flag the adapter sets itself (`--output-format`, `--resume`, `--continue`), or `--bare`, which makes Claude Code ignore the OAuth token.
+- **Settings:** `adapter: claude` needs `prompt_via: stdin`. Keep your own flags in `agent.args`, for example `--permission-mode` or `--model`. ochell refuses to start when `args` holds a flag the adapter sets itself (`--output-format`, `--resume`, `--continue`, `--max-budget-usd`), or `--bare`, which makes Claude Code ignore the OAuth token.
 - **What the ticket gets:** the agent's final message, not the raw stream. The run log still has every event.
-- **What is stored** with each run: the message, the session id, the cost in USD and the token counts. For a resumed run, Claude Code appears to report the totals of the session so far, not of that run alone; ochell stores what it reports.
+- **What is stored** with each run: the message, the session id, the cost in USD and the token counts. See [Cost and budgets](#cost-and-budgets) for how the cost of a resumed run is worked out.
+- **Budget:** for a ticket whose tier has a budget, the adapter adds `--max-budget-usd` with what the ticket has left. `--max-budget-usd` must not be in `agent.args`.
 - **Resume:** when a ticket runs again, in the same working directory as before, ochell continues the session of its last run instead of starting from zero. The run log says `session=new` or `session=resumed <id>`.
   - Claude Code keeps its sessions under the agent user's configuration directory, so that directory must be the same for both runs.
   - If a resumed run fails without opening a session (the session is gone), ochell forgets the session, and the ticket's next run starts a new one.

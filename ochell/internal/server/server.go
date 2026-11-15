@@ -1162,6 +1162,10 @@ func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) er
 		// session.
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityResponse, cancelledText(t, res))
 	}
+	if res.Outcome == task.OutcomeOverBudget {
+		// The ticket waits for a human: a question, not an error.
+		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityElicitation, overBudgetText(t, res))
+	}
 	if res.Err != nil {
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityError,
 			strings.TrimSpace(failureText(res)+"\n\n"+codeBlock(lastN(res.Message, replyMax))))
@@ -1230,6 +1234,23 @@ func cancelledText(t *task.Task, res task.Result) string {
 		again = "Delegate it again to start it again."
 	}
 	return what + ". The digital employee no longer works on " + t.Key + ", and messages on it start nothing. " + again
+}
+
+// overBudgetText is what a ticket is told when it has used up the budget
+// of its tier: what happened (res.Err), and who can do what about it. A
+// message on the ticket cannot raise a budget; an operator can start a new
+// one.
+func overBudgetText(t *task.Task, res task.Result) string {
+	what := "The ticket has used up its budget"
+	if res.Err != nil {
+		what = strings.ToUpper(res.Err.Error()[:1]) + res.Err.Error()[1:]
+	}
+	again := "a comment on this ticket"
+	if t.Source == "linear" {
+		again = "a reply here"
+	}
+	return fmt.Sprintf("%s. %s now waits for a human. Someone who looks after the orchestrator has to look at it: \"ochell cost %s %s\" shows what it has cost, and \"ochell reset %s %s\" gives it a new budget. After that, %s lets the digital employee go on where it stopped.",
+		what, t.Key, t.Source, t.Key, t.Source, t.Key, again)
 }
 
 // failureText says why a run did not succeed. It goes by the outcome: the

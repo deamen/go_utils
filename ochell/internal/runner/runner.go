@@ -155,7 +155,20 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 
 // UsePolicy sets the policy with the risk tiers. Call it before Start.
 // Without it the built-in policy holds.
-func (r *Runner) UsePolicy(p *policy.Policy) { r.policy = p }
+//
+// A policy with a budget needs an agent that can be kept to it. With any
+// other agent the budget would silently be no limit, so that is refused.
+func (r *Runner) UsePolicy(p *policy.Policy) error {
+	if !agent.LimitsBudget(r.adapter) {
+		for _, t := range p.Tiers {
+			if t.BudgetUSD > 0 {
+				return fmt.Errorf("the policy sets budget_usd for the tier %s, but agent.adapter %s reports no cost and cannot stop a run at a limit: use agent.adapter claude, or take budget_usd out of the policy", t.Name, r.cfg.Adapter)
+			}
+		}
+	}
+	r.policy = p
+	return nil
+}
 
 // SetNotifier sets who is told about the runs. Call it before Start.
 func (r *Runner) SetNotifier(n Notifier) {
@@ -382,12 +395,72 @@ func (r *Runner) Status() (Status, error) {
 	return st, err
 }
 
-// ResetAttempts lets a ticket that used up its attempts be started again.
+// CostReport is what the tickets have cost.
+type CostReport struct {
+	// Total is over every run in the store, Today over the runs that
+	// started since midnight UTC.
+	Total, Today store.Cost
+	// Tickets are the tickets that ochell touched last; the one ticket
+	// when the report is about one.
+	Tickets []TicketCost
+	// Runs are the runs of that one ticket.
+	Runs []store.RunCost
+}
+
+// TicketCost is what a ticket has cost, with the budget of its tier.
+type TicketCost struct {
+	store.TicketCost
+	// BudgetUSD is the budget of the ticket's tier; 0: none.
+	BudgetUSD float64
+}
+
+// maxCostTickets is how many tickets a report over all tickets lists.
+const maxCostTickets = 50
+
+// Cost reports what the runs have cost: for one ticket with each of its
+// runs, or, with an empty key, for the tickets that ochell touched last. It
+// returns store.ErrUnknown for a ticket that ochell has never seen.
+func (r *Runner) Cost(source, key string) (*CostReport, error) {
+	var rep CostReport
+	var err error
+	if rep.Total, err = r.store.TotalCost(time.Time{}); err != nil {
+		return nil, err
+	}
+	if rep.Today, err = r.store.TotalCost(time.Now().UTC().Truncate(24 * time.Hour)); err != nil {
+		return nil, err
+	}
+	with := func(c store.TicketCost) TicketCost {
+		return TicketCost{TicketCost: c, BudgetUSD: r.policy.Tier(c.Tier).BudgetUSD}
+	}
+	if key == "" {
+		list, err := r.store.TicketCosts(maxCostTickets)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range list {
+			rep.Tickets = append(rep.Tickets, with(c))
+		}
+		return &rep, nil
+	}
+	c, err := r.store.TicketCost(source, key)
+	if err != nil {
+		return nil, err
+	}
+	if c == nil {
+		return nil, store.ErrUnknown
+	}
+	rep.Tickets = []TicketCost{with(*c)}
+	rep.Runs, err = r.store.RunCosts(source, key)
+	return &rep, err
+}
+
+// ResetAttempts lets a ticket that used up its attempts or its budget be
+// started again: both count from zero.
 func (r *Runner) ResetAttempts(source, key string) error {
 	if err := r.store.ResetAttempts(source, key); err != nil {
 		return err
 	}
-	r.log.Info("attempts reset", "source", source, "key", key)
+	r.log.Info("attempts and budget reset", "source", source, "key", key)
 	return nil
 }
 
@@ -581,12 +654,20 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	}
 	r.mu.Unlock()
 
-	if r.notify != nil && ctx.Err() == nil {
-		if err := r.notify.Started(notifyCtx, t); err != nil {
-			log.Warn("start notification failed", "err", err)
+	// A ticket that has used up the budget of its tier is not started, by
+	// whatever asked for this run. Otherwise the run gets what is left.
+	var res task.Result
+	if spent, budget, over := r.budget(t, log); over {
+		res = task.Result{Outcome: task.OutcomeOverBudget, ExitCode: -1,
+			Err: fmt.Errorf("the run was not started: the ticket has cost %s of its budget of %s (tier %s)", usd(spent), usd(budget), t.Tier)}
+	} else {
+		if r.notify != nil && ctx.Err() == nil {
+			if err := r.notify.Started(notifyCtx, t); err != nil {
+				log.Warn("start notification failed", "err", err)
+			}
 		}
+		res = r.Run(ctx, t)
 	}
-	res := r.Run(ctx, t)
 	r.mu.Lock()
 	by, stopped := r.stops[k]
 	closed := r.closing[k]
@@ -638,6 +719,31 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 			log.Warn("cannot record that the ticket was closed", "err", err)
 		}
 	}
+}
+
+// usd writes an amount of money for a person.
+func usd(v float64) string { return fmt.Sprintf("%.2f USD", v) }
+
+// budget looks up what the ticket of t has left of the budget of its tier,
+// and sets t.BudgetUSD to it. over says that nothing is left. Without a
+// budget in the tier it does nothing.
+func (r *Runner) budget(t *task.Task, log *slog.Logger) (spent, budget float64, over bool) {
+	budget = r.policy.Tier(t.Tier).BudgetUSD
+	if budget <= 0 {
+		return 0, 0, false
+	}
+	cost, err := r.store.TicketCost(t.Source, t.Key)
+	if err != nil || cost == nil {
+		// Not knowing what was spent must not open the budget.
+		log.Error("cannot read what the ticket has cost; the run is not started", "err", err)
+		return 0, budget, true
+	}
+	spent = cost.SinceResetUSD
+	if spent >= budget {
+		return spent, budget, true
+	}
+	t.BudgetUSD = budget - spent
+	return spent, budget, false
 }
 
 // next says whether ochell itself starts the ticket of t again after a run
@@ -740,7 +846,7 @@ func (r *Runner) command(t *task.Task, view promptView, resume bool) (agent.Comm
 		}
 		args = append(args, s)
 	}
-	run := agent.Run{Args: args, Prompt: t.Prompt}
+	run := agent.Run{Args: args, Prompt: t.Prompt, BudgetUSD: t.BudgetUSD}
 	if resume {
 		return r.adapter.Resume(run, t.AgentSession)
 	}
@@ -821,6 +927,10 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	signal := "none"
 	defer func() {
 		fmt.Fprintf(lf, "\n# ---- exit=%d outcome=%s result=%s err=%v duration=%s ----\n", res.ExitCode, res.Outcome, signal, res.Err, time.Since(start))
+		// After the footer, which the harness and people look for at the
+		// end of the run's own part.
+		u := res.Usage
+		fmt.Fprintf(lf, "# cost_usd=%.6f tokens: input=%d output=%d cache_read=%d cache_write=%d\n", res.CostUSD, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
 	}()
 
 	// The workspace hooks come first. If one fails, the agent is not
@@ -868,6 +978,20 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	res.Outcome = outcome
 	rep := out.Report()
 	res.Message, res.SessionID, res.CostUSD, res.Usage = rep.Message, rep.SessionID, rep.CostUSD, rep.Usage
+	if rep.CostIsSessionTotal {
+		// The agent reports what its session has cost so far. What this
+		// run cost is the part that came on top of the earlier runs in
+		// the same session.
+		res.SessionCostUSD = rep.CostUSD
+		if res.Resumed && rep.SessionID == t.AgentSession {
+			before, err := r.store.SessionCost(t.Source, t.Key, t.AgentSession)
+			if err != nil {
+				r.log.Warn("cannot read what the session cost before this run; the run is charged the session's total", "task", t.ID, "err", err)
+			} else if before <= rep.CostUSD {
+				res.CostUSD = rep.CostUSD - before
+			}
+		}
+	}
 	res.AgentError = rep.Failed
 	// What the agent says about its run. The file is read whenever the
 	// agent ran, and stored; it decides the ticket's state only for a run
@@ -890,6 +1014,10 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	case errors.Is(w.err, launcher.ErrNotStarted):
 		res.Outcome = task.OutcomeNotStarted
 		res.Err = w.err
+	case rep.OverBudget:
+		// The agent CLI stopped at the limit that ochell gave it.
+		res.Outcome = task.OutcomeOverBudget
+		res.Err = fmt.Errorf("the run was stopped: it used up what the ticket had left of its budget (%s; tier %s)", usd(t.BudgetUSD), t.Tier)
 	case w.err != nil:
 		res.Outcome = task.OutcomeFailed
 		res.Err = w.err

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -22,7 +23,7 @@ type Claude struct{}
 
 // claudeOwned are the flags this adapter sets itself; --bare makes Claude
 // Code ignore the OAuth token. None of them may be in agent.args.
-var claudeOwned = []string{"--output-format", "--resume", "-r", "--continue", "-c", "--bare"}
+var claudeOwned = []string{"--output-format", "--resume", "-r", "--continue", "-c", "--bare", "--max-budget-usd"}
 
 // checkClaudeArgs refuses configured arguments that the adapter must own.
 func checkClaudeArgs(args []string) error {
@@ -44,8 +45,29 @@ func (Claude) command(run Run, extra ...string) Command {
 		args = append(args, "-p")
 	}
 	args = append(args, "--output-format", "stream-json", "--verbose")
+	if run.BudgetUSD > 0 {
+		args = append(args, "--max-budget-usd", strconv.FormatFloat(max(run.BudgetUSD, minBudget), 'f', 4, 64))
+	}
 	return Command{Args: append(args, extra...), Stdin: strings.NewReader(run.Prompt)}
 }
+
+// minBudget is the smallest limit that is passed on: the flag takes a
+// positive amount.
+const minBudget = 0.0001
+
+// LimitsBudget: Claude Code stops a print-mode run at --max-budget-usd.
+//
+// Checked against Claude Code 2.1.311 on 15 Nov 2026, with six runs in one
+// session:
+//   - the limit counts what this run spends, not what the session spent
+//     before it, also with --resume;
+//   - it is looked at after a call to the model, so a run ends a little
+//     above it, by at most one call;
+//   - the run then ends with a result event of the subtype
+//     error_max_budget_usd, with is_error set and no result text;
+//   - total_cost_usd of a result event is the cost of the whole session,
+//     earlier runs included; usage counts the tokens of the run alone.
+func (Claude) LimitsBudget() bool { return true }
 
 func (c Claude) Start(run Run) (Command, error) { return c.command(run), nil }
 
@@ -183,7 +205,8 @@ func (o *claudeOutput) event(line []byte) {
 		o.gotResult = true
 		o.rep.Failed = ev.IsError
 		o.rep.Message = ev.Result
-		o.rep.CostUSD = ev.CostUSD
+		o.rep.CostUSD, o.rep.CostIsSessionTotal = ev.CostUSD, true
+		o.rep.OverBudget = ev.Subtype == "error_max_budget_usd"
 		if u := ev.Usage; u != nil {
 			o.rep.Usage = Usage{InputTokens: u.Input, OutputTokens: u.Output, CacheReadTokens: u.CacheRead, CacheWriteTokens: u.CacheWrite}
 		}

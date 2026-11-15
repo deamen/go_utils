@@ -20,8 +20,10 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"text/tabwriter"
 	"time"
 
+	"ochell/internal/agent"
 	"ochell/internal/runner"
 	"ochell/internal/store"
 )
@@ -32,6 +34,9 @@ type Control interface {
 	Resume() error
 	Status() (runner.Status, error)
 	ResetAttempts(source, key string) error
+	// Cost reports what one ticket, or with an empty key the last tickets,
+	// have cost.
+	Cost(source, key string) (*runner.CostReport, error)
 	// SetTier puts a ticket under another risk tier.
 	SetTier(source, key, tier string) error
 	// Stop ends the work on a ticket for the operator named in by.
@@ -144,6 +149,18 @@ func routes(c Control, log *slog.Logger) http.Handler {
 		}
 		status(w, "")
 	})
+	mux.HandleFunc("GET /cost", func(w http.ResponseWriter, r *http.Request) {
+		source, key := r.URL.Query().Get("source"), r.URL.Query().Get("key")
+		switch rep, err := c.Cost(source, key); {
+		case err == nil:
+			answer(w, http.StatusOK, strings.TrimRight(costText(rep, key != ""), "\n"))
+		case errors.Is(err, store.ErrUnknown):
+			answer(w, http.StatusNotFound, fmt.Sprintf("ochell knows no %s ticket %s", source, key))
+		default:
+			log.Error("admin: cost failed", "err", err)
+			answer(w, http.StatusInternalServerError, err.Error())
+		}
+	})
 	mux.HandleFunc("POST /reset", func(w http.ResponseWriter, r *http.Request) {
 		source, key, tier := r.URL.Query().Get("source"), r.URL.Query().Get("key"), r.URL.Query().Get("tier")
 		note := ""
@@ -166,7 +183,7 @@ func routes(c Control, log *slog.Logger) http.Handler {
 		}
 		switch err := c.ResetAttempts(source, key); {
 		case err == nil:
-			answer(w, http.StatusOK, fmt.Sprintf("the attempts of %s %s are reset%s; assign the ticket again to start it", source, key, note))
+			answer(w, http.StatusOK, fmt.Sprintf("the attempts and the budget of %s %s are reset%s; assign the ticket again, or reply on it, to start it", source, key, note))
 		case errors.Is(err, store.ErrUnknown):
 			answer(w, http.StatusNotFound, fmt.Sprintf("ochell knows no %s ticket %s", source, key))
 		default:
@@ -202,6 +219,52 @@ func routes(c Control, log *slog.Logger) http.Handler {
 		}
 	})
 	return mux
+}
+
+// costText writes a cost report for the operator: one ticket with its
+// runs, or the last tickets.
+func costText(rep *runner.CostReport, one bool) string {
+	var b strings.Builder
+	tokens := func(u agent.Usage) string {
+		return fmt.Sprintf("%d\t%d\t%d\t%d", u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
+	}
+	budget := func(t runner.TicketCost) string {
+		if t.BudgetUSD <= 0 {
+			return "-"
+		}
+		return fmt.Sprintf("%.4f of %.2f", t.SinceResetUSD, t.BudgetUSD)
+	}
+	tw := tabwriter.NewWriter(&b, 0, 8, 2, ' ', 0)
+	if one && len(rep.Tickets) == 1 {
+		t := rep.Tickets[0]
+		fmt.Fprintf(&b, "%s %s: tier %s, %s, %d run(s), %.4f USD\n", t.Source, t.Key, t.Tier, t.State, t.Runs, t.CostUSD)
+		if t.BudgetUSD > 0 {
+			fmt.Fprintf(&b, "budget: %.4f USD of %.2f USD used since the last reset\n", t.SinceResetUSD, t.BudgetUSD)
+		} else {
+			fmt.Fprintf(&b, "budget: none in the tier %s\n", t.Tier)
+		}
+		fmt.Fprintln(tw, "RUN\tATTEMPT\tTIER\tOUTCOME\tCOST USD\tINPUT\tOUTPUT\tCACHE READ\tCACHE WRITE")
+		for _, r := range rep.Runs {
+			outcome := string(r.Outcome)
+			if outcome == "" {
+				outcome = "running"
+			}
+			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%.4f\t%s\n", r.ID, r.Attempt, r.Tier, outcome, r.CostUSD, tokens(r.Usage))
+		}
+		fmt.Fprintf(tw, "total\t\t\t\t%.4f\t%s\n", t.CostUSD, tokens(t.Usage))
+		tw.Flush()
+		return b.String()
+	}
+	fmt.Fprintf(&b, "all runs: %d run(s), %.4f USD; today (UTC): %d run(s), %.4f USD\n", rep.Total.Runs, rep.Total.CostUSD, rep.Today.Runs, rep.Today.CostUSD)
+	if len(rep.Tickets) == 0 {
+		return b.String()
+	}
+	fmt.Fprintln(tw, "TICKET\tTIER\tSTATE\tRUNS\tCOST USD\tBUDGET USD\tINPUT\tOUTPUT\tCACHE READ\tCACHE WRITE")
+	for _, t := range rep.Tickets {
+		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%d\t%.4f\t%s\t%s\n", t.Source, t.Key, t.Tier, t.State, t.Runs, t.CostUSD, budget(t), tokens(t.Usage))
+	}
+	tw.Flush()
+	return b.String()
 }
 
 // describe is the one line that pause, resume and status answer with.
