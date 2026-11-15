@@ -142,6 +142,8 @@ func AfterRun(o task.Outcome, signal result.Status) (State, Reason) {
 			return Waiting, ReasonBlocked
 		case result.LowConfidence, result.OutOfScope:
 			return Waiting, ReasonEscalation
+		case result.Plan:
+			return Waiting, ReasonPlanApproval
 		}
 		return Waiting, ReasonNoResult
 	case task.OutcomeStopped, task.OutcomeInterrupted:

@@ -64,6 +64,27 @@ type fakeRunner struct {
 	tiers map[string]string
 	// raised are the tier changes that were asked for, as "source:key to tier".
 	raised []string
+	// plans are the tickets that wait for a plan approval, by key, and
+	// approved the approvals that were recorded, as "source:key by who".
+	plans    map[string]bool
+	approved []string
+}
+
+// Approve records the approval, for the tickets in plans.
+func (f *fakeRunner) Approve(t *task.Task, by string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if !f.plans[t.Key] {
+		return store.ErrNoPlan
+	}
+	delete(f.plans, t.Key)
+	t.Cause = task.CauseApproved
+	f.approved = append(f.approved, t.Source+":"+t.Key+" by "+by)
+	f.tasks = append(f.tasks, t)
+	return nil
 }
 
 // TierChanged records the new tier; a ticket that is running is stopped.
@@ -1813,5 +1834,96 @@ func TestEscalationText(t *testing.T) {
 	if !strings.HasPrefix(got, "The agent did not do this, because it is out of its scope: It asks for a deploy.\n\nThis is an escalation (out_of_scope)") ||
 		strings.Contains(got, "moved up") || !strings.Contains(got, "reply here") || strings.Contains(got, "budget") {
 		t.Errorf("text of an agent's escalation:\n%s", got)
+	}
+}
+
+// An approval is "/approve" as the first line, from someone who may send
+// follow-ups and, when the tier has a list of approvers, is on it.
+func TestPlanApproval(t *testing.T) {
+	pol, err := policy.Parse([]byte(`
+tiers:
+  - {name: normal, plan_gate: required}
+  - {name: high, plan_gate: required, approvers: ["557058:lead"]}
+default_tier: normal
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr := &fakeRunner{
+		tiers: map[string]string{"DEV-1": "normal", "DEV-2": "high", "DEV-3": "normal"},
+		plans: map[string]bool{"DEV-1": true, "DEV-2": true},
+	}
+	jira := &tracker.Fake{}
+	s := newServer(t, testConfig(), fr)
+	s.UsePolicy(pol)
+	s.UseJira(jira)
+	comment := func(key, author, text string) *httptest.ResponseRecorder {
+		body, hdr := jiraComment(key, author, bot, text)
+		return do(s, "/webhooks/jira", body, hdr)
+	}
+	waitComments := func(key string, n int) []string {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for len(jira.Comments(key)) < n && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		return jira.Comments(key)
+	}
+
+	// The bot's own comment is dropped before anything looks at it.
+	if w := comment("DEV-1", bot, "/approve"); w.Code != 200 || !strings.Contains(w.Body.String(), "comment by the bot") || len(fr.approved) != 0 {
+		t.Fatalf("an approval by the bot: %d %s, approved %v", w.Code, w.Body, fr.approved)
+	}
+	// A tier without a list: whoever may follow up.
+	w := comment("DEV-1", "557058:dev", " /approve \nAnd keep it small.")
+	if w.Code != 200 || !strings.HasPrefix(w.Body.String(), "approved; queued ") || len(fr.approved) != 1 || !strings.HasPrefix(fr.approved[0], "jira:DEV-1 by ") {
+		t.Fatalf("approval: %d %s, approved %v", w.Code, w.Body, fr.approved)
+	}
+	if last := fr.tasks[len(fr.tasks)-1]; last.Cause != task.CauseApproved || last.Comment != "And keep it small." {
+		t.Errorf("the approved run = %+v", last)
+	}
+	// A tier with a list: only the people on it.
+	if w := comment("DEV-2", "557058:dev", "/approve"); w.Code != 200 || !strings.Contains(w.Body.String(), "may not approve plans of the tier high") || len(fr.approved) != 1 {
+		t.Fatalf("approval by someone who is not an approver: %d %s, approved %v", w.Code, w.Body, fr.approved)
+	}
+	if got := waitComments("DEV-2", 1); len(got) != 1 || !strings.Contains(got[0], `not on the list of people who may approve plans of the risk tier "high"`) {
+		t.Errorf("DEV-2 was told %q", got)
+	}
+	if w := comment("DEV-2", "557058:lead", "/approve"); w.Code != 200 || len(fr.approved) != 2 {
+		t.Fatalf("approval by an approver: %d %s", w.Code, w.Body)
+	}
+	// Nothing waits for an approval.
+	if w := comment("DEV-3", "557058:dev", "/approve"); w.Code != 200 || !strings.Contains(w.Body.String(), "nothing to approve") {
+		t.Errorf("approval without a plan: %d %s", w.Code, w.Body)
+	}
+	if got := waitComments("DEV-3", 1); len(got) != 1 || !strings.Contains(got[0], "has no plan that waits for an approval") {
+		t.Errorf("DEV-3 was told %q", got)
+	}
+	// The command inside a comment is text for the agent.
+	n := len(fr.tasks)
+	if w := comment("DEV-3", "557058:dev", "Please /approve"); w.Code != 200 || len(fr.tasks) != n+1 || fr.tasks[n].Cause != task.CauseFollowUp {
+		t.Errorf("the command in the text: %d %s", w.Code, w.Body)
+	}
+
+	// Someone who may not send follow-ups cannot approve either.
+	cfg := testConfig()
+	cfg.Sources.JiraWebhook.AllowedFollowUps = []string{"557058:lead"}
+	fr = &fakeRunner{tiers: map[string]string{"DEV-1": "normal"}, plans: map[string]bool{"DEV-1": true}, assigners: map[string]string{"DEV-1": "557058:lead"}}
+	s = newServer(t, cfg, fr)
+	s.UsePolicy(pol)
+	body, hdr := jiraComment("DEV-1", "557058:dev", bot, "/approve")
+	if w := do(s, "/webhooks/jira", body, hdr); w.Code != 200 || !strings.Contains(w.Body.String(), "the author is not allowed") || len(fr.approved) != 0 {
+		t.Errorf("approval from outside the follow-up allowlist: %d %s, approved %v", w.Code, w.Body, fr.approved)
+	}
+}
+
+func TestPlanText(t *testing.T) {
+	got := planText(task.Result{Signal: result.Plan, SignalMessage: "Step one.\nStep two."}, "comment")
+	if !strings.Contains(got, "has changed nothing yet") || !strings.Contains(got, "\n\nStep one.\nStep two.\n\n") || !strings.Contains(got, "comment with /approve as the first line") {
+		t.Errorf("plan text:\n%s", got)
+	}
+	long := planText(task.Result{Signal: result.Plan, SignalMessage: strings.Repeat("é", planMax)}, "reply")
+	if !strings.Contains(long, "[The plan is longer; this is its beginning.]") || strings.Contains(long, "�") {
+		t.Error("a long plan is not cut cleanly")
 	}
 }

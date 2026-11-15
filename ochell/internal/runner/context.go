@@ -22,13 +22,20 @@ const (
 	stalledNote = "The earlier attempt was stopped by the orchestrator because it produced no output for a long time; it probably waited for a command that never returned. The orchestrator started this attempt by itself. Check git, the pull request and the ticket's comments for what is already done, and do not wait without a time limit for a command that may hang."
 )
 
+// planNote is for a run that may only make a plan: the tier of the ticket
+// requires an approved plan, and there is none yet.
+const planNote = `This ticket needs a plan that a person has approved before anything is changed. This run is for the plan only. Read the ticket and the code, and work out what you would change, how you would verify it, and what could go wrong. Do not change files in the repository, do not push, do not open a pull request and do not change the ticket. Then report with the status "plan" and the whole plan in "message": it is shown to the people on the ticket as it is. A person approves it or says what to change, and you continue in this session.`
+
+// approvedNote is for the run that follows the approval of the plan.
+const approvedNote = "Your plan for this ticket was approved by %s. Carry it out now, verify the result, and report as usual. If it turns out that the plan cannot be followed as it is, stop and report that with the status \"needs_input\"; do not do something else instead."
+
 // runContext is the part of the prompt that says what only ochell knows
 // about this run: which attempt it is and whether it continues the earlier
 // session, what the earlier attempts left behind, and the comment that
 // triggered it. The agent still reads the ticket itself.
 //
-// It is empty for a first attempt that no comment triggered and that does
-// not take the place of an interrupted run.
+// It is empty for a first attempt that no comment triggered, that does not
+// take the place of an interrupted run and that is not held to a plan.
 func runContext(t *task.Task, resumed bool) string {
 	var lines []string
 	if t.Attempt > 1 {
@@ -38,7 +45,16 @@ func runContext(t *task.Task, resumed bool) string {
 			lines = append(lines, fmt.Sprintf("This is attempt %d on this ticket. It starts a new agent session: you do not remember the earlier attempts. Look at the branch, the pull request and the ticket's comments before you repeat work or anything that has an effect outside the repository.", t.Attempt))
 		}
 	}
+	if t.Phase == task.PhasePlan {
+		lines = append(lines, planNote)
+	}
 	switch t.Cause {
+	case task.CauseApproved:
+		by := oneLine(t.ApprovedBy)
+		if by == "" {
+			by = "a person"
+		}
+		lines = append(lines, fmt.Sprintf(approvedNote, by))
 	case task.CauseRecovery:
 		lines = append(lines, recoveryNote)
 	case task.CauseRetry:

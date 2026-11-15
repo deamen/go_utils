@@ -2840,3 +2840,188 @@ func TestEscalationWhenTheTierChangesDuringARun(t *testing.T) {
 		t.Errorf("DEV-95 = %s in tier %s, want in_review in high", tk.State, tk.Tier)
 	}
 }
+
+// gatePolicy has a plan gate in its higher tier, which a label leads to.
+const gatePolicy = `
+tiers:
+  - {name: low}
+  - {name: high, plan_gate: required, labels: [risk-high]}
+default_tier: low
+`
+
+// The plan gate: a ticket of a tier that requires it posts a plan and
+// stops; it continues on the same session only after an allowed human
+// approves; a correction gets a new plan; a low-tier ticket skips the gate.
+func TestPlanGate(t *testing.T) {
+	const session = "9c8b7a6d-5e4f-4321-8fed-cba987654321"
+	script := []Step{{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`}}
+	script = append(script, OnRun(1, Report("plan", "1. Change the retry limit.\n2. Add a test."))...)
+	// The agent calls its second plan "done"; in a run that is for a plan
+	// only, that is still a plan.
+	script = append(script, OnRun(2, Report("done", "1. Change the retry limit and the timeout.\n2. Add a test."))...)
+	script = append(script, OnRun(3, Report("done", "Implemented as planned."))...)
+	script = append(script, OnRun(4, Report("done", "Low tier work done."))...)
+	o := Start(t, Options{Script: script, Policy: gatePolicy, Configure: claudeAdapter})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	state := func(want, reason string, approved bool) {
+		t.Helper()
+		tk, _ := st.Ticket("linear", "ENG-100")
+		if tk == nil || string(tk.State) != want || string(tk.Reason) != reason || tk.PlanApproved != approved {
+			t.Fatalf("ticket = %+v, want %s (%s), plan approved: %v", tk, want, reason, approved)
+		}
+	}
+
+	// A high-tier ticket: the first run only plans.
+	o.Labels = []string{"risk-high"}
+	first := o.LinearCreated("ENG-100", "session-plan", "").TaskID(t)
+	run := o.WaitStored(st, first, 15*time.Second)
+	if run.Result.Phase != "plan" || run.Result.Signal != "plan" || run.Tier != "high" {
+		t.Errorf("first run: tier %q, %+v", run.Tier, run.Result)
+	}
+	recs := o.WaitRecords(1, 5*time.Second)
+	if !strings.Contains(recs[0].Stdin, "This run is for the plan only.") || !strings.Contains(recs[0].Stdin, `report with the status "plan"`) {
+		t.Errorf("the prompt of the first run does not ask for a plan only:\n%s", recs[0].Stdin)
+	}
+	state("waiting", "plan_approval", false)
+	acts := o.WaitActivities("session-plan", 2, 10*time.Second)
+	if acts[1].Type != "elicitation" || !strings.Contains(acts[1].Body, "has made a plan and has changed nothing yet") ||
+		!strings.Contains(acts[1].Body, "1. Change the retry limit.\n2. Add a test.") || !strings.Contains(acts[1].Body, "reply with /approve as the first line") {
+		t.Errorf("the session got %+v", acts[1])
+	}
+	// It stops there: its slot is free, and nothing goes on by itself.
+	time.Sleep(400 * time.Millisecond)
+	if n := len(o.Records()); n != 1 {
+		t.Fatalf("the agent was started %d times before an approval, want 1", n)
+	}
+	if out, _ := o.Admin("status"); out != "running; 0 queued, 0 running" {
+		t.Errorf("ochell status while the plan waits: %q", out)
+	}
+
+	// A correction is no approval: the next run plans again, in the same
+	// session.
+	second := o.LinearPrompted("ENG-100", "session-plan", "Looks good, but also raise the timeout.").TaskID(t)
+	run = o.WaitStored(st, second, 15*time.Second)
+	if run.Result.Phase != "plan" || run.Result.Signal != "plan" || !run.Result.Resumed {
+		t.Errorf("second run: %+v", run.Result)
+	}
+	recs = o.WaitRecords(2, 5*time.Second)
+	if !strings.Contains(recs[1].Stdin, "This run is for the plan only.") || !strings.Contains(recs[1].Stdin, "also raise the timeout") {
+		t.Errorf("the prompt of the second run:\n%s", recs[1].Stdin)
+	}
+	state("waiting", "plan_approval", false)
+	acts = o.WaitActivities("session-plan", 4, 10*time.Second)
+	if acts[3].Type != "elicitation" || !strings.Contains(acts[3].Body, "the retry limit and the timeout") {
+		t.Errorf("the session got %+v", acts[3])
+	}
+
+	// The approval: the same session goes on, and now does the work.
+	r := o.LinearPrompted("ENG-100", "session-plan", "/approve\nGo ahead, and keep the commit small.")
+	if r.Status != 200 || !strings.HasPrefix(r.Body, "approved; queued ") {
+		t.Fatalf("the approval: %d %q", r.Status, r.Body)
+	}
+	third := strings.TrimPrefix(r.Body, "approved; queued ")
+	run = o.WaitStored(st, third, 15*time.Second)
+	if run.Result.Phase != "" || run.Result.Signal != "done" || !run.Result.Resumed || run.Attempt != 3 {
+		t.Errorf("third run: attempt %d, %+v", run.Attempt, run.Result)
+	}
+	recs = o.WaitRecords(3, 5*time.Second)
+	if args := strings.Join(recs[2].Args, " "); !strings.HasSuffix(args, "--resume "+session) {
+		t.Errorf("the run after the approval: arguments %q, want the same session", args)
+	}
+	if p := recs[2].Stdin; strings.Contains(p, "This run is for the plan only.") || !strings.Contains(p, "Your plan for this ticket was approved by human@example.com. Carry it out now") ||
+		!strings.Contains(p, "Go ahead, and keep the commit small.") || strings.Contains(p, "/approve") {
+		t.Errorf("the prompt of the run after the approval:\n%s", p)
+	}
+	state("in_review", "", true)
+	acts = o.WaitActivities("session-plan", 6, 10*time.Second)
+	if acts[4].Type != "thought" || !strings.Contains(acts[4].Body, "The plan for ENG-100 was approved by human@example.com") ||
+		acts[5].Type != "response" || acts[5].Body != "Implemented as planned." {
+		t.Errorf("the session got %+v", acts[4:])
+	}
+	// There is no plan to approve any more.
+	if r := o.LinearPrompted("ENG-100", "session-plan", "/approve"); r.Status != 200 || r.Body != "nothing to approve" {
+		t.Errorf("a second approval: %d %q", r.Status, r.Body)
+	}
+
+	// A low-tier ticket skips the gate.
+	o.Labels = nil
+	low := o.LinearCreated("ENG-101", "session-low", "").TaskID(t)
+	run = o.WaitStored(st, low, 15*time.Second)
+	if run.Result.Phase != "" || run.Tier != "low" || run.Result.Signal != "done" {
+		t.Errorf("low-tier run: tier %q, %+v", run.Tier, run.Result)
+	}
+	recs = o.WaitRecords(4, 5*time.Second)
+	if strings.Contains(recs[3].Stdin, "for the plan only") {
+		t.Errorf("the prompt of a low-tier run asks for a plan:\n%s", recs[3].Stdin)
+	}
+	if tk, _ := st.Ticket("linear", "ENG-101"); tk.State != "in_review" {
+		t.Errorf("low-tier ticket = %s, want in_review", tk.State)
+	}
+
+	// A new assignment of the approved ticket is new work: it needs a new
+	// plan.
+	o.Labels = []string{"risk-high"}
+	again := o.LinearCreated("ENG-100", "session-plan-2", "").TaskID(t)
+	if run := o.WaitStored(st, again, 15*time.Second); run.Result.Phase != "plan" {
+		t.Errorf("the run of a new assignment: %+v", run.Result)
+	}
+}
+
+// The plan gate on a Jira ticket: the plan is a comment, and the approval
+// a comment whose first line is /approve.
+func TestPlanGateOnJira(t *testing.T) {
+	const session = "1a2b3c4d-5e6f-4789-8abc-def012345678"
+	script := []Step{{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`}}
+	script = append(script, OnRun(1, Report("plan", "Rename the field in three places."))...)
+	script = append(script, OnRun(2, Report("done", "Renamed."))...)
+	o := Start(t, Options{Script: script, Policy: gatePolicy, Configure: claudeAdapter})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-100"})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	o.Labels = []string{"risk-high"}
+	first := o.JiraAssigned("DEV-100", "Rename a field").TaskID(t)
+	o.WaitStored(st, first, 15*time.Second)
+	comments := o.WaitJiraComments("DEV-100", 2, 10*time.Second)
+	if !strings.Contains(comments[1], "Rename the field in three places.") || !strings.Contains(comments[1], "comment with /approve as the first line") {
+		t.Fatalf("the ticket got %q, want the plan and how to approve it", comments[1])
+	}
+	if tk, _ := st.Ticket("jira", "DEV-100"); tk.State != "waiting" || tk.Reason != "plan_approval" {
+		t.Fatalf("ticket = %s (%s), want waiting (plan_approval)", tk.State, tk.Reason)
+	}
+	// "/approve" in the text of a comment is no approval; the first line
+	// has to be the command.
+	corr := o.JiraCommented("DEV-100", "", "I would /approve this if it also covered the API.")
+	if corr.Status != 200 || !strings.HasPrefix(corr.Body, "queued ") {
+		t.Fatalf("a comment that only mentions the command: %d %q", corr.Status, corr.Body)
+	}
+	// That comment started a run, which the script ends as "done": still a
+	// plan, because nobody approved.
+	if run := o.WaitStored(st, corr.TaskID(t), 15*time.Second); run.Result.Phase != "plan" || run.Result.Signal != "plan" {
+		t.Errorf("the run of the comment: %+v", run.Result)
+	}
+	o.WaitJiraComments("DEV-100", 4, 10*time.Second)
+
+	r := o.JiraCommented("DEV-100", "", "/approve")
+	if r.Status != 200 || !strings.HasPrefix(r.Body, "approved; queued ") {
+		t.Fatalf("the approval: %d %q", r.Status, r.Body)
+	}
+	run := o.WaitStored(st, strings.TrimPrefix(r.Body, "approved; queued "), 15*time.Second)
+	if run.Result.Phase != "" || !run.Result.Resumed {
+		t.Errorf("the run after the approval: %+v", run.Result)
+	}
+	comments = o.WaitJiraComments("DEV-100", 6, 10*time.Second)
+	if !strings.Contains(comments[4], "The plan was approved by Someone. The digital employee carries it out now (attempt 3).") {
+		t.Errorf("the start comment of the approved run: %q", comments[4])
+	}
+	if tk, _ := st.Ticket("jira", "DEV-100"); !tk.PlanApproved || tk.PlanApprovedBy != "Someone" {
+		t.Errorf("ticket = %+v, want the approval recorded", tk)
+	}
+}

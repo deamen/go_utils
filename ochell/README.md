@@ -300,8 +300,9 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
   | `max_turns` | how many turns one run may take; `0`: no limit. Needs the `claude` adapter | `0` |
   | `labels` | labels that raise a ticket to this tier | none |
   | `allowed_assigners` | who may assign work of this tier | everyone whom the source allows |
+  | `approvers` | who may approve a plan of this tier (see [The plan gate](#the-plan-gate)) | everyone who may send follow-ups on the ticket |
 
-  `budget_usd` is enforced: see [Cost and budgets](#cost-and-budgets). `plan_gate`, `pr_review` and `auto_merge` are checked and recorded now; what acts on them comes with the next parts of the policy work.
+  `budget_usd` and `max_turns` are enforced (see [Cost and budgets](#cost-and-budgets) and [Escalation](#escalation)), and so is `plan_gate` (see [The plan gate](#the-plan-gate)). `pr_review` and `auto_merge` are checked and recorded; what acts on them comes with the handoff and with graduated autonomy.
 - **Who may assign work of a tier:** `allowed_assigners` of a tier lists Jira accountIds, and Linear user ids or email addresses.
   - It **narrows** the `allowed_assigners` of the source (see [Guards and the admin channel](#guards-and-the-admin-channel)), which is checked first. A tier without a list takes everyone whom the source allows.
   - It holds for the tier the ticket ends up in, so also for a ticket that a label raised into the tier.
@@ -316,6 +317,29 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
 - **`ochell policy-check --config config.yaml`** reads the file as `serve` does and prints the tiers. Use it in the review of a change, or with `--policy-file` on a file that is not installed yet.
 - **A change takes effect at the next start** of ochell. Tickets keep the tier they have until they are assigned again.
 - **Without `policy.file`** there is one built-in tier, `normal`, with the defaults above, and every ticket runs under it.
+
+### The plan gate
+A tier with `plan_gate: required` splits the work on a ticket in two: first a plan, then, after a person has approved it, the work.
+
+1. **The first run only plans.** Its prompt tells the agent to research, to change nothing (no file in the repository, no push, no pull request, nothing on the ticket), and to report with the status `plan` and the whole plan as the message.
+2. **The plan is posted and the ticket stops.** State `waiting`, reason `plan_approval`. The plan goes to the ticket as the agent wrote it (up to 20,000 characters): an `elicitation` in the Linear session, a comment on the Jira ticket, with how to answer. The run has ended, so its worker is free.
+3. **A person answers on the ticket:**
+
+   | Answer | What happens |
+   |---|---|
+   | `/approve` as the first line of a reply in the Linear session, or of a comment on the Jira ticket | the plan is approved. The next run continues the same agent session and does the work. Text after the first line goes to the agent with it |
+   | anything else | a correction. The next run continues the same session, plans again with the message, and posts a new plan |
+   | the stop signal, `/stop`, or taking the ticket away | the ticket is cancelled, as always |
+
+4. **After the approval** the ticket runs like any other. Follow-ups, retries and a restart keep the approval.
+
+- **An approval is the command and nothing else.** ochell does not read consent out of a message: "looks good, go ahead" is a correction, and so is a message that mentions `/approve` after its first line. The agent is not asked whether a message was an approval.
+- **Who may approve:** whoever may send the agent a follow-up on the ticket (`allowed_follow_ups`, see [Guards and the admin channel](#guards-and-the-admin-channel)). A tier can narrow that with `approvers`: Jira accountIds, Linear user ids or email addresses. Someone who is not on the list is told so, and the plan stays unapproved. ochell records who approved, and tells the agent.
+- **A new assignment is new work** and needs a new plan. So does a ticket that an [escalation](#escalation) moved into a tier with a plan gate before its plan was approved.
+- **A run for a plan that reports `done`** is taken as a plan all the same: whatever the agent calls it, nobody approved.
+- **What keeps the agent from doing the work in the plan run is its prompt.** ochell does not start the work run without the approval, and that is what it enforces. To also take the tools away in the plan run, give the agent its own restrictions (for Claude Code: its permission settings); ochell does not switch them per phase.
+- **`plan_gate: skip`** (the default): there is no plan run.
+- On a Jira ticket the approval needs the system webhook with the *Comment created* event; Jira Automation carries no comments.
 
 ### Escalation
 Some things stop a ticket and hand it to a human. Each of these triggers fires **before** the work goes on: the run is stopped, or not started, and ochell starts nothing in its place.
@@ -473,6 +497,7 @@ What a run leads to:
 | `finished` | `needs_input` | `waiting`, reason `input` |
 | `finished` | `blocked` | `waiting`, reason `blocked` |
 | `finished` | `low_confidence`, `out_of_scope` | `waiting`, reason `escalation` |
+| `finished` | `plan`; in a run for a plan also `done` | `waiting`, reason `plan_approval` (see [The plan gate](#the-plan-gate)) |
 | `finished` | missing or invalid | `waiting`, reason `no_result` |
 | `failed`, `timed_out`, `not_started` | not looked at | `failed`. A `failed` run that matches a retry pattern: `queued` again while the ticket has an attempt left; `waiting`, reason `escalation`, when it has none |
 | `stalled` | not looked at | `queued` again; `waiting`, reason `stalled`, when the attempts are used up |
@@ -481,7 +506,7 @@ What a run leads to:
 | any, with an [escalation](#escalation) trigger | | `waiting`, reason `escalation` |
 | `stopped`, `interrupted` | not looked at | `queued` again, for a new attempt with the recovery note; `waiting`, reason `interrupted`, when the attempts are used up |
 
-Some reasons are not reached yet: they belong to features that come later (the plan gate). Pausing is not a state: it holds the queue, and queued tickets stay queued.
+Pausing is not a state: it holds the queue, and queued tickets stay queued.
 
 ### Agent adapters
 An adapter holds what differs between agent CLIs: how a run is started, how an earlier session is resumed, and how the output is read (final message, session id, cost). It only builds commands and parses output. Running and stopping the process is the launcher's job, so every adapter works with every launcher. `agent.adapter` selects it.
@@ -596,6 +621,7 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 | `blocked` | something outside the ticket stops the agent | waits, reason `blocked` |
 | `low_confidence` | the agent finished but is not sure of the result | waits, reason `escalation` |
 | `out_of_scope` | the ticket asks for something the agent must not or cannot do | waits, reason `escalation` |
+| `plan` | the agent was asked for a plan first, and this is it; nothing is changed yet | waits, reason `plan_approval` (see [The plan gate](#the-plan-gate)) |
 
 - **`message`** is a short text for the people on the ticket; it is required for every status but `done`. **`pr_url`** and **`branch`** are optional. ochell keeps the last ones a ticket's runs named. Other fields are ignored.
 - **Where:** the path is in the agent's environment as `ORCH_RESULT_FILE`: `<agent.run_dir>/<task id>/result.json`. Every run has a directory of its own, so a file of an earlier run is never read. Keep `run_dir` outside the working directories, so the file cannot be committed.

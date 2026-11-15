@@ -25,6 +25,9 @@ const (
 	// CauseFollowUp: a person wrote to the agent on a ticket that ochell
 	// already knows. The message is in Comment.
 	CauseFollowUp Cause = "follow_up"
+	// CauseApproved: a person approved the agent's plan for the ticket.
+	// ApprovedBy on the task names them.
+	CauseApproved Cause = "plan_approved"
 	// CausePoll: ochell found the ticket itself when it asked the tracker
 	// for the bot's tickets; the webhook of its assignment never arrived.
 	CausePoll Cause = "poll"
@@ -98,7 +101,27 @@ type Task struct {
 	// MaxTurns is how many turns this run may take, from its tier; 0: no
 	// limit. The runner sets it.
 	MaxTurns int
+	// PlanApproved says that a person approved the agent's plan for the
+	// ticket since it was last assigned, and ApprovedBy who. The store
+	// sets both when the run starts.
+	PlanApproved bool
+	ApprovedBy   string
+	// Phase is PhasePlan for a run that may only make a plan: the tier of
+	// the ticket requires an approved plan, and there is none yet. The
+	// runner sets it.
+	Phase Phase
 }
+
+// Phase is the part of a ticket's work that a run is for.
+type Phase string
+
+const (
+	// PhaseWork: the run does the work. It is the only phase of a ticket
+	// whose tier has no plan gate.
+	PhaseWork Phase = ""
+	// PhasePlan: the run researches and writes a plan, and changes nothing.
+	PhasePlan Phase = "plan"
+)
 
 // Escalation says which trigger stopped a ticket and left it waiting for a
 // human. Each one fires before the work goes on: the run is stopped, or
@@ -187,6 +210,8 @@ type Result struct {
 	SignalMessage string
 	PRURL         string
 	Branch        string
+	// Phase is the phase the run was for.
+	Phase Phase
 	// Escalation is set when a trigger stopped the ticket: it now waits
 	// for a human, whatever the outcome says. TierBefore and TierAfter are
 	// set when the escalation moved the ticket to a higher tier.

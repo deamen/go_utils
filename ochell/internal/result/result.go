@@ -46,6 +46,9 @@ const (
 	// OutOfScope: the ticket asks for something the agent must not or
 	// cannot do.
 	OutOfScope Status = "out_of_scope"
+	// Plan: the agent was asked for a plan first, and this is it. Nothing
+	// was changed yet; a person approves or corrects the plan.
+	Plan Status = "plan"
 )
 
 // File is the content of a result file.
@@ -72,6 +75,7 @@ const Instructions = `When you stop, for any reason, write a JSON file to the pa
   blocked         something outside the ticket stops you; say what in "message"
   low_confidence  you finished, but you are not sure the result is right; say why in "message"
   out_of_scope    the ticket asks for something you must not or cannot do; say why in "message"
+  plan            only when you were asked for a plan first: the whole plan is in "message", and you have changed nothing yet
 
 "message" is a short text for the people on the ticket. "pr_url" and "branch" are optional: set them when you opened a pull request or pushed a branch.
 The file is outside the repository; do not copy or commit it. Without it the run counts as having no result, and the ticket waits for a human.`
@@ -84,7 +88,7 @@ func Parse(raw []byte) (*File, error) {
 		return nil, fmt.Errorf("not a JSON object with the expected fields: %w", err)
 	}
 	switch f.Status {
-	case Done, NeedsInput, Blocked, LowConfidence, OutOfScope:
+	case Done, NeedsInput, Blocked, LowConfidence, OutOfScope, Plan:
 	case None:
 		return nil, errors.New(`no "status"`)
 	default:

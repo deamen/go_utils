@@ -1154,3 +1154,70 @@ func TestEscalationHoldsTheTicket(t *testing.T) {
 		t.Error("AttemptsLeft(2) after one run since the reply = false")
 	}
 }
+
+// The approval of a plan is recorded on the ticket, queues the run that
+// carries the plan out, and is gone with a new assignment.
+func TestApprovePlan(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
+	approval := func(id string) *task.Task {
+		tk := newTask(id, "ENG-1", t0.Add(time.Minute))
+		tk.Cause, tk.Comment = task.CauseApproved, "keep it small"
+		return tk
+	}
+	if err := s.Approve(approval("a0"), "lead", Limits{}); !errors.Is(err, ErrUnknown) {
+		t.Errorf("approval of an unknown ticket: %v", err)
+	}
+	if err := s.Enqueue(newTask("r1", "ENG-1", t0), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Approve(approval("a1"), "lead", Limits{}); !errors.Is(err, ErrNoPlan) {
+		t.Errorf("approval of a queued ticket: %v", err)
+	}
+	got, _ := s.Claim()
+	if got.PlanApproved {
+		t.Error("a new ticket has an approved plan")
+	}
+	if err := s.Finish("r1", task.Result{Outcome: task.OutcomeFinished, Signal: result.Plan, SignalMessage: "the plan", Phase: task.PhasePlan}); err != nil {
+		t.Fatal(err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.Waiting || tk.Reason != ticket.ReasonPlanApproval || tk.PlanApproved {
+		t.Fatalf("after the plan: %+v", tk)
+	}
+	if run, _ := s.Run("r1"); run.Result.Phase != task.PhasePlan {
+		t.Errorf("stored phase = %q", run.Result.Phase)
+	}
+
+	if err := s.Approve(approval("a2"), "lead", Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Approve(approval("a3"), "lead", Limits{}); !errors.Is(err, ErrNoPlan) {
+		t.Errorf("a second approval: %v", err)
+	}
+	got, err := s.Claim()
+	if err != nil || got.ID != "a2" || !got.PlanApproved || got.ApprovedBy != "lead" || got.Cause != task.CauseApproved || got.Comment != "keep it small" {
+		t.Fatalf("claimed %+v, %v", got, err)
+	}
+	if err := s.Finish("a2", task.Result{Outcome: task.OutcomeFinished, Signal: result.Done}); err != nil {
+		t.Fatal(err)
+	}
+	if tk, _ := s.Ticket("linear", "ENG-1"); tk.State != ticket.InReview || !tk.PlanApproved || tk.PlanApprovedBy != "lead" {
+		t.Errorf("after the work: %+v", tk)
+	}
+	// A follow-up keeps the approval; a new assignment does not.
+	if _, err := s.FollowUp(newTask("r4", "ENG-1", t0.Add(2*time.Minute)), true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Claim(); !got.PlanApproved {
+		t.Error("a follow-up lost the approval")
+	}
+	if err := s.Finish("r4", task.Result{Outcome: task.OutcomeFinished, Signal: result.Done}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(newTask("r5", "ENG-1", t0.Add(3*time.Minute)), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.Claim(); got.PlanApproved || got.ApprovedBy != "" {
+		t.Errorf("a new assignment kept the approval: %+v", got)
+	}
+}
