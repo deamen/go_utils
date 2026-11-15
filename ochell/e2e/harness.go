@@ -48,6 +48,8 @@ const (
 	BotAccountID    = "712020:digital-employee"
 	// AgentToken is in the environment file of UseFakeSystemd.
 	AgentToken = "e2e-agent-token"
+	// LinearAppUserID is the Linear user of the agent app itself.
+	LinearAppUserID = "app-user-0000"
 	// HumanAccountID is who assigns the tickets, unless Ochell.Actor says
 	// otherwise: the Jira accountId and the Linear user id of the payloads.
 	HumanAccountID = "557058:human"
@@ -633,6 +635,8 @@ func (o *Ochell) LinearUpdated(key string) Response {
 	body, err := json.Marshal(map[string]any{
 		"type": "Issue", "action": "update",
 		"organizationId":   "org-0000",
+		"appUserId":        LinearAppUserID,
+		"actor":            map[string]string{"id": o.actor()},
 		"data":             map[string]any{"identifier": key, "labels": linearLabels(o.Labels)},
 		"updatedFrom":      map[string]any{"labelIds": []string{}},
 		"webhookTimestamp": time.Now().UnixMilli(),
@@ -652,6 +656,7 @@ func (o *Ochell) JiraResolved(key string) Response {
 	body, err := json.Marshal(map[string]any{
 		"timestamp":    time.Now().UnixMilli(),
 		"webhookEvent": "jira:issue_updated",
+		"user":         map[string]string{"accountId": o.actor()},
 		"issue":        map[string]any{"id": "10042", "key": key},
 		"changelog": map[string]any{"items": []map[string]string{
 			{"field": "status", "fieldId": "status", "from": "3", "to": "10001"},
@@ -821,6 +826,7 @@ func (o *Ochell) linearPrompted(key, sessionID, text, signal string) Response {
 	body, err := json.Marshal(map[string]any{
 		"type": "AgentSessionEvent", "action": "prompted",
 		"organizationId": "org-0000",
+		"appUserId":      LinearAppUserID,
 		"agentSession": map[string]any{
 			"id":      sessionID,
 			"creator": map[string]string{"id": o.actor(), "email": "human@example.com"},

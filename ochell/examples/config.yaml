@@ -248,6 +248,10 @@ sources:
     # Linear user ids or email addresses, and the word "assigner" (who
     # delegated this issue). Empty: the same people as allowed_assigners.
     allowed_follow_ups: []      # e.g. [assigner]
+    # Linear user ids that the agent itself writes as, when its ticket tool
+    # uses another account than this app. What they and the app's own user
+    # do on an issue is never taken as a person's word.
+    bot_user_ids: []
     # While the agent runs (claude adapter), its tool use is shown in the
     # session as "action" activities: at most one per this interval. Only
     # the tool's name and the file, pattern, host or program it works on

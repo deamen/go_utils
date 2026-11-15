@@ -341,6 +341,32 @@ A tier with `plan_gate: required` splits the work on a ticket in two: first a pl
 - **`plan_gate: skip`** (the default): there is no plan run.
 - On a Jira ticket the approval needs the system webhook with the *Comment created* event; Jira Automation carries no comments.
 
+### Gate integrity
+The agent can write to its tickets with its own tool (`twg`), as the bot account. So it could try to pass ochell's gates itself: approve its own plan, take a label off to get into a lower tier, assign itself a ticket again, or close the ticket as if the work had been accepted. None of that works: **what the bot account does on a ticket is never taken as a person's word.**
+
+| What the bot account does | What ochell does with it |
+|---|---|
+| a comment on a Jira ticket, a message in a Linear session: a reply, `/approve`, `/stop` | ignored. It starts no run and approves nothing. (This is also the loop guard) |
+| assigns a Jira ticket to itself, or triggers the Automation rule | rejected with 403. [The poller](#the-poller) does not start such a ticket either |
+| delegates a Linear issue to itself, or opens a session | ignored, like the sessions ochell opens itself |
+| changes labels or the issue type | ignored: no tier moves |
+| closes or completes the ticket | ignored: the ticket is not `done` for ochell, and its working directory stays |
+| takes the ticket away from itself | allowed: it stops the work, which passes no gate |
+
+And for everyone:
+- **A label that would lower the tier is ignored.** A tier only goes up while ochell knows the ticket, so removing a label, or a label that the policy gives a lower tier, changes nothing. Lowering is the operator's `ochell reset <jira|linear> <KEY> --tier <name>` (see [Policy and risk tiers](#policy-and-risk-tiers)).
+- **A plan is approved only with `/approve` from someone who may** (see [The plan gate](#the-plan-gate)). No status and no label approves anything.
+- **A budget is renewed only by an operator**, and a tier's limits are in the policy file, which the agent cannot write.
+
+Who the bot account is:
+- **Jira:** `bot_account_id` of `jira_webhook` and of `jira_automation`. Let the agent's `twg` use that same account.
+- **Linear:** the app's own user, which every signed webhook names (`appUserId`), and the user ids in `sources.linear.bot_user_ids`. Set those when the agent's tool writes to Linear as another account than the app.
+
+Limits of this:
+- **The actor comes from the webhook payload**: `user.accountId` in Jira, `actor.id` (issue events) and `agentActivity.user` (messages) in Linear. A Jira event without a user is taken as a person's.
+- **The poller does not know who closed a ticket.** When it finds a ticket closed whose agent is still running, it stops the agent, whoever closed it.
+- **A label that the bot adds counts at the next assignment**, like any label on the ticket then. It can only raise the tier.
+
 ### Escalation
 Some things stop a ticket and hand it to a human. Each of these triggers fires **before** the work goes on: the run is stopped, or not started, and ochell starts nothing in its place.
 
