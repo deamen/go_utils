@@ -3677,3 +3677,77 @@ func TestStatusAPIIsOffByDefault(t *testing.T) {
 		t.Errorf("GET /api/v1/state without the API: %d", code)
 	}
 }
+
+// The attention inbox lists exactly the tickets that wait for a person,
+// each with its reason.
+func TestInbox(t *testing.T) {
+	script := append(OnRun(1, Report("needs_input", "Which page do you mean?")), OnRun(2, Step{Print: "no result file"})...)
+	script = append(script, OnRun(3, Report("done", "Opened a pull request."))...)
+	script = append(script, OnRun(4, Step{Eprint: "broken"}, Exit(1))...)
+	script = append(script, OnRun(5, Step{Print: "working"}, Step{Sleep: "10m"})...)
+	script = append(script, OnRun(6, Report("done", "Fixed the second page."))...)
+	o := Start(t, Options{Script: script, Configure: func(c *config.Config) {
+		withAPI(c)
+		c.Agent.MaxConcurrent = 2
+	}})
+	type item struct {
+		Source, Key, State, Reason, Why, Message, Entry string
+		Since                                           time.Time
+	}
+	inbox := func() []item {
+		t.Helper()
+		code, body := o.get("/api/v1/inbox", apiToken, false)
+		var out struct{ Items []item }
+		if err := json.Unmarshal([]byte(body), &out); code != 200 || err != nil {
+			t.Fatalf("GET /api/v1/inbox: %d %v\n%s", code, err, body)
+		}
+		return out.Items
+	}
+	if got := inbox(); len(got) != 0 {
+		t.Fatalf("the inbox of a new ochell = %+v", got)
+	}
+
+	// One ticket of each kind, one after the other: a question, no result,
+	// in review, failed, and one that runs.
+	for i, key := range []string{"ENG-170", "ENG-171", "ENG-172", "ENG-173"} {
+		o.WaitRun(o.LinearCreated(key, "session-"+key, "").TaskID(t), 15*time.Second)
+		o.WaitRecords(i+1, 5*time.Second)
+	}
+	o.LinearCreated("ENG-174", "session-ENG-174", "")
+	o.WaitRecords(5, 15*time.Second)
+
+	got := inbox()
+	if len(got) != 2 {
+		t.Fatalf("the inbox has %d items, want exactly the two tickets that wait: %+v", len(got), got)
+	}
+	// The one that has waited longest comes first.
+	if q := got[0]; q.Key != "ENG-170" || q.Source != "linear" || q.State != "waiting" || q.Reason != "input" || q.Message != "Which page do you mean?" ||
+		!strings.Contains(q.Why, "The agent asked a question") || q.Entry != "/api/v1/tasks/ENG-170?source=linear" || q.Since.IsZero() {
+		t.Errorf("first item = %+v", q)
+	}
+	if n := got[1]; n.Key != "ENG-171" || n.Reason != "no_result" || !strings.Contains(n.Why, "The run ended without saying how") {
+		t.Errorf("second item = %+v", n)
+	}
+	// The entry it points at is the ticket's.
+	if code, body := o.get(got[0].Entry, apiToken, false); code != 200 || !strings.Contains(body, `"key": "ENG-170"`) {
+		t.Errorf("the entry of the first item: %d %s", code, body)
+	}
+	// The page a person looks at.
+	if code, page := o.get("/api/v1/inbox", apiToken, true); code != 200 || !strings.Contains(page, "<h1>Waiting for a person</h1>") ||
+		!strings.Contains(page, "<b>input</b>") || !strings.Contains(page, "<b>no_result</b>") || strings.Contains(page, "ENG-172") || strings.Contains(page, "ENG-173") || strings.Contains(page, "ENG-174") {
+		t.Errorf("the inbox page: %d\n%s", code, page)
+	}
+	if code, _ := o.get("/api/v1/inbox", "", false); code != 401 {
+		t.Errorf("the inbox without the token: %d", code)
+	}
+
+	// The question is answered: the ticket leaves the inbox.
+	o.LinearPrompted("ENG-170", "session-ENG-170", "The second one.")
+	o.waitFor(15*time.Second, "the answered ticket to leave the inbox", func() bool {
+		got = inbox()
+		return len(got) == 1
+	})
+	if got[0].Key != "ENG-171" {
+		t.Errorf("the inbox after the answer = %+v", got)
+	}
+}
