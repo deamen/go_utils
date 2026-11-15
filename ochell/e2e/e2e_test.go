@@ -3,6 +3,9 @@
 package e2e
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -3516,4 +3519,161 @@ func TestThrottles(t *testing.T) {
 			t.Errorf("the agent was started %d times under a policy that pauses everything", n)
 		}
 	})
+}
+
+// apiToken is the token of the status API in the tests.
+const apiToken = "e2e-status-api-token"
+
+// withAPI turns the status API on.
+func withAPI(c *config.Config) {
+	c.API = config.API{Enabled: true, Token: apiToken, PublicURL: "http://" + c.HTTP.Addr()}
+}
+
+// get asks the status API for a path, with the token unless token is "".
+// html asks for the page a browser gets.
+func (o *Ochell) get(path, token string, html bool) (int, string) {
+	o.t.Helper()
+	target := path
+	if !strings.HasPrefix(path, "http") {
+		target = o.URL + path
+	}
+	req, err := http.NewRequest("GET", target, nil)
+	if err != nil {
+		o.t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if html {
+		req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		o.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
+}
+
+// The status API: both endpoints return the live state of queued, running
+// and waiting tickets, every request needs the token, and the link in a
+// ticket's Linear session opens the ticket's entry.
+func TestStatusAPI(t *testing.T) {
+	script := append(OnRun(1, Report("needs_input", "Which page do you mean?")), OnRun(2, Step{Print: "working"}, Step{Sleep: "10m"})...)
+	o := Start(t, Options{Script: script, Configure: withAPI})
+	type ticket struct {
+		Source, Key, Title, State, Reason, Tier string
+		Attempts                                int
+		Runs                                    []struct {
+			ID, Status, Outcome, Result, Message string
+			Attempt                              int
+		}
+	}
+	state := func() (out struct {
+		Paused                   bool
+		Holds                    []string
+		Counts                   map[string]int
+		Running, Queued, Waiting []ticket
+	}) {
+		t.Helper()
+		code, body := o.get("/api/v1/state", apiToken, false)
+		if code != 200 {
+			t.Fatalf("GET /api/v1/state: %d %s", code, body)
+		}
+		if err := json.Unmarshal([]byte(body), &out); err != nil {
+			t.Fatalf("%v:\n%s", err, body)
+		}
+		return out
+	}
+
+	// One ticket waits for an answer, one runs, one is queued behind it.
+	first := o.LinearCreated("ENG-160", "session-waits", "").TaskID(t)
+	o.WaitRun(first, 15*time.Second)
+	o.LinearCreated("ENG-161", "session-runs", "")
+	o.WaitRecords(2, 15*time.Second)
+	o.JiraAssigned("DEV-160", "Queued behind the running one")
+	var st = state()
+	o.waitFor(10*time.Second, "the state to show one ticket of each kind", func() bool {
+		st = state()
+		return len(st.Running) == 1 && len(st.Queued) == 1 && len(st.Waiting) == 1
+	})
+	if st.Paused || st.Counts["running"] != 1 || st.Counts["queued"] != 1 || st.Counts["waiting"] != 1 {
+		t.Errorf("state = %+v", st)
+	}
+	if w := st.Waiting[0]; w.Key != "ENG-160" || w.Source != "linear" || w.Reason != "input" || w.Title != "Title of ENG-160" || w.Tier != "normal" || w.Attempts != 1 {
+		t.Errorf("waiting = %+v", w)
+	}
+	if st.Running[0].Key != "ENG-161" || st.Queued[0].Key != "DEV-160" || st.Queued[0].Source != "jira" {
+		t.Errorf("running %+v, queued %+v", st.Running, st.Queued)
+	}
+	// It is live: a pause shows at once.
+	o.Admin("pause")
+	if st := state(); !st.Paused {
+		t.Error("the state does not show the pause")
+	}
+	o.Admin("resume")
+
+	// One ticket, with its runs.
+	code, body := o.get("/api/v1/tasks/ENG-160", apiToken, false)
+	var entry struct{ Tickets []ticket }
+	if err := json.Unmarshal([]byte(body), &entry); code != 200 || err != nil || len(entry.Tickets) != 1 {
+		t.Fatalf("GET /api/v1/tasks/ENG-160: %d %v\n%s", code, err, body)
+	}
+	tk := entry.Tickets[0]
+	if tk.State != "waiting" || tk.Reason != "input" || len(tk.Runs) != 1 || tk.Runs[0].ID != first || tk.Runs[0].Status != "ended" ||
+		tk.Runs[0].Outcome != "finished" || tk.Runs[0].Result != "needs_input" || tk.Runs[0].Message != "Which page do you mean?" || tk.Runs[0].Attempt != 1 {
+		t.Errorf("entry of ENG-160 = %+v", tk)
+	}
+	if code, body := o.get("/api/v1/tasks/ENG-161", apiToken, false); code != 200 || !strings.Contains(body, `"status": "running"`) {
+		t.Errorf("entry of the running ticket: %d %s", code, body)
+	}
+	if code, _ := o.get("/api/v1/tasks/ENG-404", apiToken, false); code != 404 {
+		t.Errorf("an unknown ticket: %d", code)
+	}
+	if code, _ := o.get("/api/v1/tasks/ENG-160?source=jira", apiToken, false); code != 404 {
+		t.Errorf("a ticket of another source: %d", code)
+	}
+
+	// Without the token, or with a wrong one, nothing is shown.
+	for _, path := range []string{"/api/v1/state", "/api/v1/tasks/ENG-160", "/api/v1/tasks/ENG-160?source=linear&sig=00112233445566778899aabbccddeeff"} {
+		for _, token := range []string{"", "not-the-token", LinearToken} {
+			if code, body := o.get(path, token, false); code != 401 || strings.Contains(body, "ENG-160") {
+				t.Errorf("GET %s with the token %q: %d %s", path, token, code, body)
+			}
+		}
+	}
+	if !strings.Contains(o.Output(), "status API: request without a valid token") {
+		t.Error("the refused requests are not in ochell's log")
+	}
+
+	// The Linear session links to the ticket's entry, and that link opens
+	// it in a browser, without the token. It opens nothing else.
+	var link string
+	o.waitFor(10*time.Second, "the session to get its link", func() bool {
+		link = o.Linear.ExternalURL("session-waits")
+		return link != ""
+	})
+	if !strings.HasPrefix(link, o.URL+"/api/v1/tasks/ENG-160?") {
+		t.Fatalf("the link of the session = %q", link)
+	}
+	code, page := o.get(link, "", true)
+	if code != 200 || !strings.Contains(page, "<h1>linear ENG-160: Title of ENG-160</h1>") || !strings.Contains(page, "Which page do you mean?") || !strings.Contains(page, "<b>waiting</b> (input)") {
+		t.Errorf("the page behind the link: %d\n%s", code, page)
+	}
+	if code, _ := o.get(strings.Replace(link, "ENG-160", "ENG-161", 1), "", true); code != 401 {
+		t.Errorf("the link of one ticket opened another: %d", code)
+	}
+	// A browser with the token gets the state as a page.
+	if code, page := o.get("/api/v1/state", apiToken, true); code != 200 || !strings.Contains(page, "<h2>Waiting for a person</h2>") || !strings.Contains(page, "<td>linear ENG-160</td>") {
+		t.Errorf("the state page: %d\n%s", code, page)
+	}
+}
+
+// Without api.enabled there is no status API.
+func TestStatusAPIIsOffByDefault(t *testing.T) {
+	o := Start(t, Options{})
+	if code, _ := o.get("/api/v1/state", apiToken, false); code != 404 {
+		t.Errorf("GET /api/v1/state without the API: %d", code)
+	}
 }

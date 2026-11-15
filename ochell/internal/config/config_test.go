@@ -497,3 +497,32 @@ func TestPollerSettings(t *testing.T) {
 		t.Errorf("a negative interval: %v", err)
 	}
 }
+
+func TestAPISettings(t *testing.T) {
+	base := func() *Config {
+		cfg := Default()
+		cfg.Sources.JiraAutomation.Enabled = true
+		cfg.Sources.JiraAutomation.Token = "t"
+		return cfg
+	}
+	cfg := base()
+	cfg.API = API{Enabled: true, Token: "0123456789abcdef", PublicURL: "https://ochell.example.com"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a valid API: %v", err)
+	}
+	for name, c := range map[string]struct {
+		api  API
+		want string
+	}{
+		"no token":        {API{Enabled: true}, "api.token is required"},
+		"short token":     {API{Enabled: true, Token: "short"}, "at least 16 characters"},
+		"bad address":     {API{Enabled: true, Token: "0123456789abcdef", PublicURL: "ochell.example.com"}, "api.public_url must be an address"},
+		"address, no API": {API{PublicURL: "https://ochell.example.com"}, "the status API is not enabled"},
+	} {
+		cfg := base()
+		cfg.API = c.api
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
+		}
+	}
+}

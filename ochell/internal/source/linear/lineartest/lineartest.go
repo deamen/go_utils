@@ -58,6 +58,7 @@ type Server struct {
 	activities []Activity
 	issues     []*Issue
 	sessions   map[string][]string // sessions created by the agent, by issue
+	links      map[string]string   // external URL of each session
 	fail       bool
 }
 
@@ -114,6 +115,13 @@ func (s *Server) Activities(sessionID string) []Activity {
 	return out
 }
 
+// ExternalURL returns the external URL that a session was given, or "".
+func (s *Server) ExternalURL(sessionID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.links[sessionID]
+}
+
 // Sessions returns the ids of the sessions that the agent itself created
 // on an issue.
 func (s *Server) Sessions(key string) []string {
@@ -151,7 +159,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				AgentSessionID string `json:"agentSessionId"`
 				IssueID        string `json:"issueId"`
 				Ephemeral      bool   `json:"ephemeral"`
-				Content        struct {
+				ExternalURLs   []struct {
+					URL string `json:"url"`
+				} `json:"externalUrls"`
+				Content struct {
 					Type      string `json:"type"`
 					Body      string `json:"body"`
 					Action    string `json:"action"`
@@ -183,6 +194,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		id := fmt.Sprintf("own-session-%s-%d", key, len(s.sessions[key])+1)
 		s.sessions[key] = append(s.sessions[key], id)
 		data = map[string]any{"agentSessionCreateOnIssue": map[string]any{"success": true, "agentSession": map[string]string{"id": id}}}
+	case len(req.Variables.Input.ExternalURLs) > 0:
+		if s.links == nil {
+			s.links = map[string]string{}
+		}
+		s.links[req.Variables.ID] = req.Variables.Input.ExternalURLs[0].URL
 	default:
 		if in := req.Variables.Input; in.Content.Type != "" {
 			s.activities = append(s.activities, Activity{SessionID: in.AgentSessionID, Type: in.Content.Type, Body: in.Content.Body,
