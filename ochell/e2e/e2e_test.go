@@ -2369,3 +2369,78 @@ func TestBuiltInPolicy(t *testing.T) {
 		t.Errorf("ochell policy-check: exit %d, %q", code, out)
 	}
 }
+
+// Admission by tier: an assignment from someone who is not allowed for the
+// ticket's tier is rejected, and the ticket says why.
+func TestTierAdmission(t *testing.T) {
+	o := Start(t, Options{Policy: `
+tiers:
+  - {name: normal}
+  - {name: high, labels: [risk-high], allowed_assigners: ["557058:lead"]}
+default_tier: normal
+rules:
+  - {project: PAY, tier: high}
+`})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	for _, key := range []string{"DEV-80", "PAY-80", "PAY-81", "DEV-81"} {
+		o.Jira.Add(jiratest.Issue{Key: key, Summary: "Work"})
+	}
+
+	// The default assigner is not on the list of the high tier, and may
+	// assign everything else.
+	o.WaitRun(o.JiraAssigned("DEV-80", "Normal work").TaskID(t), 15*time.Second)
+	runs := len(o.Records())
+
+	if r := o.JiraAssigned("PAY-80", "High tier work"); r.Status != 403 || r.Body != "the assigner is not allowed to assign work of the tier high" {
+		t.Errorf("Jira webhook: %d %q", r.Status, r.Body)
+	}
+	comments := o.WaitJiraComments("PAY-80", 1, 10*time.Second)
+	if !strings.Contains(comments[0], "did not start work on this ticket") || !strings.Contains(comments[0], `risk tier "high"`) ||
+		!strings.Contains(comments[0], "not on the list of people who may assign work of that tier") {
+		t.Errorf("PAY-80 was told %q", comments[0])
+	}
+	if r := o.JiraAutomation("PAY-81", "High tier work"); r.Status != 403 {
+		t.Errorf("Jira Automation: %d %q", r.Status, r.Body)
+	}
+	o.WaitJiraComments("PAY-81", 1, 10*time.Second)
+	if r := o.LinearCreated("PAY-82", "session-refused", ""); r.Status != 200 || r.Body != "the assigner is not allowed to assign work of the tier high" {
+		t.Errorf("Linear: %d %q", r.Status, r.Body)
+	}
+	acts := o.WaitActivities("session-refused", 1, 10*time.Second)
+	if acts[0].Type != "error" || !strings.Contains(acts[0].Body, "did not start work on PAY-82") || !strings.Contains(acts[0].Body, `risk tier "high"`) {
+		t.Errorf("the session got %+v", acts[0])
+	}
+	// A label that raises a ticket into the tier brings the list with it.
+	o.Labels = []string{"risk-high"}
+	if r := o.JiraAssigned("DEV-81", "Raised by a label"); r.Status != 403 {
+		t.Errorf("a ticket raised by a label: %d %q", r.Status, r.Body)
+	}
+	o.Labels = nil
+	if !strings.Contains(o.Output(), `msg="rejected: the assigner may not assign work of this tier" source=jira_webhook`) ||
+		!strings.Contains(o.Output(), "key=PAY-80 tier=high tier_from=rules[0] assigner=[557058:human]") {
+		t.Error("the rejected assignment is not in ochell's log")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := len(o.Records()); n != runs {
+		t.Errorf("a run started for a rejected assignment: %d runs, want %d", n, runs)
+	}
+	for source, key := range map[string]string{"jira": "PAY-80", "linear": "PAY-82"} {
+		if tk, _ := st.Ticket(source, key); tk != nil {
+			t.Errorf("a rejected assignment left a ticket behind: %+v", tk)
+		}
+	}
+
+	// Someone on the tier's list.
+	o.Actor = "557058:lead"
+	id := o.JiraAssigned("PAY-80", "High tier work").TaskID(t)
+	o.WaitRun(id, 15*time.Second)
+	if run := o.WaitStored(st, id, 10*time.Second); run.Tier != "high" {
+		t.Errorf("the allowed assignment ran under %q", run.Tier)
+	}
+	o.WaitRun(o.LinearCreated("PAY-82", "session-allowed", "").TaskID(t), 15*time.Second)
+}

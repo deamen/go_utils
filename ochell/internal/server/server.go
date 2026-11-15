@@ -370,6 +370,9 @@ const (
 	// submitCapped: the ticket has used up its attempts, and now waits for
 	// a human. The delivery was handled.
 	submitCapped
+	// submitRefused: who assigned the ticket may not assign work of its
+	// tier. Nothing was recorded. The delivery was handled.
+	submitRefused
 )
 
 // mayAssign reports whether one of ids, the ways a payload names the person
@@ -443,6 +446,9 @@ type attrs struct {
 	labels []string
 	// issueType is the Jira issue type, when the payload has it.
 	issueType string
+	// assigner holds the ways the source names the person who assigned the
+	// ticket (an account id, an email address), as far as it says.
+	assigner []string
 }
 
 // submit queues t and writes the HTTP response.
@@ -496,6 +502,18 @@ func (s *Server) admit(t *task.Task, a attrs, log *slog.Logger) (submitResult, i
 		return submitFailed, http.StatusServiceUnavailable, "cannot queue task"
 	}
 	t.Tier = tier
+	// Who may assign work depends on the tier as well. Like an assignment
+	// that the source's own allowlist refuses, this one leaves no ticket
+	// behind.
+	if !s.policy.Tier(tier).MayAssign(a.assigner...) {
+		log.Warn("rejected: the assigner may not assign work of this tier", "key", t.Key, "tier", tier, "tier_from", why, "assigner", a.assigner)
+		code := http.StatusForbidden
+		if t.Source == "linear" {
+			// Linear would send the event again; the session is answered.
+			code = http.StatusOK
+		}
+		return submitRefused, code, "the assigner is not allowed to assign work of the tier " + tier
+	}
 	if held {
 		err = s.runner.Hold(t, ticket.ReasonNoRepoMapping)
 	} else {
@@ -637,11 +655,11 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	tk := s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery)
 	tk.Actor = t.Actor
-	res := s.submit(w, tk, attrs{labels: t.Labels, issueType: t.IssueType}, log)
+	res := s.submit(w, tk, attrs{labels: t.Labels, issueType: t.IssueType, assigner: []string{t.Actor}}, log)
 	if res == submitFailed {
 		s.forgetDelivery(keys, log)
 	}
-	s.jiraNotStarted(res, t.Key, log)
+	s.jiraNotStarted(res, tk, log)
 }
 
 // stopCommand, as the first line of a comment on a Jira ticket, stops the
@@ -736,8 +754,14 @@ func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error
 
 // jiraNotStarted tells a Jira ticket that it was accepted but is not
 // started, and what has to happen first.
-func (s *Server) jiraNotStarted(res submitResult, key string, log *slog.Logger) {
+func (s *Server) jiraNotStarted(res submitResult, t *task.Task, log *slog.Logger) {
+	key := t.Key
 	switch res {
+	case submitRefused:
+		// Once a day: the same person may try again and again.
+		if s.firstRefusal("jira", key, "tier:"+t.Tier) {
+			s.jiraComment(key, "The digital employee did not start work on this ticket: "+tierRefusalText(t.Tier), log)
+		}
 	case submitCapped:
 		s.jiraComment(key, fmt.Sprintf("The digital employee did not start work on this ticket: it has used its %d attempts. Someone who looks after the orchestrator has to look at it and reset it (ochell reset jira %s); then assign the ticket again.", s.cfg.Agent.MaxAttempts, key), log)
 	case submitHeld:
@@ -787,7 +811,7 @@ func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 	// prevents duplicate concurrent runs.
 	tk := s.newTask("jira", t.Key, t.Summary, t.URL, "", "")
 	tk.Actor = t.Actor
-	s.jiraNotStarted(s.submit(w, tk, attrs{labels: t.Labels, issueType: t.IssueType}, log), t.Key, log)
+	s.jiraNotStarted(s.submit(w, tk, attrs{labels: t.Labels, issueType: t.IssueType, assigner: []string{t.Actor}}, log), tk, log)
 }
 
 func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
@@ -960,6 +984,12 @@ func (s *Server) linearPrompted(w http.ResponseWriter, sess *linear.Session, key
 	}
 }
 
+// tierRefusalText says why an assignment was refused for its tier. It is
+// the second half of a sentence.
+func tierRefusalText(tier string) string {
+	return fmt.Sprintf("this ticket is in the risk tier %q, and the person who assigned it is not on the list of people who may assign work of that tier. Someone on that list has to assign it.", tier)
+}
+
 // pickedUpText and noRepoText are what a Linear session is told when its
 // ticket is queued, and when it is not started for want of a repository.
 func pickedUpText(key string) string {
@@ -981,7 +1011,10 @@ func waitsForRunText(key string) string {
 func (s *Server) linearSubmit(w http.ResponseWriter, t *task.Task, sess *linear.Session, keys []string, log *slog.Logger) {
 	// Linear marks a session unresponsive unless it sees an activity within
 	// ~10s of "created", so answer now rather than when the agent starts.
-	switch s.submit(w, t, attrs{labels: sess.Labels}, log) {
+	switch s.submit(w, t, attrs{labels: sess.Labels, assigner: []string{sess.Actor, sess.ActorEmail}}, log) {
+	case submitRefused:
+		s.linearActivity(sess.SessionID, linear.ActivityError,
+			"The digital employee did not start work on "+sess.Key+": "+tierRefusalText(t.Tier), log)
 	case submitQueued:
 		s.linearActivity(sess.SessionID, linear.ActivityThought, pickedUpText(sess.Key), log)
 	case submitBusy:

@@ -193,3 +193,28 @@ func TestExamplePolicy(t *testing.T) {
 		t.Errorf("PAY gets %q", tier)
 	}
 }
+
+func TestTierAllowedAssigners(t *testing.T) {
+	p, err := Parse([]byte(`
+tiers:
+  - {name: low}
+  - {name: high, allowed_assigners: ["557058:lead", Lead@Example.com]}
+default_tier: low
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Tier("low").MayAssign("anyone") || !p.Tier("low").MayAssign() {
+		t.Error("a tier without a list refuses someone")
+	}
+	high := p.Tier("high")
+	if !high.MayAssign("557058:lead") || !high.MayAssign("", "lead@example.com") {
+		t.Error("the tier refuses someone on its list")
+	}
+	if high.MayAssign("557058:other", "other@example.com") || high.MayAssign("") || high.MayAssign() {
+		t.Error("the tier allows someone who is not on its list, or nobody")
+	}
+	if _, err := Parse([]byte("tiers: [{name: a, allowed_assigners: [\"\"]}]\ndefault_tier: a")); err == nil || !strings.Contains(err.Error(), "empty entry in allowed_assigners") {
+		t.Errorf("an empty entry: %v", err)
+	}
+}

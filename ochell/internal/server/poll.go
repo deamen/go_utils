@@ -146,6 +146,21 @@ func (s *Server) pollStart(ctx context.Context, p polled, is tracker.Issue, log 
 	if len(who) > 0 {
 		t.Actor = who[0]
 	}
+	a := attrs{labels: is.Labels, issueType: is.Type, assigner: who}
+	// The tier's own list holds as well. It is checked here, before a
+	// session is opened for a ticket that is then not started.
+	if len(s.cfg.Repos) > 0 {
+		t.Repo, _ = s.cfg.RepoFor(t.Source, t.Key, is.Labels)
+	}
+	if tier, _, err := s.tierFor(t, a); err == nil && !s.policy.Tier(tier).MayAssign(who...) {
+		if s.refusedOnce(p.source, is.Key) {
+			log.Warn("poller: ticket not started: the assigner may not assign work of this tier, or is not known", "key", is.Key, "tier", tier, "assigner", who)
+			if p.source == "jira" {
+				s.jiraComment(is.Key, "The digital employee did not start work on this ticket: "+tierRefusalText(tier), log)
+			}
+		}
+		return false
+	}
 	if p.source == "linear" {
 		// Only a webhook brings a session. Without one there is nowhere
 		// to report, so ochell opens its own.
@@ -156,7 +171,7 @@ func (s *Server) pollStart(ctx context.Context, p polled, is tracker.Issue, log 
 		}
 		t.TrackerSession = session
 	}
-	switch res, _, _ := s.admit(t, attrs{labels: is.Labels, issueType: is.Type}, log); res {
+	switch res, _, _ := s.admit(t, a, log); res {
 	case submitQueued:
 		log.Info("poller: started a ticket whose webhook was missed", "key", is.Key, "task", t.ID)
 		if t.TrackerSession != "" {
@@ -167,7 +182,7 @@ func (s *Server) pollStart(ctx context.Context, p polled, is tracker.Issue, log 
 		if t.TrackerSession != "" {
 			s.linearActivity(t.TrackerSession, linear.ActivityElicitation, noRepoText(is.Key), log)
 		} else {
-			s.jiraNotStarted(res, is.Key, log)
+			s.jiraNotStarted(res, t, log)
 		}
 	}
 	return false

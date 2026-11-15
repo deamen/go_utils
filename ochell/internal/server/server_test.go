@@ -1615,3 +1615,126 @@ rules:
 		t.Errorf("built-in policy: %d %s, tasks %+v", w.Code, w.Body, fr.tasks)
 	}
 }
+
+// A tier can have its own list of who may assign work. It narrows the
+// source's list, and a refused assignment says why on the ticket.
+func TestTierAssignerAllowlist(t *testing.T) {
+	pol, err := policy.Parse([]byte(`
+tiers:
+  - {name: normal}
+  - {name: high, labels: [risk-high], allowed_assigners: ["557058:lead", lead@example.com]}
+default_tier: normal
+rules:
+  - {project: PAY, tier: high}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr := &fakeRunner{}
+	jira := &tracker.Fake{}
+	s := newServer(t, testConfig(), fr)
+	s.UsePolicy(pol)
+	s.UseJira(jira)
+	auto := func(body string) *httptest.ResponseRecorder {
+		return do(s, "/webhooks/jira-automation", body, map[string]string{"Authorization": "Bearer auto-token"})
+	}
+	comments := func(key string, n int) []string {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for len(jira.Comments(key)) < n && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		return jira.Comments(key)
+	}
+
+	// The lower tier has no list: anyone whom the source allows.
+	if w := auto(`{"issueKey":"DEV-1","summary":"s","initiatorAccountId":"557058:dev"}`); w.Code != 200 || len(fr.tasks) != 1 {
+		t.Fatalf("normal tier: %d %s", w.Code, w.Body)
+	}
+	// The higher tier: only the people on its list.
+	if w := auto(`{"issueKey":"PAY-1","summary":"s","initiatorAccountId":"557058:lead"}`); w.Code != 200 || len(fr.tasks) != 2 || fr.tasks[1].Tier != "high" {
+		t.Fatalf("high tier, allowed: %d %s", w.Code, w.Body)
+	}
+	w := auto(`{"issueKey":"PAY-2","summary":"s","initiatorAccountId":"557058:dev"}`)
+	if w.Code != 403 || !strings.Contains(w.Body.String(), "not allowed to assign work of the tier high") || len(fr.tasks) != 2 || len(fr.held) != 0 {
+		t.Fatalf("high tier, not allowed: %d %s, %d tasks, held %v", w.Code, w.Body, len(fr.tasks), fr.held)
+	}
+	got := comments("PAY-2", 1)
+	if len(got) != 1 || !strings.Contains(got[0], `risk tier "high"`) || !strings.Contains(got[0], "not on the list of people who may assign work of that tier") {
+		t.Errorf("comments on PAY-2: %q", got)
+	}
+	// The same refusal again is not commented again.
+	auto(`{"issueKey":"PAY-2","summary":"s","initiatorAccountId":"557058:dev"}`)
+	// A label that raises the tier brings the tier's list with it; so does
+	// an assignment that does not say who made it.
+	if w := auto(`{"issueKey":"DEV-2","summary":"s","initiatorAccountId":"557058:dev","labels":"risk-high"}`); w.Code != 403 {
+		t.Errorf("raised by a label: %d %s", w.Code, w.Body)
+	}
+	if w := auto(`{"issueKey":"PAY-3","summary":"s"}`); w.Code != 403 {
+		t.Errorf("no initiator: %d %s", w.Code, w.Body)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := jira.Comments("PAY-2"); len(got) != 1 {
+		t.Errorf("PAY-2 was told %d times", len(got))
+	}
+
+	// Linear: by user id or email address; the session is told.
+	api := lineartest.New(t, "tok")
+	cfg := testConfig()
+	cfg.Sources.Linear.ClientID, cfg.Sources.Linear.ClientSecret = "id", "secret"
+	cfg.Sources.Linear.APIURL = api.URL
+	cfg.Sources.Linear.TokenFile = filepath.Join(t.TempDir(), "token.json")
+	os.WriteFile(cfg.Sources.Linear.TokenFile, []byte(`{"access_token":"tok","token_type":"Bearer"}`), 0o600)
+	fr = &fakeRunner{}
+	s = newServer(t, cfg, fr)
+	s.UsePolicy(pol)
+	created := func(session, key, email string) *httptest.ResponseRecorder {
+		body := `{"type":"AgentSessionEvent","action":"created","agentSession":{"id":"` + session + `","creator":{"id":"u-1","email":"` + email + `"},"issue":{"identifier":"` + key + `","title":"t"}},"webhookTimestamp":` + strconv.FormatInt(time.Now().UnixMilli(), 10) + `}`
+		return do(s, "/webhooks/linear", body, map[string]string{"Linear-Signature": auth.SignHex("linear-secret", []byte(body)), "Linear-Delivery": session})
+	}
+	if w := created("s-lead", "PAY-10", "Lead@Example.com"); w.Code != 200 || len(fr.tasks) != 1 {
+		t.Fatalf("linear, allowed: %d %s", w.Code, w.Body)
+	}
+	if w := created("s-dev", "PAY-11", "dev@example.com"); w.Code != 200 || !strings.Contains(w.Body.String(), "not allowed to assign work of the tier high") || len(fr.tasks) != 1 {
+		t.Fatalf("linear, not allowed: %d %s", w.Code, w.Body)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(api.Activities("s-dev")) < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if acts := api.Activities("s-dev"); len(acts) != 1 || acts[0].Type != "error" || !strings.Contains(acts[0].Body, `PAY-11: this ticket is in the risk tier "high"`) {
+		t.Errorf("the session got %+v", acts)
+	}
+}
+
+// The poller does not start a ticket whose assigner may not assign work
+// of its tier.
+func TestPollRespectsTheTierAssignerAllowlist(t *testing.T) {
+	pol, err := policy.Parse([]byte("tiers: [{name: normal}, {name: high, allowed_assigners: [\"557058:lead\"]}]\ndefault_tier: normal\nrules: [{project: PAY, tier: high}]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr := &fakeRunner{}
+	jira := &tracker.Fake{
+		Issues:    []tracker.Issue{{Key: "PAY-1", Title: "a"}, {Key: "PAY-2", Title: "b"}, {Key: "DEV-1", Title: "c"}},
+		Assigners: map[string][]string{"PAY-1": {"557058:dev"}, "PAY-2": {"557058:lead"}, "DEV-1": {"557058:dev"}},
+	}
+	cfg := testConfig()
+	s := newServer(t, cfg, fr)
+	s.UsePolicy(pol)
+	s.UseJira(jira)
+	s.Poll(context.Background())
+	s.Poll(context.Background())
+	var keys []string
+	for _, tk := range fr.tasks {
+		keys = append(keys, tk.Key)
+	}
+	slices.Sort(keys)
+	if strings.Join(keys, ",") != "DEV-1,PAY-2" {
+		t.Errorf("started %v, want DEV-1 and PAY-2", keys)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := jira.Comments("PAY-1"); len(got) != 1 || !strings.Contains(got[0], `risk tier "high"`) {
+		t.Errorf("comments on PAY-1: %q", got)
+	}
+}
