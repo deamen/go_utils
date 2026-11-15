@@ -43,6 +43,10 @@ func (fakeStore) Runs(source, key string) ([]store.RunInfo, error) {
 	return []store.RunInfo{r}, nil
 }
 
+func (fakeStore) PullRequests(source, key string) ([]store.PullRequest, error) {
+	return []store.PullRequest{{URL: "https://github.com/example/web/pull/7", State: store.PRMerged, ClosedBy: "reviewer"}}, nil
+}
+
 type fakeRunner struct{}
 
 func (fakeRunner) Status() (runner.Status, error) {
@@ -82,7 +86,8 @@ func TestTokenAndSignedLink(t *testing.T) {
 		}
 	}
 	// A key that both trackers have gives both tickets; a source narrows it.
-	if w := get(a, "/api/v1/tasks/DEV-1", token, ""); w.Code != 200 || strings.Count(w.Body.String(), `"key": "DEV-1"`) != 2 {
+	if w := get(a, "/api/v1/tasks/DEV-1", token, ""); w.Code != 200 || strings.Count(w.Body.String(), `"key": "DEV-1"`) != 2 ||
+		!strings.Contains(w.Body.String(), `"state": "merged"`) || !strings.Contains(w.Body.String(), `"closed_by": "reviewer"`) {
 		t.Errorf("a key of two trackers: %d %s", w.Code, w.Body)
 	}
 

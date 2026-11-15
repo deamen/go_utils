@@ -277,6 +277,27 @@ func (r *Runner) Approve(t *task.Task, by string) error {
 	return nil
 }
 
+// OpenPullRequests returns the tracked pull requests that are open, of
+// tickets that are neither done nor cancelled.
+func (r *Runner) OpenPullRequests() ([]store.PullRequest, error) {
+	return r.store.OpenPullRequests()
+}
+
+// SetPullRequest records what became of a tracked pull request.
+func (r *Runner) SetPullRequest(source, key, url, state, closedBy, note string) error {
+	return r.store.SetPullRequest(source, key, url, state, closedBy, note)
+}
+
+// Session returns the tracker session that the last run of a ticket
+// reported to, or "".
+func (r *Runner) Session(source, key string) (string, error) {
+	t, err := r.store.LastTask(source, key)
+	if err != nil || t == nil {
+		return "", err
+	}
+	return t.TrackerSession, nil
+}
+
 // Assigner returns who last assigned a ticket to the bot, as the source
 // named them, or "" when the source did not say. known is false for a
 // ticket that ochell has never seen.
