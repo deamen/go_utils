@@ -79,6 +79,11 @@ type Agent struct {
 	// result file for ochell. The agent must be able to write there and
 	// ochell to read; it must not be inside a working directory.
 	RunDir string `yaml:"run_dir"`
+	// SecretsDir is a directory of ochell's own in which the systemd
+	// launcher puts, for the time of a run, the file with the run's
+	// credentials (the grants of its tier). Nobody but ochell and root may
+	// read it; the agent must not.
+	SecretsDir string `yaml:"secrets_dir"`
 }
 
 // Retry configures the retry of runs that failed for a reason outside the
@@ -438,6 +443,7 @@ func Default() *Config {
 			QueueSize:     100,
 			LogDir:        "logs",
 			RunDir:        "runs",
+			SecretsDir:    "secrets",
 		},
 		Sources: Sources{
 			JiraWebhook:    JiraWebhook{Path: "/webhooks/jira", MaxSkew: 2 * time.Hour},

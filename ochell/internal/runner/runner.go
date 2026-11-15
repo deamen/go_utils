@@ -91,6 +91,9 @@ type Runner struct {
 	cancels map[string]context.CancelFunc
 	stops   map[string]string
 	closing map[string]bool
+	// grants holds what each run in progress was granted, by task id, for
+	// the workspace hooks of that run. Guarded by mu.
+	grants map[string]*granted
 	// raised holds, for a ticket whose run is being stopped because the
 	// ticket moved to a higher tier, that tier. Guarded by mu.
 	raised map[string]string
@@ -106,7 +109,7 @@ type Runner struct {
 // New returns a runner that keeps its queue in st.
 func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 	r := &Runner{cfg: cfg, log: log, store: st, policy: policy.Builtin(), wake: make(chan struct{}, 1), quit: make(chan struct{}),
-		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}, raised: map[string]string{}}
+		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}, raised: map[string]string{}, grants: map[string]*granted{}}
 	r.runCtx, r.stopRuns = context.WithCancel(context.Background())
 	var err error
 	if r.prompt, err = parse("prompt_template", cfg.PromptTemplate); err != nil {
@@ -972,7 +975,7 @@ type promptView struct {
 // command renders the prompt and the arguments of a run, and asks the
 // adapter for the command. With resume it continues the ticket's session,
 // and the prompt says so; the adapter may answer agent.ErrNoResume.
-func (r *Runner) command(t *task.Task, view promptView, resume bool) (agent.Command, error) {
+func (r *Runner) command(t *task.Task, view promptView, resume bool, mcpConfig string) (agent.Command, error) {
 	view.RunContext = runContext(t, resume)
 	var err error
 	if t.Prompt, err = render(r.prompt, view); err != nil {
@@ -986,7 +989,7 @@ func (r *Runner) command(t *task.Task, view promptView, resume bool) (agent.Comm
 		}
 		args = append(args, s)
 	}
-	run := agent.Run{Args: args, Prompt: t.Prompt, BudgetUSD: t.BudgetUSD, MaxTurns: t.MaxTurns}
+	run := agent.Run{Args: args, Prompt: t.Prompt, BudgetUSD: t.BudgetUSD, MaxTurns: t.MaxTurns, MCPConfig: mcpConfig}
 	if resume {
 		return r.adapter.Resume(run, t.AgentSession)
 	}
@@ -1032,15 +1035,28 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	// the launcher runs it. A ticket that ran before, in the same working
 	// directory, continues its session if the agent can do that. The
 	// prompt tells the agent which of the two this is.
+	// What the tier grants the run: its tools and credentials. The ones
+	// that are made for this run are taken back when it has ended.
+	g, err := r.grant(ctx, t)
+	if err != nil {
+		res.Err = fmt.Errorf("%w: %v", errGrant, err)
+		return res
+	}
+	defer r.takeBack(t, g)
+	r.setGrant(t.ID, g)
+	defer r.setGrant(t.ID, nil)
+	// No secret of the run goes into the log or to the ticket.
+	rd := newRedactor(g.secrets)
+
 	view := promptView{Task: t, ResultFile: resultFile, ResultInstructions: result.Instructions}
 	var cmd agent.Command
 	err = agent.ErrNoResume
 	if t.AgentSession != "" && t.Workspace == dir {
-		cmd, err = r.command(t, view, true)
+		cmd, err = r.command(t, view, true, g.mcpConfig)
 		res.Resumed = err == nil
 	}
 	if errors.Is(err, agent.ErrNoResume) {
-		cmd, err = r.command(t, view, false)
+		cmd, err = r.command(t, view, false, g.mcpConfig)
 	}
 	if err != nil {
 		res.Err = fmt.Errorf("build the agent command: %w", err)
@@ -1052,12 +1068,16 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		return res
 	}
 	res.LogFile = filepath.Join(r.cfg.LogDir, unsafeName.ReplaceAllString(t.ID, "_")+".log")
-	lf, err := os.OpenFile(res.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+	file, err := os.OpenFile(res.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
 	if err != nil {
 		res.Err = fmt.Errorf("open log: %w", err)
 		return res
 	}
-	defer lf.Close()
+	defer file.Close()
+	// Everything that is written to the log goes through lf, which takes
+	// the run's secrets out.
+	lf := rd.writer(file)
+	defer lf.Flush()
 	session := "new"
 	if res.Resumed {
 		session = "resumed " + t.AgentSession
@@ -1090,7 +1110,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	// that takes its place continues in the same session.
 	out := r.adapter.Output(func(ev agent.Event) {
 		if ev.Tool != "" && r.progress != nil {
-			r.progress.ToolUsed(t, ev.Tool, ev.Param)
+			r.progress.ToolUsed(t, ev.Tool, rd.text(ev.Param))
 		}
 		if ev.SessionID == "" {
 			return
@@ -1106,7 +1126,8 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		Stdin:     cmd.Stdin,
 		Dir:       dir,
 		RunDir:    runDir,
-		Env:       append(r.taskEnv(t), result.EnvVar+"="+resultFile),
+		Env:       append(append(r.taskEnv(t), g.env...), result.EnvVar+"="+resultFile),
+		Secrets:   g.secrets,
 		Inherited: r.inheritedEnv(),
 		Output:    io.MultiWriter(lf, out),
 		Timeout:   r.cfg.Timeout,
@@ -1118,7 +1139,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	}
 	res.Outcome = outcome
 	rep := out.Report()
-	res.Message, res.SessionID, res.CostUSD, res.Usage = rep.Message, rep.SessionID, rep.CostUSD, rep.Usage
+	res.Message, res.SessionID, res.CostUSD, res.Usage = rd.text(rep.Message), rep.SessionID, rep.CostUSD, rep.Usage
 	if rep.CostIsSessionTotal {
 		// The agent reports what its session has cost so far. What this
 		// run cost is the part that came on top of the earlier runs in
@@ -1138,7 +1159,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	// agent ran, and stored; it decides the ticket's state only for a run
 	// that ended by itself with status 0 (ticket.AfterRun).
 	if f, err := result.Read(r.runDir, runName); err == nil {
-		res.Signal, res.SignalMessage, res.PRURL, res.Branch = f.Status, f.Message, f.PRURL, f.Branch
+		res.Signal, res.SignalMessage, res.PRURL, res.Branch = f.Status, rd.text(f.Message), rd.text(f.PRURL), rd.text(f.Branch)
 		signal = string(f.Status)
 		if t.Phase == task.PhasePlan && res.Signal == result.Done {
 			// The run was for a plan only. Whatever the agent calls it,

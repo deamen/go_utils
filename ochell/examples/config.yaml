@@ -112,6 +112,10 @@ agent:
   # {{.ResultInstructions}}, which tells the agent what to write, and
   # {{.RunContext}}, which tells a later attempt about the earlier ones.
   run_dir: /work/runs
+  # A directory of ochell's own, which the agent cannot read. With the
+  # systemd launcher, the credentials that a tier grants its runs are in a
+  # file here for the time of a run.
+  secrets_dir: /var/lib/ochell/secrets
   # The kind of agent CLI: how it is called and how its output is read.
   #   plain    any CLI: the prompt goes in, the last part of the output is
   #            the result.

@@ -24,6 +24,12 @@ owners:
 #   max_turns:  how many turns one run may take; 0 or left out: no limit.
 #               It needs agent.adapter claude
 #   labels:     a ticket with one of these labels gets at least this tier
+#   grants:     the tools and credentials of the tier's runs:
+#                 mcp_config        a file with the tier's MCP servers
+#                 env               variables for the agent (not secrets)
+#                 credentials_file  secrets as NAME=VALUE lines; mode 0600
+#                 mint, revoke      commands that make credentials for one
+#                                   run, and take them back after it
 #   approvers:  who may approve a plan of this tier, with "/approve" on the
 #               ticket. Left out: everyone who may send follow-ups
 #   allowed_assigners: who may assign work of this tier (Jira accountIds,

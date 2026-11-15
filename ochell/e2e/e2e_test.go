@@ -3125,3 +3125,228 @@ func TestBotAccountPassesNoGate(t *testing.T) {
 		t.Errorf("a close by a person: %d %q", r.Status, r.Body)
 	}
 }
+
+// grantFiles writes what a policy with grants points at, in dir: an MCP
+// configuration and a credentials file for each of two tiers, and a mint
+// and a revoke command. A minted token is "valid" while a file with its
+// name is in dir/tokens. It returns the policy.
+func grantFiles(t *testing.T, dir string) string {
+	t.Helper()
+	write := func(name, content string, mode os.FileMode) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), mode); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	if err := os.Mkdir(filepath.Join(dir, "tokens"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lowMCP := write("mcp-low.json", `{"mcpServers":{"docs":{"command":"docs-mcp"}}}`, 0o644)
+	highMCP := write("mcp-high.json", `{"mcpServers":{}}`, 0o644)
+	lowCreds := write("low.env", "# read-only\nLOW_TOKEN=low-tier-secret-1234\n", 0o600)
+	highCreds := write("high.env", "HIGH_TOKEN=high-tier-secret-5678\n", 0o600)
+	mint := write("mint", "#!/bin/sh\nset -e\ntoken=minted-for-$ORCH_TASK_KEY\n: > '"+dir+"/tokens/'$token\necho \"RUN_TOKEN=$token\"\n", 0o755)
+	revoke := write("revoke", "#!/bin/sh\nset -e\nrm '"+dir+"/tokens/'$RUN_TOKEN\n", 0o755)
+	return `
+tiers:
+  - name: none
+  - name: low
+    grants:
+      mcp_config: ` + lowMCP + `
+      env: {FAKEAGENT_TOOLSET: read-only}
+      credentials_file: ` + lowCreds + `
+      mint: [` + mint + `]
+      revoke: [` + revoke + `]
+  - name: high
+    grants:
+      mcp_config: ` + highMCP + `
+      credentials_file: ` + highCreds + `
+default_tier: none
+rules:
+  - {project: LOW, tier: low}
+  - {project: HIGH, tier: high}
+`
+}
+
+// checkGrants runs a ticket of each tier and checks that a run gets only
+// the tools and tokens of its tier, that no secret appears in the prompt,
+// the log or the text posted to the ticket, and that a token made for a
+// run stops working when the run ends.
+func checkGrants(t *testing.T, o *Ochell, files string) {
+	t.Helper()
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	record := func(id string) Record {
+		t.Helper()
+		for _, rec := range o.Records() {
+			if got, _ := rec.Getenv("ORCH_TASK_ID"); got == id {
+				return rec
+			}
+		}
+		t.Fatalf("no record of run %s", id)
+		return Record{}
+	}
+	const lowSecret, highSecret, minted = "low-tier-secret-1234", "high-tier-secret-5678", "minted-for-LOW-1"
+	token := filepath.Join(files, "tokens", minted)
+
+	// The low tier: its tools, its token, and one made for this run.
+	low := o.LinearCreated("LOW-1", "session-low-grants", "").TaskID(t)
+	run := o.WaitRun(low, 30*time.Second)
+	rec := record(low)
+	for name, want := range map[string]string{
+		"LOW_TOKEN": lowSecret, "RUN_TOKEN": minted, "FAKEAGENT_TOOLSET": "read-only",
+		"ORCH_MCP_CONFIG": filepath.Join(files, "mcp-low.json"), "ORCH_TASK_TIER": "low",
+	} {
+		if got, _ := rec.Getenv(name); got != want {
+			t.Errorf("low tier: %s = %q, want %q", name, got, want)
+		}
+	}
+	if _, ok := rec.Getenv("HIGH_TOKEN"); ok {
+		t.Error("the low-tier run has the token of the high tier")
+	}
+	if args := strings.Join(rec.Args, " "); !strings.Contains(args, "--mcp-config "+filepath.Join(files, "mcp-low.json")+" --strict-mcp-config") {
+		t.Errorf("low tier: arguments %q, want the tier's MCP servers and no others", args)
+	}
+	// The token worked while the run was going, and not after it.
+	if rec.Reads[token] != "ok" {
+		t.Errorf("the run's token did not work during the run: %q", rec.Reads[token])
+	}
+	o.waitFor(10*time.Second, "the token of the run to be revoked", func() bool { _, err := os.Stat(token); return os.IsNotExist(err) })
+
+	// The agent printed its secrets and put one in its result. None of
+	// them is in the log, in the store or on the ticket.
+	acts := o.WaitActivities("session-low-grants", 2, 10*time.Second)
+	stored := o.WaitStored(st, low, 10*time.Second)
+	for where, text := range map[string]string{
+		"the prompt": rec.Stdin, "the run log": run.Log, "the ticket": acts[1].Body,
+		"the stored message": stored.Result.Message + stored.Result.SignalMessage, "ochell's own log": o.Output(),
+	} {
+		for _, secret := range []string{lowSecret, minted, highSecret} {
+			if strings.Contains(text, secret) {
+				t.Errorf("%s holds the secret %s:\n%s", where, secret, text)
+			}
+		}
+	}
+	if !strings.Contains(run.Log, "leaking [redacted LOW_TOKEN] and [redacted RUN_TOKEN]") {
+		t.Errorf("the run log does not show where the secrets were taken out:\n%s", run.Log)
+	}
+	if acts[1].Body != "Used [redacted LOW_TOKEN] to read the docs." {
+		t.Errorf("the ticket got %q", acts[1].Body)
+	}
+
+	// The high tier: its own tools and token, nothing of the low tier,
+	// and nothing minted.
+	high := o.LinearCreated("HIGH-1", "session-high-grants", "").TaskID(t)
+	o.WaitRun(high, 30*time.Second)
+	rec = record(high)
+	if got, _ := rec.Getenv("HIGH_TOKEN"); got != highSecret {
+		t.Errorf("high tier: HIGH_TOKEN = %q", got)
+	}
+	for _, name := range []string{"LOW_TOKEN", "RUN_TOKEN", "FAKEAGENT_TOOLSET"} {
+		if v, ok := rec.Getenv(name); ok {
+			t.Errorf("the high-tier run has %s=%q of the low tier", name, v)
+		}
+	}
+	if args := strings.Join(rec.Args, " "); !strings.Contains(args, "--mcp-config "+filepath.Join(files, "mcp-high.json")+" --strict-mcp-config") {
+		t.Errorf("high tier: arguments %q", args)
+	}
+
+	// A tier without grants gets none.
+	none := o.LinearCreated("ENG-120", "session-no-grants", "").TaskID(t)
+	o.WaitRun(none, 30*time.Second)
+	rec = record(none)
+	for _, name := range []string{"LOW_TOKEN", "HIGH_TOKEN", "RUN_TOKEN", "FAKEAGENT_TOOLSET", "ORCH_MCP_CONFIG"} {
+		if v, ok := rec.Getenv(name); ok {
+			t.Errorf("a run without grants has %s=%q", name, v)
+		}
+	}
+	if args := strings.Join(rec.Args, " "); strings.Contains(args, "mcp") {
+		t.Errorf("a run without grants: arguments %q", args)
+	}
+}
+
+// grantScript is what the fake agent does in the tests of the grants: on
+// its first run it checks its token, then leaks its secrets in its output
+// and in its result.
+func grantScript(files string) []Step {
+	leak := OnRun(1,
+		Step{TryRead: filepath.Join(files, "tokens", "minted-for-LOW-1")},
+		Step{Print: "leaking low-tier-secret-1234 and minted-for-LOW-1"},
+		Report("done", "Used low-tier-secret-1234 to read the docs."))
+	return append(leak, append(OnRun(2, Report("done", "High tier work.")), OnRun(3, Report("done", "Plain work."))...)...)
+}
+
+// Per-run tools and credentials, with the agent as a child of ochell.
+func TestGrants(t *testing.T) {
+	files := t.TempDir()
+	o := Start(t, Options{Script: grantScript(files), Policy: grantFiles(t, files), Configure: claudeAdapter})
+	checkGrants(t, o, files)
+
+	// A mint command that fails: the run does not start without what its
+	// tier grants.
+	if err := os.WriteFile(filepath.Join(files, "mint"), []byte("#!/bin/sh\necho 'the identity provider said no' >&2\nexit 3\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	failed := o.LinearCreated("LOW-2", "session-mint-fails", "").TaskID(t)
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	run := o.WaitStored(st, failed, 15*time.Second)
+	if run.Result.Outcome != "not_started" || !strings.Contains(run.Result.Err.Error(), "the mint command of the tier low") || !strings.Contains(run.Result.Err.Error(), "the identity provider said no") {
+		t.Errorf("run with a failing mint command: %+v", run.Result)
+	}
+	if n := len(o.Records()); n != 3 {
+		t.Errorf("the agent was started %d times, want 3: not without its credentials", n)
+	}
+}
+
+// The same through the systemd launcher's scripts: the credentials reach
+// the unit in a file of ochell's own, are not among the unit's settings,
+// and the file is gone when the run has ended.
+func TestGrantsThroughTheSystemdLauncher(t *testing.T) {
+	files := t.TempDir()
+	var root string
+	o := Start(t, Options{Script: grantScript(files), Policy: grantFiles(t, files), Configure: func(c *config.Config) {
+		claudeAdapter(c)
+		root = UseFakeSystemd(t, c)
+		c.Agent.SecretsDir = filepath.Join(filepath.Dir(root), "secrets")
+	}})
+	checkGrants(t, o, files)
+
+	units, _ := filepath.Glob(filepath.Join(filepath.Dir(root), "systemd", "*.args"))
+	if len(units) < 3 {
+		t.Fatalf("%d units were started, want at least 3", len(units))
+	}
+	withFile := 0
+	for _, u := range units {
+		raw, err := os.ReadFile(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{"low-tier-secret-1234", "high-tier-secret-5678", "minted-for-LOW-1"} {
+			if strings.Contains(string(raw), secret) {
+				t.Errorf("the settings of the unit %s hold the secret %s", filepath.Base(u), secret)
+			}
+		}
+		if strings.Contains(string(raw), "EnvironmentFile="+o.Config.Agent.SecretsDir) {
+			withFile++
+		}
+	}
+	if withFile != 2 {
+		t.Errorf("%d units got a credentials file, want 2: the low and the high tier", withFile)
+	}
+	left, _ := os.ReadDir(o.Config.Agent.SecretsDir)
+	if len(left) != 0 {
+		t.Errorf("%d credentials files are left after the runs", len(left))
+	}
+	if info, err := os.Stat(o.Config.Agent.SecretsDir); err != nil || info.Mode().Perm() != 0o700 {
+		t.Errorf("the secrets directory: %v, %v; want mode 0700", info, err)
+	}
+}

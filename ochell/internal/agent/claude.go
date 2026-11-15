@@ -23,7 +23,7 @@ type Claude struct{}
 
 // claudeOwned are the flags this adapter sets itself; --bare makes Claude
 // Code ignore the OAuth token. None of them may be in agent.args.
-var claudeOwned = []string{"--output-format", "--resume", "-r", "--continue", "-c", "--bare", "--max-budget-usd", "--max-turns"}
+var claudeOwned = []string{"--output-format", "--resume", "-r", "--continue", "-c", "--bare", "--max-budget-usd", "--max-turns", "--mcp-config", "--strict-mcp-config"}
 
 // checkClaudeArgs refuses configured arguments that the adapter must own.
 func checkClaudeArgs(args []string) error {
@@ -47,6 +47,11 @@ func (Claude) command(run Run, extra ...string) Command {
 	args = append(args, "--output-format", "stream-json", "--verbose")
 	if run.BudgetUSD > 0 {
 		args = append(args, "--max-budget-usd", strconv.FormatFloat(max(run.BudgetUSD, minBudget), 'f', 4, 64))
+	}
+	if run.MCPConfig != "" {
+		// Only the servers of this file: not the ones of the agent user's
+		// own settings or of the repository.
+		args = append(args, "--mcp-config", run.MCPConfig, "--strict-mcp-config")
 	}
 	if run.MaxTurns > 0 {
 		args = append(args, "--max-turns", strconv.Itoa(run.MaxTurns))

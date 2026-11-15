@@ -4,7 +4,8 @@
 # start a process as another user, so it checks everything it is given.
 #
 #   ochell-launch --task ID --workdir DIR [--rundir DIR] [--runtime-max SEC]
-#                 [--stop-grace SEC] [--setenv NAME=VALUE]... -- /abs/command [ARG]...
+#                 [--stop-grace SEC] [--setenv NAME=VALUE]... [--env-file FILE]
+#                 -- /abs/command [ARG]...
 #
 # The unit is ochell-run-<ID>.service. Stdin, stdout, stderr and the exit
 # status of the agent pass through. Stop a run with ochell-stop.
@@ -13,6 +14,13 @@
 # file). Like the working directory it must be inside the workspace root and
 # is created as the agent user. The unit runs with umask 027, so ochell can
 # read what the agent writes when it is in the agent user's group.
+#
+# --env-file is a file with NAME=VALUE lines that ochell wrote for this run:
+# the credentials of the run's tier. It is loaded into the unit's
+# environment like ENV_FILE, so the values are not visible to other users.
+# It must be a regular file with an absolute path that belongs to the user
+# who called this script and that nobody else can read. That user can start
+# any command as the agent user anyway, so the file gives it nothing new.
 #
 # Settings come from /etc/ochell/launcher.conf, which must belong to root
 # (see launcher.conf.example). Nothing in the caller's control selects the
@@ -80,6 +88,7 @@ workdir=
 rundir=
 runtime_max=
 stop_grace=
+env_file=
 setenv=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -89,6 +98,7 @@ while [ $# -gt 0 ]; do
     --runtime-max) [ $# -ge 2 ] || refuse "--runtime-max needs a value"; runtime_max=$2; shift 2 ;;
     --stop-grace)  [ $# -ge 2 ] || refuse "--stop-grace needs a value"; stop_grace=$2; shift 2 ;;
     --setenv)      [ $# -ge 2 ] || refuse "--setenv needs a value"; setenv+=("$2"); shift 2 ;;
+    --env-file)    [ $# -ge 2 ] || refuse "--env-file needs a value"; env_file=$2; shift 2 ;;
     --)            shift; break ;;
     *)             refuse "unexpected argument before --: $1" ;;
   esac
@@ -157,6 +167,21 @@ for e in ${setenv[@]+"${setenv[@]}"}; do
   [[ "$e" != *[[:cntrl:]]* ]] || refuse "the value of $name contains a control character"
 done
 
+# The file with the run's credentials. systemd reads it as root, so it must
+# be the caller's own file and nothing that a link could redirect.
+if [ -n "$env_file" ]; then
+  [[ "$env_file" =~ ^/[A-Za-z0-9_./+@-]+$ ]] || refuse "--env-file must be an absolute path without special characters"
+  case "$env_file/" in
+    */../*|*/./*|*//*) refuse "--env-file must not contain '..', '.' or empty components" ;;
+  esac
+  [ ! -L "$env_file" ] || refuse "--env-file must not be a symbolic link"
+  [ -f "$env_file" ] || refuse "--env-file does not exist or is not a regular file"
+  caller=${SUDO_UID:-$(id -u)}
+  owner_mode=$(stat -c '%u %a' -- "$env_file")
+  [ "${owner_mode% *}" = "$caller" ] || refuse "--env-file must belong to the user who calls ochell-launch"
+  [ $(( 8#${owner_mode#* } & 8#077 )) -eq 0 ] || refuse "--env-file must not be accessible to group or others"
+fi
+
 # The command must be an absolute path: PATH in the unit is the system
 # default, and a name starting with '-' could be read as an option.
 [[ "$1" =~ ^/[A-Za-z0-9_./+@-]+$ ]] || refuse "the agent command must be an absolute path"
@@ -176,6 +201,7 @@ cmd=("$SYSTEMD_RUN"
   -p KillMode=control-group
   -p UMask=0027)
 [ -z "$ENV_FILE" ]    || cmd+=(-p "EnvironmentFile=$ENV_FILE")
+[ -z "$env_file" ]    || cmd+=(-p "EnvironmentFile=$env_file")
 [ -z "$runtime_max" ] || cmd+=(-p "RuntimeMaxSec=$runtime_max")
 [ -z "$stop_grace" ]  || cmd+=(-p "TimeoutStopSec=$stop_grace")
 [ "$DENY_LOOPBACK" != 1 ] || cmd+=(-p IPAddressDeny=localhost)

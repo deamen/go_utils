@@ -300,6 +300,7 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
   | `max_turns` | how many turns one run may take; `0`: no limit. Needs the `claude` adapter | `0` |
   | `labels` | labels that raise a ticket to this tier | none |
   | `allowed_assigners` | who may assign work of this tier | everyone whom the source allows |
+  | `grants` | the tools and credentials of the tier's runs (see [Tools and credentials per tier](#tools-and-credentials-per-tier)) | none |
   | `approvers` | who may approve a plan of this tier (see [The plan gate](#the-plan-gate)) | everyone who may send follow-ups on the ticket |
 
   `budget_usd` and `max_turns` are enforced (see [Cost and budgets](#cost-and-budgets) and [Escalation](#escalation)), and so is `plan_gate` (see [The plan gate](#the-plan-gate)). `pr_review` and `auto_merge` are checked and recorded; what acts on them comes with the handoff and with graduated autonomy.
@@ -340,6 +341,41 @@ A tier with `plan_gate: required` splits the work on a ticket in two: first a pl
 - **What keeps the agent from doing the work in the plan run is its prompt.** ochell does not start the work run without the approval, and that is what it enforces. To also take the tools away in the plan run, give the agent its own restrictions (for Claude Code: its permission settings); ochell does not switch them per phase.
 - **`plan_gate: skip`** (the default): there is no plan run.
 - On a Jira ticket the approval needs the system webhook with the *Comment created* event; Jira Automation carries no comments.
+
+### Tools and credentials per tier
+`grants` of a tier says which tools and credentials a run of that tier gets, on top of what every run has. A run gets the grants of its own tier and nothing of another.
+
+```yaml
+# policy.yaml
+tiers:
+  - name: low
+    grants:
+      mcp_config: /etc/ochell/mcp/read-only.json
+      env: {DOCS_SITE: https://docs.example.com}
+      credentials_file: /etc/ochell/credentials/low.env
+      mint: [/usr/local/libexec/ochell/mint-token, --scope, read]
+      revoke: [/usr/local/libexec/ochell/revoke-token]
+```
+
+| Grant | What the run gets |
+|---|---|
+| `mcp_config` | the MCP servers of this file, and no others. The `claude` adapter passes `--mcp-config <file> --strict-mcp-config`; every agent also gets the path in `ORCH_MCP_CONFIG`. The agent user must be able to read the file. Connectors of a claude.ai account are not available to the agent's token, so a tier's tools are local MCP configuration |
+| `env` | these variables. **Not for secrets**: with the `systemd` launcher, other local users can read them. With that launcher the names must be allowed by `ALLOWED_ENV` of the launch script |
+| `credentials_file` | the secrets of this file (`NAME=VALUE` lines; `#` starts a comment) in its environment. The file is read anew for each run |
+| `mint` | credentials made for this one run: ochell runs the command before the run, and what it prints as `NAME=VALUE` lines goes into the run's environment |
+| `revoke` | nothing; ochell runs the command when the run has ended, in whatever way, with the minted variables in its environment, so that it can make them useless |
+
+- **Secrets do not pass through the unit's settings or the command line.** With the `systemd` launcher, ochell writes the run's secrets to a file of its own in `agent.secrets_dir` (mode 0600, in a directory with mode 0700), and the launch script hands that file to systemd as an `EnvironmentFile`, like the launcher's `ENV_FILE`. Other users cannot read the values back with `systemctl show`, and they are not in `ps`. ochell removes the file when the run has ended. With the `direct` launcher they are in the environment of the agent process.
+- **Secrets are taken out of what ochell writes down and passes on.** In the run log, in the message that goes to the ticket, in what is stored about the run and in the tool activities, each value is replaced by `[redacted NAME]`. That covers the values of `credentials_file` and of `mint`; values shorter than 6 characters are left alone. The prompt never holds a secret: ochell does not put one there.
+  - It does not cover the launcher's `ENV_FILE` (the agent's own token), which ochell cannot read, or a secret that the agent rewrites (encoded, or split up).
+  - What the agent itself writes on the ticket or pushes, with its own tool, does not pass through ochell.
+- **`mint` and `revoke` run as ochell itself**, without a shell, with ochell's own environment plus `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_TIER` and `ORCH_TASK_REPO`. They are part of the host's configuration, like ochell, and are where a token is made from the digital employee's identity (for example with Entra ID). Each has one minute.
+  - **If `mint` fails, or the credentials file cannot be read, the run is not started** (`not_started`).
+  - **If `revoke` fails, ochell logs an error**: the credentials may still work. Give minted tokens a short life of their own as well; when ochell itself is killed during a run, nothing calls `revoke` for that run.
+- **The workspace hooks of a run get the same grants** as its agent: a clone needs the repository's credentials too.
+- **Read-only by default** is a matter of what you put in the files: give each tier the narrowest tokens that its work needs, and the tiers with more autonomy the least.
+- **The files are checked at start** (see [Policy and risk tiers](#policy-and-risk-tiers)): `credentials_file` must belong to root or to ochell's user and must not be accessible to its group or to others; `mcp_config` must exist; `mint` and `revoke` must be programs.
+- **A tier without `grants`** gets what every run has: the launcher's `ENV_FILE`, `agent.env`, and the agent user's own MCP configuration.
 
 ### Gate integrity
 The agent can write to its tickets with its own tool (`twg`), as the bot account. So it could try to pass ochell's gates itself: approve its own plan, take a label off to get into a lower tier, assign itself a ticket again, or close the ticket as if the work had been accepted. None of that works: **what the bot account does on a ticket is never taken as a person's word.**
@@ -545,7 +581,7 @@ An adapter holds what differs between agent CLIs: how a run is started, how an e
 `plain` works with any CLI that takes a prompt and prints an answer.
 
 **The `claude` adapter** (checked against Claude Code 2.1.311):
-- **Settings:** `adapter: claude` needs `prompt_via: stdin`. Keep your own flags in `agent.args`, for example `--permission-mode` or `--model`. ochell refuses to start when `args` holds a flag the adapter sets itself (`--output-format`, `--resume`, `--continue`, `--max-budget-usd`, `--max-turns`), or `--bare`, which makes Claude Code ignore the OAuth token.
+- **Settings:** `adapter: claude` needs `prompt_via: stdin`. Keep your own flags in `agent.args`, for example `--permission-mode` or `--model`. ochell refuses to start when `args` holds a flag the adapter sets itself (`--output-format`, `--resume`, `--continue`, `--max-budget-usd`, `--max-turns`, `--mcp-config`, `--strict-mcp-config`), or `--bare`, which makes Claude Code ignore the OAuth token.
 - **What the ticket gets:** the agent's final message, not the raw stream. The run log still has every event.
 - **What is stored** with each run: the message, the session id, the cost in USD and the token counts. See [Cost and budgets](#cost-and-budgets) for how the cost of a resumed run is worked out.
 - **Budget:** for a ticket whose tier has a budget, the adapter adds `--max-budget-usd` with what the ticket has left. `--max-budget-usd` must not be in `agent.args`.
@@ -661,7 +697,8 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:
 - the variables named in `agent.env_pass`, copied from ochell's environment when they are set. The default list is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), `SSL_CERT_FILE` and `SSL_CERT_DIR`;
 - `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL`, `ORCH_TASK_BRANCH`, `ORCH_TASK_TIER` (the ticket's [risk tier](#policy-and-risk-tiers)) and `ORCH_RESULT_FILE`, and `ORCH_TASK_REPO` when a repository is mapped to the ticket;
-- the variables set in `agent.env`.
+- the variables set in `agent.env`;
+- what the ticket's tier grants: `ORCH_MCP_CONFIG`, the tier's `env`, and its credentials (see [Tools and credentials per tier](#tools-and-credentials-per-tier)).
 
 Setting `env_pass` (or `--agent-env-pass`) replaces the default list. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, add that name to `env_pass`. Never add a variable that holds one of ochell's own secrets.
 

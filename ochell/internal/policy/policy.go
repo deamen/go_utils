@@ -70,6 +70,145 @@ type Tier struct {
 	// this tier: Jira accountIds, Linear user ids or email addresses.
 	// Empty: everyone who may send the agent a follow-up on the ticket.
 	Approvers []string `yaml:"approvers"`
+	// Grants are the tools and credentials that a run of this tier gets,
+	// on top of what every run has.
+	Grants Grants `yaml:"grants"`
+}
+
+// Grants are the tools and credentials of the runs of one tier.
+type Grants struct {
+	// MCPConfig is a file with the MCP servers of the tier, in the format
+	// of the agent CLI. The agent must be able to read it. A run of the
+	// tier gets these servers and no others.
+	MCPConfig string `yaml:"mcp_config"`
+	// Env is set in the agent's environment. It is not for secrets: with
+	// the systemd launcher other local users can read it.
+	Env map[string]string `yaml:"env"`
+	// CredentialsFile holds secrets as NAME=VALUE lines, which are put in
+	// the agent's environment without being visible to other users. The
+	// file is ochell's own: nobody else may read it.
+	CredentialsFile string `yaml:"credentials_file"`
+	// Mint is a command that ochell runs before each run of the tier, to
+	// get credentials that are made for that run: it prints NAME=VALUE
+	// lines. Revoke is the command that ochell runs when the run has
+	// ended, with those variables in its environment, to make them
+	// useless. Both are run by ochell itself, not as the agent.
+	Mint   []string `yaml:"mint"`
+	Revoke []string `yaml:"revoke"`
+}
+
+// Empty reports whether the tier grants nothing.
+func (g Grants) Empty() bool {
+	return g.MCPConfig == "" && len(g.Env) == 0 && g.CredentialsFile == "" && len(g.Mint) == 0
+}
+
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// validate checks what can be checked without looking at the file system.
+func (g Grants) validate(at string) []error {
+	var errs []error
+	for name, path := range map[string]string{"mcp_config": g.MCPConfig, "credentials_file": g.CredentialsFile} {
+		if path != "" && !filepath.IsAbs(path) {
+			errs = append(errs, fmt.Errorf("%s: grants.%s must be an absolute path", at, name))
+		}
+	}
+	for n := range g.Env {
+		switch {
+		case !envName.MatchString(n):
+			errs = append(errs, fmt.Errorf("%s: grants.env: %q is not a variable name", at, n))
+		case strings.HasPrefix(n, "ORCH_"):
+			errs = append(errs, fmt.Errorf("%s: grants.env: %s: names that start with ORCH_ are ochell's own", at, n))
+		}
+	}
+	for name, cmd := range map[string][]string{"mint": g.Mint, "revoke": g.Revoke} {
+		if len(cmd) > 0 && !filepath.IsAbs(cmd[0]) {
+			errs = append(errs, fmt.Errorf("%s: grants.%s: the command must be an absolute path", at, name))
+		}
+	}
+	if len(g.Revoke) > 0 && len(g.Mint) == 0 {
+		errs = append(errs, fmt.Errorf("%s: grants.revoke without grants.mint: there is nothing to revoke", at))
+	}
+	return errs
+}
+
+// ReadCredentials reads a credentials file: NAME=VALUE lines, with empty
+// lines and lines that start with # left out. It refuses a file that
+// anyone but its owner can read, or that belongs to another user than root
+// or the one ochell runs as: the agent must not get at the credentials of
+// another tier.
+func ReadCredentials(path string) ([]string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: not a regular file", path)
+	}
+	if err := checkOwner(path, info); err != nil {
+		return nil, err
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("%s: the file can be read or written by its group or by others (mode %04o); it holds secrets: chmod 600", path, info.Mode().Perm())
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCredentials(string(raw), path)
+}
+
+// ParseCredentials reads NAME=VALUE lines, as a credentials file and the
+// output of a mint command have them. from names the source in errors; a
+// value is never part of an error.
+func ParseCredentials(text, from string) ([]string, error) {
+	var out []string
+	for i, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, value, ok := strings.Cut(line, "=")
+		switch {
+		case !ok || !envName.MatchString(name):
+			return nil, fmt.Errorf("%s: line %d is not NAME=VALUE", from, i+1)
+		case strings.HasPrefix(name, "ORCH_"):
+			return nil, fmt.Errorf("%s: line %d: names that start with ORCH_ are ochell's own", from, i+1)
+		case value == "":
+			return nil, fmt.Errorf("%s: line %d: %s has no value", from, i+1, name)
+		case strings.ContainsFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f }):
+			return nil, fmt.Errorf("%s: line %d: the value of %s has a control character", from, i+1, name)
+		}
+		out = append(out, name+"="+value)
+	}
+	return out, nil
+}
+
+// checkGrants checks the files that the grants name. Load calls it; Parse
+// does not, so a policy can be parsed without its files.
+func (p *Policy) checkGrants() error {
+	var errs []error
+	for _, t := range p.Tiers {
+		g := t.Grants
+		if g.MCPConfig != "" {
+			if info, err := os.Stat(g.MCPConfig); err != nil || !info.Mode().IsRegular() {
+				errs = append(errs, fmt.Errorf("tier %s: grants.mcp_config %s is not a file that ochell can see (%v)", t.Name, g.MCPConfig, err))
+			}
+		}
+		if g.CredentialsFile != "" {
+			if _, err := ReadCredentials(g.CredentialsFile); err != nil {
+				errs = append(errs, fmt.Errorf("tier %s: grants.credentials_file: %w", t.Name, err))
+			}
+		}
+		for name, cmd := range map[string][]string{"mint": g.Mint, "revoke": g.Revoke} {
+			if len(cmd) == 0 {
+				continue
+			}
+			if info, err := os.Stat(cmd[0]); err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+				errs = append(errs, fmt.Errorf("tier %s: grants.%s: %s is not a program that ochell can run (%v)", t.Name, name, cmd[0], err))
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // MayApprove reports whether one of ids names someone who may approve a
@@ -159,6 +298,9 @@ func Load(path string) (*Policy, error) {
 	}
 	p, err := Parse(raw)
 	if err != nil {
+		return nil, fmt.Errorf("policy %s: %w", path, err)
+	}
+	if err := p.checkGrants(); err != nil {
 		return nil, fmt.Errorf("policy %s: %w", path, err)
 	}
 	p.File = path
@@ -255,6 +397,7 @@ func (p *Policy) Validate() error {
 				errs = append(errs, fmt.Errorf("%s: an empty entry in allowed_assigners", at))
 			}
 		}
+		errs = append(errs, t.Grants.validate(at)...)
 		for _, a := range t.Approvers {
 			if strings.TrimSpace(a) == "" {
 				errs = append(errs, fmt.Errorf("%s: an empty entry in approvers", at))
@@ -420,6 +563,22 @@ func (p *Policy) Describe() []string {
 		}
 		if n := len(t.AllowedAssigners); n > 0 {
 			line += fmt.Sprintf(" allowed_assigners=%d", n)
+		}
+		if g := t.Grants; !g.Empty() {
+			var what []string
+			if g.MCPConfig != "" {
+				what = append(what, "mcp_config")
+			}
+			if len(g.Env) > 0 {
+				what = append(what, "env")
+			}
+			if g.CredentialsFile != "" {
+				what = append(what, "credentials_file")
+			}
+			if len(g.Mint) > 0 {
+				what = append(what, "mint")
+			}
+			line += " grants=" + strings.Join(what, "+")
 		}
 		if n := len(t.Approvers); n > 0 {
 			line += fmt.Sprintf(" approvers=%d", n)

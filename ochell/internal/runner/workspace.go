@@ -123,11 +123,14 @@ func (r *Runner) hook(ctx context.Context, name string, t *task.Task, dir, unit 
 	start := time.Now()
 	fmt.Fprintf(out, "# ---- hook %s: %s (%d args) ----\n", name, argv[0], len(argv)-1)
 	spec := launcher.Spec{
-		TaskID:    unit + "." + name,
-		Command:   argv[0],
-		Args:      argv[1:],
-		Dir:       dir,
-		Env:       append(r.taskEnv(t), "ORCH_HOOK="+name),
+		TaskID:  unit + "." + name,
+		Command: argv[0],
+		Args:    argv[1:],
+		Dir:     dir,
+		// A hook gets what the run was granted: a clone needs the
+		// repository's credentials as much as the agent does.
+		Env:       append(append(r.taskEnv(t), r.grantOf(t.ID).env...), "ORCH_HOOK="+name),
+		Secrets:   r.grantOf(t.ID).secrets,
 		Inherited: r.inheritedEnv(),
 		Output:    out,
 		Timeout:   r.ws.cfg.HookTimeout,
