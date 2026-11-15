@@ -73,6 +73,10 @@ type Tier struct {
 	// Grants are the tools and credentials that a run of this tier gets,
 	// on top of what every run has.
 	Grants Grants `yaml:"grants"`
+	// Paused holds the tickets of this tier: none of them starts. It is
+	// the setting in the file; "ochell pause --tier" does the same on a
+	// running ochell.
+	Paused bool `yaml:"paused"`
 }
 
 // Grants are the tools and credentials of the runs of one tier.
@@ -271,9 +275,26 @@ type Policy struct {
 	DefaultTier string `yaml:"default_tier"`
 	// Rules are tried in order; the first that matches a ticket wins.
 	Rules []Rule `yaml:"rules"`
+	// Paused holds every ticket: no run starts. It is the setting in the
+	// file; "ochell pause" does the same on a running ochell.
+	Paused bool `yaml:"paused"`
+	// Throttles bound what ochell starts, over all tiers.
+	Throttles Throttles `yaml:"throttles"`
 
 	// File is where the policy was read from; empty for the built-in one.
 	File string `yaml:"-"`
+}
+
+// Throttles hold new runs back when a limit is reached. Runs that are
+// going on are not touched. 0 means no limit.
+type Throttles struct {
+	// MaxRunsPerHour is how many runs may start within one hour.
+	MaxRunsPerHour int `yaml:"max_runs_per_hour"`
+	// MaxOpenPRsPerRepo is how many pull requests of the bot may be open
+	// in one repository. A ticket that would open another one is held.
+	MaxOpenPRsPerRepo int `yaml:"max_open_prs_per_repo"`
+	// DailySpendUSD is what the runs of one day (UTC) may cost in total.
+	DailySpendUSD float64 `yaml:"daily_spend_usd"`
 }
 
 // Builtin is the policy of an ochell that has no policy file: one tier,
@@ -351,6 +372,9 @@ func (p *Policy) Validate() error {
 	}
 	if strings.ContainsAny(p.Version, " \t\n\r") || len(p.Version) > 64 {
 		errs = append(errs, errors.New("version must be one word of at most 64 characters"))
+	}
+	if th := p.Throttles; th.MaxRunsPerHour < 0 || th.MaxOpenPRsPerRepo < 0 || th.DailySpendUSD < 0 {
+		errs = append(errs, errors.New("throttles: a limit must not be negative; 0 means no limit"))
 	}
 	seen := map[string]bool{}
 	labels := map[string]string{}
@@ -582,6 +606,9 @@ func (p *Policy) Describe() []string {
 		}
 		if n := len(t.Approvers); n > 0 {
 			line += fmt.Sprintf(" approvers=%d", n)
+		}
+		if t.Paused {
+			line += " paused"
 		}
 		if t.Name == p.DefaultTier {
 			line += " (default)"

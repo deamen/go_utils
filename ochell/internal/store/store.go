@@ -184,6 +184,32 @@ type Store struct {
 	now func() time.Time
 	// policyVersion is recorded with every run that starts.
 	policyVersion atomic.Value
+	// holds are the pauses and throttles of the policy file.
+	holds atomic.Value
+}
+
+// Holds are the settings of the policy file that keep runs from starting.
+// A zero limit is no limit.
+type Holds struct {
+	// Paused holds everything, and PausedTiers the tickets of these tiers.
+	Paused      bool
+	PausedTiers []string
+	// MaxRunsPerHour is how many runs may start within one hour.
+	MaxRunsPerHour int
+	// MaxOpenPRsPerRepo is how many pull requests of the bot may be open
+	// in one repository.
+	MaxOpenPRsPerRepo int
+	// DailySpendUSD is what the runs of one day (UTC) may cost in total.
+	DailySpendUSD float64
+}
+
+// SetHolds sets the pauses and throttles of the policy file. Claim keeps
+// to them from now on.
+func (s *Store) SetHolds(h Holds) { s.holds.Store(h) }
+
+func (s *Store) policyHolds() Holds {
+	h, _ := s.holds.Load().(Holds)
+	return h
 }
 
 // SetPolicyVersion sets the version of the policy that is in force. It is
@@ -591,6 +617,101 @@ func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 
 const settingPaused = "paused"
 
+// settingPausedTier is the prefix of the setting that pauses one tier.
+const settingPausedTier = "paused:tier:"
+
+// SetTierPaused pauses the tickets of one tier, or ends that pause. While
+// it is set, Claim hands out no run of a ticket in that tier. Like the
+// pause of everything, it is kept across a restart.
+func (s *Store) SetTierPaused(tier string, paused bool) error {
+	if !paused {
+		_, err := s.db.Exec(`DELETE FROM settings WHERE key = ?`, settingPausedTier+tier)
+		return err
+	}
+	_, err := s.db.Exec(`INSERT INTO settings (key, value) VALUES (?, '1') ON CONFLICT (key) DO NOTHING`, settingPausedTier+tier)
+	return err
+}
+
+// pausedTiers returns the tiers that a command paused.
+func pausedTiers(q interface {
+	Query(string, ...any) (*sql.Rows, error)
+}) ([]string, error) {
+	rows, err := q.Query(`SELECT key FROM settings WHERE key LIKE ? ORDER BY key`, settingPausedTier+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tiers []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		tiers = append(tiers, strings.TrimPrefix(k, settingPausedTier))
+	}
+	return tiers, rows.Err()
+}
+
+// Holding is what keeps runs from starting right now.
+type Holding struct {
+	// Paused: a command paused everything. PolicyPaused: the policy file
+	// does.
+	Paused, PolicyPaused bool
+	// Tiers are the tiers that a command paused, and PolicyTiers the ones
+	// that the policy file pauses.
+	Tiers, PolicyTiers []string
+	// Throttles says, for each throttle that holds everything now, which
+	// one and why.
+	Throttles []string
+}
+
+// All reports whether no run at all can start.
+func (h Holding) All() bool { return h.Paused || h.PolicyPaused || len(h.Throttles) > 0 }
+
+// Holding reports what keeps runs from starting right now.
+func (s *Store) Holding() (Holding, error) {
+	var h Holding
+	err := s.tx(func(tx *sql.Tx) error {
+		var err error
+		h, err = s.holding(tx)
+		return err
+	})
+	return h, err
+}
+
+func (s *Store) holding(tx *sql.Tx) (Holding, error) {
+	pol := s.policyHolds()
+	h := Holding{PolicyPaused: pol.Paused, PolicyTiers: pol.PausedTiers}
+	var err error
+	if h.Paused, err = paused(tx); err != nil {
+		return h, err
+	}
+	if h.Tiers, err = pausedTiers(tx); err != nil {
+		return h, err
+	}
+	now := s.now()
+	if pol.MaxRunsPerHour > 0 {
+		var n int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM runs WHERE started_at IS NOT NULL AND started_at > ?`, ms(now.Add(-time.Hour))).Scan(&n); err != nil {
+			return h, err
+		}
+		if n >= pol.MaxRunsPerHour {
+			h.Throttles = append(h.Throttles, fmt.Sprintf("max_runs_per_hour: %d runs started in the last hour, the limit is %d", n, pol.MaxRunsPerHour))
+		}
+	}
+	if pol.DailySpendUSD > 0 {
+		var spent float64
+		if err := tx.QueryRow(`SELECT COALESCE(SUM(cost_usd), 0) FROM runs WHERE started_at IS NOT NULL AND started_at >= ?`,
+			ms(now.UTC().Truncate(24*time.Hour))).Scan(&spent); err != nil {
+			return h, err
+		}
+		if spent >= pol.DailySpendUSD {
+			h.Throttles = append(h.Throttles, fmt.Sprintf("daily_spend_usd: the runs of today (UTC) have cost %.2f USD, the limit is %.2f", spent, pol.DailySpendUSD))
+		}
+	}
+	return h, nil
+}
+
 // SetPaused sets the pause flag. While it is set, Claim hands out no run:
 // queued runs stay queued, and running ones go on. The flag is kept across
 // a restart.
@@ -779,6 +900,36 @@ func (s *Store) SetTier(source, key, tier string) error {
 	return nil
 }
 
+// openPRs counts the pull requests of the bot that are open in the
+// repository of the ticket t: the ones of tickets that are neither done
+// nor cancelled. ochell does not ask the code host; a pull request counts
+// as open until its ticket is closed.
+const openPRs = `SELECT COUNT(DISTINCT o.pr_url) FROM tickets o
+	WHERE o.repo = t.repo AND o.pr_url != '' AND o.state NOT IN ('done', 'cancelled')`
+
+// HeldByPRs returns the repositories in which a queued ticket waits
+// because max pull requests of the bot are open there.
+func (s *Store) HeldByPRs(max int) ([]string, error) {
+	if max <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`SELECT DISTINCT t.repo FROM runs r JOIN tickets t USING (source, key)
+		WHERE r.status = ? AND t.repo != '' AND t.pr_url = '' AND (`+openPRs+`) >= ? ORDER BY t.repo`, runQueued, max)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var repos []string
+	for rows.Next() {
+		var r string
+		if err := rows.Scan(&r); err != nil {
+			return nil, err
+		}
+		repos = append(repos, r)
+	}
+	return repos, rows.Err()
+}
+
 // Claim takes the oldest queued run that may start and marks it, and its
 // ticket, as running. It returns nil when nothing is queued or every queued
 // run still waits for its time (a retry with backoff), and while the pause
@@ -792,11 +943,26 @@ func (s *Store) Claim() (*task.Task, error) {
 	now := ms(s.now())
 	var t *task.Task
 	err := s.tx(func(tx *sql.Tx) error {
-		if held, err := paused(tx); err != nil || held {
+		hold, err := s.holding(tx)
+		if err != nil || hold.All() {
 			return err
 		}
+		// The oldest queued run whose time has come, of a ticket that is
+		// not in a paused tier and would not open one pull request too many
+		// in its repository. A ticket that has a pull request already
+		// works on that one.
+		query := `SELECT r.id FROM runs r JOIN tickets t USING (source, key) WHERE r.status = ? AND r.not_before <= ?`
+		args := []any{runQueued, now}
+		for _, tier := range append(append([]string{}, hold.Tiers...), hold.PolicyTiers...) {
+			query += ` AND t.tier != ?`
+			args = append(args, tier)
+		}
+		if max := s.policyHolds().MaxOpenPRsPerRepo; max > 0 {
+			query += ` AND (t.repo = '' OR t.pr_url != '' OR (` + openPRs + `) < ?)`
+			args = append(args, max)
+		}
 		var id string
-		err := tx.QueryRow(`SELECT id FROM runs WHERE status = ? AND not_before <= ? ORDER BY received_at, rowid LIMIT 1`, runQueued, now).Scan(&id)
+		err = tx.QueryRow(query+` ORDER BY r.received_at, r.rowid LIMIT 1`, args...).Scan(&id)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}

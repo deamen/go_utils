@@ -224,6 +224,9 @@ func (r *Runner) Closed(source, key string) error {
 		return err
 	}
 	r.log.Info("ticket closed in the tracker", "source", source, "key", key, "state", tk.State)
+	// A closed ticket no longer counts as an open pull request: a ticket
+	// that the throttle held may start now.
+	r.wakeWorker()
 	if r.ws.cfg.Cleanup && r.ws.root != "" && (tk.Workspace != "" || tk.PreparedWorkspace != "") {
 		r.wg.Add(1)
 		go func() {

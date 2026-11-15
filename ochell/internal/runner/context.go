@@ -29,6 +29,10 @@ const planNote = `This ticket needs a plan that a person has approved before any
 // approvedNote is for the run that follows the approval of the plan.
 const approvedNote = "Your plan for this ticket was approved by %s. Carry it out now, verify the result, and report as usual. If it turns out that the plan cannot be followed as it is, stop and report that with the status \"needs_input\"; do not do something else instead."
 
+// killedNote is for the run that takes the place of one that an operator's
+// kill switch stopped.
+const killedNote = "An operator of the orchestrator stopped every running agent, and your run on this ticket was cut off before it ended. The orchestrator was resumed and started this attempt. You may have done part of the work already: check git, the pull request and the ticket's comments before you repeat anything that has an effect outside the working directory."
+
 // runContext is the part of the prompt that says what only ochell knows
 // about this run: which attempt it is and whether it continues the earlier
 // session, what the earlier attempts left behind, and the comment that
@@ -57,6 +61,8 @@ func runContext(t *task.Task, resumed bool) string {
 		lines = append(lines, fmt.Sprintf(approvedNote, by))
 	case task.CauseRecovery:
 		lines = append(lines, recoveryNote)
+	case task.CauseKilled:
+		lines = append(lines, killedNote)
 	case task.CauseRetry:
 		lines = append(lines, retryNote)
 	case task.CauseStalled:
