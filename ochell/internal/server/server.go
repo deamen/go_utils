@@ -64,6 +64,9 @@ type Submitter interface {
 	ActiveTickets(source string) ([]string, error)
 	// Tier returns the risk tier recorded for a ticket, or "".
 	Tier(source, key string) (string, error)
+	// TierChanged gives a ticket that ochell knows a higher tier. stopped:
+	// its agent was running under the lower one, and is being stopped.
+	TierChanged(source, key, tier string) (stopped bool, err error)
 	// Assigner returns who last assigned a ticket to the bot, as the
 	// source named them, or "". known: ochell has seen the ticket.
 	Assigner(source, key string) (assigner string, known bool, err error)
@@ -544,6 +547,52 @@ func (s *Server) admit(t *task.Task, a attrs, log *slog.Logger) (submitResult, i
 	}
 }
 
+// updated handles the tracker's report that a ticket changed, and writes
+// the HTTP response. What matters is whether the ticket now belongs in a
+// higher tier than ochell has for it, for example because someone added a
+// label. A ticket that ochell does not know is nobody's business here, and
+// nothing lowers a tier.
+func (s *Server) updated(w http.ResponseWriter, source, key string, a attrs, log *slog.Logger) {
+	if !validKey.MatchString(key) {
+		reply(w, http.StatusOK, "ignored")
+		return
+	}
+	had, err := s.runner.Tier(source, key)
+	if err != nil {
+		log.Error("cannot read the tier of the ticket", "key", key, "err", err)
+		reply(w, http.StatusServiceUnavailable, "cannot read the ticket")
+		return
+	}
+	if had == "" {
+		log.Debug("ignored: an update of a ticket that ochell does not hold", "key", key)
+		reply(w, http.StatusOK, "ignored")
+		return
+	}
+	t := &task.Task{Source: source, Key: key}
+	if len(s.cfg.Repos) > 0 {
+		t.Repo, _ = s.cfg.RepoFor(source, key, a.labels)
+	}
+	tier, why, err := s.tierFor(t, a)
+	if err != nil || tier == had {
+		reply(w, http.StatusOK, "ignored")
+		return
+	}
+	switch stopped, err := s.runner.TierChanged(source, key, tier); {
+	case err == nil && stopped:
+		log.Warn("the ticket moved to a higher tier during its run; the run is being stopped", "key", key, "from", had, "tier", tier, "tier_from", why)
+		reply(w, http.StatusOK, "tier of "+key+" raised to "+tier+"; its run is being stopped")
+	case err == nil:
+		log.Info("the ticket moved to a higher tier", "key", key, "from", had, "tier", tier, "tier_from", why)
+		reply(w, http.StatusOK, "tier of "+key+" raised to "+tier)
+	case errors.Is(err, store.ErrUnknown):
+		reply(w, http.StatusOK, "ignored")
+	default:
+		// 503 makes the tracker send the event again.
+		log.Error("cannot raise the tier of the ticket", "key", key, "err", err)
+		reply(w, http.StatusServiceUnavailable, "cannot raise the tier")
+	}
+}
+
 // stop ends the work on a ticket for a person and writes the HTTP response.
 // It reports whether there was something to stop; the ticket is then told
 // by the runner, through Finished. keys are the de-duplication keys of the
@@ -633,6 +682,10 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 		if c, cerr := jira.ParseComment(body); !errors.Is(cerr, jira.ErrIgnored) {
 			s.jiraCommented(w, c, cerr, deliveryKeys("jira", delivery, body), delivery, log)
+			return
+		}
+		if u, ok := jira.ParseUpdated(body); ok {
+			s.updated(w, "jira", u.Key, attrs{labels: u.Labels, issueType: u.IssueType}, log)
 			return
 		}
 		log.Debug("ignored", "reason", err)
@@ -835,6 +888,10 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 		}
 		if key, ok := ev.Undelegated(); ok && validKey.MatchString(key) {
 			s.stop(w, "linear", key, "someone who took the issue away from the digital employee", nil, log)
+			return
+		}
+		if key, labels, ok := ev.Updated(); ok {
+			s.updated(w, "linear", key, attrs{labels: labels}, log)
 			return
 		}
 		log.Debug("ignored", "reason", err)
@@ -1162,9 +1219,9 @@ func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) er
 		// session.
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityResponse, cancelledText(t, res))
 	}
-	if res.Outcome == task.OutcomeOverBudget {
+	if res.Escalation != "" {
 		// The ticket waits for a human: a question, not an error.
-		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityElicitation, overBudgetText(t, res))
+		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityElicitation, escalationText(t, res))
 	}
 	if res.Err != nil {
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityError,
@@ -1236,21 +1293,41 @@ func cancelledText(t *task.Task, res task.Result) string {
 	return what + ". The digital employee no longer works on " + t.Key + ", and messages on it start nothing. " + again
 }
 
-// overBudgetText is what a ticket is told when it has used up the budget
-// of its tier: what happened (res.Err), and who can do what about it. A
-// message on the ticket cannot raise a budget; an operator can start a new
-// one.
-func overBudgetText(t *task.Task, res task.Result) string {
-	what := "The ticket has used up its budget"
-	if res.Err != nil {
-		what = strings.ToUpper(res.Err.Error()[:1]) + res.Err.Error()[1:]
+// escalationText is what a ticket is told when an escalation stopped it:
+// what happened, that it now waits for a human and under which tier, and
+// what a human can do: let it go on, change what is asked, or cancel it.
+func escalationText(t *task.Task, res task.Result) string {
+	var what string
+	switch res.Escalation {
+	case task.EscalationLowConfidence, task.EscalationOutOfScope:
+		// The agent said so itself; its words are the cause.
+		_, what = signalActivity(res)
+	default:
+		what = "The digital employee stopped work on " + t.Key
+		if res.Err != nil {
+			what = strings.ToUpper(res.Err.Error()[:1]) + res.Err.Error()[1:] + "."
+		}
 	}
-	again := "a comment on this ticket"
+	b := strings.Builder{}
+	b.WriteString(strings.TrimSpace(what))
+	fmt.Fprintf(&b, "\n\nThis is an escalation (%s): %s now waits for a human.", res.Escalation, t.Key)
+	if res.TierAfter != "" {
+		fmt.Fprintf(&b, " It moved up from the risk tier %q to %q, and its next run is under that tier.", res.TierBefore, res.TierAfter)
+	}
+	reply, cancel := "comment on this ticket", "write "+stopCommand+" as the first line of a comment, or take the ticket away from the digital employee"
 	if t.Source == "linear" {
-		again = "a reply here"
+		reply, cancel = "reply here", "send the stop signal, or take the issue away from the digital employee"
 	}
-	return fmt.Sprintf("%s. %s now waits for a human. Someone who looks after the orchestrator has to look at it: \"ochell cost %s %s\" shows what it has cost, and \"ochell reset %s %s\" gives it a new budget. After that, %s lets the digital employee go on where it stopped.",
-		what, t.Key, t.Source, t.Key, t.Source, t.Key, again)
+	fmt.Fprintf(&b, "\n- To let it go on where it stopped: %s. The agent's session is kept.", reply)
+	fmt.Fprintf(&b, "\n- To change what it should do: change the ticket, and say so when you %s.", reply)
+	fmt.Fprintf(&b, "\n- To cancel: %s.", cancel)
+	switch res.Escalation {
+	case task.EscalationBudget:
+		fmt.Fprintf(&b, "\n\nA message cannot raise a budget. If the ticket has nothing left under its tier, someone who looks after the orchestrator has to give it a new budget first: \"ochell cost %s %s\" shows what it has cost, \"ochell reset %s %s\" starts the budget anew.", t.Source, t.Key, t.Source, t.Key)
+	case task.EscalationRetries:
+		b.WriteString("\n\nA message from a person starts the ticket's count of attempts anew.")
+	}
+	return b.String()
 }
 
 // failureText says why a run did not succeed. It goes by the outcome: the

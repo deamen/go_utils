@@ -23,7 +23,7 @@ type Claude struct{}
 
 // claudeOwned are the flags this adapter sets itself; --bare makes Claude
 // Code ignore the OAuth token. None of them may be in agent.args.
-var claudeOwned = []string{"--output-format", "--resume", "-r", "--continue", "-c", "--bare", "--max-budget-usd"}
+var claudeOwned = []string{"--output-format", "--resume", "-r", "--continue", "-c", "--bare", "--max-budget-usd", "--max-turns"}
 
 // checkClaudeArgs refuses configured arguments that the adapter must own.
 func checkClaudeArgs(args []string) error {
@@ -48,6 +48,9 @@ func (Claude) command(run Run, extra ...string) Command {
 	if run.BudgetUSD > 0 {
 		args = append(args, "--max-budget-usd", strconv.FormatFloat(max(run.BudgetUSD, minBudget), 'f', 4, 64))
 	}
+	if run.MaxTurns > 0 {
+		args = append(args, "--max-turns", strconv.Itoa(run.MaxTurns))
+	}
 	return Command{Args: append(args, extra...), Stdin: strings.NewReader(run.Prompt)}
 }
 
@@ -65,6 +68,8 @@ const minBudget = 0.0001
 //     above it, by at most one call;
 //   - the run then ends with a result event of the subtype
 //     error_max_budget_usd, with is_error set and no result text;
+//   - a run that reaches --max-turns ends the same way, with the subtype
+//     error_max_turns;
 //   - total_cost_usd of a result event is the cost of the whole session,
 //     earlier runs included; usage counts the tokens of the run alone.
 func (Claude) LimitsBudget() bool { return true }
@@ -207,6 +212,7 @@ func (o *claudeOutput) event(line []byte) {
 		o.rep.Message = ev.Result
 		o.rep.CostUSD, o.rep.CostIsSessionTotal = ev.CostUSD, true
 		o.rep.OverBudget = ev.Subtype == "error_max_budget_usd"
+		o.rep.OverTurns = ev.Subtype == "error_max_turns"
 		if u := ev.Usage; u != nil {
 			o.rep.Usage = Usage{InputTokens: u.Input, OutputTokens: u.Output, CacheReadTokens: u.CacheRead, CacheWriteTokens: u.CacheWrite}
 		}

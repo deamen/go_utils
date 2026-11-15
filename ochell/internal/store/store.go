@@ -164,6 +164,12 @@ var migrations = []string{
 	// runs.cost_usd is the cost of the run alone.
 	`ALTER TABLE runs ADD COLUMN session_cost_usd REAL NOT NULL DEFAULT 0;
 	ALTER TABLE tickets ADD COLUMN cost_base REAL NOT NULL DEFAULT 0;`,
+
+	// Version 16: the escalation that a run ended with, if any.
+	// A message that an escalation kept back goes with the ticket's next
+	// run, whenever that starts.
+	`ALTER TABLE runs ADD COLUMN escalation TEXT NOT NULL DEFAULT '';
+	ALTER TABLE followups ADD COLUMN held INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Store is safe for concurrent use.
@@ -307,6 +313,16 @@ func attemptsLeft(tx *sql.Tx, source, key string, max int) (bool, error) {
 	return used < max, err
 }
 
+// AttemptsLeft reports whether a ticket may have another run under the
+// attempt cap max (0: no cap).
+func (s *Store) AttemptsLeft(source, key string, max int) (left bool, err error) {
+	err = s.tx(func(tx *sql.Tx) error {
+		left, err = attemptsLeft(tx, source, key, max)
+		return err
+	})
+	return left, err
+}
+
 // queueFull reports whether max runs (0: no limit) are already waiting.
 func queueFull(tx *sql.Tx, max int) (bool, error) {
 	if max <= 0 {
@@ -426,9 +442,14 @@ const maxWaitingMessages = 50
 
 // takeFollowUps removes and returns the messages that wait for the next
 // run of a ticket, oldest first, and the tracker session of the last one
-// that names one.
-func takeFollowUps(tx *sql.Tx, source, key string) (bodies []string, session string, err error) {
-	rows, err := tx.Query(`SELECT body, tracker_session FROM followups WHERE source = ? AND key = ? ORDER BY id`, source, key)
+// that names one. With held it takes only the messages that an escalation
+// kept back.
+func takeFollowUps(tx *sql.Tx, source, key string, held bool) (bodies []string, session string, err error) {
+	only := ""
+	if held {
+		only = " AND held = 1"
+	}
+	rows, err := tx.Query(`SELECT body, tracker_session FROM followups WHERE source = ? AND key = ?`+only+` ORDER BY id`, source, key)
 	if err != nil {
 		return nil, "", err
 	}
@@ -446,7 +467,7 @@ func takeFollowUps(tx *sql.Tx, source, key string) (bodies []string, session str
 	if err := rows.Close(); err != nil {
 		return nil, "", err
 	}
-	_, err = tx.Exec(`DELETE FROM followups WHERE source = ? AND key = ?`, source, key)
+	_, err = tx.Exec(`DELETE FROM followups WHERE source = ? AND key = ?`+only, source, key)
 	return bodies, session, err
 }
 
@@ -742,6 +763,18 @@ func (s *Store) Claim() (*task.Task, error) {
 		if _, err := tx.Exec(`UPDATE tickets SET attempts = attempts + 1 WHERE source = ? AND key = ?`, source, key); err != nil {
 			return err
 		}
+		// Messages that an escalation left waiting go with this run, before
+		// what the run itself was asked.
+		if waiting, session, err := takeFollowUps(tx, source, key, true); err != nil {
+			return err
+		} else if len(waiting) > 0 {
+			sep := task.CommentSeparator
+			if _, err := tx.Exec(`UPDATE runs SET comment = CASE WHEN comment != '' THEN ? || ? || comment ELSE ? END,
+					tracker_session = CASE WHEN tracker_session != '' THEN tracker_session ELSE ? END
+				WHERE id = ?`, strings.Join(waiting, sep), sep, strings.Join(waiting, sep), session, id); err != nil {
+				return err
+			}
+		}
 		version, _ := s.policyVersion.Load().(string)
 		if _, err := tx.Exec(`UPDATE runs SET status = ?, started_at = ?, policy_version = ?,
 			attempt = (SELECT attempts FROM tickets t WHERE t.source = runs.source AND t.key = runs.key),
@@ -814,7 +847,16 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result, again *Again) (ne
 			again = nil
 		}
 	}
-	waiting, waitingSession, err := takeFollowUps(tx, source, key)
+	if res.Escalation != "" && res.Outcome != task.OutcomeCancelled {
+		// An escalation stops the ticket: nothing follows by itself, not
+		// another try and not a run for the messages that arrived during
+		// this one. They stay, and go with the ticket's next run (Claim).
+		if _, err := tx.Exec(`UPDATE followups SET held = 1 WHERE source = ? AND key = ?`, source, key); err != nil {
+			return "", err
+		}
+		return "", s.move(tx, source, key, ticket.Waiting, ticket.ReasonEscalation)
+	}
+	waiting, waitingSession, err := takeFollowUps(tx, source, key, false)
 	if err != nil {
 		return "", err
 	}
@@ -895,11 +937,11 @@ func (s *Store) end(tx *sql.Tx, id string, res task.Result) error {
 	r, err := tx.Exec(`UPDATE runs SET status = ?, ended_at = ?, outcome = ?, exit_code = ?, error = ?, log_file = ?,
 			workdir = ?, resumed = ?, agent_session = ?, message = ?, cost_usd = ?,
 			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
-			signal = ?, signal_message = ?, pr_url = ?, branch = ?, session_cost_usd = ?
+			signal = ?, signal_message = ?, pr_url = ?, branch = ?, session_cost_usd = ?, escalation = ?
 		WHERE id = ? AND status != ?`, runEnded, now, string(res.Outcome), exit, msg, res.LogFile,
 		res.Workdir, res.Resumed, res.SessionID, res.Message, res.CostUSD,
 		res.Usage.InputTokens, res.Usage.OutputTokens, res.Usage.CacheReadTokens, res.Usage.CacheWriteTokens,
-		res.Signal, res.SignalMessage, res.PRURL, res.Branch, res.SessionCostUSD,
+		res.Signal, res.SignalMessage, res.PRURL, res.Branch, res.SessionCostUSD, res.Escalation,
 		id, runEnded)
 	if err != nil {
 		return err
@@ -1209,12 +1251,12 @@ func (s *Store) Run(id string) (*Run, error) {
 	res := &r.Result
 	err := s.db.QueryRow(`SELECT source, key, status, attempt, tier, policy_version, outcome, exit_code, error, log_file,
 			workdir, resumed, agent_session, message, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			signal, signal_message, pr_url, branch, session_cost_usd
+			signal, signal_message, pr_url, branch, session_cost_usd, escalation
 		FROM runs WHERE id = ?`, id).
 		Scan(&r.Source, &r.Key, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &outcome, &exit, &msg, &res.LogFile,
 			&res.Workdir, &res.Resumed, &res.SessionID, &res.Message, &res.CostUSD,
 			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
-			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD)
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD, &res.Escalation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

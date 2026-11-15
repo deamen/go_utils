@@ -591,6 +591,61 @@ func (o *Ochell) JiraAssigned(key, summary string) Response {
 	})
 }
 
+// JiraUpdated sends a signed Jira system webhook: something on the ticket
+// changed that is not its assignee, such as its labels (Ochell.Labels) or
+// its issue type (Ochell.IssueType).
+func (o *Ochell) JiraUpdated(key string) Response {
+	o.t.Helper()
+	fields := map[string]any{
+		"summary":  "Summary of " + key,
+		"assignee": map[string]string{"accountId": BotAccountID},
+		"labels":   o.Labels,
+	}
+	if o.IssueType != "" {
+		fields["issuetype"] = map[string]string{"name": o.IssueType}
+	}
+	body, err := json.Marshal(map[string]any{
+		"timestamp":    time.Now().UnixMilli(),
+		"webhookEvent": "jira:issue_updated",
+		"user":         map[string]string{"accountId": o.actor(), "displayName": "Someone"},
+		"issue": map[string]any{
+			"id": "10042", "key": key,
+			"self":   "https://example.atlassian.net/rest/api/2/issue/10042",
+			"fields": fields,
+		},
+		"changelog": map[string]any{"items": []map[string]any{
+			{"field": "labels", "fieldId": "labels", "fromString": "", "toString": strings.Join(o.Labels, " ")},
+		}},
+	})
+	if err != nil {
+		o.t.Fatal(err)
+	}
+	return o.Post(o.Config.Sources.JiraWebhook.Path, body, map[string]string{
+		"X-Hub-Signature":                "sha256=" + auth.SignHex(JiraSecret, body),
+		"X-Atlassian-Webhook-Identifier": nextDelivery(),
+	})
+}
+
+// LinearUpdated sends a signed Linear "Issue" update: something on the
+// issue changed, such as its labels (Ochell.Labels).
+func (o *Ochell) LinearUpdated(key string) Response {
+	o.t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"type": "Issue", "action": "update",
+		"organizationId":   "org-0000",
+		"data":             map[string]any{"identifier": key, "labels": linearLabels(o.Labels)},
+		"updatedFrom":      map[string]any{"labelIds": []string{}},
+		"webhookTimestamp": time.Now().UnixMilli(),
+	})
+	if err != nil {
+		o.t.Fatal(err)
+	}
+	return o.Post(o.Config.Sources.Linear.Path, body, map[string]string{
+		"Linear-Signature": auth.SignHex(LinearSecret, body),
+		"Linear-Delivery":  nextDelivery(),
+	})
+}
+
 // JiraResolved sends a signed Jira system webhook: the ticket was resolved.
 func (o *Ochell) JiraResolved(key string) Response {
 	o.t.Helper()

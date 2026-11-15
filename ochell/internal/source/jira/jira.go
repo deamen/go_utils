@@ -171,6 +171,24 @@ func actor(u *User) string {
 	return u.AccountID
 }
 
+// ParseUpdated returns the issue of a jira:issue_updated event, with the
+// labels and the issue type it has now. Such an event can mean that the
+// ticket belongs in another tier.
+func ParseUpdated(body []byte) (*Ticket, bool) {
+	var ev WebhookEvent
+	if json.Unmarshal(body, &ev) != nil || ev.WebhookEvent != "jira:issue_updated" || ev.Issue == nil || ev.Issue.Key == "" {
+		return nil, false
+	}
+	return &Ticket{
+		Key:       ev.Issue.Key,
+		Summary:   ev.Issue.Fields.Summary,
+		URL:       BrowseURL(ev.Issue.Self, ev.Issue.Key),
+		Labels:    ev.Issue.Fields.labels(),
+		IssueType: ev.Issue.Fields.issueType(),
+		Actor:     actor(ev.User),
+	}, true
+}
+
 // ParseClosed reports whether a webhook payload says that an issue was
 // closed, and returns its key: the issue was deleted, or it was resolved
 // (its changelog sets the resolution). A workflow that closes issues

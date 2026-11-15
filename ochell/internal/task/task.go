@@ -95,7 +95,32 @@ type Task struct {
 	// BudgetUSD is what this run may cost: what the ticket has left of the
 	// budget of its tier. The runner sets it; 0: no limit.
 	BudgetUSD float64
+	// MaxTurns is how many turns this run may take, from its tier; 0: no
+	// limit. The runner sets it.
+	MaxTurns int
 }
+
+// Escalation says which trigger stopped a ticket and left it waiting for a
+// human. Each one fires before the work goes on: the run is stopped, or
+// not started, and nothing follows by itself.
+type Escalation string
+
+const (
+	// EscalationBudget: the ticket used up the budget of its tier.
+	EscalationBudget Escalation = "budget"
+	// EscalationTurns: the run reached the turn limit of its tier.
+	EscalationTurns Escalation = "turns"
+	// EscalationRetries: the run failed for a temporary reason again, and
+	// the ticket has no attempt left for another try.
+	EscalationRetries Escalation = "retries"
+	// EscalationTierChange: the ticket moved to a higher tier while the
+	// agent was working on it.
+	EscalationTierChange Escalation = "tier_change"
+	// EscalationLowConfidence and EscalationOutOfScope: the agent said so
+	// itself, in its result file.
+	EscalationLowConfidence Escalation = "low_confidence"
+	EscalationOutOfScope    Escalation = "out_of_scope"
+)
 
 // Outcome says why a run ended. ochell sets it from its own record of what
 // it asked for; the exit code alone cannot tell a stopped run from a
@@ -122,6 +147,9 @@ const (
 	// The agent was stopped when the run reached it, or was not started
 	// because nothing was left.
 	OutcomeOverBudget Outcome = "over_budget"
+	// OutcomeOverTurns: the agent was stopped at the turn limit of the
+	// ticket's tier.
+	OutcomeOverTurns Outcome = "over_turns"
 	// OutcomeNotStarted: the agent never ran.
 	OutcomeNotStarted Outcome = "not_started"
 	// OutcomeInterrupted: ochell itself stopped while the agent was running,
@@ -159,6 +187,12 @@ type Result struct {
 	SignalMessage string
 	PRURL         string
 	Branch        string
+	// Escalation is set when a trigger stopped the ticket: it now waits
+	// for a human, whatever the outcome says. TierBefore and TierAfter are
+	// set when the escalation moved the ticket to a higher tier.
+	Escalation Escalation
+	TierBefore string
+	TierAfter  string
 	// Next is set when ochell has queued another run of the ticket in
 	// place of this one, and says why. The ticket is then not waiting for
 	// anyone.

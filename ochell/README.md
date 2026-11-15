@@ -92,7 +92,7 @@ ochell starts a ticket again by itself in two cases. Both count as an attempt, s
 
 - **A failure that is not the task's own.** A run that failed and whose final message matches one of `agent.retry.patterns` (with the `plain` adapter: the last 4 KB of its output) failed for a temporary reason. The default patterns are a rate limit, "overloaded", an API error 429 or 5xx, a gateway error and a broken connection. The ticket is queued again and starts after a wait: `retry.backoff` (1m) after the first attempt, doubled with each further attempt of the ticket, up to `retry.max_backoff` (30m).
   - A failed run that matches no pattern is a task failure and is not retried: the ticket is `failed`.
-  - When the attempts are used up, the ticket is `failed`, and gets the error of the last run.
+  - When the attempts are used up, that is an [escalation](#escalation): the ticket waits for a human, and is told the error of the last run.
   - `patterns: []` turns the retry off. The default patterns were not checked against what Claude Code prints for each of these errors; look at a failed run's log and add what you see.
   - With the `claude` adapter, a run whose result event says `is_error` counts as failed even when the process exits with status 0.
 - **A stalled agent.** With `agent.stall_timeout` set, an agent that wrote no output for that long is stopped, with all its processes, and the ticket is started again after the same wait. After the last attempt the ticket waits for a human with the reason `stalled`.
@@ -297,6 +297,7 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
   | `pr_review` | `required`, `sampled` | `required` |
   | `auto_merge` | `never`, `after_ci` | `never` |
   | `budget_usd` | what one ticket may cost; `0`: no limit | `0` |
+  | `max_turns` | how many turns one run may take; `0`: no limit. Needs the `claude` adapter | `0` |
   | `labels` | labels that raise a ticket to this tier | none |
   | `allowed_assigners` | who may assign work of this tier | everyone whom the source allows |
 
@@ -315,6 +316,38 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
 - **`ochell policy-check --config config.yaml`** reads the file as `serve` does and prints the tiers. Use it in the review of a change, or with `--policy-file` on a file that is not installed yet.
 - **A change takes effect at the next start** of ochell. Tickets keep the tier they have until they are assigned again.
 - **Without `policy.file`** there is one built-in tier, `normal`, with the defaults above, and every ticket runs under it.
+
+### Escalation
+Some things stop a ticket and hand it to a human. Each of these triggers fires **before** the work goes on: the run is stopped, or not started, and ochell starts nothing in its place.
+
+| Trigger | Fires when | Detected by |
+|---|---|---|
+| `budget` | the ticket has used up `budget_usd` of its tier (see [Cost and budgets](#cost-and-budgets)) | ochell, through the limit it gives the run |
+| `turns` | a run reaches `max_turns` of its tier | ochell, through the limit it gives the run (`--max-turns` of Claude Code) |
+| `retries` | a run fails for a temporary reason again and the ticket has no attempt left (`agent.max_attempts`) | ochell |
+| `tier_change` | the ticket moves to a higher tier while the agent is working on it, for example because someone adds a label | ochell, from the tracker's update event |
+| `low_confidence`, `out_of_scope` | the agent says so in its [result file](#the-result-file) | the agent |
+
+When one fires:
+- **The run stops**, with all its processes, and its worker is free. For `tier_change` that is at once, in the middle of the run.
+- **The ticket waits for a human**: state `waiting`, reason `escalation`. The run records which trigger it was (`escalation` in the store, and a line in ochell's log).
+- **The agent's session is kept**, so the work can go on where it stopped.
+- **The ticket moves up one tier** in the policy's list, unless it is in the highest already. For `tier_change` it moves to the tier that the change gave it. Its next run is under that tier, with that tier's gates and limits.
+- **The ticket is told**: what happened, which trigger, the tier it is in now, and what a human can do. An `elicitation` in the Linear session; a comment on the Jira ticket.
+- **Messages that arrived during the run start nothing.** They are kept, and go with the run that a human starts.
+
+What a human can do then:
+- **Resume:** reply in the Linear session or comment on the Jira ticket. The run continues the agent's session.
+- **Re-scope:** change the ticket, and say so in that reply.
+- **Cancel:** the stop signal in Linear, `/stop` in a Jira comment, or take the ticket away from the digital employee (see *Stopping from the ticket*).
+
+Notes:
+- **`budget` at the highest tier, or when the next tier has nothing left either, needs an operator:** a reply starts a run that is refused again. `ochell reset <jira|linear> <KEY>` gives the ticket a new budget.
+- **Only a move to a higher tier is a trigger.** An update that would lower the tier changes nothing. A ticket whose agent is not running only gets the new tier: there is nothing to stop.
+- **The tier's update events** are `jira:issue_updated` of the Jira system webhook, and `Issue` updates of Linear (the app's webhook must subscribe to issue events). Jira Automation sends none.
+- `needs_input` and `blocked` from the agent are not escalations: the ticket waits with its own reason and stays in its tier.
+- A ticket that used up its attempts and is assigned again is refused as before (see [Guards and the admin channel](#guards-and-the-admin-channel)).
+- Two triggers of the findings come later, with the read-only GitHub access: CI that is still red after N fixes, and a review requested by CODEOWNERS.
 
 ### Cost and budgets
 ochell records what each run cost, as far as the agent says, and stops a ticket that has used up the budget of its tier.
@@ -340,7 +373,8 @@ ochell records what each run cost, as far as the agent says, and stops a ticket 
 - **The budget of a ticket** is `budget_usd` of its tier. What counts against it is what the ticket's runs have cost since the last reset.
   - **Each run gets what is left as its limit** (`--max-budget-usd` of Claude Code, which counts the run alone). Claude Code stops the run when it reaches the limit. It looks after each call to the model, so a run ends a little above the limit, by at most one call.
   - **A ticket with nothing left is not started**, whatever asks for the run: a new assignment, a reply, a retry, the poller.
-  - **In both cases the ticket waits for a human**, with the reason `escalation`, and is told why and what to do: an `elicitation` in the Linear session, a comment on the Jira ticket. The run's outcome is `over_budget`. The agent session is kept.
+  - **In both cases this is an [escalation](#escalation):** the ticket waits for a human, moves up one tier, and is told why and what to do. The run's outcome is `over_budget`. The agent session is kept.
+  - **After the escalation the ticket is one tier up, and that tier's budget counts.** If that leaves it something, a reply on the ticket lets it go on. If not, or if it was in the highest tier already:
   - **Only an operator gives a ticket a new budget:** `ochell reset <jira|linear> <KEY>`. The count starts at zero again, the record of what was spent stays, and a reply on the ticket (or a new assignment) then continues in the same session. A message on the ticket cannot raise a budget.
   - **A budget needs the `claude` adapter.** With `plain`, ochell would know no cost and could stop nothing, so it refuses to start when the policy sets `budget_usd`.
   - The budget is what the agent CLI reports as its cost. It is not the bill.
@@ -429,7 +463,7 @@ Every ticket ochell has seen is in one of these states. They are defined, with t
 
 A ticket that is `queued` or `running` takes no second run. From every other state a new assignment queues it again.
 
-Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation` (the agent was not sure or out of scope, or the ticket used up its attempts or its budget), and `interrupted` (ochell itself stopped during the run, and the ticket had no attempt left to start it again).
+Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation` (an [escalation](#escalation) trigger fired, or the ticket used up its attempts and was assigned again), and `interrupted` (ochell itself stopped during the run, and the ticket had no attempt left to start it again).
 
 What a run leads to:
 
@@ -440,10 +474,11 @@ What a run leads to:
 | `finished` | `blocked` | `waiting`, reason `blocked` |
 | `finished` | `low_confidence`, `out_of_scope` | `waiting`, reason `escalation` |
 | `finished` | missing or invalid | `waiting`, reason `no_result` |
-| `failed`, `timed_out`, `not_started` | not looked at | `failed`. A `failed` run that matches a retry pattern: `queued` again while the ticket has an attempt left |
+| `failed`, `timed_out`, `not_started` | not looked at | `failed`. A `failed` run that matches a retry pattern: `queued` again while the ticket has an attempt left; `waiting`, reason `escalation`, when it has none |
 | `stalled` | not looked at | `queued` again; `waiting`, reason `stalled`, when the attempts are used up |
 | `cancelled` | not looked at | `cancelled` |
-| `over_budget` | not looked at | `waiting`, reason `escalation` (see [Cost and budgets](#cost-and-budgets)) |
+| `over_budget`, `over_turns` | not looked at | `waiting`, reason `escalation` |
+| any, with an [escalation](#escalation) trigger | | `waiting`, reason `escalation` |
 | `stopped`, `interrupted` | not looked at | `queued` again, for a new attempt with the recovery note; `waiting`, reason `interrupted`, when the attempts are used up |
 
 Some reasons are not reached yet: they belong to features that come later (the plan gate). Pausing is not a state: it holds the queue, and queued tickets stay queued.
@@ -459,7 +494,7 @@ An adapter holds what differs between agent CLIs: how a run is started, how an e
 `plain` works with any CLI that takes a prompt and prints an answer.
 
 **The `claude` adapter** (checked against Claude Code 2.1.311):
-- **Settings:** `adapter: claude` needs `prompt_via: stdin`. Keep your own flags in `agent.args`, for example `--permission-mode` or `--model`. ochell refuses to start when `args` holds a flag the adapter sets itself (`--output-format`, `--resume`, `--continue`, `--max-budget-usd`), or `--bare`, which makes Claude Code ignore the OAuth token.
+- **Settings:** `adapter: claude` needs `prompt_via: stdin`. Keep your own flags in `agent.args`, for example `--permission-mode` or `--model`. ochell refuses to start when `args` holds a flag the adapter sets itself (`--output-format`, `--resume`, `--continue`, `--max-budget-usd`, `--max-turns`), or `--bare`, which makes Claude Code ignore the OAuth token.
 - **What the ticket gets:** the agent's final message, not the raw stream. The run log still has every event.
 - **What is stored** with each run: the message, the session id, the cost in USD and the token counts. See [Cost and budgets](#cost-and-budgets) for how the cost of a resumed run is worked out.
 - **Budget:** for a ticket whose tier has a budget, the adapter adds `--max-budget-usd` with what the ticket has left. `--max-budget-usd` must not be in `agent.args`.

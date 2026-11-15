@@ -21,6 +21,8 @@ owners:
 #   auto_merge: never | after_ci   (default never)
 #   budget_usd: what one ticket may cost; 0 or left out: no limit. It needs
 #               agent.adapter claude; "ochell reset" starts it anew
+#   max_turns:  how many turns one run may take; 0 or left out: no limit.
+#               It needs agent.adapter claude
 #   labels:     a ticket with one of these labels gets at least this tier
 #   allowed_assigners: who may assign work of this tier (Jira accountIds,
 #               Linear user ids or email addresses); it narrows the

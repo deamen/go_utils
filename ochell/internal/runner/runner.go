@@ -91,6 +91,9 @@ type Runner struct {
 	cancels map[string]context.CancelFunc
 	stops   map[string]string
 	closing map[string]bool
+	// raised holds, for a ticket whose run is being stopped because the
+	// ticket moved to a higher tier, that tier. Guarded by mu.
+	raised map[string]string
 	// wake tells an idle worker to look at the queue.
 	wake chan struct{}
 	// quit is closed when Shutdown begins: workers start no more tasks.
@@ -103,7 +106,7 @@ type Runner struct {
 // New returns a runner that keeps its queue in st.
 func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 	r := &Runner{cfg: cfg, log: log, store: st, policy: policy.Builtin(), wake: make(chan struct{}, 1), quit: make(chan struct{}),
-		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}}
+		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}, raised: map[string]string{}}
 	r.runCtx, r.stopRuns = context.WithCancel(context.Background())
 	var err error
 	if r.prompt, err = parse("prompt_template", cfg.PromptTemplate); err != nil {
@@ -163,6 +166,9 @@ func (r *Runner) UsePolicy(p *policy.Policy) error {
 		for _, t := range p.Tiers {
 			if t.BudgetUSD > 0 {
 				return fmt.Errorf("the policy sets budget_usd for the tier %s, but agent.adapter %s reports no cost and cannot stop a run at a limit: use agent.adapter claude, or take budget_usd out of the policy", t.Name, r.cfg.Adapter)
+			}
+			if t.MaxTurns > 0 {
+				return fmt.Errorf("the policy sets max_turns for the tier %s, but agent.adapter %s cannot stop a run at a limit: use agent.adapter claude, or take max_turns out of the policy", t.Name, r.cfg.Adapter)
 			}
 		}
 	}
@@ -482,6 +488,97 @@ func (r *Runner) SetTier(source, key, tier string) error {
 	return nil
 }
 
+// TierChanged is called when the tracker shows that a ticket now belongs
+// in a higher tier than the one ochell has for it, for example because a
+// label was added. The ticket gets that tier.
+//
+// A run that is going on started under the lower tier. It is stopped, and
+// the ticket waits for a human (an escalation): stopped is then true, and
+// the ticket is told when the run has ended. A ticket without a running
+// agent only gets the tier; its next run starts under it.
+//
+// It returns store.ErrUnknown for a ticket that ochell has never seen, and
+// ErrNoTier.
+func (r *Runner) TierChanged(source, key, tier string) (stopped bool, err error) {
+	if !r.policy.Has(tier) {
+		return false, fmt.Errorf("%w: %q", ErrNoTier, tier)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return false, ErrStopped
+	}
+	tk, err := r.store.Ticket(source, key)
+	if err != nil {
+		return false, err
+	}
+	if tk == nil {
+		return false, store.ErrUnknown
+	}
+	if tk.State != ticket.Running {
+		r.log.Info("the ticket moved to a higher tier", "source", source, "key", key, "from", tk.Tier, "tier", tier)
+		return false, r.store.SetTier(source, key, tier)
+	}
+	// The worker ends the run as an escalation and sets the tier; if it has
+	// not got as far as starting the agent, it finds the request when it
+	// does.
+	k := ticketKey(source, key)
+	r.raised[k] = tier
+	if cancel := r.cancels[k]; cancel != nil {
+		cancel()
+	}
+	r.log.Warn("stopping the run of a ticket that moved to a higher tier", "source", source, "key", key, "from", tk.Tier, "tier", tier)
+	return true, nil
+}
+
+// escalate decides whether the run of t, which ended as res, was stopped
+// by an escalation trigger, and acts on it: the ticket moves up one tier,
+// and nothing is queued in the run's place. again is the run that ochell
+// would start by itself, or nil. raisedTo is the tier that the ticket moved
+// to in the tracker during the run, or "".
+//
+// The triggers: the budget or the turn limit of the tier; a temporary
+// failure when the ticket has no attempt left for another try; a move to a
+// higher tier during the run; and the agent's own word that it is not sure
+// of its result or that the ticket is out of its scope.
+func (r *Runner) escalate(t *task.Task, res *task.Result, again *store.Again, raisedTo string) *store.Again {
+	to := r.policy.Next(t.Tier)
+	switch {
+	case res.Outcome == task.OutcomeCancelled:
+		// A person stopped it; that is the end of it.
+		return again
+	case raisedTo != "":
+		res.Escalation, to = task.EscalationTierChange, raisedTo
+		res.Err = fmt.Errorf("the run was stopped: the ticket moved from the risk tier %s to %s while the agent was working on it", t.Tier, raisedTo)
+	case res.Outcome == task.OutcomeOverBudget:
+		res.Escalation = task.EscalationBudget
+	case res.Outcome == task.OutcomeOverTurns:
+		res.Escalation = task.EscalationTurns
+	case again != nil && again.Cause == task.CauseRetry:
+		if left, err := r.store.AttemptsLeft(t.Source, t.Key, again.MaxAttempts); err != nil || left {
+			return again
+		}
+		res.Escalation = task.EscalationRetries
+		res.Err = fmt.Errorf("the run failed with an error that looks temporary (%v), and the ticket has used its %d attempts", res.Err, again.MaxAttempts)
+	case res.Outcome == task.OutcomeFinished && res.Signal == result.LowConfidence:
+		res.Escalation = task.EscalationLowConfidence
+	case res.Outcome == task.OutcomeFinished && res.Signal == result.OutOfScope:
+		res.Escalation = task.EscalationOutOfScope
+	default:
+		return again
+	}
+	if to != t.Tier && r.policy.Higher(t.Tier, to) == to {
+		if err := r.store.SetTier(t.Source, t.Key, to); err != nil {
+			r.log.Error("cannot move the escalated ticket up a tier", "task", t.ID, "err", err)
+		} else {
+			res.TierBefore, res.TierAfter = t.Tier, to
+		}
+	}
+	r.log.Warn("escalation: the ticket now waits for a human", "task", t.ID, "source", t.Source, "key", t.Key,
+		"trigger", res.Escalation, "tier", t.Tier, "tier_now", to, "session", res.SessionID)
+	return nil
+}
+
 // Hold records the ticket of t as waiting for a human, without starting
 // anything. It returns ErrBusy when the ticket has a queued or running task.
 func (r *Runner) Hold(t *task.Task, reason ticket.Reason) error {
@@ -652,6 +749,9 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 		// The stop came between the claim and now.
 		cancel()
 	}
+	if _, moved := r.raised[k]; moved {
+		cancel()
+	}
 	r.mu.Unlock()
 
 	// A ticket that has used up the budget of its tier is not started, by
@@ -671,9 +771,11 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	r.mu.Lock()
 	by, stopped := r.stops[k]
 	closed := r.closing[k]
+	raisedTo := r.raised[k]
 	delete(r.cancels, k)
 	delete(r.stops, k)
 	delete(r.closing, k)
+	delete(r.raised, k)
 	r.mu.Unlock()
 	if stopped {
 		// A person stopped it, which also holds when the run ended by
@@ -691,6 +793,8 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	if a, ok := r.next(t, res); ok {
 		again = &a
 	}
+	// An escalation trigger stops the ticket here, before anything goes on.
+	again = r.escalate(t, &res, again, raisedTo)
 	next, err := r.store.FinishAndQueue(t.ID, res, again)
 	switch {
 	case err != nil:
@@ -724,11 +828,13 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 // usd writes an amount of money for a person.
 func usd(v float64) string { return fmt.Sprintf("%.2f USD", v) }
 
-// budget looks up what the ticket of t has left of the budget of its tier,
-// and sets t.BudgetUSD to it. over says that nothing is left. Without a
-// budget in the tier it does nothing.
+// budget sets the limits of the run of t from the ticket's tier:
+// t.MaxTurns, and t.BudgetUSD, which is what the ticket has left of the
+// tier's budget. over says that nothing is left.
 func (r *Runner) budget(t *task.Task, log *slog.Logger) (spent, budget float64, over bool) {
-	budget = r.policy.Tier(t.Tier).BudgetUSD
+	tier := r.policy.Tier(t.Tier)
+	t.MaxTurns = tier.MaxTurns
+	budget = tier.BudgetUSD
 	if budget <= 0 {
 		return 0, 0, false
 	}
@@ -846,7 +952,7 @@ func (r *Runner) command(t *task.Task, view promptView, resume bool) (agent.Comm
 		}
 		args = append(args, s)
 	}
-	run := agent.Run{Args: args, Prompt: t.Prompt, BudgetUSD: t.BudgetUSD}
+	run := agent.Run{Args: args, Prompt: t.Prompt, BudgetUSD: t.BudgetUSD, MaxTurns: t.MaxTurns}
 	if resume {
 		return r.adapter.Resume(run, t.AgentSession)
 	}
@@ -1018,6 +1124,9 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		// The agent CLI stopped at the limit that ochell gave it.
 		res.Outcome = task.OutcomeOverBudget
 		res.Err = fmt.Errorf("the run was stopped: it used up what the ticket had left of its budget (%s; tier %s)", usd(t.BudgetUSD), t.Tier)
+	case rep.OverTurns:
+		res.Outcome = task.OutcomeOverTurns
+		res.Err = fmt.Errorf("the run was stopped: it reached the limit of %d turns of the tier %s", t.MaxTurns, t.Tier)
 	case w.err != nil:
 		res.Outcome = task.OutcomeFailed
 		res.Err = w.err

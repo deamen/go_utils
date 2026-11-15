@@ -25,10 +25,13 @@ type Run struct {
 	// BudgetUSD is what this run may cost at most; 0: no limit. Only an
 	// adapter that LimitsBudget can keep to it.
 	BudgetUSD float64
+	// MaxTurns is how many turns this run may take at most; 0: no limit.
+	// It needs the same kind of adapter.
+	MaxTurns int
 }
 
-// BudgetLimiter is an Adapter whose agent CLI can stop a run at a spending
-// limit, and reports what a run cost.
+// BudgetLimiter is an Adapter whose agent CLI can stop a run at a limit
+// (of spending, of turns), and reports what a run cost.
 type BudgetLimiter interface {
 	LimitsBudget() bool
 }
@@ -68,6 +71,8 @@ type Report struct {
 	// OverBudget says that the agent CLI stopped the run because it
 	// reached Run.BudgetUSD.
 	OverBudget bool
+	// OverTurns says that it stopped the run at Run.MaxTurns.
+	OverTurns bool
 }
 
 // Usage is the token count of one run, as far as the agent reports it.
