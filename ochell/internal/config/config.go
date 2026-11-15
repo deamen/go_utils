@@ -326,6 +326,20 @@ type Policy struct {
 	File string `yaml:"file"`
 }
 
+// API configures the status API: read-only pages about what ochell is
+// doing, for people. They show ticket titles and what agents said, and the
+// agent runs on the same host and can reach any local port, so every
+// request needs the token.
+type API struct {
+	Enabled bool `yaml:"enabled"`
+	// Token is what a request must send as "Authorization: Bearer <token>".
+	Token string `yaml:"token"`
+	// PublicURL is the address under which people reach ochell's status
+	// API, e.g. https://ochell.example.com. With it, the Linear session
+	// of a ticket links to the ticket's entry.
+	PublicURL string `yaml:"public_url"`
+}
+
 // Poller configures the safety net behind the webhooks: ochell asks each
 // tracker for the bot's open tickets, at start and then at this interval.
 type Poller struct {
@@ -340,6 +354,7 @@ type Config struct {
 	Admin    Admin    `yaml:"admin"`
 	Store    Store    `yaml:"store"`
 	Policy   Policy   `yaml:"policy"`
+	API      API      `yaml:"api"`
 	// Repos says which repository a ticket belongs to. The first entry
 	// that matches wins. When the list is not empty, a ticket that no
 	// entry matches is not started and waits for a human. When it is
@@ -648,6 +663,17 @@ func (c *Config) Validate() error {
 	}
 	if c.Store.Path == "" {
 		errs = append(errs, errors.New("store.path is required"))
+	}
+	if c.API.Enabled && len(c.API.Token) < 16 {
+		errs = append(errs, errors.New("api.token is required when the status API is enabled, with at least 16 characters"))
+	}
+	if c.API.PublicURL != "" {
+		if u, err := url.Parse(c.API.PublicURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" {
+			errs = append(errs, errors.New("api.public_url must be an address such as https://ochell.example.com"))
+		}
+		if !c.API.Enabled {
+			errs = append(errs, errors.New("api.public_url is set but the status API is not enabled"))
+		}
 	}
 	for i, r := range c.Repos {
 		if r.Source != "" && r.Source != "jira" && r.Source != "linear" {

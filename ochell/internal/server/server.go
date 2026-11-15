@@ -100,10 +100,16 @@ type Server struct {
 	// jira is ochell's access to the Jira API; nil without sources.jira_api.
 	jira tracker.Client
 	// policy holds the risk tiers; the built-in one without a policy file.
-	policy  *policy.Policy
-	extURL  *template.Template
-	handler http.Handler
-	now     func() time.Time
+	policy *policy.Policy
+	extURL *template.Template
+	// api is the status API, mounted under apiPrefix, and statusLink gives
+	// the address of a ticket's entry there for a person ("": none). Both
+	// are nil without the status API.
+	api        http.Handler
+	apiPrefix  string
+	statusLink func(source, key string) string
+	handler    http.Handler
+	now        func() time.Time
 
 	// tools holds, by Linear session, when tool use was last shown there
 	// and how much was left out since.
@@ -176,6 +182,14 @@ func (s *Server) buildAllowlists() error {
 // holds.
 func (s *Server) UsePolicy(p *policy.Policy) { s.policy = p }
 
+// UseAPI mounts the status API under prefix, on the same listeners as the
+// webhooks. link gives the address of a ticket's entry for a person, or
+// "". Call it before the server handles requests.
+func (s *Server) UseAPI(prefix string, h http.Handler, link func(source, key string) string) {
+	s.api, s.apiPrefix, s.statusLink = h, prefix, link
+	s.handler = s.routes()
+}
+
 // Handler returns the HTTP handler (used by tests).
 func (s *Server) Handler() http.Handler { return s.handler }
 
@@ -184,6 +198,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, "ok\n")
 	})
+	if s.api != nil {
+		// For people, not for a tracker: no source IP filter. The API
+		// checks its own token.
+		mux.Handle(s.apiPrefix, s.api)
+	}
 	src := s.cfg.Sources
 	guard := func(h http.HandlerFunc, l *ipsync.Allowlist) http.Handler {
 		if l == nil {
@@ -1291,12 +1310,22 @@ func (s *Server) Started(ctx context.Context, t *task.Task) error {
 	if s.reportsToJira(t) {
 		return s.jiraRunStarted(ctx, t)
 	}
-	if !s.reportsToLinear(t) || s.extURL == nil {
+	if !s.reportsToLinear(t) {
 		return nil
 	}
+	// The session links to a page about the run: the configured one, or
+	// else the ticket's entry in ochell's own status API.
 	var b strings.Builder
-	if err := s.extURL.Execute(&b, t); err != nil {
-		return err
+	switch {
+	case s.extURL != nil:
+		if err := s.extURL.Execute(&b, t); err != nil {
+			return err
+		}
+	case s.statusLink != nil:
+		b.WriteString(s.statusLink(t.Source, t.Key))
+	}
+	if b.Len() == 0 {
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

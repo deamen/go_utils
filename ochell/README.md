@@ -249,6 +249,32 @@ repos:
 - **A ticket that no entry matches is not started.** It is recorded as `waiting` with the reason `no_repo_mapping`, the request is answered with 200 `not started: …`, ochell logs a warning, and a Linear session is told why. After the mapping is added, assign the ticket again.
 - With no `repos` at all, every ticket runs, without a repository.
 
+### The status API
+Read-only pages about what ochell is doing, on the same listener as the webhooks.
+
+```yaml
+api:
+  enabled: true
+  token: ${OCHELL_API_TOKEN}
+  public_url: https://ochell.example.com
+```
+
+| Endpoint | Shows |
+|---|---|
+| `GET /api/v1/state` | whether runs start and what holds them back; how many tickets are in each state; and the tickets that are running, queued, and waiting for a person, each with its state, reason, tier and attempts |
+| `GET /api/v1/tasks/<key>` | one ticket with every run: when it started and ended, why it was queued, its outcome, its cost, and what the agent said. Add `?source=jira` or `?source=linear` when both trackers have the key |
+
+- **The answer is JSON.** A browser (a request that accepts `text/html`) gets a plain page with the same content.
+- **Every request needs the token**: `Authorization: Bearer <api.token>`, at least 16 characters. The pages show ticket titles and what agents said, and the agent runs on the same host and can reach any local port, so a loopback address is not enough. Do not put the token in the agent's environment.
+
+  ```
+  curl -H "Authorization: Bearer $OCHELL_API_TOKEN" http://127.0.0.1:8080/api/v1/state
+  ```
+- **The link in a Linear session.** With `public_url`, ochell sets the external link of each ticket's agent session to the ticket's entry. That link carries a signature made with the token for that one ticket, so it opens in a browser without the token, and opens nothing else. Whoever can see the session can open the entry. `sources.linear.external_url`, when set, is used instead.
+- **It is live:** every request reads the store.
+- The lists hold at most 200 tickets each, the ones that changed last first; a message of an agent is cut at 4,000 characters.
+- Without `api.enabled` there are no such endpoints.
+
 ### Policy and risk tiers
 Every ticket runs under a **risk tier**. A tier says how much autonomy a class of work gets; the **policy file** defines the tiers and says which tickets get which. People decide that ahead of time, in the review of a change to this file, instead of looking at every run.
 
@@ -845,6 +871,7 @@ Notes:
   - Ticket keys must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` before they are used in file names or templates.
   - Signatures and tokens are compared in constant time.
 - **Agent environment:** the agent gets an allowlisted environment, not ochell's own (see [Agent environment](#agent-environment)).
+- **Status API:** it needs its token on every request, also from the same host (see [The status API](#the-status-api)).
 - **Policy:** the tiers and limits are in a file of ochell's own, which the agent must not be able to write (see [Policy and risk tiers](#policy-and-risk-tiers)). Nothing in a ticket or a repository widens them.
 - **Agent OS user:** with the `direct` launcher the agent runs as the same OS user as ochell and can read ochell's files. Deploy with the `systemd` launcher (see [Launchers](#launchers)).
 - **Secrets:** never commit secrets or TLS keys. The repository's pre-commit hooks reject private keys.

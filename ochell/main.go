@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"ochell/internal/admin"
+	"ochell/internal/api"
 	"ochell/internal/config"
 	"ochell/internal/ipsync"
 	"ochell/internal/policy"
@@ -163,6 +164,11 @@ func serve(args []string) error {
 		return err
 	}
 	srv.UsePolicy(pol)
+	if cfg.API.Enabled {
+		status := api.New(cfg.API, st, r, log)
+		srv.UseAPI(api.Prefix, status, status.Link)
+		log.Info("status API", "path", api.Prefix, "public_url", cfg.API.PublicURL)
+	}
 	if err := r.UsePolicy(pol); err != nil {
 		return fmt.Errorf("invalid policy:\n%w", err)
 	}

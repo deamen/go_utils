@@ -29,6 +29,15 @@ admin:
 store:
   path: /var/lib/ochell/ochell.db
 
+# The status API: read-only pages about what ochell is doing, on the same
+# listener as the webhooks (GET /api/v1/state, /api/v1/tasks/<key>). Every
+# request needs the token. With public_url, the Linear session of a ticket
+# links to the ticket's entry.
+api:
+  enabled: false
+  token: ${OCHELL_API_TOKEN}
+  public_url: ""            # e.g. https://ochell.example.com
+
 # The policy file: the risk tiers, and which tier a ticket runs under (see
 # examples/policy.yaml). It must not be writable by the agent's OS user.
 # Leave it out for one built-in tier that every ticket runs under.

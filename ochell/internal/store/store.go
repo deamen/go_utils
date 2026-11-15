@@ -1379,21 +1379,121 @@ type Ticket struct {
 	Updated time.Time
 }
 
-// Ticket returns the stored ticket, or nil when ochell has never seen it.
-func (s *Store) Ticket(source, key string) (*Ticket, error) {
-	t := Ticket{Source: source, Key: key}
+const ticketColumns = `source, key, title, url, repo, tier, assigner, plan_approved, plan_approved_by, state, reason, attempts,
+	workspace, prepared_workspace, agent_session, pr_url, branch, created_at, updated_at`
+
+func scanTicket(row interface{ Scan(...any) error }) (*Ticket, error) {
+	var t Ticket
 	var created, updated int64
-	err := s.db.QueryRow(`SELECT title, url, repo, tier, assigner, plan_approved, plan_approved_by, state, reason, attempts, workspace, prepared_workspace, agent_session, pr_url, branch, created_at, updated_at
-		FROM tickets WHERE source = ? AND key = ?`, source, key).
-		Scan(&t.Title, &t.URL, &t.Repo, &t.Tier, &t.Assigner, &t.PlanApproved, &t.PlanApprovedBy, &t.State, &t.Reason, &t.Attempts, &t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
+	if err := row.Scan(&t.Source, &t.Key, &t.Title, &t.URL, &t.Repo, &t.Tier, &t.Assigner, &t.PlanApproved, &t.PlanApprovedBy, &t.State, &t.Reason, &t.Attempts,
+		&t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated); err != nil {
 		return nil, err
 	}
 	t.Created, t.Updated = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
 	return &t, nil
+}
+
+// Ticket returns the stored ticket, or nil when ochell has never seen it.
+func (s *Store) Ticket(source, key string) (*Ticket, error) {
+	t, err := scanTicket(s.db.QueryRow(`SELECT `+ticketColumns+` FROM tickets WHERE source = ? AND key = ?`, source, key))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return t, err
+}
+
+// Tickets returns the tickets that are in one of the given states, the
+// ones that changed last first; with no state, every ticket. limit bounds
+// how many; 0: all.
+func (s *Store) Tickets(limit int, states ...ticket.State) ([]Ticket, error) {
+	query, args := `SELECT `+ticketColumns+` FROM tickets`, []any{}
+	if len(states) > 0 {
+		query += ` WHERE state IN (?` + strings.Repeat(", ?", len(states)-1) + `)`
+		for _, st := range states {
+			args = append(args, st)
+		}
+	}
+	query += ` ORDER BY updated_at DESC, source, key`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	return s.tickets(query, args...)
+}
+
+// TicketsByKey returns the tickets with this key, of any source.
+func (s *Store) TicketsByKey(key string) ([]Ticket, error) {
+	return s.tickets(`SELECT `+ticketColumns+` FROM tickets WHERE key = ? ORDER BY source`, key)
+}
+
+func (s *Store) tickets(query string, args ...any) ([]Ticket, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Ticket
+	for rows.Next() {
+		t, err := scanTicket(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	return out, rows.Err()
+}
+
+// RunInfo is one run of a ticket, as far as a person who looks at the
+// ticket wants to see it.
+type RunInfo struct {
+	Run
+	// Cause says why the run was queued; empty for a plain assignment.
+	Cause task.Cause
+	// Received is when the run was queued; Started and Ended are zero for
+	// a run that has not got that far.
+	Received, Started, Ended time.Time
+}
+
+// Runs returns the runs of a ticket, oldest first.
+func (s *Store) Runs(source, key string) ([]RunInfo, error) {
+	rows, err := s.db.Query(`SELECT id, status, attempt, tier, policy_version, cause, received_at, started_at, ended_at,
+			outcome, exit_code, error, log_file, resumed, agent_session, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			signal, signal_message, pr_url, branch, escalation, phase
+		FROM runs WHERE source = ? AND key = ? ORDER BY received_at, rowid`, source, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RunInfo
+	for rows.Next() {
+		r := RunInfo{Run: Run{Source: source, Key: key}}
+		var received int64
+		var started, ended, exit sql.NullInt64
+		var outcome, msg string
+		res := &r.Result
+		if err := rows.Scan(&r.ID, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &r.Cause, &received, &started, &ended,
+			&outcome, &exit, &msg, &res.LogFile, &res.Resumed, &res.SessionID, &res.CostUSD,
+			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.Escalation, &res.Phase); err != nil {
+			return nil, err
+		}
+		r.Received = time.UnixMilli(received).UTC()
+		if started.Valid {
+			r.Started = time.UnixMilli(started.Int64).UTC()
+		}
+		if ended.Valid {
+			r.Ended = time.UnixMilli(ended.Int64).UTC()
+		}
+		res.Outcome, res.ExitCode = task.Outcome(outcome), -1
+		if exit.Valid {
+			res.ExitCode = int(exit.Int64)
+		}
+		if msg != "" {
+			res.Err = errors.New(msg)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // SetPrepared records the working directory in which the after_create hook
