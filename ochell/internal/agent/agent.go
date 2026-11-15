@@ -22,6 +22,22 @@ type Run struct {
 	Args []string
 	// Prompt is the rendered prompt.
 	Prompt string
+	// BudgetUSD is what this run may cost at most; 0: no limit. Only an
+	// adapter that LimitsBudget can keep to it.
+	BudgetUSD float64
+}
+
+// BudgetLimiter is an Adapter whose agent CLI can stop a run at a spending
+// limit, and reports what a run cost.
+type BudgetLimiter interface {
+	LimitsBudget() bool
+}
+
+// LimitsBudget reports whether the adapter can keep a run to
+// Run.BudgetUSD.
+func LimitsBudget(a Adapter) bool {
+	b, ok := a.(BudgetLimiter)
+	return ok && b.LimitsBudget()
 }
 
 // Command is how the agent is to be called: the arguments after
@@ -42,9 +58,16 @@ type Report struct {
 	// SessionID identifies the agent's session, for Resume. Empty when the
 	// agent has no sessions.
 	SessionID string
-	// CostUSD is what the run cost, 0 when the agent does not say.
-	CostUSD float64
-	Usage   Usage
+	// CostUSD is what the agent reports as the cost, 0 when it does not
+	// say. With CostIsSessionTotal it is the cost of the whole session so
+	// far, earlier runs included, and not of this run alone.
+	CostUSD            float64
+	CostIsSessionTotal bool
+	// Usage is the token count of this run alone.
+	Usage Usage
+	// OverBudget says that the agent CLI stopped the run because it
+	// reached Run.BudgetUSD.
+	OverBudget bool
 }
 
 // Usage is the token count of one run, as far as the agent reports it.

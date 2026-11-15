@@ -48,6 +48,7 @@ var availCmds = [][2]string{
 	{"resume", "end a pause"},
 	{"status", "say whether the running ochell is paused, and what is queued and running"},
 	{"reset", "reset the attempts of a ticket, and with --tier set its risk tier: ochell reset <jira|linear> <KEY> [--tier NAME]"},
+	{"cost", "show what the tickets have cost, or one ticket with its runs: ochell cost [<jira|linear> <KEY>]"},
 	{"stop", "stop the run of a ticket and release the ticket: ochell stop <jira|linear> <KEY>"},
 	{"version", "print the version"},
 }
@@ -91,7 +92,7 @@ func main() {
 		err = jiraCheck(args)
 	case "policy-check":
 		err = policyCheck(args)
-	case "pause", "resume", "status", "reset", "stop":
+	case "pause", "resume", "status", "reset", "stop", "cost":
 		err = adminCommand(cmd, args)
 	case "version":
 		fmt.Printf("%s-%s\n", version, build)
@@ -162,7 +163,9 @@ func serve(args []string) error {
 		return err
 	}
 	srv.UsePolicy(pol)
-	r.UsePolicy(pol)
+	if err := r.UsePolicy(pol); err != nil {
+		return fmt.Errorf("invalid policy:\n%w", err)
+	}
 	r.SetNotifier(srv)
 	if err := r.UseWorkspace(cfg.Workspace); err != nil {
 		return err
@@ -264,6 +267,16 @@ func adminCommand(cmd string, args []string) error {
 	switch cmd {
 	case "status":
 		method = "GET"
+	case "cost":
+		method = "GET"
+		if len(rest) != 0 && (len(rest) != 2 || (rest[0] != "jira" && rest[0] != "linear")) {
+			return errors.New("usage: ochell cost [<jira|linear> <KEY>] [flags]")
+		}
+		if len(rest) == 2 {
+			query.Set("source", rest[0])
+			query.Set("key", rest[1])
+		}
+		rest = nil
 	case "reset", "stop":
 		if len(rest) != 2 || (rest[0] != "jira" && rest[0] != "linear") {
 			return fmt.Errorf("usage: ochell %s <jira|linear> <KEY> [flags]", cmd)

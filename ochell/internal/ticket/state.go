@@ -150,6 +150,8 @@ func AfterRun(o task.Outcome, signal result.Status) (State, Reason) {
 		return Waiting, ReasonStalled
 	case task.OutcomeCancelled:
 		return Cancelled, ""
+	case task.OutcomeOverBudget:
+		return Waiting, ReasonEscalation
 	}
 	// failed, timed_out, not_started
 	return Failed, ""

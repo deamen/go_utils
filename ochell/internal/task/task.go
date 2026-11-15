@@ -92,6 +92,9 @@ type Task struct {
 	Branch string
 	// Prompt is rendered by the runner from the prompt template.
 	Prompt string
+	// BudgetUSD is what this run may cost: what the ticket has left of the
+	// budget of its tier. The runner sets it; 0: no limit.
+	BudgetUSD float64
 }
 
 // Outcome says why a run ended. ochell sets it from its own record of what
@@ -115,6 +118,10 @@ const (
 	// OutcomeCancelled: a person stopped the run, or released the ticket:
 	// from the ticket, by unassigning it, or from ochell itself.
 	OutcomeCancelled Outcome = "cancelled"
+	// OutcomeOverBudget: the ticket has used up the budget of its tier.
+	// The agent was stopped when the run reached it, or was not started
+	// because nothing was left.
+	OutcomeOverBudget Outcome = "over_budget"
 	// OutcomeNotStarted: the agent never ran.
 	OutcomeNotStarted Outcome = "not_started"
 	// OutcomeInterrupted: ochell itself stopped while the agent was running,
@@ -136,11 +143,14 @@ type Result struct {
 	// Resumed says that the run continued the session of an earlier run.
 	Resumed bool
 	// SessionID is the agent's session, for a later resume; CostUSD and
-	// Usage are what the run cost. All three are empty for an agent that
-	// does not report them.
+	// Usage are what this run alone cost. All three are empty for an agent
+	// that does not report them.
 	SessionID string
 	CostUSD   float64
 	Usage     agent.Usage
+	// SessionCostUSD is what the agent's session has cost so far, earlier
+	// runs included, for an agent that reports that; 0 otherwise.
+	SessionCostUSD float64
 	// Signal is what the agent's result file says about the run, and
 	// SignalMessage its text for the people on the ticket. Signal is
 	// result.None when the run left no valid file. PRURL and Branch are

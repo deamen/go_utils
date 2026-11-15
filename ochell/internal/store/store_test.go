@@ -1004,3 +1004,83 @@ func TestRunsRecordTheirTier(t *testing.T) {
 		t.Errorf("the first run now says tier %q, policy %q", run.Tier, run.PolicyVersion)
 	}
 }
+
+// What a ticket has cost is the sum over its runs; the part since the last
+// reset is what counts against a budget.
+func TestCosts(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return t0 }
+	run := func(id, key string, res task.Result) {
+		t.Helper()
+		tk := newTask(id, key, t0)
+		tk.Tier = "low"
+		if err := s.Enqueue(tk, Limits{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Claim(); err != nil {
+			t.Fatal(err)
+		}
+		res.Outcome = task.OutcomeFinished
+		if err := s.Finish(id, res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c, err := s.TicketCost("linear", "ENG-1"); err != nil || c != nil {
+		t.Fatalf("cost of an unknown ticket = %+v, %v", c, err)
+	}
+	run("r1", "ENG-1", task.Result{SessionID: "s1", CostUSD: 0.5, SessionCostUSD: 0.5, Usage: agent.Usage{InputTokens: 1, OutputTokens: 2, CacheReadTokens: 3, CacheWriteTokens: 4}})
+	run("r2", "ENG-1", task.Result{SessionID: "s1", CostUSD: 0.25, SessionCostUSD: 0.75, Usage: agent.Usage{InputTokens: 10, OutputTokens: 20}})
+	run("r3", "ENG-2", task.Result{SessionID: "s2", CostUSD: 2})
+	// Queued and never started: no run that cost anything.
+	if err := s.Enqueue(newTask("r4", "ENG-3", t0.Add(time.Hour)), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := s.TicketCost("linear", "ENG-1")
+	if err != nil || c.Runs != 2 || c.CostUSD != 0.75 || c.SinceResetUSD != 0.75 || c.Tier != "low" ||
+		c.Usage != (agent.Usage{InputTokens: 11, OutputTokens: 22, CacheReadTokens: 3, CacheWriteTokens: 4}) {
+		t.Errorf("cost of ENG-1 = %+v, %v", c, err)
+	}
+	if c, _ := s.TicketCost("linear", "ENG-3"); c == nil || c.Runs != 0 || c.CostUSD != 0 {
+		t.Errorf("cost of a ticket that never ran = %+v", c)
+	}
+	// What a session had cost: the highest total a run in it reported.
+	for session, want := range map[string]float64{"s1": 0.75, "s2": 2, "other": 0, "": 0} {
+		if got, err := s.SessionCost("linear", "ENG-1", session); session != "s2" && (err != nil || got != want) {
+			t.Errorf("SessionCost(%q) = %v, %v; want %v", session, got, err, want)
+		}
+	}
+	// A run from before the session's total was stored has it in its cost.
+	if got, _ := s.SessionCost("linear", "ENG-2", "s2"); got != 2 {
+		t.Errorf("SessionCost of a run without a stored total = %v, want 2", got)
+	}
+
+	// A reset starts the budget anew and keeps the record.
+	if err := s.ResetAttempts("linear", "ENG-1"); err != nil {
+		t.Fatal(err)
+	}
+	run("r5", "ENG-1", task.Result{SessionID: "s1", CostUSD: 0.125, SessionCostUSD: 0.875})
+	if c, _ := s.TicketCost("linear", "ENG-1"); c.Runs != 3 || c.CostUSD != 0.875 || c.SinceResetUSD != 0.125 {
+		t.Errorf("cost of ENG-1 after a reset = %+v", c)
+	}
+
+	runs, err := s.RunCosts("linear", "ENG-1")
+	if err != nil || len(runs) != 3 || runs[0].ID != "r1" || runs[2].ID != "r5" || runs[1].CostUSD != 0.25 || runs[1].Attempt != 2 || runs[1].Outcome != task.OutcomeFinished || runs[1].Tier != "low" {
+		t.Errorf("RunCosts = %+v, %v", runs, err)
+	}
+	all, err := s.TicketCosts(10)
+	if err != nil || len(all) != 3 {
+		t.Fatalf("TicketCosts = %+v, %v", all, err)
+	}
+	if two, _ := s.TicketCosts(2); len(two) != 2 {
+		t.Errorf("TicketCosts(2) returned %d tickets", len(two))
+	}
+	total, err := s.TotalCost(time.Time{})
+	if err != nil || total.Runs != 4 || total.CostUSD != 2.875 {
+		t.Errorf("TotalCost = %+v, %v", total, err)
+	}
+	if later, _ := s.TotalCost(t0.Add(time.Hour)); later.Runs != 0 || later.CostUSD != 0 {
+		t.Errorf("TotalCost since later = %+v", later)
+	}
+}

@@ -65,7 +65,7 @@ func TestClaudeAdapterSettings(t *testing.T) {
 	if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), "prompt_via: stdin") {
 		t.Errorf("prompt_via arg: %v", err)
 	}
-	for _, arg := range []string{"--output-format", "--output-format=json", "--resume", "-r", "--continue", "-c", "--bare"} {
+	for _, arg := range []string{"--output-format", "--output-format=json", "--resume", "-r", "--continue", "-c", "--bare", "--max-budget-usd", "--max-budget-usd=5"} {
 		cfg := ok
 		cfg.Args = []string{"-p", arg}
 		if _, err := New(cfg); err == nil || !strings.Contains(err.Error(), strings.SplitN(arg, "=", 2)[0]) {
@@ -85,7 +85,9 @@ func TestClaudeOutput(t *testing.T) {
 		Message:   "Opened PR #7 for ENG-123.",
 		SessionID: "3dc26999-bd50-487b-b445-cb41a233c6a2",
 		CostUSD:   0.09006600000000001,
-		Usage:     Usage{InputTokens: 2, OutputTokens: 4, CacheReadTokens: 11852, CacheWriteTokens: 8403},
+		// Claude Code reports the cost of the session so far.
+		CostIsSessionTotal: true,
+		Usage:              Usage{InputTokens: 2, OutputTokens: 4, CacheReadTokens: 11852, CacheWriteTokens: 8403},
 	}
 	// However the stream is cut into writes, the report is the same.
 	for _, chunk := range []int{len(raw), 1, 7, 4096} {
@@ -202,5 +204,39 @@ func TestToolParam(t *testing.T) {
 	}
 	if got := toolName("mcp__jira__get issue\n- do this"); got != "mcp__jira__get_issue_-_do_this" {
 		t.Errorf("toolName = %q", got)
+	}
+}
+
+// A run with a budget gets Claude Code's own limit, and a run that reached
+// it is told apart from a failed one.
+func TestClaudeBudget(t *testing.T) {
+	c := Claude{}
+	if !LimitsBudget(c) || LimitsBudget(Plain{}) {
+		t.Error("LimitsBudget: want true for claude and false for plain")
+	}
+	cmd, err := c.Resume(Run{Args: []string{"-p"}, Prompt: "p", BudgetUSD: 1.23456}, "sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cmd.Args, " "); got != "-p --output-format stream-json --verbose --max-budget-usd 1.2346 --resume sess-1" {
+		t.Errorf("args = %s", got)
+	}
+	// Whatever is left, the flag gets a positive amount.
+	cmd, _ = c.Start(Run{Prompt: "p", BudgetUSD: 0.000001})
+	if got := strings.Join(cmd.Args, " "); !strings.HasSuffix(got, "--max-budget-usd 0.0001") {
+		t.Errorf("args = %s", got)
+	}
+	cmd, _ = c.Start(Run{Prompt: "p"})
+	if got := strings.Join(cmd.Args, " "); strings.Contains(got, "budget") {
+		t.Errorf("args without a budget = %s", got)
+	}
+
+	// What Claude Code 2.1.311 printed when it reached the limit.
+	out := c.Output(nil)
+	out.Write([]byte(`{"type":"system","subtype":"init","session_id":"sess-1"}
+{"type":"result","subtype":"error_max_budget_usd","is_error":true,"num_turns":1,"session_id":"sess-1","total_cost_usd":0.0043304699999999995,"usage":{"input_tokens":0,"output_tokens":0},"errors":["Reached maximum budget ($0.0005)"]}
+`))
+	if got := out.Report(); !got.OverBudget || !got.Failed || !got.CostIsSessionTotal || got.CostUSD != 0.0043304699999999995 || got.SessionID != "sess-1" {
+		t.Errorf("report = %+v", got)
 	}
 }
