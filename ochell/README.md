@@ -162,7 +162,6 @@ ochell version
 ochell status --config config.yaml                # paused or running; what is queued and running
 ochell pause  --config config.yaml [--tier NAME]  # hold the queue: no new run starts
 ochell resume --config config.yaml [--tier NAME]
-ochell kill   --config config.yaml [--tier NAME]  # the kill switch: pause, and stop every running agent
 ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts and the budget of a ticket; --tier NAME also sets its risk tier
 ochell cost [<jira|linear> <KEY>] --config config.yaml  # what the tickets have cost, or one ticket with its runs
 ochell stop  <jira|linear> <KEY> --config config.yaml   # stop the run of a ticket and release it
@@ -378,19 +377,17 @@ tiers:
 - **The files are checked at start** (see [Policy and risk tiers](#policy-and-risk-tiers)): `credentials_file` must belong to root or to ochell's user and must not be accessible to its group or to others; `mcp_config` must exist; `mint` and `revoke` must be programs.
 - **A tier without `grants`** gets what every run has: the launcher's `ENV_FILE`, `agent.env`, and the agent user's own MCP configuration.
 
-### Kill switch and throttles
-The hard controls: an operator can stop everything at once, and the policy bounds how much ochell starts.
+### Pauses and throttles
+The hard controls: an operator can hold what ochell starts, and the policy bounds how much it starts.
 
 | Command | What it does |
 |---|---|
 | `ochell pause` | holds the queue: no new run starts. Running agents go on |
-| `ochell kill` | the kill switch: pauses, and stops every running agent with all its processes |
 | `ochell resume` | ends the pause; what is queued runs |
-| `ochell pause --tier NAME`, `ochell kill --tier NAME`, `ochell resume --tier NAME` | the same for the tickets of one tier. The other tiers are not touched |
+| `ochell pause --tier NAME`, `ochell resume --tier NAME` | the same for the tickets of one tier. The other tiers are not touched |
 | `ochell status` | says whether runs start, how many are queued and running, and what holds runs back |
 
-- **`ochell kill` stops the agents within the grace period** of a stop (`agent.stop_grace`, 10s by default): SIGTERM, then SIGKILL, for the whole process group or unit (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down)).
-- **The tickets of the stopped runs are queued again**, and wait there like everything else until `ochell resume`. Each is told that the kill switch stopped it, and by which OS user. Its next run continues the agent's session, with a note for the agent that it was cut off and has to check what is already done. To keep a ticket from going on, release it with `ochell stop <jira|linear> <KEY>` before you resume.
+- **A pause stops nothing that runs.** To stop the agent of one ticket, use `ochell stop <jira|linear> <KEY>` (see [Guards and the admin channel](#guards-and-the-admin-channel)). ochell has no command that stops every running agent: that is not an orchestrator's work.
 - **Webhooks are still accepted** while ochell is paused; their tickets are queued.
 - **A pause is kept across a restart**, of everything and of a tier.
 - **A pause can also be a setting in the policy file:** `paused: true` at the top holds everything, and `paused: true` in a tier holds that tier. A command does not end such a pause; change the file and restart.
@@ -508,7 +505,7 @@ ochell records what each run cost, as far as the agent says, and stops a ticket 
 Limits on what starts a run, and one way to talk to the running ochell.
 
 - **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). **A message from a person (a reply in the ticket's Linear session, a comment on the Jira ticket) starts the count again**: the cap is there to stop what runs without anyone looking, and here someone looked. The attempt number in the prompt still counts every run. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear> <KEY>` sets the count back to zero (and starts the ticket's [budget](#cost-and-budgets) anew); then assign the ticket again.
-- **Pause:** see also [Kill switch and throttles](#kill-switch-and-throttles), for the pause of one tier and for stopping what runs. `ochell pause` holds the queue. No new run starts; running agents go on; webhooks are still accepted and queued. `ochell resume` ends it, and the queued tasks run. Both take effect at once, without a restart, and a pause is kept across a restart. `ochell status` says which it is, and how many tasks are queued and running.
+- **Pause:** see also [Pauses and throttles](#pauses-and-throttles), for the pause of one tier. `ochell pause` holds the queue. No new run starts; running agents go on; webhooks are still accepted and queued. `ochell resume` ends it, and the queued tasks run. Both take effect at once, without a restart, and a pause is kept across a restart. `ochell status` says which it is, and how many tasks are queued and running.
 - **Assigner allowlist:** `allowed_assigners` of a source, when it is not empty, lists who may assign work. Anyone else is rejected, and the rejection is logged with the ticket and the assigner. Nothing is stored for a rejected assignment.
 
   | Source | Who is checked | A rejected assignment |
@@ -534,7 +531,7 @@ Limits on what starts a run, and one way to talk to the running ochell.
   - A ticket whose assigner ochell does not know (a Jira Automation rule that sends no initiator) has no `assigner`.
   - Message text is never a way in: what a comment says does not change who may send one, or what the agent may do.
 
-**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `kill`, `reset`, `stop`, `cost`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
+**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `cost`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
 - Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port: the agent runs on the same host and can reach any local port. With the `systemd` launcher the agent is another user and cannot open the socket; with the `direct` launcher it is the same user and can.
 - Keep the socket in a directory that the agent user cannot write to.
 

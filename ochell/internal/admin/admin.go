@@ -34,9 +34,6 @@ type Control interface {
 	// tier the tickets of that tier.
 	Pause(tier string) error
 	Resume(tier string) error
-	// Kill pauses in the same way and stops the running agents; it
-	// returns how many. by names the operator.
-	Kill(tier, by string) (int, error)
 	Status() (runner.Status, error)
 	ResetAttempts(source, key string) error
 	// Cost reports what one ticket, or with an empty key the last tickets,
@@ -127,7 +124,7 @@ func routes(c Control, log *slog.Logger) http.Handler {
 		}
 		answer(w, http.StatusOK, prefix+describe(st))
 	}
-	// tierError answers a pause, resume or kill that failed.
+	// tierError answers a pause or resume that failed.
 	tierError := func(w http.ResponseWriter, tier string, err error) {
 		if errors.Is(err, runner.ErrNoTier) {
 			answer(w, http.StatusBadRequest, fmt.Sprintf("the policy has no tier %q", tier))
@@ -150,20 +147,6 @@ func routes(c Control, log *slog.Logger) http.Handler {
 			return
 		}
 		status(w, "")
-	})
-	mux.HandleFunc("POST /kill", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		tier := q.Get("tier")
-		n, err := c.Kill(tier, operator(q.Get("user"))+`, with "ochell kill" on the host`)
-		if err != nil {
-			tierError(w, tier, err)
-			return
-		}
-		what, again := "every running agent", "ochell resume"
-		if tier != "" {
-			what, again = "every running agent of the tier "+tier, "ochell resume --tier "+tier
-		}
-		status(w, fmt.Sprintf("kill switch: stopping %s (%d); their tickets are queued again and wait, like everything else, for %q\n", what, n, again))
 	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("format") == "json" {
@@ -296,17 +279,7 @@ func costText(rep *runner.CostReport, one bool) string {
 	return b.String()
 }
 
-// operator names who ran a command, as the client says: everyone who can
-// open the socket is ochell's own OS user, so this is a note for the
-// ticket, not a credential.
-func operator(user string) string {
-	if user = strings.TrimSpace(user); user != "" {
-		return "the operator " + user
-	}
-	return "an operator"
-}
-
-// describe is what pause, resume, kill and status answer with: one line
+// describe is what pause, resume and status answer with: one line
 // that says whether runs start and how many are queued and running, and a
 // line for everything that holds runs back.
 func describe(st runner.Status) string {

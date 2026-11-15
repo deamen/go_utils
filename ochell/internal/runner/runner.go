@@ -91,10 +91,6 @@ type Runner struct {
 	cancels map[string]context.CancelFunc
 	stops   map[string]string
 	closing map[string]bool
-	// running holds the tier of each run in progress, and kills who used
-	// the kill switch on it, by source and key. Guarded by mu.
-	running map[string]string
-	kills   map[string]string
 	// grants holds what each run in progress was granted, by task id, for
 	// the workspace hooks of that run. Guarded by mu.
 	grants map[string]*granted
@@ -113,8 +109,7 @@ type Runner struct {
 // New returns a runner that keeps its queue in st.
 func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 	r := &Runner{cfg: cfg, log: log, store: st, policy: policy.Builtin(), wake: make(chan struct{}, 1), quit: make(chan struct{}),
-		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}, raised: map[string]string{}, grants: map[string]*granted{},
-		running: map[string]string{}, kills: map[string]string{}}
+		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}, raised: map[string]string{}, grants: map[string]*granted{}}
 	r.runCtx, r.stopRuns = context.WithCancel(context.Background())
 	var err error
 	if r.prompt, err = parse("prompt_template", cfg.PromptTemplate); err != nil {
@@ -445,36 +440,6 @@ func (r *Runner) Resume(tier string) error {
 	}
 	r.wakeWorker()
 	return nil
-}
-
-// Kill is the kill switch: it pauses, and stops the agents that are
-// running, with all their processes. With a tier it does both for the
-// tickets of that tier only. It returns how many agents it stops; they end
-// within the grace period of a stop (agent.stop_grace).
-//
-// The tickets of the stopped runs are queued again and stay queued, like
-// everything else, until Resume. Their next run has a note for the agent
-// that it was cut off. by names the operator, for the tickets.
-func (r *Runner) Kill(tier, by string) (int, error) {
-	// The pause comes first, so that nothing starts while the agents stop.
-	if err := r.Pause(tier); err != nil {
-		return 0, err
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	n := 0
-	for k, cancel := range r.cancels {
-		if tier != "" && r.running[k] != tier {
-			continue
-		}
-		if _, asked := r.kills[k]; !asked {
-			r.kills[k] = by
-		}
-		cancel()
-		n++
-	}
-	r.log.Warn("kill switch: stopping the running agents", "tier", tier, "by", by, "agents", n)
-	return n, nil
 }
 
 // Status is what ochell is doing right now.
@@ -874,7 +839,6 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	k := ticketKey(t.Source, t.Key)
 	r.mu.Lock()
 	r.cancels[k] = cancel
-	r.running[k] = t.Tier
 	if _, asked := r.stops[k]; asked {
 		// The stop came between the claim and now.
 		cancel()
@@ -907,9 +871,6 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	by, stopped := r.stops[k]
 	closed := r.closing[k]
 	raisedTo := r.raised[k]
-	killedBy, killed := r.kills[k]
-	delete(r.running, k)
-	delete(r.kills, k)
 	delete(r.cancels, k)
 	delete(r.stops, k)
 	delete(r.closing, k)
@@ -927,14 +888,8 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	}
 	// Record the end before telling the ticket, so the ticket is free for
 	// a new run by the time someone reads the answer.
-	if killed && !stopped && raisedTo == "" && res.Outcome == task.OutcomeStopped {
-		res.Err = fmt.Errorf("the run was stopped by the kill switch (%s)", killedBy)
-	}
 	var again *store.Again
 	if a, ok := r.next(t, res); ok {
-		if killed && a.Cause == task.CauseRecovery {
-			a.Cause = task.CauseKilled
-		}
 		again = &a
 	}
 	// An escalation trigger stops the ticket here, before anything goes on.

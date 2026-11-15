@@ -58,8 +58,8 @@ tiers:
 
 # Hard controls. "paused: true" here holds every ticket, and in a tier the
 # tickets of that tier, until the file is changed and ochell restarted. The
-# commands "ochell pause", "ochell kill" and "ochell resume" do the same on
-# a running ochell.
+# commands "ochell pause" and "ochell resume" do the same on a running
+# ochell.
 paused: false
 
 # Throttles hold new runs when a limit is reached. 0 or left out: no limit.

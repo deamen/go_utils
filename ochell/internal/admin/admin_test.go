@@ -22,7 +22,6 @@ type fakeControl struct {
 	reset   []string
 	stopped []string
 	tier    string
-	killed  []string
 }
 
 func (f *fakeControl) Pause(tier string) error {
@@ -42,13 +41,6 @@ func (f *fakeControl) Resume(tier string) error {
 	}
 	f.st.Paused, f.st.Holds = false, nil
 	return nil
-}
-func (f *fakeControl) Kill(tier, by string) (int, error) {
-	if err := f.Pause(tier); err != nil {
-		return 0, err
-	}
-	f.killed = append(f.killed, tier+" by "+by)
-	return f.st.Running, nil
 }
 func (f *fakeControl) Status() (runner.Status, error) { return f.st, nil }
 func (f *fakeControl) Stop(source, key, by string) (runner.Stopped, error) {
@@ -149,7 +141,7 @@ func TestCommands(t *testing.T) {
 	if _, err := Call(path, "POST", "reset", url.Values{"source": {"jira"}, "key": {"NOPE-1"}}); err == nil || !strings.Contains(err.Error(), "knows no jira ticket NOPE-1") {
 		t.Errorf("reset of an unknown ticket: %v", err)
 	}
-	// A pause of one tier, and the kill switch.
+	// A pause of one tier.
 	got, err = Call(path, "POST", "pause", url.Values{"tier": {"high"}})
 	if err != nil || !strings.Contains(got, "\nheld: tier high is paused by a command") {
 		t.Errorf("pause of a tier = %q, %v", got, err)
@@ -159,17 +151,6 @@ func TestCommands(t *testing.T) {
 	}
 	if got, err = Call(path, "POST", "resume", url.Values{"tier": {"high"}}); err != nil || strings.Contains(got, "held:") {
 		t.Errorf("resume of a tier = %q, %v", got, err)
-	}
-	got, err = Call(path, "POST", "kill", url.Values{"user": {"ops"}})
-	if err != nil || !strings.Contains(got, "kill switch: stopping every running agent (1)") || !strings.Contains(got, "paused: no new run starts") ||
-		len(c.killed) != 1 || c.killed[0] != ` by the operator ops, with "ochell kill" on the host` {
-		t.Errorf("kill = %q, %v; killed %q", got, err, c.killed)
-	}
-	if got, err = Call(path, "POST", "kill", url.Values{"tier": {"high"}}); err != nil || !strings.Contains(got, "every running agent of the tier high (1)") || !strings.Contains(got, `"ochell resume --tier high"`) {
-		t.Errorf("kill of a tier = %q, %v", got, err)
-	}
-	if _, err := Call(path, "POST", "resume", nil); err != nil {
-		t.Fatal(err)
 	}
 	// What the tickets have cost, and one ticket with its runs.
 	got, err = Call(path, "GET", "cost", nil)
