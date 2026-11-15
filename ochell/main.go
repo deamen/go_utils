@@ -44,8 +44,9 @@ var availCmds = [][2]string{
 	{"linear-install", "print the Linear agent app install URL"},
 	{"jira-check", "check the Jira API access: list the bot's open tickets, and comment on one with --comment-on"},
 	{"policy-check", "check the policy file and print its tiers"},
-	{"pause", "hold the queue of the running ochell: no new run starts"},
-	{"resume", "end a pause"},
+	{"pause", "hold the queue of the running ochell: no new run starts; --tier NAME holds one tier"},
+	{"resume", "end a pause; --tier NAME ends the pause of one tier"},
+	{"kill", "the kill switch: pause, and stop every running agent; --tier NAME does both for one tier"},
 	{"status", "say whether the running ochell is paused, and what is queued and running"},
 	{"reset", "reset the attempts of a ticket, and with --tier set its risk tier: ochell reset <jira|linear> <KEY> [--tier NAME]"},
 	{"cost", "show what the tickets have cost, or one ticket with its runs: ochell cost [<jira|linear> <KEY>]"},
@@ -92,7 +93,7 @@ func main() {
 		err = jiraCheck(args)
 	case "policy-check":
 		err = policyCheck(args)
-	case "pause", "resume", "status", "reset", "stop", "cost":
+	case "pause", "resume", "kill", "status", "reset", "stop", "cost":
 		err = adminCommand(cmd, args)
 	case "version":
 		fmt.Printf("%s-%s\n", version, build)
@@ -256,8 +257,11 @@ func adminCommand(cmd string, args []string) error {
 	}
 	var tier string
 	cfg, err := config.Load(cmd, args, func(fs *flag.FlagSet) {
-		if cmd == "reset" {
+		switch cmd {
+		case "reset":
 			fs.StringVar(&tier, "tier", "", "also put the ticket under this risk tier; the one way to lower a tier")
+		case "pause", "resume", "kill":
+			fs.StringVar(&tier, "tier", "", "only the tickets of this risk tier")
 		}
 	})
 	if err != nil {
@@ -267,6 +271,16 @@ func adminCommand(cmd string, args []string) error {
 	switch cmd {
 	case "status":
 		method = "GET"
+	case "pause", "resume", "kill":
+		if tier != "" {
+			query.Set("tier", tier)
+		}
+		if cmd == "kill" {
+			// For the note on the tickets.
+			if u, err := user.Current(); err == nil {
+				query.Set("user", u.Username)
+			}
+		}
 	case "cost":
 		method = "GET"
 		if len(rest) != 0 && (len(rest) != 2 || (rest[0] != "jira" && rest[0] != "linear")) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1219,5 +1220,142 @@ func TestApprovePlan(t *testing.T) {
 	}
 	if got, _ := s.Claim(); got.PlanApproved || got.ApprovedBy != "" {
 		t.Errorf("a new assignment kept the approval: %+v", got)
+	}
+}
+
+// Pauses of a tier and the throttles keep Claim from handing out a run;
+// everything else goes on.
+func TestHolds(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	now := time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	seq := 0
+	queue := func(key, tier, repo string) string {
+		t.Helper()
+		seq++
+		tk := newTask("r"+strconv.Itoa(seq), key, now.Add(time.Duration(seq)*time.Millisecond))
+		tk.Tier, tk.Repo = tier, repo
+		if err := s.Enqueue(tk, Limits{}); err != nil {
+			t.Fatal(err)
+		}
+		return tk.ID
+	}
+	claim := func() string {
+		t.Helper()
+		got, err := s.Claim()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil {
+			return ""
+		}
+		return got.Key
+	}
+	finish := func(id string, res task.Result) {
+		t.Helper()
+		if res.Outcome == "" {
+			res.Outcome, res.Signal = task.OutcomeFinished, result.Done
+		}
+		if err := s.Finish(id, res); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A paused tier: its tickets wait, the others run, in their order.
+	queue("HIGH-1", "high", "")
+	low1 := queue("LOW-1", "low", "")
+	if err := s.SetTierPaused("high", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := claim(); got != "LOW-1" {
+		t.Fatalf("claimed %q, want LOW-1: HIGH-1 is in a paused tier", got)
+	}
+	if got := claim(); got != "" {
+		t.Fatalf("claimed %q from a paused tier", got)
+	}
+	if h, _ := s.Holding(); h.All() || len(h.Tiers) != 1 || h.Tiers[0] != "high" {
+		t.Errorf("Holding = %+v", h)
+	}
+	// The policy file can pause a tier too.
+	s.SetHolds(Holds{PausedTiers: []string{"high"}})
+	if err := s.SetTierPaused("high", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := claim(); got != "" {
+		t.Fatalf("claimed %q from a tier that the policy pauses", got)
+	}
+	s.SetHolds(Holds{})
+	if got := claim(); got != "HIGH-1" {
+		t.Fatalf("claimed %q after the pause ended, want HIGH-1", got)
+	}
+	finish(low1, task.Result{CostUSD: 3})
+	finish("r1", task.Result{CostUSD: 4})
+
+	// Runs per hour: two have started within the hour.
+	s.SetHolds(Holds{MaxRunsPerHour: 2})
+	third := queue("LOW-2", "low", "")
+	if got := claim(); got != "" {
+		t.Fatalf("claimed %q over the limit of runs per hour", got)
+	}
+	if h, _ := s.Holding(); !h.All() || len(h.Throttles) != 1 || !strings.Contains(h.Throttles[0], "max_runs_per_hour: 2 runs started in the last hour, the limit is 2") {
+		t.Errorf("Holding = %+v", h)
+	}
+	now = now.Add(61 * time.Minute)
+	if got := claim(); got != "LOW-2" {
+		t.Fatalf("claimed %q an hour later, want LOW-2", got)
+	}
+	finish(third, task.Result{CostUSD: 5})
+
+	// The daily spend: 5 USD today (the first two runs were an hour ago,
+	// but on the same day: 12 in all).
+	s.SetHolds(Holds{DailySpendUSD: 12})
+	queue("LOW-3", "low", "")
+	if got := claim(); got != "" {
+		t.Fatalf("claimed %q over the daily spend", got)
+	}
+	if h, _ := s.Holding(); len(h.Throttles) != 1 || !strings.Contains(h.Throttles[0], "daily_spend_usd: the runs of today (UTC) have cost 12.00 USD, the limit is 12.00") {
+		t.Errorf("Holding = %+v", h)
+	}
+	now = now.Add(24 * time.Hour)
+	if got := claim(); got != "LOW-3" {
+		t.Fatalf("claimed %q the next day, want LOW-3", got)
+	}
+	// It opens a pull request in its repository.
+	finish("r4", task.Result{PRURL: "https://example.test/pr/1"})
+
+	// Open pull requests per repository. LOW-3 has none recorded for a
+	// repository; give the next tickets one.
+	s.SetHolds(Holds{MaxOpenPRsPerRepo: 1})
+	a := queue("WEB-1", "low", "web")
+	if got := claim(); got != "WEB-1" {
+		t.Fatalf("claimed %q, want WEB-1: no pull request is open in web", got)
+	}
+	finish(a, task.Result{PRURL: "https://example.test/web/pr/7"})
+	queue("WEB-2", "low", "web")
+	other := queue("API-1", "low", "api")
+	if got := claim(); got != "API-1" {
+		t.Fatalf("claimed %q, want API-1: WEB-2 would open a second pull request in web", got)
+	}
+	finish(other, task.Result{})
+	if repos, _ := s.HeldByPRs(1); len(repos) != 1 || repos[0] != "web" {
+		t.Errorf("HeldByPRs = %v", repos)
+	}
+	// The ticket that has the pull request works on it.
+	if _, err := s.FollowUp(newTask("r9", "WEB-1", now), true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := claim(); got != "WEB-1" {
+		t.Fatalf("claimed %q, want WEB-1: it has the pull request already", got)
+	}
+	finish("r9", task.Result{})
+	if got := claim(); got != "" {
+		t.Fatalf("claimed %q while a pull request is open in web", got)
+	}
+	// The ticket of the pull request is closed: the next one may start.
+	if _, err := s.CloseTicket("linear", "WEB-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := claim(); got != "WEB-2" {
+		t.Fatalf("claimed %q after the pull request's ticket was closed, want WEB-2", got)
 	}
 }

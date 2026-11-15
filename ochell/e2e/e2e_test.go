@@ -3350,3 +3350,287 @@ func TestGrantsThroughTheSystemdLauncher(t *testing.T) {
 		t.Errorf("the secrets directory: %v, %v; want mode 0700", info, err)
 	}
 }
+
+// hanging makes the first n runs of the fake agent start two children, one
+// of which ignores SIGTERM, and then hang; every later run reports done.
+func hanging(n int) []Step {
+	var script []Step
+	for i := 1; i <= n; i++ {
+		script = append(script, OnRun(i, Step{Spawn: &Spawn{Count: 1}}, Step{Spawn: &Spawn{Count: 1, IgnoreTerm: true}}, Step{Print: "working"}, Step{Sleep: "10m"})...)
+	}
+	return append(script, Report("done", "Done after the resume."))
+}
+
+// waitHanging waits until n runs have started their two children.
+func waitHanging(t *testing.T, o *Ochell, n int) []Record {
+	t.Helper()
+	var recs []Record
+	o.waitFor(15*time.Second, "the agents to start their children", func() bool {
+		recs = o.Records()
+		ready := 0
+		for _, r := range recs {
+			if len(r.Children) == 2 {
+				ready++
+			}
+		}
+		return ready >= n
+	})
+	return recs
+}
+
+// The kill switch: it stops dispatch and cancels all running agents within
+// the grace period. Their tickets wait in the queue, and go on after the
+// resume.
+func TestKillSwitch(t *testing.T) {
+	o := Start(t, Options{Script: hanging(3), Configure: func(c *config.Config) {
+		c.Agent.MaxConcurrent = 3
+		c.Agent.StopGrace = time.Second
+	}})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	keys := []string{"ENG-130", "ENG-131", "ENG-132"}
+	for _, key := range keys {
+		o.LinearCreated(key, "session-"+key, "")
+	}
+	recs := waitHanging(t, o, 3)
+
+	pulled := time.Now()
+	out, code := o.Admin("kill")
+	if code != 0 || !strings.Contains(out, "kill switch: stopping every running agent (3)") || !strings.Contains(out, "paused: no new run starts") {
+		t.Fatalf("ochell kill: exit %d, %q", code, out)
+	}
+	// Every agent and every child is gone, also the ones that ignore
+	// SIGTERM: within the grace period of one second, and a little.
+	for _, rec := range recs {
+		expectAllGone(t, rec, 2)
+	}
+	if d := time.Since(pulled); d > 6*time.Second {
+		t.Errorf("the agents were gone %s after the kill, with a grace period of 1s", d)
+	}
+	o.waitFor(10*time.Second, "the stopped runs to be queued again", func() bool {
+		out, _ := o.Admin("status")
+		return out == "paused: no new run starts; 3 queued, 0 running"
+	})
+	for _, key := range keys {
+		if tk, _ := st.Ticket("linear", key); tk.State != "queued" {
+			t.Errorf("%s = %s, want queued", key, tk.State)
+		}
+		acts := o.WaitActivities("session-"+key, 2, 10*time.Second)
+		if acts[1].Type != "thought" || !strings.Contains(acts[1].Body, "The run was stopped by the kill switch (the operator ") ||
+			!strings.Contains(acts[1].Body, "starts when the orchestrator is resumed") {
+			t.Errorf("%s was told %+v", key, acts[1])
+		}
+	}
+	// Dispatch is stopped: new work is accepted, and waits.
+	o.LinearCreated("ENG-133", "session-ENG-133", "")
+	time.Sleep(500 * time.Millisecond)
+	if out, _ := o.Admin("status"); out != "paused: no new run starts; 4 queued, 0 running" {
+		t.Errorf("ochell status after the kill: %q", out)
+	}
+	if n := len(o.Records()); n != 3 {
+		t.Fatalf("the agent was started %d times, want 3: nothing starts after the kill", n)
+	}
+
+	// After the resume everything goes on; the agents are told what
+	// happened to their earlier run.
+	if out, code := o.Admin("resume"); code != 0 || !strings.HasPrefix(out, "running; ") {
+		t.Fatalf("ochell resume: exit %d, %q", code, out)
+	}
+	recs = o.WaitRecords(7, 20*time.Second)
+	told := 0
+	for _, rec := range recs[3:] {
+		if strings.Contains(rec.Stdin, "An operator of the orchestrator stopped every running agent") {
+			told++
+		}
+	}
+	if told != 3 {
+		t.Errorf("%d of the runs after the resume have the note about the kill switch, want 3", told)
+	}
+	for _, key := range append(keys, "ENG-133") {
+		key := key
+		o.waitFor(15*time.Second, key+" to be in review", func() bool {
+			tk, _ := st.Ticket("linear", key)
+			return tk != nil && tk.State == "in_review"
+		})
+	}
+}
+
+// The kill switch and the pause for one tier: only that tier's agents are
+// stopped and only its tickets are held.
+func TestKillSwitchForOneTier(t *testing.T) {
+	o := Start(t, Options{
+		Script: hanging(2),
+		Policy: "tiers:\n  - {name: low}\n  - {name: high, labels: [risk-high]}\ndefault_tier: low\n",
+		Configure: func(c *config.Config) {
+			c.Agent.MaxConcurrent = 3
+			c.Agent.StopGrace = time.Second
+		},
+	})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	o.LinearCreated("ENG-140", "session-low", "")
+	o.Labels = []string{"risk-high"}
+	o.LinearCreated("ENG-141", "session-high", "")
+	var low, high Record
+	for _, rec := range waitHanging(t, o, 2) {
+		if key, _ := rec.Getenv("ORCH_TASK_KEY"); key == "ENG-140" {
+			low = rec
+		} else {
+			high = rec
+		}
+	}
+
+	if out, code := o.Admin("kill", "--tier", "nope"); code == 0 || !strings.Contains(out, `the policy has no tier "nope"`) {
+		t.Errorf("ochell kill --tier nope: exit %d, %q", code, out)
+	}
+	out, code := o.Admin("kill", "--tier", "high")
+	if code != 0 || !strings.Contains(out, "stopping every running agent of the tier high (1)") {
+		t.Fatalf("ochell kill --tier high: exit %d, %q", code, out)
+	}
+	expectAllGone(t, high, 2)
+	if !Alive(low.PID) {
+		t.Fatal("the agent of the other tier was stopped as well")
+	}
+	o.waitFor(10*time.Second, "the stopped run to be queued again", func() bool {
+		out, _ := o.Admin("status")
+		return out == "running; 1 queued, 1 running\nheld: tier high is paused by a command; \"ochell resume --tier high\" ends it"
+	})
+	// A new ticket of the paused tier waits; one of the other tier runs.
+	o.LinearCreated("ENG-142", "session-high-2", "")
+	o.Labels = nil
+	third := o.LinearCreated("ENG-143", "session-low-2", "").TaskID(t)
+	o.WaitRun(third, 15*time.Second)
+	if n := len(o.Records()); n != 3 {
+		t.Errorf("the agent was started %d times, want 3", n)
+	}
+	for _, key := range []string{"ENG-141", "ENG-142"} {
+		if tk, _ := st.Ticket("linear", key); tk.State != "queued" {
+			t.Errorf("%s = %s, want queued: its tier is paused", key, tk.State)
+		}
+	}
+	// The tier is resumed: its tickets run.
+	if out, code := o.Admin("resume", "--tier", "high"); code != 0 || strings.Contains(out, "held:") {
+		t.Fatalf("ochell resume --tier high: exit %d, %q", code, out)
+	}
+	for _, key := range []string{"ENG-141", "ENG-142"} {
+		key := key
+		o.waitFor(15*time.Second, key+" to be in review", func() bool {
+			tk, _ := st.Ticket("linear", key)
+			return tk != nil && tk.State == "in_review"
+		})
+	}
+	if !Alive(low.PID) {
+		t.Error("the agent of the other tier did not live through all this")
+	}
+	// "ochell pause --tier" holds without stopping anything.
+	if out, code := o.Admin("pause", "--tier", "low"); code != 0 || !strings.Contains(out, "held: tier low is paused by a command") {
+		t.Errorf("ochell pause --tier low: exit %d, %q", code, out)
+	}
+	if !Alive(low.PID) {
+		t.Error("a pause stopped a running agent")
+	}
+}
+
+// The throttles: each one holds new runs when its limit is reached.
+func TestThrottles(t *testing.T) {
+	queued := func(t *testing.T, o *Ochell, want string) {
+		t.Helper()
+		var out string
+		o.waitFor(10*time.Second, "ochell status to show the throttle", func() bool {
+			out, _ = o.Admin("status")
+			return strings.Contains(out, want)
+		})
+		time.Sleep(400 * time.Millisecond)
+		if now, _ := o.Admin("status"); !strings.Contains(now, want) {
+			t.Errorf("ochell status = %q, want %q in it", now, want)
+		}
+	}
+
+	t.Run("runs per hour", func(t *testing.T) {
+		o := Start(t, Options{Policy: "tiers: [{name: normal}]\ndefault_tier: normal\nthrottles: {max_runs_per_hour: 2}\n"})
+		o.WaitRun(o.LinearCreated("ENG-150", "s-1", "").TaskID(t), 15*time.Second)
+		o.WaitRun(o.LinearCreated("ENG-151", "s-2", "").TaskID(t), 15*time.Second)
+		o.LinearCreated("ENG-152", "s-3", "")
+		queued(t, o, "running; 1 queued, 0 running\nheld: throttle max_runs_per_hour: 2 runs started in the last hour, the limit is 2")
+		if n := len(o.Records()); n != 2 {
+			t.Errorf("the agent was started %d times, want 2", n)
+		}
+	})
+
+	t.Run("daily spend", func(t *testing.T) {
+		cost := Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"6d5c4b3a-2190-4f8e-9d7c-6b5a49382716","total_cost_usd":0.6}`}
+		o := Start(t, Options{
+			Script:    []Step{cost, Report("done", "Done.")},
+			Policy:    "tiers: [{name: normal}]\ndefault_tier: normal\nthrottles: {daily_spend_usd: 1}\n",
+			Configure: claudeAdapter,
+		})
+		o.WaitRun(o.LinearCreated("ENG-153", "s-1", "").TaskID(t), 15*time.Second)
+		// 0.60 is under the cap: the second run starts, and takes the day
+		// to 1.20.
+		o.WaitRun(o.LinearCreated("ENG-154", "s-2", "").TaskID(t), 15*time.Second)
+		o.LinearCreated("ENG-155", "s-3", "")
+		queued(t, o, "held: throttle daily_spend_usd: the runs of today (UTC) have cost 1.20 USD, the limit is 1.00")
+		if n := len(o.Records()); n != 2 {
+			t.Errorf("the agent was started %d times, want 2", n)
+		}
+		// The throttle needs an agent that reports its cost.
+		if out, code := o.Admin("serve", "--agent-adapter", "plain"); code == 0 || !strings.Contains(out, "throttles.daily_spend_usd, but agent.adapter plain reports no cost") {
+			t.Errorf("the daily spend with the plain adapter: exit %d, %q", code, out)
+		}
+	})
+
+	t.Run("open pull requests per repository", func(t *testing.T) {
+		const web, api = "git@example.com:org/web.git", "git@example.com:org/api.git"
+		o := Start(t, Options{
+			Script: []Step{Report("done", "Opened a pull request.", "pr_url", "https://example.com/org/repo/pull/1")},
+			Policy: "tiers: [{name: normal}]\ndefault_tier: normal\nthrottles: {max_open_prs_per_repo: 1}\n",
+			Configure: func(c *config.Config) {
+				c.Repos = []config.Repo{{Source: "jira", Project: "DEV", Repo: web}, {Source: "jira", Project: "OPS", Repo: api}}
+			},
+		})
+		for _, key := range []string{"DEV-150", "DEV-151", "OPS-150"} {
+			o.Jira.Add(jiratest.Issue{Key: key})
+		}
+		st, err := store.Open(o.Config.Store.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer st.Close()
+		// The first ticket opens a pull request in web.
+		o.WaitStored(st, o.JiraAssigned("DEV-150", "First").TaskID(t), 15*time.Second)
+		// The second would open another one there: it waits.
+		second := o.JiraAssigned("DEV-151", "Second").TaskID(t)
+		queued(t, o, "held: throttle max_open_prs_per_repo: 1 pull requests of the bot are open in "+web)
+		// Another repository is not held, and neither is the ticket that
+		// has the pull request.
+		o.WaitStored(st, o.JiraAssigned("OPS-150", "Other repository").TaskID(t), 15*time.Second)
+		o.WaitStored(st, o.JiraCommented("DEV-150", "", "Please rename the function.").TaskID(t), 15*time.Second)
+		if tk, _ := st.Ticket("jira", "DEV-151"); tk.State != "queued" || len(o.Records()) != 3 {
+			t.Fatalf("DEV-151 = %s with %d runs in all; want it queued, with 3 runs", tk.State, len(o.Records()))
+		}
+		// The pull request's ticket is closed: the held one starts.
+		if r := o.JiraResolved("DEV-150"); r.Status != 200 {
+			t.Fatalf("resolved: %d %q", r.Status, r.Body)
+		}
+		o.WaitStored(st, second, 15*time.Second)
+	})
+
+	t.Run("paused in the policy file", func(t *testing.T) {
+		o := Start(t, Options{Policy: "paused: true\ntiers: [{name: normal}]\ndefault_tier: normal\n"})
+		o.LinearCreated("ENG-156", "s-1", "")
+		queued(t, o, "paused: no new run starts; 1 queued, 0 running\nheld: paused by the policy file (paused: true)")
+		// A command does not end a pause that the file sets.
+		if out, code := o.Admin("resume"); code != 0 || !strings.HasPrefix(out, "paused: no new run starts; 1 queued, 0 running") {
+			t.Errorf("ochell resume: exit %d, %q", code, out)
+		}
+		if n := len(o.Records()); n != 0 {
+			t.Errorf("the agent was started %d times under a policy that pauses everything", n)
+		}
+	})
+}

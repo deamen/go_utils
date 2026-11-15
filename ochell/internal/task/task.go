@@ -25,6 +25,9 @@ const (
 	// CauseFollowUp: a person wrote to the agent on a ticket that ochell
 	// already knows. The message is in Comment.
 	CauseFollowUp Cause = "follow_up"
+	// CauseKilled: an operator's kill switch stopped the earlier run of the
+	// ticket, and this run takes its place once ochell is resumed.
+	CauseKilled Cause = "killed"
 	// CauseApproved: a person approved the agent's plan for the ticket.
 	// ApprovedBy on the task names them.
 	CauseApproved Cause = "plan_approved"

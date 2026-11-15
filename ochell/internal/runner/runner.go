@@ -91,6 +91,10 @@ type Runner struct {
 	cancels map[string]context.CancelFunc
 	stops   map[string]string
 	closing map[string]bool
+	// running holds the tier of each run in progress, and kills who used
+	// the kill switch on it, by source and key. Guarded by mu.
+	running map[string]string
+	kills   map[string]string
 	// grants holds what each run in progress was granted, by task id, for
 	// the workspace hooks of that run. Guarded by mu.
 	grants map[string]*granted
@@ -109,7 +113,8 @@ type Runner struct {
 // New returns a runner that keeps its queue in st.
 func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 	r := &Runner{cfg: cfg, log: log, store: st, policy: policy.Builtin(), wake: make(chan struct{}, 1), quit: make(chan struct{}),
-		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}, raised: map[string]string{}, grants: map[string]*granted{}}
+		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}, raised: map[string]string{}, grants: map[string]*granted{},
+		running: map[string]string{}, kills: map[string]string{}}
 	r.runCtx, r.stopRuns = context.WithCancel(context.Background())
 	var err error
 	if r.prompt, err = parse("prompt_template", cfg.PromptTemplate); err != nil {
@@ -165,6 +170,17 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 // A policy with a budget needs an agent that can be kept to it. With any
 // other agent the budget would silently be no limit, so that is refused.
 func (r *Runner) UsePolicy(p *policy.Policy) error {
+	holds := store.Holds{Paused: p.Paused, MaxRunsPerHour: p.Throttles.MaxRunsPerHour,
+		MaxOpenPRsPerRepo: p.Throttles.MaxOpenPRsPerRepo, DailySpendUSD: p.Throttles.DailySpendUSD}
+	for _, t := range p.Tiers {
+		if t.Paused {
+			holds.PausedTiers = append(holds.PausedTiers, t.Name)
+		}
+	}
+	if holds.DailySpendUSD > 0 && !agent.LimitsBudget(r.adapter) {
+		return fmt.Errorf("the policy sets throttles.daily_spend_usd, but agent.adapter %s reports no cost: use agent.adapter claude, or take the throttle out of the policy", r.cfg.Adapter)
+	}
+	r.store.SetHolds(holds)
 	if !agent.LimitsBudget(r.adapter) {
 		for _, t := range p.Tiers {
 			if t.BudgetUSD > 0 {
@@ -375,6 +391,7 @@ func (r *Runner) stopLocked(source, key, by string) (Stopped, error) {
 		t = &task.Task{Source: source, Key: key}
 	}
 	r.log.Warn("ticket stopped", "source", source, "key", key, "by", by, "was_queued", queued != nil)
+	r.wakeWorker()
 	if r.notify != nil {
 		r.wg.Add(1)
 		go func() {
@@ -388,38 +405,121 @@ func (r *Runner) stopLocked(source, key, by string) (Stopped, error) {
 }
 
 // Pause holds the queue: no new run starts until Resume. Running agents go
-// on, and webhooks are still accepted and queued. The flag is in the store,
-// so it is kept across a restart.
-func (r *Runner) Pause() error {
-	if err := r.store.SetPaused(true); err != nil {
+// on, and webhooks are still accepted and queued. With a tier, only the
+// tickets of that tier are held. The flag is in the store, so it is kept
+// across a restart.
+func (r *Runner) Pause(tier string) error {
+	if tier == "" {
+		if err := r.store.SetPaused(true); err != nil {
+			return err
+		}
+		r.log.Warn("paused: no new run starts until ochell is resumed")
+		return nil
+	}
+	if !r.policy.Has(tier) {
+		return fmt.Errorf("%w: %q", ErrNoTier, tier)
+	}
+	if err := r.store.SetTierPaused(tier, true); err != nil {
 		return err
 	}
-	r.log.Warn("paused: no new run starts until ochell is resumed")
+	r.log.Warn("tier paused: no run of a ticket in this tier starts until it is resumed", "tier", tier)
 	return nil
 }
 
-// Resume ends a pause.
-func (r *Runner) Resume() error {
-	if err := r.store.SetPaused(false); err != nil {
-		return err
+// Resume ends a pause: of everything, or with a tier of that tier. A pause
+// that the policy file sets is not ended by it.
+func (r *Runner) Resume(tier string) error {
+	if tier == "" {
+		if err := r.store.SetPaused(false); err != nil {
+			return err
+		}
+		r.log.Info("resumed")
+	} else {
+		if !r.policy.Has(tier) {
+			return fmt.Errorf("%w: %q", ErrNoTier, tier)
+		}
+		if err := r.store.SetTierPaused(tier, false); err != nil {
+			return err
+		}
+		r.log.Info("tier resumed", "tier", tier)
 	}
-	r.log.Info("resumed")
 	r.wakeWorker()
 	return nil
 }
 
+// Kill is the kill switch: it pauses, and stops the agents that are
+// running, with all their processes. With a tier it does both for the
+// tickets of that tier only. It returns how many agents it stops; they end
+// within the grace period of a stop (agent.stop_grace).
+//
+// The tickets of the stopped runs are queued again and stay queued, like
+// everything else, until Resume. Their next run has a note for the agent
+// that it was cut off. by names the operator, for the tickets.
+func (r *Runner) Kill(tier, by string) (int, error) {
+	// The pause comes first, so that nothing starts while the agents stop.
+	if err := r.Pause(tier); err != nil {
+		return 0, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for k, cancel := range r.cancels {
+		if tier != "" && r.running[k] != tier {
+			continue
+		}
+		if _, asked := r.kills[k]; !asked {
+			r.kills[k] = by
+		}
+		cancel()
+		n++
+	}
+	r.log.Warn("kill switch: stopping the running agents", "tier", tier, "by", by, "agents", n)
+	return n, nil
+}
+
 // Status is what ochell is doing right now.
 type Status struct {
+	// Paused: nothing starts, because of a command or of the policy file.
 	Paused  bool `json:"paused"`
 	Queued  int  `json:"queued"`
 	Running int  `json:"running"`
+	// Holds says what keeps runs from starting besides a plain "ochell
+	// pause", one line each: a pause in the policy file or of a tier, and
+	// each throttle that has reached its limit.
+	Holds []string `json:"holds,omitempty"`
 }
 
 func (r *Runner) Status() (Status, error) {
 	var st Status
-	var err error
-	if st.Paused, err = r.store.Paused(); err != nil {
+	h, err := r.store.Holding()
+	if err != nil {
 		return st, err
+	}
+	st.Paused = h.Paused || h.PolicyPaused
+	switch {
+	case h.Paused && h.PolicyPaused:
+		st.Holds = append(st.Holds, "paused by a command and by the policy file (paused: true)")
+	case h.Paused:
+		// The plain pause needs no line of its own.
+	case h.PolicyPaused:
+		st.Holds = append(st.Holds, "paused by the policy file (paused: true); change the file and restart to end it")
+	}
+	for _, t := range h.Tiers {
+		st.Holds = append(st.Holds, fmt.Sprintf("tier %s is paused by a command; \"ochell resume --tier %s\" ends it", t, t))
+	}
+	for _, t := range h.PolicyTiers {
+		st.Holds = append(st.Holds, fmt.Sprintf("tier %s is paused by the policy file", t))
+	}
+	for _, t := range h.Throttles {
+		st.Holds = append(st.Holds, "throttle "+t)
+	}
+	max := r.policy.Throttles.MaxOpenPRsPerRepo
+	repos, err := r.store.HeldByPRs(max)
+	if err != nil {
+		return st, err
+	}
+	for _, repo := range repos {
+		st.Holds = append(st.Holds, fmt.Sprintf("throttle max_open_prs_per_repo: %d pull requests of the bot are open in %s; tickets that would open another wait", max, repo))
 	}
 	st.Queued, st.Running, err = r.store.Counts()
 	return st, err
@@ -669,8 +769,13 @@ func (r *Runner) Start() error {
 	if n, err := r.store.Active(); err == nil && n > 0 {
 		r.log.Info("tasks queued before the restart will be run", "tasks", n)
 	}
-	if held, err := r.store.Paused(); err == nil && held {
-		r.log.Warn("ochell is paused: no run starts until it is resumed (ochell resume)")
+	if st, err := r.Status(); err == nil {
+		if st.Paused {
+			r.log.Warn("ochell is paused: no run starts until it is resumed (ochell resume)")
+		}
+		for _, h := range st.Holds {
+			r.log.Warn("runs are held back: " + h)
+		}
 	}
 
 	n := max(r.cfg.MaxConcurrent, 1)
@@ -769,6 +874,7 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	k := ticketKey(t.Source, t.Key)
 	r.mu.Lock()
 	r.cancels[k] = cancel
+	r.running[k] = t.Tier
 	if _, asked := r.stops[k]; asked {
 		// The stop came between the claim and now.
 		cancel()
@@ -801,6 +907,9 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	by, stopped := r.stops[k]
 	closed := r.closing[k]
 	raisedTo := r.raised[k]
+	killedBy, killed := r.kills[k]
+	delete(r.running, k)
+	delete(r.kills, k)
 	delete(r.cancels, k)
 	delete(r.stops, k)
 	delete(r.closing, k)
@@ -818,8 +927,14 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	}
 	// Record the end before telling the ticket, so the ticket is free for
 	// a new run by the time someone reads the answer.
+	if killed && !stopped && raisedTo == "" && res.Outcome == task.OutcomeStopped {
+		res.Err = fmt.Errorf("the run was stopped by the kill switch (%s)", killedBy)
+	}
 	var again *store.Again
 	if a, ok := r.next(t, res); ok {
+		if killed && a.Cause == task.CauseRecovery {
+			a.Cause = task.CauseKilled
+		}
 		again = &a
 	}
 	// An escalation trigger stops the ticket here, before anything goes on.
