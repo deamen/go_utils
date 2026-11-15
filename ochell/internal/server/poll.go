@@ -156,7 +156,7 @@ func (s *Server) pollStart(ctx context.Context, p polled, is tracker.Issue, log 
 		}
 		t.TrackerSession = session
 	}
-	switch res, _, _ := s.admit(t, is.Labels, log); res {
+	switch res, _, _ := s.admit(t, attrs{labels: is.Labels, issueType: is.Type}, log); res {
 	case submitQueued:
 		log.Info("poller: started a ticket whose webhook was missed", "key", is.Key, "task", t.ID)
 		if t.TrackerSession != "" {

@@ -24,6 +24,8 @@ type Issue struct {
 	Key, Summary string
 	Labels       []string
 	Components   []string
+	// Type is the issue type, such as "Bug".
+	Type string
 	// Status is the current status; Statuses are the ones it can move to.
 	Status   string
 	Statuses []string
@@ -302,6 +304,7 @@ func (s *Server) search(w http.ResponseWriter, body []byte) {
 		Summary    string   `json:"summary"`
 		Labels     []string `json:"labels"`
 		Components []name   `json:"components"`
+		IssueType  name     `json:"issuetype"`
 	}
 	type issue struct {
 		Key    string `json:"key"`
@@ -316,7 +319,7 @@ func (s *Server) search(w http.ResponseWriter, body []byte) {
 			break
 		}
 		is := open[i]
-		f := fields{Summary: is.Summary, Labels: is.Labels}
+		f := fields{Summary: is.Summary, Labels: is.Labels, IssueType: name{is.Type}}
 		for _, c := range is.Components {
 			f.Components = append(f.Components, name{c})
 		}

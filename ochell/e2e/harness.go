@@ -195,6 +195,9 @@ type Options struct {
 	Script []Step
 	// Configure changes the configuration before ochell starts.
 	Configure func(c *config.Config)
+	// Policy, when set, is the content of the policy file that ochell is
+	// started with (policy.file).
+	Policy string
 	// Env is added to the environment of the ochell process.
 	Env []string
 	// OtherAgentUser prepares for an agent that runs as another OS user (the
@@ -214,6 +217,10 @@ type Ochell struct {
 	// Actor is the user who assigns the tickets in the payloads that are
 	// sent from now on. Empty: HumanAccountID.
 	Actor string
+	// Labels and IssueType are those of the tickets in the payloads that
+	// are sent from now on. A Linear issue has no type.
+	Labels    []string
+	IssueType string
 
 	t         *testing.T
 	bin       string
@@ -344,6 +351,12 @@ func Start(t *testing.T, opts Options) *Ochell {
 	// Off, so that a test counts only the activities it is about. The
 	// test of the tool activities turns them on.
 	cfg.Sources.Linear.ToolActivityInterval = 0
+	if opts.Policy != "" {
+		cfg.Policy.File = filepath.Join(dir, "policy.yaml")
+		if err := os.WriteFile(cfg.Policy.File, []byte(opts.Policy), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if opts.Configure != nil {
 		opts.Configure(cfg)
 	}
@@ -545,6 +558,16 @@ func nextDelivery() string {
 // to the digital employee.
 func (o *Ochell) JiraAssigned(key, summary string) Response {
 	o.t.Helper()
+	fields := map[string]any{
+		"summary":  summary,
+		"assignee": map[string]string{"accountId": BotAccountID},
+	}
+	if len(o.Labels) > 0 {
+		fields["labels"] = o.Labels
+	}
+	if o.IssueType != "" {
+		fields["issuetype"] = map[string]string{"name": o.IssueType}
+	}
 	body, err := json.Marshal(map[string]any{
 		"timestamp":             time.Now().UnixMilli(),
 		"webhookEvent":          "jira:issue_updated",
@@ -552,11 +575,8 @@ func (o *Ochell) JiraAssigned(key, summary string) Response {
 		"user":                  map[string]string{"accountId": o.actor()},
 		"issue": map[string]any{
 			"id": "10042", "key": key,
-			"self": "https://example.atlassian.net/rest/api/2/issue/10042",
-			"fields": map[string]any{
-				"summary":  summary,
-				"assignee": map[string]string{"accountId": BotAccountID},
-			},
+			"self":   "https://example.atlassian.net/rest/api/2/issue/10042",
+			"fields": fields,
 		},
 		"changelog": map[string]any{"items": []map[string]string{
 			{"field": "assignee", "fieldId": "assignee", "from": "557058:human", "to": BotAccountID},
@@ -655,6 +675,8 @@ func (o *Ochell) JiraAutomation(key, summary string) Response {
 		"url":               "https://example.atlassian.net/browse/" + key,
 		"assigneeAccountId": BotAccountID, "event": "assigned",
 		"initiatorAccountId": o.actor(),
+		"labels":             strings.Join(o.Labels, ", "),
+		"issueType":          o.IssueType,
 	})
 	if err != nil {
 		o.t.Fatal(err)
@@ -683,9 +705,10 @@ func (o *Ochell) linearCreated(key, sessionID, promptContext, comment string) Re
 	session := map[string]any{
 		"id":      sessionID,
 		"creator": map[string]string{"id": o.actor(), "email": "human@example.com"},
-		"issue": map[string]string{
+		"issue": map[string]any{
 			"id": "issue-" + key, "identifier": key, "title": "Title of " + key,
-			"url": "https://linear.app/example/issue/" + key,
+			"url":    "https://linear.app/example/issue/" + key,
+			"labels": linearLabels(o.Labels),
 		},
 	}
 	if comment != "" {
@@ -705,6 +728,15 @@ func (o *Ochell) linearCreated(key, sessionID, promptContext, comment string) Re
 		"Linear-Signature": auth.SignHex(LinearSecret, body),
 		"Linear-Delivery":  nextDelivery(),
 	})
+}
+
+// linearLabels is how a Linear payload lists the labels of an issue.
+func linearLabels(names []string) []map[string]string {
+	out := []map[string]string{}
+	for _, n := range names {
+		out = append(out, map[string]string{"name": n})
+	}
+	return out
 }
 
 // LinearPrompted sends a signed Linear AgentSessionEvent "prompted": a

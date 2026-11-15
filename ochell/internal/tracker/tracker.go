@@ -18,6 +18,8 @@ type Issue struct {
 	URL string
 	// Labels holds the labels of the ticket; for Jira also its components.
 	Labels []string
+	// Type is the Jira issue type, such as "Bug"; empty for Linear.
+	Type string
 }
 
 // Status is what a tracker says about one ticket that the bot had.

@@ -53,6 +53,17 @@ type Fields struct {
 	Components []struct {
 		Name string `json:"name"`
 	} `json:"components"`
+	IssueType *struct {
+		Name string `json:"name"`
+	} `json:"issuetype"`
+}
+
+// issueType returns the name of the issue type, or "".
+func (f Fields) issueType() string {
+	if f.IssueType == nil {
+		return ""
+	}
+	return f.IssueType.Name
 }
 
 // labels returns the labels and component names of the issue.
@@ -102,6 +113,9 @@ type Ticket struct {
 	// Labels holds the labels and component names of the issue, as far as
 	// the payload has them.
 	Labels []string
+	// IssueType is the name of the issue type, such as "Bug", when the
+	// payload has it.
+	IssueType string
 	// Actor is the accountId of the user who assigned the issue: the user
 	// of the webhook event, or the initiator of the Automation rule. Empty
 	// when the payload does not say.
@@ -141,11 +155,12 @@ func ParseWebhook(body []byte, botAccountID string) (*Ticket, error) {
 		return nil, fmt.Errorf("%w: event %q", ErrIgnored, ev.WebhookEvent)
 	}
 	return &Ticket{
-		Key:     ev.Issue.Key,
-		Summary: ev.Issue.Fields.Summary,
-		URL:     BrowseURL(ev.Issue.Self, ev.Issue.Key),
-		Labels:  ev.Issue.Fields.labels(),
-		Actor:   actor(ev.User),
+		Key:       ev.Issue.Key,
+		Summary:   ev.Issue.Fields.Summary,
+		URL:       BrowseURL(ev.Issue.Self, ev.Issue.Key),
+		Labels:    ev.Issue.Fields.labels(),
+		IssueType: ev.Issue.Fields.issueType(),
+		Actor:     actor(ev.User),
 	}, nil
 }
 
@@ -289,6 +304,9 @@ type AutomationPayload struct {
 	// Labels is optional: a list, or one text with commas, which is what
 	// the smart value {{issue.labels}} gives.
 	Labels labelList `json:"labels"`
+	// IssueType is optional: {{issue.issueType.name}}. A policy rule with
+	// issue_type needs it.
+	IssueType string `json:"issueType"`
 	// Issue is set when the rule sends "Work item data (Jira format)".
 	Issue *Issue `json:"issue"`
 }
@@ -328,7 +346,7 @@ func ParseAutomation(body []byte, botAccountID string) (*Ticket, error) {
 	if err := json.Unmarshal(body, &p); err != nil {
 		return nil, fmt.Errorf("decode jira automation payload: %w", err)
 	}
-	t := &Ticket{Key: p.IssueKey, Summary: p.Summary, URL: p.URL, Labels: p.Labels, Actor: strings.TrimSpace(p.Initiator)}
+	t := &Ticket{Key: p.IssueKey, Summary: p.Summary, URL: p.URL, Labels: p.Labels, IssueType: strings.TrimSpace(p.IssueType), Actor: strings.TrimSpace(p.Initiator)}
 	assignee := p.Assignee
 	if p.Issue != nil {
 		if t.Key == "" {
@@ -341,6 +359,9 @@ func ParseAutomation(body []byte, botAccountID string) (*Ticket, error) {
 			t.URL = BrowseURL(p.Issue.Self, p.Issue.Key)
 		}
 		t.Labels = append(t.Labels, p.Issue.Fields.labels()...)
+		if t.IssueType == "" {
+			t.IssueType = p.Issue.Fields.issueType()
+		}
 		if assignee == "" && p.Issue.Fields.Assignee != nil {
 			assignee = p.Issue.Fields.Assignee.AccountID
 		}

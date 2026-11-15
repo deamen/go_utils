@@ -27,6 +27,7 @@ import (
 	"ochell/internal/agent"
 	"ochell/internal/config"
 	"ochell/internal/launcher"
+	"ochell/internal/policy"
 	"ochell/internal/result"
 	"ochell/internal/store"
 	"ochell/internal/task"
@@ -66,9 +67,11 @@ type Runner struct {
 	progress ProgressNotifier
 	adapter  agent.Adapter
 	launcher launcher.Launcher
-	prompt   *template.Template
-	args     []*template.Template
-	workdir  *template.Template
+	// policy holds the risk tiers; the built-in one without a policy file.
+	policy  *policy.Policy
+	prompt  *template.Template
+	args    []*template.Template
+	workdir *template.Template
 	// transient are agent.retry.patterns: what the output of a run that
 	// failed for a temporary reason looks like.
 	transient []*regexp.Regexp
@@ -99,7 +102,7 @@ type Runner struct {
 
 // New returns a runner that keeps its queue in st.
 func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
-	r := &Runner{cfg: cfg, log: log, store: st, wake: make(chan struct{}, 1), quit: make(chan struct{}),
+	r := &Runner{cfg: cfg, log: log, store: st, policy: policy.Builtin(), wake: make(chan struct{}, 1), quit: make(chan struct{}),
 		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}}
 	r.runCtx, r.stopRuns = context.WithCancel(context.Background())
 	var err error
@@ -149,6 +152,10 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 	}
 	return r, nil
 }
+
+// UsePolicy sets the policy with the risk tiers. Call it before Start.
+// Without it the built-in policy holds.
+func (r *Runner) UsePolicy(p *policy.Policy) { r.policy = p }
 
 // SetNotifier sets who is told about the runs. Call it before Start.
 func (r *Runner) SetNotifier(n Notifier) {
@@ -225,6 +232,17 @@ func (r *Runner) Assigner(source, key string) (assigner string, known bool, err 
 		return "", false, err
 	}
 	return tk.Assigner, true, nil
+}
+
+// Tier returns the risk tier that ochell has recorded for a ticket, or ""
+// when it has none: ochell has never seen the ticket, or saw it before
+// there were tiers.
+func (r *Runner) Tier(source, key string) (string, error) {
+	tk, err := r.store.Ticket(source, key)
+	if err != nil || tk == nil {
+		return "", err
+	}
+	return tk.Tier, nil
 }
 
 // State returns the state of a ticket; ticket.None for one that ochell has
@@ -370,6 +388,24 @@ func (r *Runner) ResetAttempts(source, key string) error {
 		return err
 	}
 	r.log.Info("attempts reset", "source", source, "key", key)
+	return nil
+}
+
+// ErrNoTier is returned for a tier that the policy does not have.
+var ErrNoTier = errors.New("the policy has no such tier")
+
+// SetTier puts a ticket under another risk tier, for an operator. It is the
+// one way to lower a tier: nothing that happens on the ticket does. The
+// next run of the ticket uses it. It returns ErrNoTier, and
+// store.ErrUnknown for a ticket that ochell has never seen.
+func (r *Runner) SetTier(source, key, tier string) error {
+	if !r.policy.Has(tier) {
+		return fmt.Errorf("%w: %q", ErrNoTier, tier)
+	}
+	if err := r.store.SetTier(source, key, tier); err != nil {
+		return err
+	}
+	r.log.Info("tier set by an operator", "source", source, "key", key, "tier", tier)
 	return nil
 }
 
@@ -522,7 +558,7 @@ func (r *Runner) Running() int {
 }
 
 func (r *Runner) handle(ctx context.Context, t *task.Task) {
-	log := r.log.With("task", t.ID, "source", t.Source, "key", t.Key, "attempt", t.Attempt)
+	log := r.log.With("task", t.ID, "source", t.Source, "key", t.Key, "attempt", t.Attempt, "tier", t.Tier)
 
 	// One thing at a time in the ticket's working directory. If the
 	// directory was removed since the task was claimed, the run must
@@ -779,8 +815,8 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	if res.Resumed {
 		session = "resumed " + t.AgentSession
 	}
-	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s\n# command=%s (%d args) workdir=%s session=%s\n# prompt:\n%s\n",
-		t.ID, t.Source, t.Key, t.URL, r.cfg.Command, len(cmd.Args), dir, session, t.Prompt)
+	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s tier=%s\n# command=%s (%d args) workdir=%s session=%s\n# prompt:\n%s\n",
+		t.ID, t.Source, t.Key, t.URL, t.Tier, r.cfg.Command, len(cmd.Args), dir, session, t.Prompt)
 	// signal is what the footer of the log says about the result file.
 	signal := "none"
 	defer func() {
@@ -984,6 +1020,9 @@ func (r *Runner) taskEnv(t *task.Task) []string {
 	}
 	if t.Repo != "" {
 		env = append(env, "ORCH_TASK_REPO="+t.Repo)
+	}
+	if t.Tier != "" {
+		env = append(env, "ORCH_TASK_TIER="+t.Tier)
 	}
 	if branch := r.ws.view(t).Branch; branch != "" {
 		env = append(env, "ORCH_TASK_BRANCH="+branch)

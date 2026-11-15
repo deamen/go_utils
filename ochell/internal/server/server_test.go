@@ -19,6 +19,7 @@ import (
 
 	"ochell/internal/auth"
 	"ochell/internal/config"
+	"ochell/internal/policy"
 	"ochell/internal/result"
 	"ochell/internal/runner"
 	"ochell/internal/source/linear"
@@ -59,6 +60,14 @@ type fakeRunner struct {
 	assigners map[string]string
 	// sessions maps a tracker session to its ticket key.
 	sessions map[string]string
+	// tiers maps a ticket key to the tier that ochell has recorded for it.
+	tiers map[string]string
+}
+
+func (f *fakeRunner) Tier(source, key string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tiers[key], nil
 }
 
 // FollowUp accepts a message for the tickets in known, and for every ticket
@@ -1540,4 +1549,69 @@ func TestToolUsedIsRateLimited(t *testing.T) {
 	now = now.Add(time.Hour)
 	s.ToolUsed(tk, "Read", "x")
 	wait(4)
+}
+
+// Every ticket gets a tier of the policy: that of the first rule that
+// matches it, else the default, raised by a label; and never a lower one
+// than it had.
+func TestTiers(t *testing.T) {
+	pol, err := policy.Parse([]byte(`
+tiers:
+  - {name: low}
+  - {name: normal}
+  - {name: high, labels: [risk-high]}
+default_tier: normal
+rules:
+  - {source: jira, project: OPS, issue_type: Bug, tier: low}
+  - {project: PAY, tier: high}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr := &fakeRunner{tiers: map[string]string{"OPS-5": "high", "OPS-6": "retired"}}
+	s := newServer(t, testConfig(), fr)
+	s.UsePolicy(pol)
+	post := func(body string) {
+		t.Helper()
+		w := do(s, "/webhooks/jira-automation", body, map[string]string{"Authorization": "Bearer auto-token"})
+		if w.Code != 200 || !strings.HasPrefix(w.Body.String(), "queued") {
+			t.Fatalf("%s: %d %s", body, w.Code, w.Body)
+		}
+	}
+	post(`{"issueKey":"DEV-1","summary":"s"}`)
+	post(`{"issueKey":"OPS-1","summary":"s","issueType":"Bug"}`)
+	post(`{"issueKey":"OPS-2","summary":"s","issueType":"Story"}`)
+	post(`{"issueKey":"OPS-3","summary":"s","issue":{"key":"OPS-3","fields":{"issuetype":{"name":"Bug"}}}}`)
+	post(`{"issueKey":"OPS-4","summary":"s","issueType":"Bug","labels":"ui, Risk-High"}`)
+	post(`{"issueKey":"PAY-1","summary":"s"}`)
+	// A ticket that had a higher tier keeps it; one whose tier the policy
+	// no longer has gets what the policy says now.
+	post(`{"issueKey":"OPS-5","summary":"s","issueType":"Bug"}`)
+	post(`{"issueKey":"OPS-6","summary":"s","issueType":"Bug"}`)
+	want := map[string]string{"DEV-1": "normal", "OPS-1": "low", "OPS-2": "normal", "OPS-3": "low", "OPS-4": "high", "PAY-1": "high", "OPS-5": "high", "OPS-6": "low"}
+	for _, tk := range fr.tasks {
+		if tk.Tier != want[tk.Key] {
+			t.Errorf("%s: tier %q, want %q", tk.Key, tk.Tier, want[tk.Key])
+		}
+	}
+	if len(fr.tasks) != len(want) {
+		t.Errorf("%d tasks, want %d", len(fr.tasks), len(want))
+	}
+
+	// The system webhook carries the issue type and the labels itself.
+	body := strings.Replace(jiraBody(t, time.Now()), `"fields": {`, `"fields": {"issuetype": {"name": "Bug"}, "labels": ["risk-high"],`, 1)
+	hdr := map[string]string{"X-Hub-Signature": "sha256=" + auth.SignHex("jira-secret", []byte(body)), "X-Atlassian-Webhook-Identifier": "tier-1"}
+	if w := do(s, "/webhooks/jira", body, hdr); w.Code != 200 {
+		t.Fatalf("system webhook: %d %s", w.Code, w.Body)
+	}
+	if last := fr.tasks[len(fr.tasks)-1]; last.Tier != "high" {
+		t.Errorf("system webhook: %s has tier %q, want high from its label", last.Key, last.Tier)
+	}
+
+	// Without a policy file every ticket runs under the built-in tier.
+	fr = &fakeRunner{}
+	s = newServer(t, testConfig(), fr)
+	if w := do(s, "/webhooks/jira-automation", `{"issueKey":"PAY-1","summary":"s"}`, map[string]string{"Authorization": "Bearer auto-token"}); w.Code != 200 || fr.tasks[0].Tier != policy.DefaultTierName {
+		t.Errorf("built-in policy: %d %s, tasks %+v", w.Code, w.Body, fr.tasks)
+	}
 }
