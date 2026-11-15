@@ -3,12 +3,15 @@
 package e2e
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -3982,5 +3985,117 @@ func TestCIFeedback(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 	if n := len(o.Records()); n != 5 || state("linear", "ENG-190") != "in_review" {
 		t.Errorf("after the agent gave up: %d runs, ENG-190 = %s", n, state("linear", "ENG-190"))
+	}
+}
+
+// The audit trail: every run has a record with the policy version, the
+// tier and the grants it ran under, the hash of its prompt, its tokens and
+// cost, and its outcome; and the outcome metrics can be queried per tier
+// for a period.
+func TestAuditTrail(t *testing.T) {
+	gh := githubtest.New(t)
+	pr := gh.Open(githubtest.PullRequest{Owner: "example", Repo: "web", Number: 7, HeadRef: "bot/LOW-200"})
+	files := t.TempDir()
+	const session = "4e3d2c1b-0a99-4887-b665-544332211000"
+	result := func(cost float64) Step {
+		return Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"` + session + `","total_cost_usd":` +
+			strconv.FormatFloat(cost, 'f', -1, 64) + `,"usage":{"input_tokens":11,"output_tokens":22,"cache_read_input_tokens":33,"cache_creation_input_tokens":44}}`}
+	}
+	script := append(OnRun(1, result(0.5), Report("done", "Opened a pull request.", "pr_url", pr)), OnRun(2, result(0.75), Report("done", "Renamed it."))...)
+	script = append(script, OnRun(3, result(2), Report("needs_input", "Which service?"))...)
+	o := Start(t, Options{Script: script, Policy: strings.Replace(grantFiles(t, files), "tiers:", "version: audit-1\ntiers:", 1), Configure: func(c *config.Config) {
+		claudeAdapter(c)
+		withAPI(c)
+		withGitHub(gh)(c)
+	}})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	began := time.Now().Add(-time.Minute)
+
+	// A low-tier ticket: a pull request, a follow-up from a person, a merge.
+	first := o.LinearCreated("LOW-200", "session-audit", "").TaskID(t)
+	o.WaitRun(first, 15*time.Second)
+	o.waitFor(10*time.Second, "LOW-200 to be in review", func() bool { tk, _ := st.Ticket("linear", "LOW-200"); return tk.State == "in_review" })
+	second := o.LinearPrompted("LOW-200", "session-audit", "Please rename the function.").TaskID(t)
+	o.WaitRun(second, 15*time.Second)
+	o.waitFor(10*time.Second, "LOW-200 to be in review again", func() bool { tk, _ := st.Ticket("linear", "LOW-200"); return tk.State == "in_review" })
+	gh.Merge("example", "web", 7, "reviewer")
+	o.waitFor(10*time.Second, "LOW-200 to be done", func() bool { tk, _ := st.Ticket("linear", "LOW-200"); return tk.State == "done" })
+	// A high-tier ticket that asks a question.
+	third := o.LinearCreated("HIGH-200", "session-audit-2", "").TaskID(t)
+	o.WaitRun(third, 15*time.Second)
+
+	// The record of a run, in the store.
+	rec := o.WaitRecords(1, 5*time.Second)[0]
+	sum := sha256.Sum256([]byte(rec.Stdin))
+	run := o.WaitStored(st, first, 10*time.Second)
+	if run.PolicyVersion != "audit-1" || run.Tier != "low" || run.Result.PromptHash != hex.EncodeToString(sum[:]) || run.Result.Outcome != "finished" ||
+		run.Result.CostUSD != 0.5 || run.Result.Usage.InputTokens != 11 || run.Result.Usage.OutputTokens != 22 || run.Result.Usage.CacheReadTokens != 33 || run.Result.Usage.CacheWriteTokens != 44 {
+		t.Errorf("record of the first run: policy %q, tier %q, %+v", run.PolicyVersion, run.Tier, run.Result)
+	}
+	// The grants by name, and no value of a secret.
+	wantGrants := "mcp_config=" + filepath.Join(files, "mcp-low.json") + " env=FAKEAGENT_TOOLSET credentials=LOW_TOKEN minted=RUN_TOKEN"
+	if run.Result.Grants != wantGrants {
+		t.Errorf("grants of the first run = %q, want %q", run.Result.Grants, wantGrants)
+	}
+	if run := o.WaitStored(st, third, 10*time.Second); run.Tier != "high" || run.Result.Grants != "mcp_config="+filepath.Join(files, "mcp-high.json")+" credentials=HIGH_TOKEN" || run.Result.Signal != "needs_input" {
+		t.Errorf("record of the high-tier run: tier %q, %+v", run.Tier, run.Result)
+	}
+
+	// The same record through the status API.
+	code, body := o.get("/api/v1/tasks/LOW-200", apiToken, false)
+	var entry struct {
+		Tickets []struct {
+			Runs []struct {
+				ID, Outcome string
+				CostUSD     float64 `json:"cost_usd"`
+				Audit       struct {
+					PolicyVersion string `json:"policy_version"`
+					Tier, Grants  string
+					PromptSHA256  string `json:"prompt_sha256"`
+					InputTokens   int64  `json:"input_tokens"`
+					OutputTokens  int64  `json:"output_tokens"`
+				}
+			}
+		}
+	}
+	if err := json.Unmarshal([]byte(body), &entry); code != 200 || err != nil || len(entry.Tickets) != 1 || len(entry.Tickets[0].Runs) != 2 {
+		t.Fatalf("GET /api/v1/tasks/LOW-200: %d %v\n%s", code, err, body)
+	}
+	if r := entry.Tickets[0].Runs[0]; r.ID != first || r.Outcome != "finished" || r.CostUSD != 0.5 || r.Audit.PolicyVersion != "audit-1" || r.Audit.Tier != "low" ||
+		r.Audit.Grants != wantGrants || r.Audit.PromptSHA256 != hex.EncodeToString(sum[:]) || r.Audit.InputTokens != 11 || r.Audit.OutputTokens != 22 {
+		t.Errorf("the first run in the API = %+v", r)
+	}
+	for _, secret := range []string{"low-tier-secret-1234", "minted-for-LOW-200"} {
+		if strings.Contains(body, secret) {
+			t.Errorf("the API shows the secret %s", secret)
+		}
+	}
+
+	// The outcome metrics per tier, for a period that covers the test.
+	out, code := o.Admin("outcomes", "--since", "1h")
+	if code != 0 {
+		t.Fatalf("ochell outcomes: exit %d, %q", code, out)
+	}
+	// low: one ticket, two runs, 0.75 (the session's 0.50, then 0.25
+	// more); a pull request that a person sent back once, then merged.
+	// high: one ticket, one run, 2.00, no pull request.
+	for _, want := range []*regexp.Regexp{
+		regexp.MustCompile(`(?m)^high\s+1\s+1\s+2\.0000\s+2\.0000\s+0\s+-\s+-\s+0\s+-\s+0$`),
+		regexp.MustCompile(`(?m)^low\s+1\s+2\s+0\.7500\s+0\.7500\s+1\s+\S+\s+1 of 1 \(100%\)\s+1\s+0 of 1 \(0%\)\s+0$`),
+	} {
+		if !want.MatchString(out) {
+			t.Errorf("ochell outcomes lacks a line like %s:\n%s", want, out)
+		}
+	}
+	// A period before the test has nothing.
+	if out, code := o.Admin("outcomes", "--since", "2026-01-01", "--until", began.UTC().Format(time.RFC3339)); code != 0 || !strings.Contains(out, "no run started in this period") {
+		t.Errorf("ochell outcomes of an earlier period: exit %d, %q", code, out)
+	}
+	if out, code := o.Admin("outcomes", "--since", "last week"); code == 0 || !strings.Contains(out, "is not a date") {
+		t.Errorf("ochell outcomes with a bad date: exit %d, %q", code, out)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"ochell/internal/agent"
 	"ochell/internal/runner"
@@ -74,6 +75,11 @@ func (f *fakeControl) Cost(source, key string) (*runner.CostReport, error) {
 		}
 	}
 	return rep, nil
+}
+
+func (f *fakeControl) Outcomes(since, until time.Time) ([]store.Outcomes, error) {
+	return []store.Outcomes{{Tier: "low", Tickets: 4, Runs: 6, CostUSD: 2, PullRequests: 3, Reworked: 1, Merged: 2, MergedUntouched: 1, Reopened: 1,
+		TimeToPR: []time.Duration{10 * time.Minute, 30 * time.Minute, 20 * time.Minute}}}, nil
 }
 
 func (f *fakeControl) SetTier(source, key, tier string) error {
@@ -151,6 +157,16 @@ func TestCommands(t *testing.T) {
 	}
 	if got, err = Call(path, "POST", "resume", url.Values{"tier": {"high"}}); err != nil || strings.Contains(got, "held:") {
 		t.Errorf("resume of a tier = %q, %v", got, err)
+	}
+	// The outcome metrics per tier, for a period.
+	period := url.Values{"since": {"2026-11-01T00:00:00Z"}, "until": {"2026-11-15T00:00:00Z"}}
+	got, err = Call(path, "GET", "outcomes", period)
+	if err != nil || !strings.Contains(got, "outcomes per tier, 2026-11-01 00:00 to 2026-11-15 00:00 (UTC)") ||
+		!strings.Contains(got, "low   4        6     2.0000    0.5000           3              20m0s                1 of 3 (33%)  2       1 of 2 (50%)      1") {
+		t.Errorf("outcomes = %v\n%s", err, got)
+	}
+	if _, err := Call(path, "GET", "outcomes", url.Values{"since": {"yesterday"}, "until": {"2026-11-15T00:00:00Z"}}); err == nil {
+		t.Error("outcomes with a since that is no time were accepted")
 	}
 	// What the tickets have cost, and one ticket with its runs.
 	got, err = Call(path, "GET", "cost", nil)

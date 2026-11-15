@@ -164,6 +164,7 @@ ochell pause  --config config.yaml [--tier NAME]  # hold the queue: no new run s
 ochell resume --config config.yaml [--tier NAME]
 ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts and the budget of a ticket; --tier NAME also sets its risk tier
 ochell cost [<jira|linear> <KEY>] --config config.yaml  # what the tickets have cost, or one ticket with its runs
+ochell outcomes [--since D] [--until D] --config config.yaml   # outcome metrics per tier for a period
 ochell stop  <jira|linear> <KEY> --config config.yaml   # stop the run of a ticket and release it
 ```
 
@@ -290,6 +291,46 @@ The agent opens a pull request and hands the ticket over; a person reviews and m
   - **Whose comments count:** `github.allowed_reviewers` (GitHub logins); without that list, the people whom GitHub calls owner, member or collaborator of the repository. Never the digital employee's own account (`bot_login`).
   - ochell looks at the first hundred comments of each kind on a pull request.
 - All of this is by polling, every `github.poll_interval`; ochell needs no webhook from GitHub.
+
+### Audit trail and outcome metrics
+**Every run has a record** in the store, which answers afterwards under which rules it ran and what came of it.
+
+| In the record | What it is |
+|---|---|
+| policy version, tier | the version of the [policy](#policy-and-risk-tiers) in force when the run started, and the tier it ran under |
+| grants | what the tier granted the run, by name: the tools file, and the names of the variables from `env`, the credentials file and `mint`. Never a value |
+| prompt hash | the SHA-256 of the prompt the agent was given. The prompt itself is in the run log, not in the store |
+| tokens, cost | input, output, cache read and cache write tokens, and the cost in USD (see [Cost and budgets](#cost-and-budgets)) |
+| outcome | how the run ended, the agent's own result, its message, and the trigger if one stopped it |
+| phase, cause, times | whether it was a plan run, why it was queued, and when it was received, started and ended |
+
+- **Where to read it:** `GET /api/v1/tasks/<key>` of [the status API](#the-status-api) shows every run of a ticket with an `audit` part; the SQLite file has the same in its `runs` table.
+- The record is written when the run ends, in the same transaction as the ticket's new state.
+
+**Outcome metrics per tier, for a period:**
+
+```
+$ ochell outcomes --since 2026-11-08 --until 2026-11-15 --config config.yaml
+outcomes per tier, 2026-11-08 00:00 to 2026-11-15 00:00 (UTC)
+TIER    TICKETS  RUNS  COST USD  COST PER TICKET  PULL REQUESTS  TIME TO PR (MEDIAN)  SENT BACK      MERGED  MERGED UNTOUCHED  REOPENED
+high    3        9     41.2000   13.7333          2              1h12m0s              1 of 2 (50%)   1       0 of 1 (0%)       0
+low     14       17    9.8000    0.7000           13             9m30s                2 of 13 (15%)  12      10 of 12 (83%)    1
+```
+
+| Column | Meaning |
+|---|---|
+| tickets, runs, cost, cost per ticket | the runs that started in the period, the tickets they belong to, and what they cost |
+| pull requests | tickets that first handed over a pull request in the period |
+| time to PR | for those tickets, from the start of the first run to that hand-over; the median |
+| sent back | the rework rate: of those tickets, the ones that a person sent back with a follow-up after the pull request |
+| merged, merged untouched | pull requests merged in the period (it needs [the GitHub access](#handoff-review-merge-done)), and of them the ones whose ticket no person sent back after the hand-over |
+| reopened | tickets that were done and were assigned again in the period |
+
+- `--since` and `--until` take a date (`2026-11-08`), a time (`2026-11-08T09:00:00Z`) or how long ago (`168h`). The default is the last seven days.
+- A ticket counts under the tier it has now.
+- **"Merged untouched" is the nearest ochell can get to "merged without human changes"**: it knows whether a person asked for changes through the ticket or the pull request, not whether someone pushed commits to the branch themselves.
+- There is no escalation rate here.
+- These numbers are for the regular look at how each class of work goes. If people send back a large share of one tier's pull requests, change the policy or the prompt for that tier rather than correcting pull requests one by one.
 
 ### The status API
 Read-only pages about what ochell is doing, on the same listener as the webhooks.
@@ -603,7 +644,7 @@ Limits on what starts a run, and one way to talk to the running ochell.
   - A ticket whose assigner ochell does not know (a Jira Automation rule that sends no initiator) has no `assigner`.
   - Message text is never a way in: what a comment says does not change who may send one, or what the agent may do.
 
-**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `cost`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
+**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `cost`, `outcomes`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
 - Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port: the agent runs on the same host and can reach any local port. With the `systemd` launcher the agent is another user and cannot open the socket; with the `direct` launcher it is the same user and can.
 - Keep the socket in a directory that the agent user cannot write to.
 

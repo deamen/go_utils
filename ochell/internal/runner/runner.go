@@ -11,6 +11,8 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -566,6 +568,12 @@ func (r *Runner) Status() (Status, error) {
 	}
 	st.Queued, st.Running, err = r.store.Counts()
 	return st, err
+}
+
+// Outcomes returns the outcome metrics per tier, for the period from
+// since up to until.
+func (r *Runner) Outcomes(since, until time.Time) ([]store.Outcomes, error) {
+	return r.store.Outcomes(since, until)
 }
 
 // CostReport is what the tickets have cost.
@@ -1196,6 +1204,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	defer r.setGrant(t.ID, nil)
 	// No secret of the run goes into the log or to the ticket.
 	rd := newRedactor(g.secrets)
+	res.Grants = g.describe()
 
 	view := promptView{Task: t, ResultFile: resultFile, ResultInstructions: result.Instructions}
 	var cmd agent.Command
@@ -1211,6 +1220,10 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 		res.Err = fmt.Errorf("build the agent command: %w", err)
 		return res
 	}
+	// For the audit record: which prompt this run was given, without
+	// keeping the prompt itself in the store.
+	sum := sha256.Sum256([]byte(t.Prompt))
+	res.PromptHash = hex.EncodeToString(sum[:])
 
 	if err := os.MkdirAll(r.cfg.LogDir, 0o750); err != nil {
 		res.Err = fmt.Errorf("create log dir: %w", err)

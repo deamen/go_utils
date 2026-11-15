@@ -175,6 +175,25 @@ type Run struct {
 	// Message is what the agent said for the people on the ticket.
 	Message string  `json:"message,omitempty"`
 	CostUSD float64 `json:"cost_usd,omitempty"`
+	// Audit is the rest of the run's record: under which policy it ran,
+	// what it was given, and what it used.
+	Audit *Audit `json:"audit,omitempty"`
+}
+
+// Audit is the part of a run's record that says under which rules it ran.
+// It is set for a run that has started.
+type Audit struct {
+	PolicyVersion string `json:"policy_version"`
+	Tier          string `json:"tier"`
+	// Grants names the tools file and the variables that the tier granted
+	// the run; never a value.
+	Grants string `json:"grants,omitempty"`
+	// PromptSHA256 is the hash of the prompt the agent was given.
+	PromptSHA256     string `json:"prompt_sha256,omitempty"`
+	InputTokens      int64  `json:"input_tokens"`
+	OutputTokens     int64  `json:"output_tokens"`
+	CacheReadTokens  int64  `json:"cache_read_tokens"`
+	CacheWriteTokens int64  `json:"cache_write_tokens"`
 }
 
 func ticketOf(t store.Ticket) Ticket {
@@ -199,6 +218,9 @@ func runOf(r store.RunInfo) Run {
 	}
 	if !r.Started.IsZero() {
 		out.Started = &r.Started
+		u := r.Result.Usage
+		out.Audit = &Audit{PolicyVersion: r.PolicyVersion, Tier: r.Tier, Grants: r.Result.Grants, PromptSHA256: r.Result.PromptHash,
+			InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CacheReadTokens: u.CacheReadTokens, CacheWriteTokens: u.CacheWriteTokens}
 	}
 	if !r.Ended.IsZero() {
 		out.Ended = &r.Ended

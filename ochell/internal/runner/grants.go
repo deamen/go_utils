@@ -79,6 +79,36 @@ func (r *Runner) grant(ctx context.Context, t *task.Task) (*granted, error) {
 	return out, nil
 }
 
+// describe names what was granted, for the audit record of the run: the
+// tools file, and the names of the variables. Never a value.
+func (g *granted) describe() string {
+	var parts []string
+	if g.mcpConfig != "" {
+		parts = append(parts, "mcp_config="+g.mcpConfig)
+	}
+	names := func(list []string) string {
+		var out []string
+		for _, e := range list {
+			name, _, _ := strings.Cut(e, "=")
+			if name != "ORCH_MCP_CONFIG" {
+				out = append(out, name)
+			}
+		}
+		return strings.Join(out, ",")
+	}
+	if n := names(g.env); n != "" {
+		parts = append(parts, "env="+n)
+	}
+	static := g.secrets[:len(g.secrets)-len(g.minted)]
+	if n := names(static); n != "" {
+		parts = append(parts, "credentials="+n)
+	}
+	if n := names(g.minted); n != "" {
+		parts = append(parts, "minted="+n)
+	}
+	return strings.Join(parts, " ")
+}
+
 // setGrant notes what the run with this task id was granted, or with nil
 // that the run has ended.
 func (r *Runner) setGrant(id string, g *granted) {
