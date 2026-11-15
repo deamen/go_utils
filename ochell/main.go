@@ -49,6 +49,7 @@ var availCmds = [][2]string{
 	{"resume", "end a pause; --tier NAME ends the pause of one tier"},
 	{"status", "say whether the running ochell is paused, and what is queued and running"},
 	{"reset", "reset the attempts of a ticket, and with --tier set its risk tier: ochell reset <jira|linear> <KEY> [--tier NAME]"},
+	{"outcomes", "show the outcome metrics per tier for a period: ochell outcomes [--since 2026-11-01] [--until 2026-11-15]"},
 	{"cost", "show what the tickets have cost, or one ticket with its runs: ochell cost [<jira|linear> <KEY>]"},
 	{"stop", "stop the run of a ticket and release the ticket: ochell stop <jira|linear> <KEY>"},
 	{"version", "print the version"},
@@ -93,7 +94,7 @@ func main() {
 		err = jiraCheck(args)
 	case "policy-check":
 		err = policyCheck(args)
-	case "pause", "resume", "status", "reset", "stop", "cost":
+	case "pause", "resume", "status", "reset", "stop", "cost", "outcomes":
 		err = adminCommand(cmd, args)
 	case "version":
 		fmt.Printf("%s-%s\n", version, build)
@@ -216,6 +217,23 @@ func serve(args []string) error {
 	return err
 }
 
+// moment reads a point in time as an operator writes it: a date, a time,
+// or how long before now. Empty gives def.
+func moment(s string, now, def time.Time) (time.Time, error) {
+	if s == "" {
+		return def, nil
+	}
+	for _, layout := range []string{"2006-01-02", time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	if d, err := time.ParseDuration(s); err == nil && d >= 0 {
+		return now.Add(-d), nil
+	}
+	return time.Time{}, fmt.Errorf("%q is not a date (2026-11-01), a time (2026-11-01T09:00:00Z) or how long ago (168h)", s)
+}
+
 // loadPolicy reads the policy file of the configuration, or returns the
 // built-in policy when there is none.
 func loadPolicy(cfg *config.Config) (*policy.Policy, error) {
@@ -261,11 +279,14 @@ func adminCommand(cmd string, args []string) error {
 	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		rest, args = append(rest, args[0]), args[1:]
 	}
-	var tier string
+	var tier, since, until string
 	cfg, err := config.Load(cmd, args, func(fs *flag.FlagSet) {
 		switch cmd {
 		case "reset":
 			fs.StringVar(&tier, "tier", "", "also put the ticket under this risk tier; the one way to lower a tier")
+		case "outcomes":
+			fs.StringVar(&since, "since", "", "start of the period: a date (2026-11-01), a time (2026-11-01T09:00:00Z), or how long ago (168h); default: 7 days ago")
+			fs.StringVar(&until, "until", "", "end of the period, in the same forms; default: now")
 		case "pause", "resume":
 			fs.StringVar(&tier, "tier", "", "only the tickets of this risk tier")
 		}
@@ -281,6 +302,19 @@ func adminCommand(cmd string, args []string) error {
 		if tier != "" {
 			query.Set("tier", tier)
 		}
+	case "outcomes":
+		method = "GET"
+		now := time.Now()
+		from, err := moment(since, now, now.Add(-7*24*time.Hour))
+		if err != nil {
+			return fmt.Errorf("--since: %w", err)
+		}
+		to, err := moment(until, now, now)
+		if err != nil {
+			return fmt.Errorf("--until: %w", err)
+		}
+		query.Set("since", from.UTC().Format(time.RFC3339Nano))
+		query.Set("until", to.UTC().Format(time.RFC3339Nano))
 	case "cost":
 		method = "GET"
 		if len(rest) != 0 && (len(rest) != 2 || (rest[0] != "jira" && rest[0] != "linear")) {

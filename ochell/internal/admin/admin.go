@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -39,6 +40,8 @@ type Control interface {
 	// Cost reports what one ticket, or with an empty key the last tickets,
 	// have cost.
 	Cost(source, key string) (*runner.CostReport, error)
+	// Outcomes returns the outcome metrics per tier for a period.
+	Outcomes(since, until time.Time) ([]store.Outcomes, error)
 	// SetTier puts a ticket under another risk tier.
 	SetTier(source, key, tier string) error
 	// Stop ends the work on a ticket for the operator named in by.
@@ -173,6 +176,21 @@ func routes(c Control, log *slog.Logger) http.Handler {
 			answer(w, http.StatusInternalServerError, err.Error())
 		}
 	})
+	mux.HandleFunc("GET /outcomes", func(w http.ResponseWriter, r *http.Request) {
+		since, err1 := time.Parse(time.RFC3339, r.URL.Query().Get("since"))
+		until, err2 := time.Parse(time.RFC3339, r.URL.Query().Get("until"))
+		if err1 != nil || err2 != nil || !until.After(since) {
+			answer(w, http.StatusBadRequest, "since and until must be times, with until after since")
+			return
+		}
+		list, err := c.Outcomes(since, until)
+		if err != nil {
+			log.Error("admin: outcomes failed", "err", err)
+			answer(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		answer(w, http.StatusOK, strings.TrimRight(OutcomesText(list, since, until), "\n"))
+	})
 	mux.HandleFunc("POST /reset", func(w http.ResponseWriter, r *http.Request) {
 		source, key, tier := r.URL.Query().Get("source"), r.URL.Query().Get("key"), r.URL.Query().Get("tier")
 		note := ""
@@ -274,6 +292,55 @@ func costText(rep *runner.CostReport, one bool) string {
 	fmt.Fprintln(tw, "TICKET\tTIER\tSTATE\tRUNS\tCOST USD\tBUDGET USD\tINPUT\tOUTPUT\tCACHE READ\tCACHE WRITE")
 	for _, t := range rep.Tickets {
 		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%d\t%.4f\t%s\t%s\n", t.Source, t.Key, t.Tier, t.State, t.Runs, t.CostUSD, budget(t), tokens(t.Usage))
+	}
+	tw.Flush()
+	return b.String()
+}
+
+// Median returns the middle of some durations, 0 for none.
+func Median(d []time.Duration) time.Duration {
+	if len(d) == 0 {
+		return 0
+	}
+	sorted := slices.Clone(d)
+	slices.Sort(sorted)
+	if n := len(sorted); n%2 == 0 {
+		return (sorted[n/2-1] + sorted[n/2]) / 2
+	}
+	return sorted[len(sorted)/2]
+}
+
+// share writes a part of a whole as "3 of 4 (75%)", and "-" for no whole.
+func share(part, whole int) string {
+	if whole == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d of %d (%d%%)", part, whole, (100*part+whole/2)/whole)
+}
+
+// OutcomesText writes the outcome metrics per tier for the operator.
+func OutcomesText(list []store.Outcomes, since, until time.Time) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "outcomes per tier, %s to %s (UTC)\n", since.UTC().Format("2006-01-02 15:04"), until.UTC().Format("2006-01-02 15:04"))
+	if len(list) == 0 {
+		b.WriteString("no run started in this period\n")
+		return b.String()
+	}
+	tw := tabwriter.NewWriter(&b, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(tw, "TIER\tTICKETS\tRUNS\tCOST USD\tCOST PER TICKET\tPULL REQUESTS\tTIME TO PR (MEDIAN)\tSENT BACK\tMERGED\tMERGED UNTOUCHED\tREOPENED")
+	for _, o := range list {
+		tier, per, ttp := o.Tier, "-", "-"
+		if tier == "" {
+			tier = "(none)"
+		}
+		if o.Tickets > 0 {
+			per = fmt.Sprintf("%.4f", o.CostUSD/float64(o.Tickets))
+		}
+		if len(o.TimeToPR) > 0 {
+			ttp = Median(o.TimeToPR).Round(time.Second).String()
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%.4f\t%s\t%d\t%s\t%s\t%d\t%s\t%d\n", tier, o.Tickets, o.Runs, o.CostUSD, per, o.PullRequests, ttp,
+			share(o.Reworked, o.PullRequests), o.Merged, share(o.MergedUntouched, o.Merged), o.Reopened)
 	}
 	tw.Flush()
 	return b.String()

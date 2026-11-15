@@ -215,6 +215,12 @@ type Result struct {
 	Branch        string
 	// Phase is the phase the run was for.
 	Phase Phase
+	// PromptHash is the SHA-256 of the prompt the agent was given, and
+	// Grants names what the run's tier granted it: the names of the tools
+	// file and of the variables, never a value. Both are for the audit
+	// record of the run.
+	PromptHash string
+	Grants     string
 	// AwaitChecks says that the work was handed over with a pull request
 	// whose checks ochell follows: the ticket is not in review yet.
 	AwaitChecks bool

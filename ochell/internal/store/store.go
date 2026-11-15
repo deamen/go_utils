@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -198,6 +199,13 @@ var migrations = []string{
 	// was passed on.
 	`ALTER TABLE pull_requests ADD COLUMN checked_sha TEXT NOT NULL DEFAULT '';
 	ALTER TABLE pull_requests ADD COLUMN seen_comment INTEGER NOT NULL DEFAULT 0;`,
+
+	// Version 20: the rest of the audit record of a run (the hash of its
+	// prompt and what its tier granted it), and whether the run started
+	// a ticket again that was done.
+	`ALTER TABLE runs ADD COLUMN prompt_hash TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN grants TEXT NOT NULL DEFAULT '';
+	ALTER TABLE runs ADD COLUMN reopened INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Store is safe for concurrent use.
@@ -425,7 +433,14 @@ func (s *Store) Enqueue(t *task.Task, lim Limits) error {
 		if err := s.move(tx, t.Source, t.Key, ticket.Queued, ""); err != nil {
 			return err
 		}
-		return insertRun(tx, t)
+		if err := insertRun(tx, t); err != nil {
+			return err
+		}
+		if from == ticket.Done {
+			// The ticket was done and is assigned again: reopened.
+			_, err = tx.Exec(`UPDATE runs SET reopened = 1 WHERE id = ?`, t.ID)
+		}
+		return err
 	})
 }
 
@@ -1186,11 +1201,13 @@ func (s *Store) end(tx *sql.Tx, id string, res task.Result) error {
 	r, err := tx.Exec(`UPDATE runs SET status = ?, ended_at = ?, outcome = ?, exit_code = ?, error = ?, log_file = ?,
 			workdir = ?, resumed = ?, agent_session = ?, message = ?, cost_usd = ?,
 			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
-			signal = ?, signal_message = ?, pr_url = ?, branch = ?, session_cost_usd = ?, escalation = ?, phase = ?
+			signal = ?, signal_message = ?, pr_url = ?, branch = ?, session_cost_usd = ?, escalation = ?, phase = ?,
+			prompt_hash = ?, grants = ?
 		WHERE id = ? AND status != ?`, runEnded, now, string(res.Outcome), exit, msg, res.LogFile,
 		res.Workdir, res.Resumed, res.SessionID, res.Message, res.CostUSD,
 		res.Usage.InputTokens, res.Usage.OutputTokens, res.Usage.CacheReadTokens, res.Usage.CacheWriteTokens,
 		res.Signal, res.SignalMessage, res.PRURL, res.Branch, res.SessionCostUSD, res.Escalation, res.Phase,
+		res.PromptHash, res.Grants,
 		id, runEnded)
 	if err != nil {
 		return err
@@ -1498,7 +1515,7 @@ type RunInfo struct {
 func (s *Store) Runs(source, key string) ([]RunInfo, error) {
 	rows, err := s.db.Query(`SELECT id, status, attempt, tier, policy_version, cause, received_at, started_at, ended_at,
 			outcome, exit_code, error, log_file, resumed, agent_session, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			signal, signal_message, pr_url, branch, escalation, phase
+			signal, signal_message, pr_url, branch, escalation, phase, prompt_hash, grants
 		FROM runs WHERE source = ? AND key = ? ORDER BY received_at, rowid`, source, key)
 	if err != nil {
 		return nil, err
@@ -1514,7 +1531,7 @@ func (s *Store) Runs(source, key string) ([]RunInfo, error) {
 		if err := rows.Scan(&r.ID, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &r.Cause, &received, &started, &ended,
 			&outcome, &exit, &msg, &res.LogFile, &res.Resumed, &res.SessionID, &res.CostUSD,
 			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
-			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.Escalation, &res.Phase); err != nil {
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.Escalation, &res.Phase, &res.PromptHash, &res.Grants); err != nil {
 			return nil, err
 		}
 		r.Received = time.UnixMilli(received).UTC()
@@ -1747,12 +1764,12 @@ func (s *Store) Run(id string) (*Run, error) {
 	res := &r.Result
 	err := s.db.QueryRow(`SELECT source, key, status, attempt, tier, policy_version, outcome, exit_code, error, log_file,
 			workdir, resumed, agent_session, message, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			signal, signal_message, pr_url, branch, session_cost_usd, escalation, phase
+			signal, signal_message, pr_url, branch, session_cost_usd, escalation, phase, prompt_hash, grants
 		FROM runs WHERE id = ?`, id).
 		Scan(&r.Source, &r.Key, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &outcome, &exit, &msg, &res.LogFile,
 			&res.Workdir, &res.Resumed, &res.SessionID, &res.Message, &res.CostUSD,
 			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
-			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD, &res.Escalation, &res.Phase)
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD, &res.Escalation, &res.Phase, &res.PromptHash, &res.Grants)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1796,4 +1813,118 @@ func (s *Store) AddDelivery(key string, ttl time.Duration) (bool, error) {
 func (s *Store) RemoveDelivery(key string) error {
 	_, err := s.db.Exec(`DELETE FROM deliveries WHERE key = ?`, key)
 	return err
+}
+
+// Outcomes are the outcome metrics of the tickets of one tier, for a
+// period. They are what a person looks at to judge how a class of work
+// goes, and whether its policy should change.
+type Outcomes struct {
+	Tier string
+	// Tickets had a run that started in the period, and Runs is how many.
+	Tickets, Runs int
+	// CostUSD is what those runs cost.
+	CostUSD float64
+	// PullRequests is how many tickets first handed over a pull request in
+	// the period, and TimeToPR how long each of them took from the start
+	// of its first run to that hand-over.
+	PullRequests int
+	TimeToPR     []time.Duration
+	// Reworked is how many of those tickets a person then sent back: they
+	// got a follow-up after the pull request.
+	Reworked int
+	// Merged is how many pull requests were merged in the period, and
+	// MergedUntouched how many of them were of tickets that no person
+	// sent back after the hand-over.
+	Merged, MergedUntouched int
+	// Reopened is how many tickets were done and were assigned again in
+	// the period.
+	Reopened int
+}
+
+// Outcomes returns the outcome metrics per tier for the period from since
+// up to until, the tiers in alphabetical order. A ticket counts under the
+// tier it has now.
+func (s *Store) Outcomes(since, until time.Time) ([]Outcomes, error) {
+	from, to := ms(since), ms(until)
+	byTier := map[string]*Outcomes{}
+	get := func(tier string) *Outcomes {
+		if byTier[tier] == nil {
+			byTier[tier] = &Outcomes{Tier: tier}
+		}
+		return byTier[tier]
+	}
+	rows, err := s.db.Query(`SELECT t.tier, COUNT(DISTINCT t.source || ' ' || t.key), COUNT(*), COALESCE(SUM(r.cost_usd), 0),
+			COUNT(DISTINCT CASE WHEN r.reopened = 1 THEN t.source || ' ' || t.key END)
+		FROM runs r JOIN tickets t USING (source, key)
+		WHERE r.started_at >= ? AND r.started_at < ? GROUP BY t.tier`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var tier string
+		var o Outcomes
+		if err := rows.Scan(&tier, &o.Tickets, &o.Runs, &o.CostUSD, &o.Reopened); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		got := get(tier)
+		got.Tickets, got.Runs, got.CostUSD, got.Reopened = o.Tickets, o.Runs, o.CostUSD, o.Reopened
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	// Per ticket: when its first run started, when it first handed over a
+	// pull request, and whether a person sent it back after that.
+	const handover = `(SELECT MIN(p.ended_at) FROM runs p WHERE p.source = t.source AND p.key = t.key AND p.pr_url != '')`
+	const sentBack = `(SELECT COUNT(*) FROM runs f WHERE f.source = t.source AND f.key = t.key AND f.cause = 'follow_up' AND f.received_at > ` + handover + `)`
+	rows, err = s.db.Query(`SELECT t.tier, (SELECT MIN(x.started_at) FROM runs x WHERE x.source = t.source AND x.key = t.key), `+handover+`, `+sentBack+`
+		FROM tickets t WHERE `+handover+` >= ? AND `+handover+` < ?`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var tier string
+		var first, pr sql.NullInt64
+		var back int
+		if err := rows.Scan(&tier, &first, &pr, &back); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		o := get(tier)
+		o.PullRequests++
+		if first.Valid && pr.Valid && pr.Int64 >= first.Int64 {
+			o.TimeToPR = append(o.TimeToPR, time.Duration(pr.Int64-first.Int64)*time.Millisecond)
+		}
+		if back > 0 {
+			o.Reworked++
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	rows, err = s.db.Query(`SELECT t.tier, COUNT(*), COUNT(CASE WHEN `+sentBack+` = 0 THEN 1 END)
+		FROM pull_requests pr JOIN tickets t USING (source, key)
+		WHERE pr.state = ? AND pr.updated_at >= ? AND pr.updated_at < ? GROUP BY t.tier`, PRMerged, from, to)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var tier string
+		var merged, untouched int
+		if err := rows.Scan(&tier, &merged, &untouched); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		o := get(tier)
+		o.Merged, o.MergedUntouched = merged, untouched
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	out := make([]Outcomes, 0, len(byTier))
+	for _, o := range byTier {
+		out = append(out, *o)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Tier < out[j].Tier })
+	return out, nil
 }

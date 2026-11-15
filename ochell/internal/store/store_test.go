@@ -1507,3 +1507,87 @@ func TestWaitingForChecks(t *testing.T) {
 	}
 	state(ticket.InReview)
 }
+
+// The outcome metrics per tier, for a period.
+func TestOutcomes(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+	now := t0
+	s.now = func() time.Time { return now }
+	seq := 0
+	// run queues, starts and ends one run of a ticket; the clock moves on
+	// by took while it runs.
+	run := func(key, tier string, followUp bool, took time.Duration, res task.Result) {
+		t.Helper()
+		seq++
+		tk := newTask("r"+strconv.Itoa(seq), key, now)
+		tk.Tier = tier
+		var err error
+		if followUp {
+			tk.Cause = task.CauseFollowUp
+			_, err = s.FollowUp(tk, true, Limits{})
+		} else {
+			err = s.Enqueue(tk, Limits{})
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Claim(); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(took)
+		if res.Outcome == "" {
+			res.Outcome, res.Signal = task.OutcomeFinished, result.Done
+		}
+		if err := s.Finish(tk.ID, res); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Minute)
+	}
+	pr := func(n string) string { return "https://example.test/pr/" + n }
+
+	// LOW-1: a pull request after 10 minutes, merged as it was.
+	run("LOW-1", "low", false, 10*time.Minute, task.Result{CostUSD: 1, PRURL: pr("1")})
+	s.SetPullRequest("linear", "LOW-1", pr("1"), PRMerged, "reviewer", "")
+	// LOW-2: two runs to its pull request (30 minutes and a pause), sent
+	// back once by a person, then merged.
+	run("LOW-2", "low", false, 10*time.Minute, task.Result{CostUSD: 1, Outcome: task.OutcomeFinished, Signal: result.NeedsInput})
+	run("LOW-2", "low", true, 18*time.Minute, task.Result{CostUSD: 2, PRURL: pr("2")})
+	run("LOW-2", "low", true, 5*time.Minute, task.Result{CostUSD: 0.5})
+	s.SetPullRequest("linear", "LOW-2", pr("2"), PRMerged, "reviewer", "")
+	// LOW-3: no pull request.
+	run("LOW-3", "low", false, time.Minute, task.Result{CostUSD: 0.5, Outcome: task.OutcomeFailed, ExitCode: 1, Err: errors.New("exit status 1")})
+	// HIGH-1: done, then assigned again: reopened.
+	run("HIGH-1", "high", false, 20*time.Minute, task.Result{CostUSD: 4, PRURL: pr("3")})
+	if _, err := s.CloseTicket("linear", "HIGH-1"); err != nil {
+		t.Fatal(err)
+	}
+	run("HIGH-1", "high", false, 5*time.Minute, task.Result{CostUSD: 1})
+	end := now
+
+	got, err := s.Outcomes(t0, end)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("Outcomes = %+v, %v", got, err)
+	}
+	high, low := got[0], got[1]
+	if low.Tier != "low" || low.Tickets != 3 || low.Runs != 5 || low.CostUSD != 5 || low.PullRequests != 2 || low.Reworked != 1 ||
+		low.Merged != 2 || low.MergedUntouched != 1 || low.Reopened != 0 {
+		t.Errorf("low = %+v", low)
+	}
+	// 10 minutes for LOW-1; for LOW-2 from the start of its first run to
+	// the end of the run with the pull request: 10 + 1 + 18.
+	if len(low.TimeToPR) != 2 || low.TimeToPR[0]+low.TimeToPR[1] != 39*time.Minute {
+		t.Errorf("time to pull request of low = %v", low.TimeToPR)
+	}
+	if high.Tier != "high" || high.Tickets != 1 || high.Runs != 2 || high.CostUSD != 5 || high.PullRequests != 1 || high.Reworked != 0 || high.Merged != 0 || high.Reopened != 1 {
+		t.Errorf("high = %+v", high)
+	}
+	// A period before all this, and one that covers only the last run.
+	if got, _ := s.Outcomes(t0.Add(-time.Hour), t0); len(got) != 0 {
+		t.Errorf("outcomes of an empty period = %+v", got)
+	}
+	last, _ := s.Outcomes(end.Add(-6*time.Minute-30*time.Second), end)
+	if len(last) != 1 || last[0].Tier != "high" || last[0].Runs != 1 || last[0].CostUSD != 1 || last[0].Reopened != 1 || last[0].PullRequests != 0 {
+		t.Errorf("outcomes of the last minutes = %+v", last)
+	}
+}
