@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Token is the token the fake API accepts.
@@ -27,15 +28,65 @@ type PullRequest struct {
 
 	merged, closed bool
 	mergedBy       string
+	comments       []Comment
+}
+
+// Check is a check run of a commit.
+type Check struct {
+	Name string
+	// Status is queued, in_progress or completed; Conclusion is set when
+	// it is completed.
+	Status, Conclusion string
+	Title, Summary     string
+}
+
+// Comment is something written on a pull request. Kind is "issue" (the
+// conversation), "diff" (a line of the diff) or "review".
+type Comment struct {
+	Kind, Author, Association, Body, Path, Review string
+	At                                            time.Time
 }
 
 // Server is a fake GitHub API.
 type Server struct {
 	URL string
 
-	mu    sync.Mutex
-	pulls []*PullRequest
-	calls int
+	mu     sync.Mutex
+	pulls  []*PullRequest
+	checks map[string][]Check // by commit
+	calls  int
+}
+
+// SetChecks sets the check runs of a commit.
+func (s *Server) SetChecks(sha string, checks ...Check) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.checks == nil {
+		s.checks = map[string][]Check{}
+	}
+	s.checks[sha] = checks
+}
+
+// Push gives a pull request a new head commit, as a push to its branch
+// does.
+func (s *Server) Push(owner, repo string, number int, sha string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p := s.find(owner, repo, number); p != nil {
+		p.HeadSHA = sha
+	}
+}
+
+// Comment adds a comment to a pull request, written now.
+func (s *Server) Comment(owner, repo string, number int, c Comment) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p := s.find(owner, repo, number); p != nil {
+		if c.At.IsZero() {
+			c.At = time.Now()
+		}
+		p.comments = append(p.comments, c)
+	}
 }
 
 // New starts a fake GitHub API that is closed when the test ends.
@@ -96,7 +147,11 @@ func (s *Server) Calls() int {
 	return s.calls
 }
 
-var pullPath = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/pulls/(\d+)$`)
+var (
+	pullPath    = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/pulls/(\d+)$`)
+	commitPath  = regexp.MustCompile(`^/repos/[^/]+/[^/]+/commits/([^/]+)/(check-runs|status)$`)
+	commentPath = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/(issues|pulls)/(\d+)/(comments|reviews)$`)
+)
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -111,6 +166,49 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		// ochell only reads.
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if m := commitPath.FindStringSubmatch(r.URL.Path); m != nil {
+		if m[2] == "status" {
+			json.NewEncoder(w).Encode(map[string]any{"state": "pending", "statuses": []any{}})
+			return
+		}
+		runs := []map[string]any{}
+		for _, c := range s.checks[m[1]] {
+			run := map[string]any{"name": c.Name, "status": c.Status, "html_url": s.URL + "/checks/" + c.Name,
+				"output": map[string]string{"title": c.Title, "summary": c.Summary}}
+			if c.Status == "completed" {
+				run["conclusion"] = c.Conclusion
+			} else {
+				run["conclusion"] = nil
+			}
+			runs = append(runs, run)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"total_count": len(runs), "check_runs": runs})
+		return
+	}
+	if m := commentPath.FindStringSubmatch(r.URL.Path); m != nil {
+		n, _ := strconv.Atoi(m[4])
+		kind := map[string]string{"issues/comments": "issue", "pulls/comments": "diff", "pulls/reviews": "review"}[m[3]+"/"+m[5]]
+		list := []map[string]any{}
+		if p := s.find(m[1], m[2], n); p != nil {
+			for i, c := range p.comments {
+				if c.Kind != kind {
+					continue
+				}
+				item := map[string]any{"id": 1000*p.Number + i + 1, "body": c.Body, "user": map[string]string{"login": c.Author}, "author_association": c.Association}
+				if kind == "review" {
+					item["state"], item["submitted_at"] = c.Review, c.At.UTC().Format(time.RFC3339Nano)
+				} else {
+					item["created_at"] = c.At.UTC().Format(time.RFC3339Nano)
+				}
+				if kind == "diff" {
+					item["path"] = c.Path
+				}
+				list = append(list, item)
+			}
+		}
+		json.NewEncoder(w).Encode(list)
 		return
 	}
 	m := pullPath.FindStringSubmatch(r.URL.Path)

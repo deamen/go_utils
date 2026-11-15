@@ -192,6 +192,12 @@ var migrations = []string{
 	);
 	INSERT INTO pull_requests (source, key, url, created_at, updated_at)
 		SELECT source, key, pr_url, updated_at, updated_at FROM tickets WHERE pr_url != '';`,
+
+	// Version 19: how far ochell has followed a pull request: the commit
+	// whose failed checks the agent was given, and the newest comment that
+	// was passed on.
+	`ALTER TABLE pull_requests ADD COLUMN checked_sha TEXT NOT NULL DEFAULT '';
+	ALTER TABLE pull_requests ADD COLUMN seen_comment INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Store is safe for concurrent use.
@@ -1118,6 +1124,17 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result, again *Again) (ne
 		}
 	default:
 		to, reason := ticket.AfterRun(res.Outcome, res.Signal)
+		if to == ticket.InReview && res.AwaitChecks {
+			// Not for a reviewer yet: the checks of the pull request come
+			// first, when the ticket has one that is followed.
+			var open int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM pull_requests WHERE source = ? AND key = ? AND state = ?`, source, key, PROpen).Scan(&open); err != nil {
+				return "", err
+			}
+			if open > 0 {
+				to = ticket.Checking
+			}
+		}
 		return "", s.move(tx, source, key, to, reason)
 	}
 	if err := s.move(tx, source, key, ticket.Queued, ""); err != nil {
@@ -1547,13 +1564,18 @@ type PullRequest struct {
 	// ClosedBy is who merged or closed it, as the code host names them.
 	ClosedBy string
 	// Note says why a pull request was rejected.
-	Note    string
-	Created time.Time
-	Updated time.Time
+	Note string
+	// CheckedSHA is the commit whose failed checks the agent was last
+	// given, and SeenComment when the newest comment that was passed on to
+	// the agent was written.
+	CheckedSHA  string
+	SeenComment time.Time
+	Created     time.Time
+	Updated     time.Time
 }
 
 func (s *Store) pullRequests(query string, args ...any) ([]PullRequest, error) {
-	rows, err := s.db.Query(`SELECT source, key, url, state, closed_by, note, created_at, updated_at FROM pull_requests `+query, args...)
+	rows, err := s.db.Query(`SELECT source, key, url, state, closed_by, note, created_at, updated_at, checked_sha, seen_comment FROM pull_requests `+query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1561,9 +1583,12 @@ func (s *Store) pullRequests(query string, args ...any) ([]PullRequest, error) {
 	var out []PullRequest
 	for rows.Next() {
 		var p PullRequest
-		var created, updated int64
-		if err := rows.Scan(&p.Source, &p.Key, &p.URL, &p.State, &p.ClosedBy, &p.Note, &created, &updated); err != nil {
+		var created, updated, seen int64
+		if err := rows.Scan(&p.Source, &p.Key, &p.URL, &p.State, &p.ClosedBy, &p.Note, &created, &updated, &p.CheckedSHA, &seen); err != nil {
 			return nil, err
+		}
+		if seen > 0 {
+			p.SeenComment = time.UnixMilli(seen).UTC()
 		}
 		p.Created, p.Updated = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
 		out = append(out, p)
@@ -1588,6 +1613,70 @@ func (s *Store) SetPullRequest(source, key, url, state, closedBy, note string) e
 	_, err := s.db.Exec(`UPDATE pull_requests SET state = ?, closed_by = ?, note = ?, updated_at = ? WHERE source = ? AND key = ? AND url = ?`,
 		state, closedBy, note, ms(s.now()), source, key, url)
 	return err
+}
+
+// NotePullRequest records how far ochell has followed a pull request: the
+// commit whose failed checks the agent was given ("": unchanged) and when
+// the newest comment that was passed on was written (zero: unchanged).
+func (s *Store) NotePullRequest(source, key, url, checkedSHA string, seenComment time.Time) error {
+	seen := int64(0)
+	if !seenComment.IsZero() {
+		seen = ms(seenComment)
+	}
+	_, err := s.db.Exec(`UPDATE pull_requests SET
+			checked_sha = CASE WHEN ? != '' THEN ? ELSE checked_sha END,
+			seen_comment = MAX(seen_comment, ?), updated_at = ?
+		WHERE source = ? AND key = ? AND url = ?`, checkedSHA, checkedSHA, seen, ms(s.now()), source, key, url)
+	return err
+}
+
+// ErrNotChecking is returned when a ticket does not wait for the checks
+// of its pull request.
+var ErrNotChecking = errors.New("the ticket does not wait for the checks of its pull request")
+
+// ToReview moves a ticket that waited for the checks of its pull request
+// to review: the checks passed, or the agent cannot fix them.
+func (s *Store) ToReview(source, key string) error {
+	return s.tx(func(tx *sql.Tx) error {
+		from, err := state(tx, source, key)
+		if err != nil {
+			return err
+		}
+		if from != ticket.Checking {
+			return ErrNotChecking
+		}
+		return s.move(tx, source, key, ticket.InReview, "")
+	})
+}
+
+// WakeForChecks queues a run of a ticket whose pull request failed its
+// checks. t.Comment says what failed. It returns ErrNotChecking unless the
+// ticket waits for its checks, ErrAttempts when the ticket has used
+// lim.MaxAttempts runs, and ErrQueueFull.
+func (s *Store) WakeForChecks(t *task.Task, lim Limits) error {
+	return s.tx(func(tx *sql.Tx) error {
+		from, err := state(tx, t.Source, t.Key)
+		if err != nil {
+			return err
+		}
+		if from != ticket.Checking {
+			return ErrNotChecking
+		}
+		if ok, err := attemptsLeft(tx, t.Source, t.Key, lim.MaxAttempts); err != nil {
+			return err
+		} else if !ok {
+			return ErrAttempts
+		}
+		if full, err := queueFull(tx, lim.MaxQueued); err != nil {
+			return err
+		} else if full {
+			return ErrQueueFull
+		}
+		if err := s.move(tx, t.Source, t.Key, ticket.Queued, ""); err != nil {
+			return err
+		}
+		return insertRun(tx, t)
+	})
 }
 
 // ErrUnknown is returned for a ticket that ochell has never seen.

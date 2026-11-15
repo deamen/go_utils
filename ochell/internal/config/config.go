@@ -354,6 +354,13 @@ type GitHub struct {
 	// BotLogin is the GitHub login of the digital employee. A pull request
 	// that this account merged itself is not taken as accepted work.
 	BotLogin string `yaml:"bot_login"`
+	// ChecksGrace is how long ochell waits for a check to appear on a
+	// pull request before it takes the pull request to have none.
+	ChecksGrace time.Duration `yaml:"checks_grace"`
+	// AllowedReviewers are the GitHub logins whose comments on a pull
+	// request are passed on to the agent. Empty: the people whom GitHub
+	// calls owner, member or collaborator of the repository.
+	AllowedReviewers []string `yaml:"allowed_reviewers"`
 }
 
 // Enabled reports whether the GitHub access is configured.
@@ -452,7 +459,7 @@ func Default() *Config {
 		Store:     Store{Path: "ochell.db"},
 		Workspace: Workspace{Branch: "bot/{{.Key}}", HookTimeout: 10 * time.Minute},
 		Poller:    Poller{Interval: 5 * time.Minute},
-		GitHub:    GitHub{PollInterval: 2 * time.Minute},
+		GitHub:    GitHub{PollInterval: 2 * time.Minute, ChecksGrace: 2 * time.Minute},
 		Agent: Agent{
 			Command:        "claude",
 			Args:           []string{"-p"},
@@ -743,6 +750,9 @@ func (c *Config) Validate() error {
 	if g := c.GitHub; g.Enabled() {
 		if g.PollInterval <= 0 {
 			errs = append(errs, errors.New("github.poll_interval must be positive"))
+		}
+		if g.ChecksGrace < 0 {
+			errs = append(errs, errors.New("github.checks_grace must not be negative"))
 		}
 		if g.APIURL != "" {
 			if u, err := url.Parse(g.APIURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {

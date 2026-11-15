@@ -45,6 +45,9 @@ func (s *Server) jiraComment(key, body string, log *slog.Logger) {
 
 // jiraStarted is the comment for the start of a run.
 func jiraStarted(t *task.Task) string {
+	if t.Cause == task.CauseChecks {
+		return fmt.Sprintf("The checks of the pull request failed. The digital employee is looking at the failure (attempt %d).", t.Attempt)
+	}
 	if t.Cause == task.CauseApproved {
 		by := t.ApprovedBy
 		if by == "" {
@@ -86,7 +89,13 @@ func jiraFinished(t *task.Task, res task.Result, canReply bool) string {
 		return msg
 	}
 	_, msg := signalActivity(res)
-	if res.Signal == result.Done {
+	if res.Signal == result.Done && res.AwaitChecks {
+		msg = "The digital employee finished its work on this ticket.\n\n" + msg
+		if res.PRURL != "" {
+			msg += "\n\nPull request: " + res.PRURL
+		}
+		msg += "\n\n" + awaitChecksNote
+	} else if res.Signal == result.Done {
 		msg = "The digital employee finished its work on this ticket, which is now ready for review.\n\n" + msg
 		if res.PRURL != "" {
 			msg += "\n\nPull request: " + res.PRURL
@@ -122,7 +131,7 @@ func (s *Server) jiraRunFinished(ctx context.Context, t *task.Task, res task.Res
 	}
 	// Only finished work is handed to the reviewers.
 	status := s.cfg.Sources.JiraAPI.ReviewStatus
-	if status == "" || res.Err != nil || res.Signal != result.Done {
+	if status == "" || res.Err != nil || res.Signal != result.Done || res.AwaitChecks {
 		return nil
 	}
 	if err := s.jira.SetStatus(ctx, t.Key, status); err != nil {

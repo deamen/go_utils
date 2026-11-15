@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -180,4 +181,183 @@ func (c *Client) PullRequest(ctx context.Context, ref Ref) (*PullRequest, error)
 		pr.Author = in.User.Login
 	}
 	return pr, nil
+}
+
+// States of the checks of a commit.
+const (
+	// ChecksNone: nothing checks this commit, as far as GitHub knows.
+	ChecksNone = "none"
+	// ChecksPending: at least one check has not finished.
+	ChecksPending = "pending"
+	ChecksPassed  = "passed"
+	ChecksFailed  = "failed"
+)
+
+// Checks is the state of the checks of one commit.
+type Checks struct {
+	// State is ChecksNone, ChecksPending, ChecksPassed or ChecksFailed. It
+	// is ChecksFailed only when every check has finished and at least one
+	// did not succeed, so that Failed is the whole list.
+	State  string
+	Failed []FailedCheck
+}
+
+// FailedCheck is one check that did not succeed.
+type FailedCheck struct {
+	Name string
+	// Conclusion is what GitHub calls the end: failure, timed_out, …
+	Conclusion string
+	// Summary is what the check says about itself: its title and summary,
+	// or the description of a commit status.
+	Summary string
+	URL     string
+}
+
+// maxSummary is how much of what a check says about itself is kept.
+const maxSummary = 4000
+
+// Checks reads the checks of a commit: its check runs (GitHub Actions and
+// other apps) and its commit statuses (older integrations).
+func (c *Client) Checks(ctx context.Context, ref Ref, sha string) (*Checks, error) {
+	var runs struct {
+		CheckRuns []struct {
+			Name       string `json:"name"`
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+			HTMLURL    string `json:"html_url"`
+			Output     struct {
+				Title   string `json:"title"`
+				Summary string `json:"summary"`
+			} `json:"output"`
+		} `json:"check_runs"`
+	}
+	if err := c.get(ctx, ref.path("/commits/"+url.PathEscape(sha)+"/check-runs?per_page=100"), &runs); err != nil {
+		return nil, err
+	}
+	var status struct {
+		Statuses []struct {
+			State       string `json:"state"`
+			Context     string `json:"context"`
+			Description string `json:"description"`
+			TargetURL   string `json:"target_url"`
+		} `json:"statuses"`
+	}
+	if err := c.get(ctx, ref.path("/commits/"+url.PathEscape(sha)+"/status?per_page=100"), &status); err != nil {
+		return nil, err
+	}
+	out := &Checks{State: ChecksNone}
+	pending, total := false, 0
+	for _, r := range runs.CheckRuns {
+		total++
+		if r.Status != "completed" {
+			pending = true
+			continue
+		}
+		switch r.Conclusion {
+		case "success", "neutral", "skipped":
+		default:
+			summary := strings.TrimSpace(r.Output.Title + "\n" + r.Output.Summary)
+			out.Failed = append(out.Failed, FailedCheck{Name: r.Name, Conclusion: r.Conclusion, Summary: clip(summary), URL: r.HTMLURL})
+		}
+	}
+	for _, s := range status.Statuses {
+		total++
+		switch s.State {
+		case "success":
+		case "pending":
+			pending = true
+		default:
+			out.Failed = append(out.Failed, FailedCheck{Name: s.Context, Conclusion: s.State, Summary: clip(s.Description), URL: s.TargetURL})
+		}
+	}
+	switch {
+	case total == 0:
+	case pending:
+		out.State, out.Failed = ChecksPending, nil
+	case len(out.Failed) > 0:
+		out.State = ChecksFailed
+	default:
+		out.State = ChecksPassed
+	}
+	return out, nil
+}
+
+func clip(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > maxSummary {
+		return strings.ToValidUTF8(s[:maxSummary], "") + " […]"
+	}
+	return s
+}
+
+// Comment is something a person wrote on a pull request: a comment in the
+// conversation, a comment on a line of the diff, or the text of a review.
+type Comment struct {
+	// ID identifies the comment among the comments of its Kind, which is
+	// "issue" (the conversation), "diff" (a line of the diff) or "review".
+	ID     int64
+	Kind   string
+	Author string
+	// Association is how GitHub relates the author to the repository:
+	// OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, NONE, …
+	Association string
+	Body        string
+	// Path is the file that a comment on the diff is about.
+	Path string
+	// Review is the state of a review: APPROVED, CHANGES_REQUESTED,
+	// COMMENTED.
+	Review  string
+	Created time.Time
+}
+
+// Comments reads what was written on a pull request at or after since,
+// oldest first: at most a hundred of each kind. GitHub's times are whole
+// seconds, so the caller tells comments it has seen apart by Kind and ID.
+func (c *Client) Comments(ctx context.Context, ref Ref, since time.Time) ([]Comment, error) {
+	type raw struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+		Path string `json:"path"`
+		// State is set for a review.
+		State string `json:"state"`
+		User  *struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Association string    `json:"author_association"`
+		Created     time.Time `json:"created_at"`
+		Submitted   time.Time `json:"submitted_at"`
+	}
+	n := strconv.Itoa(ref.Number)
+	var out []Comment
+	for kind, path := range map[string]string{
+		"issue":  ref.path("/issues/" + n + "/comments?per_page=100"),
+		"diff":   ref.path("/pulls/" + n + "/comments?per_page=100"),
+		"review": ref.path("/pulls/" + n + "/reviews?per_page=100"),
+	} {
+		var list []raw
+		if err := c.get(ctx, path, &list); err != nil {
+			return nil, err
+		}
+		for _, r := range list {
+			at := r.Created
+			if at.IsZero() {
+				at = r.Submitted
+			}
+			if strings.TrimSpace(r.Body) == "" || at.Before(since) {
+				continue
+			}
+			cm := Comment{ID: r.ID, Kind: kind, Association: r.Association, Body: r.Body, Path: r.Path, Review: r.State, Created: at}
+			if r.User != nil {
+				cm.Author = r.User.Login
+			}
+			out = append(out, cm)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Created.Equal(out[j].Created) {
+			return out[i].Created.Before(out[j].Created)
+		}
+		return out[i].Kind+strconv.FormatInt(out[i].ID, 10) < out[j].Kind+strconv.FormatInt(out[j].ID, 10)
+	})
+	return out, nil
 }

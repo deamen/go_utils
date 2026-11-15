@@ -84,6 +84,12 @@ type Submitter interface {
 	OpenPullRequests() ([]store.PullRequest, error)
 	SetPullRequest(source, key, url, state, closedBy, note string) error
 	Session(source, key string) (string, error)
+	// NotePullRequest records how far a pull request has been followed.
+	// ToReview moves a ticket that waited for the checks of its pull
+	// request to review, and WakeForChecks queues a run to fix them.
+	NotePullRequest(source, key, url, checkedSHA string, seenComment time.Time) error
+	ToReview(source, key string) error
+	WakeForChecks(t *task.Task) error
 	// Hold records a ticket as waiting for a human, without a task.
 	Hold(*task.Task, ticket.Reason) error
 	// Closed is called when the tracker reports a ticket as closed.
@@ -1437,8 +1443,17 @@ func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) er
 			strings.TrimSpace(failureText(res)+"\n\n"+codeBlock(lastN(res.Message, replyMax))))
 	}
 	kind, msg := signalActivity(res)
+	if res.AwaitChecks {
+		// Not the end yet: the session stays open until the checks of the
+		// pull request are through.
+		kind, msg = linear.ActivityThought, msg+"\n\n"+awaitChecksNote
+	}
 	return s.linear.CreateActivity(ctx, t.TrackerSession, kind, msg)
 }
+
+// awaitChecksNote is what a ticket is told when its work is handed over
+// and the checks of its pull request come first.
+const awaitChecksNote = "The pull request is not ready for review yet: its checks are running. If they fail, the digital employee looks at the failure; when they pass, this ticket says so."
 
 // signalActivity turns the result of a run that ended by itself into what
 // the Linear session is told. The agent's signal decides: a finished piece

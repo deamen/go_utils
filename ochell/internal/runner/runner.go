@@ -91,6 +91,10 @@ type Runner struct {
 	cancels map[string]context.CancelFunc
 	stops   map[string]string
 	closing map[string]bool
+	// followChecks says that ochell follows the checks of pull requests
+	// (it has access to GitHub): a ticket whose run handed a pull request
+	// over waits for them before it is in review.
+	followChecks bool
 	// grants holds what each run in progress was granted, by task id, for
 	// the workspace hooks of that run. Guarded by mu.
 	grants map[string]*granted
@@ -188,6 +192,59 @@ func (r *Runner) UsePolicy(p *policy.Policy) error {
 	}
 	r.policy = p
 	return nil
+}
+
+// FollowChecks says that the checks of pull requests are followed. Call
+// it before Start.
+func (r *Runner) FollowChecks(on bool) { r.followChecks = on }
+
+// handOver looks at a run that ended with the work handed over (done).
+//
+// With the checks of pull requests followed, a ticket that has a pull
+// request is not in review yet: it waits for the checks. And in a run that
+// was started because the checks failed, "blocked" is the agent's word
+// that it cannot fix them: the ticket then goes to review as it is, for a
+// person to decide.
+func (r *Runner) handOver(t *task.Task, res *task.Result) {
+	if res.Outcome != task.OutcomeFinished || t.Phase == task.PhasePlan {
+		return
+	}
+	if t.Cause == task.CauseChecks && res.Signal == result.Blocked {
+		res.Signal = result.Done
+		res.SignalMessage = "The checks of the pull request still fail, and the agent says that it cannot fix them: " + res.SignalMessage
+		return
+	}
+	if r.followChecks && res.Signal == result.Done && (res.PRURL != "" || t.PRURL != "") {
+		res.AwaitChecks = true
+	}
+}
+
+// ToReview moves a ticket that waited for the checks of its pull request
+// to review.
+func (r *Runner) ToReview(source, key string) error {
+	return r.store.ToReview(source, key)
+}
+
+// WakeForChecks queues a run of a ticket whose pull request failed its
+// checks; t.Comment says what failed. It returns store.ErrNotChecking,
+// ErrAttempts when the ticket has no attempt left, and ErrQueueFull.
+func (r *Runner) WakeForChecks(t *task.Task) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return ErrStopped
+	}
+	t.Cause = task.CauseChecks
+	if err := r.store.WakeForChecks(t, store.Limits{MaxQueued: max(r.cfg.QueueSize, 1), MaxAttempts: r.cfg.MaxAttempts}); err != nil {
+		return err
+	}
+	r.wakeWorker()
+	return nil
+}
+
+// NotePullRequest records how far a pull request has been followed.
+func (r *Runner) NotePullRequest(source, key, url, checkedSHA string, seenComment time.Time) error {
+	return r.store.NotePullRequest(source, key, url, checkedSHA, seenComment)
 }
 
 // SetNotifier sets who is told about the runs. Call it before Start.
@@ -913,6 +970,7 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	if a, ok := r.next(t, res); ok {
 		again = &a
 	}
+	r.handOver(t, &res)
 	// An escalation trigger stops the ticket here, before anything goes on.
 	again = r.escalate(t, &res, again, raisedTo)
 	next, err := r.store.FinishAndQueue(t.ID, res, again)
