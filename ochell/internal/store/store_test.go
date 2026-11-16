@@ -1157,6 +1157,69 @@ func TestEscalationHoldsTheTicket(t *testing.T) {
 	}
 }
 
+// A run that the watchdog stopped leaves its ticket waiting with a reason
+// of its own, and nothing in its place: not the run that ochell would have
+// started, and not one for the messages that arrived during it. The run
+// that a person starts then knows how the one before it ended.
+func TestNoProgressHoldsTheTicket(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	t0 := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	if err := s.Enqueue(newTask("r1", "ENG-1", t0), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if first, err := s.Claim(); err != nil || first.LastOutcome != "" {
+		t.Fatalf("first run = %+v, %v", first, err)
+	}
+	during := newTask("m1", "ENG-1", t0.Add(time.Second))
+	during.Comment = "written during the run"
+	if later, err := s.FollowUp(during, true, Limits{}); err != nil || !later {
+		t.Fatalf("FollowUp during the run = %v, %v", later, err)
+	}
+	res := task.Result{Outcome: task.OutcomeNoProgress, ExitCode: -1, SessionID: "sess-1", Workdir: "/work/ENG-1",
+		Err: errors.New("the agent made no progress and was stopped: it made the same tool call 20 times in a row (Bash gh)")}
+	next, err := s.FinishAndQueue("r1", res, &Again{ID: "r2", Cause: task.CauseStalled})
+	if err != nil || next != "" {
+		t.Fatalf("FinishAndQueue = %q, %v; want nothing queued", next, err)
+	}
+	tk, _ := s.Ticket("linear", "ENG-1")
+	if tk.State != ticket.Waiting || tk.Reason != ticket.ReasonNoProgress || tk.AgentSession != "sess-1" {
+		t.Errorf("ticket = %s (%s), session %q; want waiting (no_progress) with its session", tk.State, tk.Reason, tk.AgentSession)
+	}
+	if run, _ := s.Run("r1"); run.Result.Outcome != task.OutcomeNoProgress || run.Result.Escalation != "" || !strings.Contains(run.Result.Err.Error(), "20 times in a row (Bash gh)") {
+		t.Errorf("stored run = %+v", run.Result)
+	}
+	if got, _ := s.Claim(); got != nil {
+		t.Fatalf("a run was queued after the watchdog stopped one: %+v", got)
+	}
+	if m, _ := s.Metrics(); m.Ended[task.OutcomeNoProgress] != 1 {
+		t.Errorf("metrics: ended = %v", m.Ended)
+	}
+
+	// A person replies: the kept message comes first, and the run knows
+	// what happened to the one before it.
+	reply := newTask("r3", "ENG-1", t0.Add(time.Minute))
+	reply.Comment = "go on, but use the API"
+	if _, err := s.FollowUp(reply, true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Claim()
+	if err != nil || got == nil || got.Comment != "written during the run"+task.CommentSeparator+"go on, but use the API" ||
+		got.LastOutcome != task.OutcomeNoProgress || got.AgentSession != "sess-1" {
+		t.Fatalf("claimed %+v, %v", got, err)
+	}
+	if err := s.Finish("r3", task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput}); err != nil {
+		t.Fatal(err)
+	}
+	again := newTask("r4", "ENG-1", t0.Add(2*time.Minute))
+	again.Comment = "the second one"
+	if _, err := s.FollowUp(again, true, Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Claim(); err != nil || got == nil || got.LastOutcome != task.OutcomeFinished {
+		t.Fatalf("the run after that = %+v, %v; want the outcome of the run before it", got, err)
+	}
+}
+
 // The approval of a plan is recorded on the ticket, queues the run that
 // carries the plan out, and is gone with a new assignment.
 func TestApprovePlan(t *testing.T) {

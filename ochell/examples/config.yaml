@@ -245,6 +245,15 @@ agent:
   # test suite, looks the same as a hung agent, so keep it well above the
   # longest step you expect.
   stall_timeout: 30m
+  # The watchdog: stop a run in which the agent made the same tool call, or
+  # the same two or three calls in the same order, this many times in a row.
+  # Such a run is not started again; its ticket waits for a human with the
+  # reason no_progress. 0 (the default): off. It needs adapter: claude; the
+  # plain adapter reports no tool calls.
+  # An agent that waits for the checks of its pull request repeats one call
+  # too: set this well above the longest such wait you expect, in calls.
+  watchdog:
+    repeats: 60
   # A failed run whose final message (plain adapter: the end of its output)
   # matches one of these regular expressions failed for a temporary reason,
   # and ochell starts the ticket again after a wait: backoff after the first

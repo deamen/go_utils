@@ -363,6 +363,7 @@ var reasons = map[ticket.Reason]string{
 	ticket.ReasonPlanApproval:  "The agent's plan waits for an approval: /approve on the ticket, or say what to change.",
 	ticket.ReasonBlocked:       "The agent is blocked by something outside the ticket. Remove the obstacle, then reply on the ticket.",
 	ticket.ReasonStalled:       "The agent stopped producing output and was stopped, and the ticket has no attempt left. Look at the run log, then reply on the ticket.",
+	ticket.ReasonNoProgress:    "The agent made the same tool calls over and over and was stopped; nothing was started in its place. Look at the run log, then reply on the ticket to let it go on, or stop it.",
 	ticket.ReasonNoResult:      "The run ended without saying how. Look at what it did, then reply on the ticket.",
 	ticket.ReasonNoRepoMapping: "No repository is configured for the ticket. Add one to repos, then assign the ticket again.",
 	ticket.ReasonEscalation:    "A limit or the agent itself stopped the work. Decide whether it goes on: reply on the ticket, change it, or stop it.",

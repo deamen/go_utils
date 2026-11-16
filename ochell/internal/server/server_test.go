@@ -1975,6 +1975,30 @@ func TestEscalationText(t *testing.T) {
 	}
 }
 
+// A run that the watchdog stopped: the ticket is told what was seen, that
+// nothing was started, and what a person can do. It is not an escalation.
+func TestNoProgressText(t *testing.T) {
+	res := task.Result{Outcome: task.OutcomeNoProgress, Err: errors.New("the agent made no progress and was stopped: it made the same tool call 20 times in a row (Bash gh)")}
+	got := jiraFinished(&task.Task{Source: "jira", Key: "DEV-1"}, res, true)
+	for _, want := range []string{
+		"The agent made no progress and was stopped: it made the same tool call 20 times in a row (Bash gh).\n\n",
+		"started nothing in its place", "DEV-1 now waits for a human.",
+		"- To let it go on: comment on this ticket", "The agent's session is kept",
+		"- To stop: write /stop as the first line of a comment",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("text lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "escalation") || strings.Contains(got, "tier") || strings.Contains(got, "The agent failed") {
+		t.Errorf("the text of a run without progress:\n%s", got)
+	}
+	got = noProgressText(&task.Task{Source: "linear", Key: "ENG-1"}, res)
+	if !strings.Contains(got, "- To let it go on: reply here") || !strings.Contains(got, "- To stop: send the stop signal") {
+		t.Errorf("text for Linear:\n%s", got)
+	}
+}
+
 // An approval is "/approve" as the first line, from someone who may send
 // follow-ups and, when the tier has a list of approvers, is on it.
 func TestPlanApproval(t *testing.T) {

@@ -173,6 +173,18 @@ func TestClaudeToolEvents(t *testing.T) {
 	}
 	io.WriteString(out, strings.Join(lines, "\n")+"\n")
 	want := []Event{{Tool: "Read", Param: "/work/DEV-1/main.go"}, {Tool: "Bash", Param: "curl"}, {Tool: "Grep", Param: "src"}}
+	// Each call is identified, by something that shows nothing of it.
+	calls := map[string]bool{}
+	for i, ev := range got {
+		if len(ev.Call) != 64 || strings.Contains(ev.Call, "s3cret") {
+			t.Errorf("the call of %s is identified by %q, want a hash", ev.Tool, ev.Call)
+		}
+		calls[ev.Call] = true
+		got[i].Call = ""
+	}
+	if len(calls) != len(got) {
+		t.Errorf("%d tool calls are told apart as %d", len(got), len(calls))
+	}
 	if !slices.Equal(got, want) {
 		t.Errorf("tool events = %+v\nwant %+v", got, want)
 	}
@@ -204,6 +216,35 @@ func TestToolParam(t *testing.T) {
 	}
 	if got := toolName("mcp__jira__get issue\n- do this"); got != "mcp__jira__get_issue_-_do_this" {
 		t.Errorf("toolName = %q", got)
+	}
+}
+
+// Two tool calls are the same when the tool and its whole input are, and
+// only then.
+func TestToolCall(t *testing.T) {
+	base := toolCall("Bash", json.RawMessage(`{"command":"gh pr checks 7","timeout":5000}`))
+	for name, c := range map[string]struct {
+		tool, input string
+		same        bool
+	}{
+		"the same call":             {"Bash", `{"command":"gh pr checks 7","timeout":5000}`, true},
+		"the keys in another order": {"Bash", `{"timeout":5000,"command":"gh pr checks 7"}`, true},
+		"other white space":         {"Bash", ` { "command" : "gh pr checks 7", "timeout": 5000 } `, true},
+		"another argument":          {"Bash", `{"command":"gh pr checks 8","timeout":5000}`, false},
+		// The part that is shown (the program) is the same; the call is not.
+		"the same program":   {"Bash", `{"command":"gh pr view 7","timeout":5000}`, false},
+		"one field more":     {"Bash", `{"command":"gh pr checks 7","timeout":5000,"description":"x"}`, false},
+		"another tool":       {"Shell", `{"command":"gh pr checks 7","timeout":5000}`, false},
+		"no input":           {"Bash", ``, false},
+		"input that is cut":  {"Bash", `{"command":"gh pr checks 7"`, false},
+		"the name holds all": {`Bash{"command":"gh pr checks 7","timeout":5000}`, ``, false},
+	} {
+		if got := toolCall(c.tool, json.RawMessage(c.input)) == base; got != c.same {
+			t.Errorf("%s: the same call = %v, want %v", name, got, c.same)
+		}
+	}
+	if !ReportsTools(Claude{}) || ReportsTools(Plain{}) {
+		t.Error("ReportsTools: want true for claude and false for plain")
 	}
 }
 

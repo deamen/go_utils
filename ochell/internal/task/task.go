@@ -104,6 +104,9 @@ type Task struct {
 	// runs of the ticket reported, if any. The store sets them too.
 	PRURL  string
 	Branch string
+	// LastOutcome says how the ticket's last run before this one ended;
+	// empty: there was none. The store sets it when the run starts.
+	LastOutcome Outcome
 	// Prompt is rendered by the runner from the prompt template.
 	Prompt string
 	// BudgetUSD is what this run may cost: what the ticket has left of the
@@ -175,6 +178,10 @@ const (
 	// OutcomeStalled: ochell stopped the agent because it wrote no output
 	// for agent.stall_timeout.
 	OutcomeStalled Outcome = "stalled"
+	// OutcomeNoProgress: ochell stopped the agent because it made the same
+	// tool calls over and over (agent.watchdog). The run is not started
+	// again: the ticket waits for a human.
+	OutcomeNoProgress Outcome = "no_progress"
 	// OutcomeStopped: ochell stopped the agent for another reason, such as
 	// its own shutdown.
 	OutcomeStopped Outcome = "stopped"

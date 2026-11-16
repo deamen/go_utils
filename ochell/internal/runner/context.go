@@ -22,6 +22,10 @@ const (
 	stalledNote = "The earlier attempt was stopped by the orchestrator because it produced no output for a long time; it probably waited for a command that never returned. The orchestrator started this attempt by itself. Check git, the pull request and the ticket's comments for what is already done, and do not wait without a time limit for a command that may hang."
 )
 
+// noProgressNote is for the run that a person starts after the watchdog
+// stopped the one before it.
+const noProgressNote = "Your earlier run on this ticket was stopped by the orchestrator because it made the same tool calls over and over without getting further. A person has now asked you to go on. Do not start the same calls again: work out first why they led nowhere, and take another way. If you were waiting for something outside your control, do not wait for it in a loop; report with the status \"blocked\" and say what you are waiting for."
+
 // planNote is for a run that may only make a plan: the tier of the ticket
 // requires an approved plan, and there is none yet.
 const planNote = `This ticket needs a plan that a person has approved before anything is changed. This run is for the plan only. Read the ticket and the code, and work out what you would change, how you would verify it, and what could go wrong. Do not change files in the repository, do not push, do not open a pull request and do not change the ticket. Then report with the status "plan" and the whole plan in "message": it is shown to the people on the ticket as it is. A person approves it or says what to change, and you continue in this session.`
@@ -63,6 +67,9 @@ func runContext(t *task.Task, resumed bool) string {
 		} else {
 			lines = append(lines, fmt.Sprintf("This is attempt %d on this ticket. It starts a new agent session: you do not remember the earlier attempts. Look at the branch, the pull request and the ticket's comments before you repeat work or anything that has an effect outside the repository.", t.Attempt))
 		}
+	}
+	if t.LastOutcome == task.OutcomeNoProgress {
+		lines = append(lines, noProgressNote)
 	}
 	if t.Phase == task.PhasePlan {
 		lines = append(lines, planNote)

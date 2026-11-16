@@ -46,6 +46,19 @@ func LimitsBudget(a Adapter) bool {
 	return ok && b.LimitsBudget()
 }
 
+// ToolReporter is an Adapter that reports the agent's tool calls while it
+// runs, as Events.
+type ToolReporter interface {
+	ReportsTools() bool
+}
+
+// ReportsTools reports whether the adapter passes on the tool calls of a
+// run. Without them nobody can see what the agent does before it ends.
+func ReportsTools(a Adapter) bool {
+	t, ok := a.(ToolReporter)
+	return ok && t.ReportsTools()
+}
+
 // Command is how the agent is to be called: the arguments after
 // agent.command, and what to write to its stdin (nil: nothing).
 type Command struct {
@@ -97,6 +110,12 @@ type Event struct {
 	// only what it knows to be neither (see toolParam).
 	Tool  string
 	Param string
+	// Call identifies the tool call: a hash of the tool's name and its
+	// whole input. Two calls with the same tool and the same input have
+	// the same Call, and that is all it says: nothing of the input can be
+	// read from it. It is for comparing calls (the watchdog), and is
+	// neither logged nor stored.
+	Call string
 }
 
 // Output receives everything the agent writes to stdout and stderr during

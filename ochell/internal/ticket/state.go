@@ -65,6 +65,9 @@ const (
 	ReasonBlocked Reason = "blocked"
 	// ReasonStalled: the agent stopped making progress and was stopped.
 	ReasonStalled Reason = "stalled"
+	// ReasonNoProgress: the agent made the same tool calls over and over
+	// and was stopped. Unlike a stalled run it is not started again.
+	ReasonNoProgress Reason = "no_progress"
 	// ReasonNoResult: the run ended without saying how.
 	ReasonNoResult Reason = "no_result"
 	// ReasonNoRepoMapping: ochell does not know which repository the ticket
@@ -80,6 +83,7 @@ const (
 var reasons = map[Reason]bool{
 	ReasonInput: true, ReasonPlanApproval: true, ReasonBlocked: true, ReasonStalled: true,
 	ReasonNoResult: true, ReasonNoRepoMapping: true, ReasonEscalation: true, ReasonInterrupted: true,
+	ReasonNoProgress: true,
 }
 
 // moves lists, for each state, the states a ticket may move to.
@@ -158,6 +162,8 @@ func AfterRun(o task.Outcome, signal result.Status) (State, Reason) {
 		return Waiting, ReasonInterrupted
 	case task.OutcomeStalled:
 		return Waiting, ReasonStalled
+	case task.OutcomeNoProgress:
+		return Waiting, ReasonNoProgress
 	case task.OutcomeCancelled:
 		return Cancelled, ""
 	case task.OutcomeOverBudget, task.OutcomeOverTurns:

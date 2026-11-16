@@ -692,13 +692,15 @@ func (s *Store) Hold(t *task.Task, reason ticket.Reason) error {
 }
 
 const taskColumns = `r.id, r.source, r.key, t.title, t.url, r.context, r.tracker_session, r.delivery_id, r.received_at, r.attempt,
-	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo, t.prepared_workspace, r.cause, t.tier, t.plan_approved, t.plan_approved_by`
+	t.agent_session, t.workspace, r.comment, t.pr_url, t.branch, t.repo, t.prepared_workspace, r.cause, t.tier, t.plan_approved, t.plan_approved_by,
+	COALESCE((SELECT p.outcome FROM runs p WHERE p.source = r.source AND p.key = r.key AND p.status = 'ended' AND p.rowid != r.rowid
+		ORDER BY p.ended_at DESC, p.rowid DESC LIMIT 1), '')`
 
 func scanTask(row interface{ Scan(...any) error }) (*task.Task, error) {
 	var t task.Task
 	var received int64
 	if err := row.Scan(&t.ID, &t.Source, &t.Key, &t.Title, &t.URL, &t.Context, &t.TrackerSession, &t.DeliveryID, &received, &t.Attempt,
-		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo, &t.PreparedWorkspace, &t.Cause, &t.Tier, &t.PlanApproved, &t.ApprovedBy); err != nil {
+		&t.AgentSession, &t.Workspace, &t.Comment, &t.PRURL, &t.Branch, &t.Repo, &t.PreparedWorkspace, &t.Cause, &t.Tier, &t.PlanApproved, &t.ApprovedBy, &t.LastOutcome); err != nil {
 		return nil, err
 	}
 	t.Received = time.UnixMilli(received).UTC()
@@ -1297,14 +1299,25 @@ func (s *Store) finish(tx *sql.Tx, id string, res task.Result, again *Again) (ne
 			again = nil
 		}
 	}
-	if res.Escalation != "" && res.Outcome != task.OutcomeCancelled {
-		// An escalation stops the ticket: nothing follows by itself, not
-		// another try and not a run for the messages that arrived during
-		// this one. They stay, and go with the ticket's next run (Claim).
+	stopped := ticket.Reason("")
+	switch {
+	case res.Outcome == task.OutcomeCancelled:
+	case res.Escalation != "":
+		stopped = ticket.ReasonEscalation
+	case res.Outcome == task.OutcomeNoProgress:
+		// The watchdog stopped the run. Whoever wrote during it did not
+		// know that yet.
+		stopped = ticket.ReasonNoProgress
+	}
+	if stopped != "" {
+		// An escalation or the watchdog stops the ticket: nothing follows
+		// by itself, not another try and not a run for the messages that
+		// arrived during this one. They stay, and go with the ticket's
+		// next run (Claim).
 		if _, err := tx.Exec(`UPDATE followups SET held = 1 WHERE source = ? AND key = ?`, source, key); err != nil {
 			return "", err
 		}
-		return "", s.move(tx, source, key, ticket.Waiting, ticket.ReasonEscalation)
+		return "", s.move(tx, source, key, ticket.Waiting, stopped)
 	}
 	waiting, waitingSession, err := takeFollowUps(tx, source, key, false)
 	if err != nil {

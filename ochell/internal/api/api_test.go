@@ -127,7 +127,7 @@ func TestTokenAndSignedLink(t *testing.T) {
 // Every reason a ticket can wait for has a line that says what to do.
 func TestEveryReasonIsExplained(t *testing.T) {
 	for _, r := range []ticket.Reason{ticket.ReasonInput, ticket.ReasonPlanApproval, ticket.ReasonBlocked, ticket.ReasonStalled,
-		ticket.ReasonNoResult, ticket.ReasonNoRepoMapping, ticket.ReasonEscalation, ticket.ReasonInterrupted} {
+		ticket.ReasonNoResult, ticket.ReasonNoRepoMapping, ticket.ReasonEscalation, ticket.ReasonInterrupted, ticket.ReasonNoProgress} {
 		if reasons[r] == "" {
 			t.Errorf("the inbox has no text for the reason %s", r)
 		}

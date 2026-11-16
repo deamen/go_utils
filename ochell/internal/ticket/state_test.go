@@ -99,6 +99,7 @@ func TestAfterRun(t *testing.T) {
 		{task.OutcomeStopped, result.Done}:     {Waiting, ReasonInterrupted},
 		{task.OutcomeInterrupted, result.None}: {Waiting, ReasonInterrupted},
 		{task.OutcomeStalled, result.Done}:     {Waiting, ReasonStalled},
+		{task.OutcomeNoProgress, result.Done}:  {Waiting, ReasonNoProgress},
 	}
 	for r, w := range want {
 		o := r.outcome

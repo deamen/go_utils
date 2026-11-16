@@ -101,8 +101,37 @@ ochell starts a ticket again by itself in two cases. Both count as an attempt, s
 - **The next run is told as well.** Its run context says that the earlier attempt was cut off by an outside error, or was stopped as stalled, and that the agent must check what is already done.
 - While a ticket waits for its retry it is `queued`: a new assignment in that time is answered with `already in progress`. A wait is kept across a restart.
 
+### The watchdog
+A run can be busy and still get nowhere: the agent makes the same tool call again and again, and every call costs. The watchdog looks at the tool calls of a run while it goes on, and stops a run that goes round in a circle.
+
+```yaml
+agent:
+  adapter: claude       # the watchdog needs an adapter that reports tool calls
+  watchdog:
+    repeats: 60         # 0 (the default): off
+```
+
+- **What it looks for:** the same tool call `repeats` times in a row, or the same two or three calls, in the same order, `repeats` times in a row (A B A B …). Two calls are the same when the tool and its whole input are the same. Nothing else counts: the same program with other arguments is another call.
+- **It is checked as the calls arrive**, not on a timer: each tool call that the adapter reports is compared with the ones before it. There is no interval to set, and a run is stopped at the call that completes the circle.
+- **When it fires:**
+  - **The run stops**, with all its processes, as at `agent.stall_timeout`. Its outcome is `no_progress`, and the run log, ochell's log and the store say what was seen: which tool, and how often.
+  - **ochell starts nothing in its place.** A stalled run is tried again; a run in a circle would go round again. Messages that arrived during the run start nothing either: they are kept, and go with the run that a person starts.
+  - **The ticket waits for a human**: state `waiting`, reason `no_progress`. It is in the [inbox](#the-status-api), and stays in its tier.
+  - **The ticket is told** what was seen and what a person can do: an `elicitation` in the Linear session, a comment on the Jira ticket.
+  - **The agent's session is kept.**
+- **What a human can do then:**
+  - **Let it go on:** reply in the Linear session or comment on the Jira ticket, best with what the agent should do differently. The run continues the agent's session, and its run context tells the agent that it was stopped for repeating itself and must take another way.
+  - **Stop:** the stop signal in Linear, `/stop` in a Jira comment, or take the ticket away from the digital employee.
+- **It is off by default.** Repeating a call is not always a fault: an agent that waits for the checks of its pull request asks for their status with the same command many times, alone or in turn with a `sleep`. Set `repeats` well above the longest such wait you expect, counted in calls, or leave it off; `60` is a start for an agent that asks once or twice a minute and should not wait longer than half an hour.
+- **It is a heuristic, and ochell asks no model.** ochell has no access to a model of its own, and what a run costs is not its business. So the watchdog does not judge whether the work is any good, only whether the calls repeat. An agent that goes wrong with a different call each time is not seen; `max_turns` and the budget of its tier, and `agent.timeout`, bound that.
+- **It is not an [escalation](#escalation)**: the ticket does not move to another tier, and there is no trigger of that name. Nor does it change a tier's [level of autonomy](#graduated-autonomy): `ochell flag` is for a guardrail outside ochell, and the level follows what people send back.
+- **Only the host sets it.** It is a setting of `config.yaml`; neither the policy file, a ticket nor a repository's `WORKFLOW.md` can turn it off or raise it.
+- **It needs the `claude` adapter**, which reports each tool call from Claude Code's event stream. The `plain` adapter reports none: the watchdog then sees nothing, and ochell says so in its log at start. `agent.stall_timeout` works with every adapter, and covers the other case, an agent that says nothing at all.
+- **Nothing of a tool's input is kept.** ochell compares a hash of the tool's name and its input, in memory, for the time of the run. What it writes down is what a Linear session shows anyway: the tool's name and the file, the host or the program it works on (see [Agent adapters](#agent-adapters)).
+- **Not seen:** a tool call whose line in the event stream is longer than 8 MiB, which the adapter skips. That Claude Code can resume a session whose run was stopped in the middle of a tool call was not checked for this case; it is what a stalled or interrupted run relies on as well.
+
 ### Stopping agents and shutting down
-- **A stop ends the whole agent**, not only its top process: sub-agents, MCP servers and git children too. ochell sends SIGTERM, and SIGKILL after `agent.stop_grace` (10s). This happens at `agent.timeout`, at `agent.stall_timeout` and on shutdown.
+- **A stop ends the whole agent**, not only its top process: sub-agents, MCP servers and git children too. ochell sends SIGTERM, and SIGKILL after `agent.stop_grace` (10s). This happens at `agent.timeout`, at `agent.stall_timeout`, when the [watchdog](#the-watchdog) fires and on shutdown.
   - With the `systemd` launcher ochell stops the unit, and systemd signals every process in it.
   - With the `direct` launcher the agent runs in its own process group and ochell signals the group. A child that leaves the group (`setsid`) is not reached; use the `systemd` launcher where that matters. When the agent exits by itself, what it left running in its group is killed as well.
 - **Shutdown** (SIGTERM or Ctrl-C): ochell stops accepting webhooks and waits up to `agent.drain_timeout` (30s) for running agents to finish. Then it stops the ones still running. A second signal ends the wait at once. Tasks that were queued but not started stay in the store and run after the next start.
@@ -197,6 +226,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-launcher` | `direct` (default) or `systemd`; see [Launchers](#launchers) |
 | `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
 | `--agent-stall-timeout` | Stop an agent that wrote no output for this long, and start the ticket again (default `0`: never); see [Retry and stall detection](#retry-and-stall-detection) |
+| `--agent-watchdog-repeats` | Stop an agent that made the same tool call, or the same few calls in a row, this many times, and leave the ticket to a human (default `0`: never); see [The watchdog](#the-watchdog) |
 | `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-max-attempts`, `--agent-log-dir`, `--agent-run-dir` | Execution settings |
 | `--agent-stop-grace`, `--agent-drain-timeout` | Time between SIGTERM and SIGKILL when an agent is stopped; how long a shutdown waits for running agents (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down)) |
 | `--jira-webhook`, `--jira-webhook-secret`, `--jira-bot-account-id` | Jira system webhook source |
@@ -319,7 +349,7 @@ agent:
 |---|---|---|
 | `ochell_runs_started_total{cause}` | counter | runs that were started, by why they were queued: `assigned`, `retry`, `stalled`, `recovery`, `follow_up`, `poll`, … |
 | `ochell_runs_ended_total{outcome}` | counter | runs that have ended, by outcome |
-| `ochell_run_failures_total` | counter | runs that failed, timed out, stalled or could not be started |
+| `ochell_run_failures_total` | counter | runs that failed, timed out, stalled, made no progress (`no_progress`) or could not be started |
 | `ochell_run_retries_total` | counter | runs that ochell started by itself after a temporary failure or a stall |
 | `ochell_run_duration_seconds` | histogram | how long the runs took (buckets of 1, 5, 15, 30, 60 and 120 minutes) |
 | `ochell_cost_usd_total`, `ochell_tokens_total{kind}` | counter | what the runs cost, as the agent reports it |
@@ -977,6 +1007,7 @@ Notes:
 - **Only a move to a higher tier is a trigger.** An update that would lower the tier changes nothing. A ticket whose agent is not running only gets the new tier: there is nothing to stop.
 - **The tier's update events** are `jira:issue_updated` of the Jira system webhook, and `Issue` updates of Linear (the app's webhook must subscribe to issue events). Jira Automation sends none.
 - `needs_input` and `blocked` from the agent are not escalations: the ticket waits with its own reason and stays in its tier.
+- A run that [the watchdog](#the-watchdog) stopped is not an escalation either: the ticket waits with the reason `no_progress` and stays in its tier.
 - A ticket that used up its attempts and is assigned again is refused as before (see [Guards and the admin channel](#guards-and-the-admin-channel)).
 - Two triggers of the findings come later, with the read-only GitHub access: CI that is still red after N fixes, and a review requested by CODEOWNERS.
 
@@ -1096,7 +1127,7 @@ Every ticket ochell has seen is in one of these states. They are defined, with t
 
 A ticket that is `queued` or `running` takes no second run. From every other state a new assignment queues it again.
 
-Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation` (an [escalation](#escalation) trigger fired, or the ticket used up its attempts and was assigned again), and `interrupted` (ochell itself stopped during the run, and the ticket had no attempt left to start it again).
+Reasons of a `waiting` ticket: `input` (the agent asked a question), `plan_approval`, `blocked`, `stalled`, `no_progress` (the [watchdog](#the-watchdog) stopped a run that went round in a circle), `no_result` (the run ended without saying how), `no_repo_mapping`, `escalation` (an [escalation](#escalation) trigger fired, or the ticket used up its attempts and was assigned again), and `interrupted` (ochell itself stopped during the run, and the ticket had no attempt left to start it again).
 
 What a run leads to:
 
@@ -1110,6 +1141,7 @@ What a run leads to:
 | `finished` | missing or invalid | `waiting`, reason `no_result` |
 | `failed`, `timed_out`, `not_started` | not looked at | `failed`. A `failed` run that matches a retry pattern: `queued` again while the ticket has an attempt left; `waiting`, reason `escalation`, when it has none |
 | `stalled` | not looked at | `queued` again; `waiting`, reason `stalled`, when the attempts are used up |
+| `no_progress` | not looked at | `waiting`, reason `no_progress`; never `queued` again by ochell itself |
 | `cancelled` | not looked at | `cancelled` |
 | `over_budget`, `over_turns` | not looked at | `waiting`, reason `escalation` |
 | any, with an [escalation](#escalation) trigger | | `waiting`, reason `escalation` |
@@ -1138,6 +1170,7 @@ An adapter holds what differs between agent CLIs: how a run is started, how an e
 - **Tool use in the Linear session:** while the agent runs, ochell shows the tools it uses as `action` activities in the ticket's Linear session, so the session shows progress between "picked up" and the result.
   - **Not every use is shown:** at most one activity per `sources.linear.tool_activity_interval` (30s). The next one says how many tool calls were left out. Each is ephemeral: Linear replaces it with the next activity, so the session shows what the agent does now, not a list.
   - **What is shown** is the tool's name and one short part of its input: the file or search pattern it works on, the host of a URL, or the name of the program that a command runs. The arguments of a command, prompts and queries are never shown: tool input can hold ticket text and secrets.
+  - The same tool calls are what [the watchdog](#the-watchdog) looks at.
   - `tool_activity_interval: 0s` posts none. A Jira ticket has no place for this, and gets none. The `plain` adapter does not know what the agent does.
   - Whether Linear shows an ephemeral `action` as described was not checked against Linear.
 
@@ -1181,6 +1214,7 @@ Then set `agent.launcher: systemd` and check the result with `scripts/check-laun
 | `failed` | the agent exited by itself with another status |
 | `timed_out` | ochell stopped it at `agent.timeout` |
 | `stalled` | ochell stopped it because it wrote no output for `agent.stall_timeout` |
+| `no_progress` | ochell stopped it because it made the same tool calls over and over (see [The watchdog](#the-watchdog)) |
 | `stopped` | ochell stopped it because it is shutting down. The ticket is queued again |
 | `cancelled` | a person stopped the run, from the ticket or by closing or unassigning it |
 | `not_started` | the agent never ran: the command could not be executed, or the launch was refused. With the systemd launcher these are exit codes from 200 (250: refused by the launch script; 203: systemd could not execute the command) |
@@ -1199,6 +1233,7 @@ A repository can bring its own prompt in its `WORKFLOW.md`, which then takes the
 - that the run has [ochell's ticket tools](#ticket-tools), and must use them and not `twg`, when its tier grants them;
 - which attempt this is, and whether it continues the agent session of the earlier attempt or starts a new one. In a new session the agent is told to look at the branch, the pull request and the ticket's comments before it repeats work;
 - that the earlier attempt was cut off by a temporary error, or was stopped as stalled, when ochell retries by itself (see [Retry and stall detection](#retry-and-stall-detection));
+- that the earlier run was stopped because it made the same tool calls over and over, and that the agent must take another way, when a person lets a ticket go on that [the watchdog](#the-watchdog) stopped;
 - the recovery note, when the run takes the place of one that ochell cut short or did not see the end of (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down));
 - the branch and the pull request that earlier attempts reported in their result files, with the instruction to continue there;
 - the comment that started the run, when someone asked for it in one: a mention of the agent in a Linear comment, a reply in the Linear agent session, or a comment on the Jira ticket. The comment is quoted as a message from a person on the ticket, with the note that it does not change what the agent may do.
@@ -1359,6 +1394,7 @@ Notes:
   - Ticket keys must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` before they are used in file names or templates.
   - Signatures and tokens are compared in constant time.
 - **Agent environment:** the agent gets an allowlisted environment, not ochell's own (see [Agent environment](#agent-environment)).
+- **The watchdog** compares the agent's tool calls by a hash, and keeps nothing of their input (see [The watchdog](#the-watchdog)). It stops a run that repeats itself; it is not a guardrail against what the agent does.
 - **Metrics:** the endpoint needs its own token on every scrape (see [Metrics](#metrics)).
 - **Status API:** it needs its token on every request, also from the same host (see [The status API](#the-status-api)).
 - **Ticket tools:** with them the agent holds no tracker token. Each run has a token of its own that opens its own ticket, for reading and commenting only, while the run goes on (see [Ticket tools](#ticket-tools)). What the tools return is ticket text, and as untrusted as the ticket.
