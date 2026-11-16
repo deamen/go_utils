@@ -163,8 +163,8 @@ func serve(args []string) error {
 		return err
 	}
 	log.Info("policy", "file", pol.File, "version", pol.Version, "tiers", len(pol.Tiers), "default_tier", pol.DefaultTier, "rules", len(pol.Rules))
-	if pol.File != "" && cfg.Agent.Launcher != "systemd" {
-		log.Warn("the agent runs as ochell's own OS user (agent.launcher direct) and can write whatever ochell can, the policy file included; use the systemd launcher where the policy has to hold against the agent")
+	if pol.File != "" && cfg.Agent.Launcher == "direct" {
+		log.Warn("the agent runs as ochell's own OS user (agent.launcher direct) and can write whatever ochell can, the policy file included; use the systemd or the podman launcher where the policy has to hold against the agent")
 	}
 
 	st, err := store.Open(cfg.Store.Path)

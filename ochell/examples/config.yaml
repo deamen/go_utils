@@ -52,7 +52,8 @@ metrics:
 # that opens that ticket only, and needs no tracker token. It needs
 # sources.jira_api for Jira tickets and the installed app for Linear.
 # "url" is the address for an agent on this host; empty: the http listener
-# on the loopback address. See examples/mcp-ticket-tools.json for the MCP
+# on the loopback address, or with the podman launcher under the name
+# host.containers.internal. See examples/mcp-ticket-tools.json for the MCP
 # configuration of such a tier.
 ticket_tools:
   enabled: false
@@ -198,8 +199,8 @@ agent:
   token_expires: ""         # e.g. 2027-11-13
   token_warn_days: 30
   # A directory of ochell's own, which the agent cannot read. With the
-  # systemd launcher, the credentials that a tier grants its runs are in a
-  # file here for the time of a run.
+  # systemd and podman launchers, the credentials that a tier grants its
+  # runs are in a file here for the time of a run.
   secrets_dir: /var/lib/ochell/secrets
   # The kind of agent CLI: how it is called and how its output is read.
   #   plain    any CLI: the prompt goes in, the last part of the output is
@@ -218,10 +219,36 @@ agent:
   #            run_dir; args and workdir may only use .ID .Source .Key;
   #            env_pass is not used. ochell must be in the agent user's group
   #            to read the result files.
+  #   podman   a container of its own for each run and each workspace hook,
+  #            started by ochell's own OS user (rootless podman). The
+  #            container holds the working directory of its ticket, the
+  #            directory of its run, the ticket's home directory and nothing
+  #            else of the host. Requires podman.image and an absolute
+  #            workdir with {{.Key}}; env_pass is not used.
   launcher: direct
   systemd:
     launch_command: [sudo, -n, /usr/local/libexec/ochell/ochell-launch]
     stop_command: [sudo, -n, /usr/local/libexec/ochell/ochell-stop]
+  podman:
+    # The podman program: a name on ochell's PATH, or a path.
+    command: podman
+    # The image of every container. It must hold the agent CLI and what the
+    # workspace hooks call (git). Required with launcher: podman.
+    # image: registry.example.com/ochell-agent:7
+    # never (default): only an image that is already on the host. missing,
+    # newer, always: podman pulls it.
+    pull: never
+    # The agent's own credential, as NAME=VALUE lines (CLAUDE_CODE_OAUTH_TOKEN
+    # or ANTHROPIC_API_KEY). Owned by ochell's user, mode 0600. podman reads
+    # it; it is not mounted in a container.
+    # env_file: /etc/ochell/agent.env
+    # One directory per ticket: the agent's home directory (/home/agent) in
+    # that ticket's containers, where the agent CLI keeps its sessions.
+    # Removed with the ticket's working directory.
+    state_dir: /var/lib/ochell/state
+    # Added to every "podman run" after ochell's own options. The host's
+    # alone; ochell does not check them.
+    # args: [--memory=8g, --cpus=4]
   # Time between SIGTERM and SIGKILL when a run is stopped, at the time limit
   # or on shutdown. The whole agent is stopped, with its children.
   stop_grace: 10s

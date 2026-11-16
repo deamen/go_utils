@@ -89,6 +89,15 @@ func (r *Runner) grant(ctx context.Context, t *task.Task) (*granted, error) {
 	return out, nil
 }
 
+// files are the files of the host that the run may read: a container gets
+// them read-only.
+func (g *granted) files() []string {
+	if g.mcpConfig == "" {
+		return nil
+	}
+	return []string{g.mcpConfig}
+}
+
 // describe names what was granted, for the audit record of the run: the
 // tools file, and the names of the variables. Never a value.
 func (g *granted) describe() string {

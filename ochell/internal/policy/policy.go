@@ -617,7 +617,8 @@ func (p *Policy) Validate() error {
 // file in its place.
 //
 // It cannot check who the agent's OS user is. With the systemd launcher
-// that is another user, who is covered by this check. With the direct
+// that is another user, who is covered by this check, and with the podman
+// launcher the file is not in the agent's container. With the direct
 // launcher the agent runs as ochell's own user and can write whatever
 // ochell can.
 func CheckFile(path string) error {
