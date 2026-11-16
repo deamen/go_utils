@@ -28,6 +28,7 @@ import (
 	"ochell/internal/admin"
 	"ochell/internal/api"
 	"ochell/internal/config"
+	"ochell/internal/github"
 	"ochell/internal/ipsync"
 	"ochell/internal/metrics"
 	"ochell/internal/policy"
@@ -37,6 +38,7 @@ import (
 	"ochell/internal/store"
 	"ochell/internal/tracker"
 	"ochell/internal/tracker/jiraapi"
+	"ochell/internal/workflow"
 )
 
 var version = "dev"
@@ -48,6 +50,7 @@ var availCmds = [][2]string{
 	{"linear-install", "print the Linear agent app install URL"},
 	{"jira-check", "check the Jira API access: list the bot's open tickets, and comment on one with --comment-on"},
 	{"policy-check", "check the policy file and print its tiers"},
+	{"workflow-check", "check a repository's WORKFLOW.md against the policy: ochell workflow-check --file WORKFLOW.md"},
 	{"pause", "hold the queue of the running ochell: no new run starts; --tier NAME holds one tier"},
 	{"resume", "end a pause; --tier NAME ends the pause of one tier"},
 	{"status", "say whether the running ochell is paused, and what is queued and running"},
@@ -99,6 +102,8 @@ func main() {
 		err = jiraCheck(args)
 	case "policy-check":
 		err = policyCheck(args)
+	case "workflow-check":
+		err = workflowCheck(args)
 	case "restore":
 		err = restore(args)
 	case "pause", "resume", "status", "reset", "stop", "cost", "outcomes", "backup":
@@ -186,6 +191,13 @@ func serve(args []string) error {
 	r.SetNotifier(srv)
 	if err := r.UseWorkspace(cfg.Workspace); err != nil {
 		return err
+	}
+	if cfg.Workflow.Enabled {
+		// The file comes from the default branch, through ochell's own
+		// read access to GitHub; never from a working directory, which the
+		// agent can write.
+		r.UseWorkflow(cfg.Workflow, workflow.GitHub{Client: github.New(cfg.GitHub.APIURL, cfg.GitHub.Token)})
+		log.Info("a repository's WORKFLOW.md is read from its default branch at the start of each run", "allow_hooks", cfg.Workflow.AllowHooks, "review_statuses", cfg.Workflow.ReviewStatuses)
 	}
 	expiry, _ := cfg.Agent.TokenExpiry()
 	if cfg.Metrics.Enabled {
@@ -359,6 +371,61 @@ func policyCheck(args []string) error {
 	fmt.Printf("version %s, %d rule(s); tiers from the lowest to the highest:\n", pol.Version, len(pol.Rules))
 	for _, line := range pol.Describe() {
 		fmt.Println("  " + line)
+	}
+	return nil
+}
+
+// workflowCheck reads a WORKFLOW.md as "serve" would read it from a
+// repository, and prints what it would mean under each tier of the policy.
+// It is what a review of a change to the file can run before the merge.
+func workflowCheck(args []string) error {
+	var file string
+	cfg, err := config.Load("workflow-check", args, func(fs *flag.FlagSet) {
+		fs.StringVar(&file, "file", workflow.FileName, "the WORKFLOW.md to check")
+	})
+	if err != nil {
+		return err
+	}
+	pol, err := loadPolicy(cfg)
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+	f, err := workflow.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s is invalid; ochell would keep the last good version:\n%w", file, err)
+	}
+	fmt.Printf("%s is valid\n", file)
+	if f.Prompt != "" {
+		fmt.Println("prompt: the file's own")
+	} else {
+		fmt.Println("prompt: the host's (agent.prompt_template)")
+	}
+	if !cfg.Workflow.Enabled {
+		fmt.Println("note: workflow.enabled is not set in this configuration; ochell would not read the file")
+	}
+	for _, t := range pol.Tiers {
+		e := f.Apply(workflow.Host{Tier: t, AllowHooks: cfg.Workflow.AllowHooks, ReviewStatuses: cfg.Workflow.ReviewStatuses,
+			LimitsTurns: cfg.Agent.Adapter == "claude", AbsoluteCommands: cfg.Agent.Launcher == "systemd"})
+		line := fmt.Sprintf("tier %s: plan_gate=%s pr_review=%s auto_merge=%s", t.Name, e.Tier.PlanGate, e.Tier.PRReview, e.Tier.AutoMerge)
+		if e.Tier.MaxTurns > 0 {
+			line += fmt.Sprintf(" max_turns=%d", e.Tier.MaxTurns)
+		}
+		if e.ReviewStatus != "" {
+			line += fmt.Sprintf(" review_status=%q", e.ReviewStatus)
+		}
+		for _, h := range e.Hooks.All() {
+			if len(h.Command) > 0 {
+				line += " hook=" + h.Name
+			}
+		}
+		fmt.Println(line)
+		for _, ig := range e.Ignored {
+			fmt.Println("  " + ig)
+		}
 	}
 	return nil
 }

@@ -1722,3 +1722,40 @@ func TestMetrics(t *testing.T) {
 		t.Errorf("cost %v, usage %+v", m.CostUSD, m.Usage)
 	}
 }
+
+// What ochell knows about a repository's WORKFLOW.md is kept, so the last
+// good version is still there after a restart.
+func TestWorkflows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ochell.db")
+	s := open(t, path)
+	const repo = "git@github.com:example/web.git"
+	if w, err := s.Workflow(repo); err != nil || w != nil {
+		t.Fatalf("before anything is stored: %+v, %v", w, err)
+	}
+	loaded := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	want := Workflow{Repo: repo, Version: "sha:1", Content: "---\nplan_gate: required\n---\nprompt", Loaded: loaded, Checked: loaded.Add(time.Hour),
+		Error: "invalid", Ignored: []string{"plan_gate: skip is ignored", "hooks.before_run is ignored"}}
+	if err := s.SaveWorkflow(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveWorkflow(Workflow{Repo: "git@github.com:example/api.git", Checked: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s = open(t, path)
+	got, err := s.Workflow(repo)
+	if err != nil || got == nil || got.Version != want.Version || got.Content != want.Content || !got.Loaded.Equal(want.Loaded) || !got.Checked.Equal(want.Checked) ||
+		got.Error != want.Error || strings.Join(got.Ignored, "|") != strings.Join(want.Ignored, "|") {
+		t.Errorf("stored %+v, %v; want %+v", got, err, want)
+	}
+	// Saving again replaces the row.
+	want.Version, want.Error, want.Ignored = "sha:2", "", nil
+	if err := s.SaveWorkflow(want); err != nil {
+		t.Fatal(err)
+	}
+	list, err := s.Workflows()
+	if err != nil || len(list) != 2 || list[0].Repo != "git@github.com:example/api.git" || !list[0].Loaded.IsZero() ||
+		list[1].Version != "sha:2" || list[1].Error != "" || list[1].Ignored != nil {
+		t.Errorf("all: %+v, %v", list, err)
+	}
+}

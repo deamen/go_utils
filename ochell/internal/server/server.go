@@ -62,6 +62,9 @@ type Submitter interface {
 	// ticket that waited. store.ErrUnknown and store.ErrReleased say that
 	// there was nothing to stop.
 	Stop(source, key, by string) (runner.Stopped, error)
+	// ReviewStatus returns the Jira status that the WORKFLOW.md of the
+	// ticket's repository chooses for the hand-over, or "".
+	ReviewStatus(source, key string) string
 	// State returns the state of a ticket, ticket.None for one that ochell
 	// has never seen. ActiveTickets returns the keys of the tickets of a
 	// source that have a queued or running task.

@@ -216,6 +216,9 @@ func (f *fakeRunner) set(source, key string, st ticket.State) {
 	f.states[source+":"+key] = st
 }
 
+// ReviewStatus: no repository chooses a status of its own.
+func (f *fakeRunner) ReviewStatus(source, key string) string { return "" }
+
 // Stop records the request, and answers with stopResult or stopErr.
 func (f *fakeRunner) Stop(source, key, by string) (runner.Stopped, error) {
 	f.mu.Lock()

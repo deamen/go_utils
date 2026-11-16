@@ -4355,3 +4355,217 @@ func TestMetricsEndpointIsOffByDefault(t *testing.T) {
 		t.Error("a warning about a token that is far from its end")
 	}
 }
+
+// workflowPolicy has a tier without a plan gate and, behind a label, one
+// with it.
+const workflowPolicy = `
+tiers:
+  - {name: low}
+  - {name: high, plan_gate: required, labels: [risk-high]}
+default_tier: low
+`
+
+// A repository's WORKFLOW.md, read from its default branch: a change takes
+// effect with the next run, without a restart; an invalid file leaves the
+// last good one in force, also across a restart; a setting that would widen
+// the host's policy is ignored and reported, while the rest of the file
+// holds; and a setting that narrows the policy holds.
+func TestRepoWorkflow(t *testing.T) {
+	gh := githubtest.New(t)
+	const tail = "\n\n{{.RunContext}}\n\n{{.ResultInstructions}}\n"
+	merge := func(content string) { gh.SetFile("example", "web", "WORKFLOW.md", content) }
+	merge("Rules of example/web, first version: work on {{.Key}} in small commits." + tail)
+	hookRan := filepath.Join(t.TempDir(), "hook-ran")
+	o := Start(t, Options{
+		Script: []Step{Report("done", "Done.")},
+		Policy: workflowPolicy,
+		Configure: func(c *config.Config) {
+			withGitHub(gh)(c)
+			withAPI(c)
+			c.Repos = []config.Repo{{Project: "*", Repo: "http://" + gh.Host() + "/example/web.git"}}
+			// Hooks of a repository are not allowed on this host.
+			c.Workflow = config.Workflow{Enabled: true}
+		},
+	})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	// run waits for a run to end and returns its log, which holds the
+	// prompt, and its stored record.
+	run := func(id string) (string, *store.Run) {
+		t.Helper()
+		logged := o.WaitRun(id, 15*time.Second).Log
+		return logged, o.WaitStored(st, id, 15*time.Second)
+	}
+	state := func() string {
+		t.Helper()
+		code, body := o.get("/api/v1/state", apiToken, false)
+		if code != 200 {
+			t.Fatalf("GET /api/v1/state: %d %s", code, body)
+		}
+		return body
+	}
+
+	// The first run gets the repository's prompt, not the host's.
+	logged, first := run(o.LinearCreated("ENG-300", "session-wf", "").TaskID(t))
+	if !strings.Contains(logged, "first version: work on ENG-300 in small commits.") || strings.Contains(logged, "You are the digital employee") ||
+		!strings.Contains(logged, "ORCH_RESULT_FILE") || !strings.HasPrefix(first.Result.Workflow, "sha:") {
+		t.Fatalf("the first run: workflow %q, log:\n%s", first.Result.Workflow, logged)
+	}
+	if recs := o.WaitRecords(1, 5*time.Second); !strings.Contains(recs[0].Stdin, "first version: work on ENG-300") {
+		t.Errorf("the agent's prompt:\n%s", recs[0].Stdin)
+	}
+
+	// A change is merged to the default branch. The next run has it; the
+	// same ochell process goes on.
+	merge("Rules of example/web, second version." + tail)
+	logged, second := run(o.LinearPrompted("ENG-300", "session-wf", "Please also update the docs.").TaskID(t))
+	if !strings.Contains(logged, "second version.") || strings.Contains(logged, "first version") || !strings.Contains(logged, "Please also update the docs.") ||
+		second.Result.Workflow == first.Result.Workflow || !strings.HasPrefix(second.Result.Workflow, "sha:") {
+		t.Fatalf("the run after the change: workflow %q, log:\n%s", second.Result.Workflow, logged)
+	}
+	if n := strings.Count(o.Output(), "starting ochell"); n != 1 {
+		t.Fatalf("ochell was started %d times, want 1: the change must take effect without a restart", n)
+	}
+	if !strings.Contains(o.Output(), "WORKFLOW.md of the repository changed; the new version is in force") {
+		t.Error("ochell's log does not say that the file changed")
+	}
+
+	// An invalid file is merged: it names a setting that is not the
+	// repository's to set. The last good version stays in force.
+	merge("---\nbudget_usd: 1000\n---\nRules of example/web, third version." + tail)
+	logged, third := run(o.LinearPrompted("ENG-300", "session-wf", "And the changelog.").TaskID(t))
+	if !strings.Contains(logged, "second version.") || strings.Contains(logged, "third version") || third.Result.Workflow != second.Result.Workflow ||
+		!strings.Contains(logged, "# workflow: WORKFLOW.md on the default branch (sha:") || !strings.Contains(logged, "is invalid") {
+		t.Fatalf("the run after the invalid change: workflow %q, log:\n%s", third.Result.Workflow, logged)
+	}
+	if body := state(); !strings.Contains(body, "field budget_usd not found") || !strings.Contains(body, "the last good version ("+second.Result.Workflow+") stays in force") ||
+		!strings.Contains(body, `"version": "`+second.Result.Workflow+`"`) {
+		t.Errorf("the state page does not report the invalid file:\n%s", body)
+	}
+	if out, _ := o.Admin("status"); !strings.Contains(out, "\nworkflow http://"+gh.Host()+"/example/web.git: WORKFLOW.md on the default branch (sha:") || !strings.Contains(out, "is invalid") {
+		t.Errorf("ochell status does not report the invalid file: %q", out)
+	}
+	if !strings.Contains(o.Output(), "level=WARN") || !strings.Contains(o.Output(), "stays in force") {
+		t.Error("ochell's log does not warn about the invalid file")
+	}
+	// The last good version is in the store, so a restart keeps it too.
+	o.Signal(syscall.SIGTERM)
+	o.WaitExit(20 * time.Second)
+	o.Restart()
+	logged, again := run(o.LinearPrompted("ENG-300", "session-wf", "And the tests.").TaskID(t))
+	if !strings.Contains(logged, "second version.") || again.Result.Workflow != second.Result.Workflow {
+		t.Fatalf("the run after a restart with the invalid file: workflow %q, log:\n%s", again.Result.Workflow, logged)
+	}
+
+	// A valid file that tries to widen the policy: no plan for a tier that
+	// requires one, and a hook on a host that allows a repository none.
+	// Both are ignored and reported; the prompt of the same file holds.
+	merge("---\nplan_gate: skip\nhooks:\n  before_run: [/bin/sh, -c, 'touch " + hookRan + "']\n---\nRules of example/web, fourth version." + tail)
+	o.Labels = []string{"risk-high"}
+	logged, high := run(o.LinearCreated("ENG-301", "session-wf-high", "").TaskID(t))
+	if high.Tier != "high" || high.Result.Phase != "plan" || !strings.Contains(logged, "This run is for the plan only.") {
+		t.Fatalf("plan_gate: skip widened the tier high: tier %q, phase %q, log:\n%s", high.Tier, high.Result.Phase, logged)
+	}
+	if !strings.Contains(logged, "fourth version.") || high.Result.Workflow == second.Result.Workflow {
+		t.Errorf("the rest of the file does not hold: workflow %q, log:\n%s", high.Result.Workflow, logged)
+	}
+	if _, err := os.Stat(hookRan); err == nil {
+		t.Error("the repository's hook ran on a host that does not allow one")
+	}
+	for _, want := range []string{
+		"# workflow: plan_gate: skip is ignored: the tier high requires an approved plan",
+		"# workflow: hooks.before_run is ignored: the host does not run a repository's hooks (workflow.allow_hooks)",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("the run log lacks %q:\n%s", want, logged)
+		}
+	}
+	body := state()
+	for _, want := range []string{"plan_gate: skip is ignored: the tier high requires an approved plan", "hooks.before_run is ignored", `"version": "` + high.Result.Workflow + `"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the state page lacks %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "budget_usd") {
+		t.Errorf("the state page still reports the invalid file:\n%s", body)
+	}
+	if code, page := o.get("/api/v1/state", apiToken, true); code != 200 || !strings.Contains(page, "WORKFLOW.md of the repositories") || !strings.Contains(page, "plan_gate: skip is ignored") {
+		t.Errorf("the state page for a browser: %d\n%s", code, page)
+	}
+	if out, _ := o.Admin("status"); !strings.Contains(out, "example/web.git: plan_gate: skip is ignored") {
+		t.Errorf("ochell status does not report the ignored setting: %q", out)
+	}
+	if !strings.Contains(o.Output(), "a setting is ignored") {
+		t.Error("ochell's log does not report the ignored settings")
+	}
+	if tk, _ := st.Ticket("linear", "ENG-301"); tk == nil || tk.State != "waiting" || tk.Reason != "plan_approval" {
+		t.Errorf("the ticket of the tier high = %+v, want it to wait for the approval of its plan", tk)
+	}
+	// The run's record names the version it ran under.
+	if code, entry := o.get("/api/v1/tasks/ENG-301?source=linear", apiToken, false); code != 200 || !strings.Contains(entry, `"workflow": "`+high.Result.Workflow+`"`) {
+		t.Errorf("the ticket's entry does not name the version of the file: %d\n%s", code, entry)
+	}
+
+	// Narrowing holds: the repository asks for a plan where the tier does
+	// not, and the low-tier ticket gets a run that only plans.
+	merge("---\nplan_gate: required\n---\nRules of example/web, fifth version." + tail)
+	o.Labels = nil
+	logged, low := run(o.LinearCreated("ENG-302", "session-wf-low", "").TaskID(t))
+	if low.Tier != "low" || low.Result.Phase != "plan" || !strings.Contains(logged, "This run is for the plan only.") || !strings.Contains(logged, "fifth version.") {
+		t.Fatalf("the repository's plan gate: tier %q, phase %q, log:\n%s", low.Tier, low.Result.Phase, logged)
+	}
+	if tk, _ := st.Ticket("linear", "ENG-302"); tk == nil || tk.State != "waiting" || tk.Reason != "plan_approval" {
+		t.Errorf("the low-tier ticket = %+v, want it to wait for the approval of its plan", tk)
+	}
+	if body := state(); strings.Contains(body, "is ignored") {
+		t.Errorf("the state page reports an ignored setting for a file that only narrows:\n%s", body)
+	}
+	// After the approval the work is done under the same file.
+	r := o.LinearPrompted("ENG-302", "session-wf-low", "/approve")
+	if r.Status != 200 || !strings.HasPrefix(r.Body, "approved; queued ") {
+		t.Fatalf("the approval: %d %q", r.Status, r.Body)
+	}
+	if _, work := run(strings.TrimPrefix(r.Body, "approved; queued ")); work.Result.Phase != "" || work.Result.Signal != "done" {
+		t.Errorf("the run after the approval: %+v", work.Result)
+	}
+}
+
+// A repository's hooks run after the host's when the host allows them, the
+// status of the hand-over is the repository's when the host lists it, and
+// its turn limit holds where the tier has none.
+func TestRepoWorkflowHooksAndReviewStatus(t *testing.T) {
+	gh := githubtest.New(t)
+	marks := filepath.Join(t.TempDir(), "marks")
+	mark := func(name string) string { return "[/bin/sh, -c, 'echo " + name + " >> " + marks + "']" }
+	gh.SetFile("example", "web", "WORKFLOW.md", "---\nmax_turns: 7\nreview_status: Code Review\nhooks:\n  after_create: "+mark("repo_after_create")+
+		"\n  before_run: "+mark("repo_before_run")+"\n  after_run: "+mark("repo_after_run")+"\n---\n")
+	o := Start(t, Options{
+		Script: []Step{Report("done", "Done.")},
+		Configure: func(c *config.Config) {
+			withGitHub(gh)(c)
+			claudeAdapter(c)
+			c.Repos = []config.Repo{{Project: "*", Repo: "http://" + gh.Host() + "/example/web.git"}}
+			c.Workspace.Hooks.BeforeRun = []string{"/bin/sh", "-c", "echo host_before_run >> " + marks}
+			c.Sources.JiraAPI.ReviewStatus = "In Review"
+			c.Workflow = config.Workflow{Enabled: true, AllowHooks: true, ReviewStatuses: []string{"In Review", "Code Review"}}
+		},
+	})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-310", Status: "In Progress", Statuses: []string{"In Review", "Code Review"}})
+	logged := o.WaitRun(o.JiraAssigned("DEV-310", "Add a retry").TaskID(t), 15*time.Second).Log
+	// No prompt in the file: the host's holds.
+	if !strings.Contains(logged, "You are the digital employee") || !strings.Contains(logged, "# ---- hook before_run of WORKFLOW.md: /bin/sh") {
+		t.Errorf("the run log:\n%s", logged)
+	}
+	raw, _ := os.ReadFile(marks)
+	if got, want := strings.Fields(string(raw)), []string{"repo_after_create", "host_before_run", "repo_before_run", "repo_after_run"}; !slices.Equal(got, want) {
+		t.Errorf("the hooks ran as %v, want %v", got, want)
+	}
+	// The tier has no turn limit; the repository's is passed to the agent.
+	if args := strings.Join(o.WaitRecords(1, 5*time.Second)[0].Args, " "); !strings.Contains(args, "--max-turns 7") {
+		t.Errorf("the agent's arguments lack the repository's turn limit: %s", args)
+	}
+	o.waitFor(10*time.Second, "DEV-310 to be moved to the repository's review status", func() bool { return o.Jira.Status("DEV-310") == "Code Review" })
+}

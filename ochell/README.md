@@ -156,6 +156,7 @@ ochell ngrok-sync --config config.yaml [--dry-run] [--loop]
 ochell linear-install --config config.yaml        # prints the agent install URL
 ochell jira-check --config config.yaml [--comment-on KEY]   # check the Jira API access
 ochell policy-check --config config.yaml          # check the policy file and print its tiers
+ochell workflow-check --file WORKFLOW.md --config config.yaml   # check a repository's WORKFLOW.md against the policy
 ochell version
 
 # commands to the running ochell, over its admin socket (see "Guards and the admin channel")
@@ -211,7 +212,8 @@ The agent runs without a shell, with its working directory set to `workdir` (ren
 ochell keeps its durable state in one SQLite file, `store.path` (default `ochell.db` in the working directory). It is created when missing, readable by its owner only, and updated in place when a newer ochell needs more tables. It holds:
 - the **tickets** ochell has worked on: state (see [Ticket states](#ticket-states)), risk tier, number of attempts, working directory, and the agent's session id for a resume;
 - the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, the risk tier and the policy version it ran under, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to, and what the agent adapter read from it (final message, session id, cost, token counts);
-- the **webhook deliveries** handled in the last 24 hours.
+- the **webhook deliveries** handled in the last 24 hours;
+- the last valid **`WORKFLOW.md`** of each repository (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)).
 
 So a restart loses no queued task, and a retried or replayed delivery from before the restart is still recognised. SQLite keeps two more files next to it while ochell runs (`-wal` and `-shm`). Do not copy the file of a running ochell by hand; use the [backup](#backup-and-restore).
 
@@ -231,7 +233,7 @@ sources:
 - **Use the same Jira account as the agent's `twg`.** What ochell writes then comes from the bot account, like what the agent writes.
 - **`jql`** selects the bot's open tickets, which is what the poller starts from. The default is `assignee = currentUser() AND statusCategory != Done`: the account that owns the token, so no account id is needed.
 - **Check it** with `ochell jira-check --config config.yaml`. It lists the tickets that the JQL selects; with `--comment-on KEY` it also adds a test comment to that ticket.
-- **`review_status`** is optional: the status, for example `In Review`, that a ticket is moved to when the agent reports its work as done. The ticket's workflow must have a transition to it from where the ticket is. If the move fails, ochell logs a warning, and the comment is there all the same.
+- **`review_status`** is optional: the status, for example `In Review`, that a ticket is moved to when the agent reports its work as done. The ticket's workflow must have a transition to it from where the ticket is. If the move fails, ochell logs a warning, and the comment is there all the same. A repository can choose another one from a list of the host's (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)).
 - The token is ochell's own. It is not passed to the agent.
 - Without `base_url` ochell runs as before, and nothing that needs the API happens.
 
@@ -393,6 +395,7 @@ retention:
 | In the record | What it is |
 |---|---|
 | policy version, tier | the version of the [policy](#policy-and-risk-tiers) in force when the run started, and the tier it ran under |
+| workflow | the version of the repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) that the run ran under, if any |
 | grants | what the tier granted the run, by name: the tools file, and the names of the variables from `env`, the credentials file and `mint`. Never a value |
 | prompt hash | the SHA-256 of the prompt the agent was given. The prompt itself is in the run log, not in the store |
 | tokens, cost | input, output, cache read and cache write tokens, and the cost in USD (see [Cost and budgets](#cost-and-budgets)) |
@@ -439,7 +442,7 @@ api:
 
 | Endpoint | Shows |
 |---|---|
-| `GET /api/v1/state` | whether runs start and what holds them back; how many tickets are in each state; and the tickets that are running, queued, and waiting for a person, each with its state, reason, tier and attempts |
+| `GET /api/v1/state` | whether runs start and what holds them back; how many tickets are in each state; the tickets that are running, queued, and waiting for a person, each with its state, reason, tier and attempts; and for each repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) the version in force and what of the file is not |
 | `GET /api/v1/inbox` | **the attention inbox**: exactly the tickets that wait for a person, each with its reason |
 | `GET /api/v1/tasks/<key>` | one ticket with every run: when it started and ended, why it was queued, its outcome, its cost, and what the agent said. Add `?source=jira` or `?source=linear` when both trackers have the key |
 
@@ -585,6 +588,66 @@ tiers:
 - **The files are checked at start** (see [Policy and risk tiers](#policy-and-risk-tiers)): `credentials_file` must belong to root or to ochell's user and must not be accessible to its group or to others; `mcp_config` must exist; `mint` and `revoke` must be programs.
 - **A tier without `grants`** gets what every run has: the launcher's `ENV_FILE`, `agent.env`, and the agent user's own MCP configuration.
 
+### WORKFLOW.md in the repository
+A repository can say how its tickets are worked, in a file `WORKFLOW.md` at its top: the prompt, hooks, the status of the hand-over, and limits that are stricter than the tier's. The file is versioned with the code, and the people who own the repository change it in a pull request.
+
+```yaml
+# config.yaml
+workflow:
+  enabled: true
+  allow_hooks: false
+  review_statuses: [In Review, Code Review]
+```
+
+```
+---
+plan_gate: required
+max_turns: 60
+review_status: Code Review
+hooks:
+  before_run: [/bin/sh, -c, 'git fetch origin']
+---
+You are the digital employee assigned {{.Source}} ticket {{.Key}} ({{.URL}}).
+Run `npm test` before you push.
+
+{{.RunContext}}
+
+{{.ResultInstructions}}
+```
+
+The file is YAML front matter between two lines of `---`, and after it the prompt. Both parts are optional. See [examples/WORKFLOW.md](examples/WORKFLOW.md).
+
+- **It is read from the default branch only.** At the start of every run, ochell asks GitHub for the file of the ticket's repository (see [Repositories](#repositories)) without naming a branch, and GitHub answers from the default branch. ochell never reads it from the working directory or from the ticket's branch: the agent writes both.
+  - So a change takes effect once a person has merged it, with the next run, **without a restart** of ochell.
+  - It needs [the GitHub access](#handoff-review-merge-done), and `github.token` then also needs read access to the contents of the repositories. A repository on another host than the configured GitHub has no `WORKFLOW.md` for ochell.
+  - **What keeps the agent from changing the default branch is GitHub**, as for a merge: protect the branch (a required review by someone else, no bypass for the digital employee's account). ochell cannot enforce that. This is also why the file can only narrow the policy: if the branch protection fails, the agent gains nothing from the file.
+- **It can only narrow the host's policy.** What the file may set, and what narrower means:
+
+  | Setting | Narrower is | A value that is not narrower |
+  |---|---|---|
+  | `plan_gate` | `required`, for a tier with `skip` | `skip` for a tier with `required`: ignored |
+  | `pr_review` | `required`, for a tier with `sampled` | `sampled` for a tier with `required`: ignored |
+  | `auto_merge` | `never`, for a tier with `after_ci` | `after_ci` for a tier with `never`: ignored |
+  | `max_turns` | a number below the tier's limit, or any number for a tier without one. Needs the `claude` adapter | a number above the tier's limit: ignored |
+  | `review_status` | one of `workflow.review_statuses`; it takes the place of `sources.jira_api.review_status` for the repository's tickets | any other status: ignored. A status moves the ticket in Jira, so the host says which ones a repository may choose |
+  | `hooks` (`after_create`, `before_run`, `after_run`) | with `workflow.allow_hooks`: the hook runs **after** the host's hook of the same name, never in its place | without `allow_hooks`: ignored |
+  | the prompt (the text after the front matter) | it takes the place of `agent.prompt_template`. A prompt is text for the agent and grants nothing | |
+
+  - The tier is the ticket's own (see [Policy and risk tiers](#policy-and-risk-tiers)): the same file can narrow one tier and be ignored in part for another.
+  - **A setting that would widen the policy is ignored and reported; the rest of the file holds.** Where it is reported: a warning in ochell's log, a `# workflow:` line in the log of the run, `ochell status`, and `GET /api/v1/state` of [the status API](#the-status-api) (`workflows`, with the reason for each setting). The ticket is not told: it would be told at every run.
+  - **Nothing else can be set.** The budget, the grants, the labels, who may assign or approve, the pauses and the throttles are the policy file's alone. A file that names one of them, or any setting that ochell does not know, is invalid as a whole.
+  - A run that reaches the `max_turns` of the file ends like one that reaches the tier's (see [Escalation](#escalation)).
+- **An invalid file keeps the last good one.** ochell keeps the last version that was valid in [the store](#the-store), and it stays in force, also across a restart, while the default branch has a file that is invalid or that ochell cannot read (GitHub does not answer, or the token cannot see the repository). The reason is reported in the same places. Without an earlier good version the host's settings hold alone.
+  - A file that was **removed** from the default branch is no longer in force: the host's settings hold alone.
+- **Why hooks need the host's yes.** A hook is a command that ochell runs for every ticket of the repository, as the agent's OS user and with the run's [grants](#tools-and-credentials-per-tier), before anyone has looked at the run. The agent can already run commands there, so a hook reaches nothing new; but it runs without the agent deciding to, also in a run that is only for a plan. The host decides whether repositories may do that. `before_remove` cannot be set: a working directory is removed outside any run.
+- **The templates are not Go templates.** In the prompt and in a hook's arguments only `{{.Name}}` is replaced, so that text from a repository is never run as a template program. Anything else in `{{ }}` makes the file invalid.
+  - The prompt: `.Source`, `.Key`, `.Title`, `.URL`, `.Repo`, `.Context`, `.ID`, `.Attempt`, `.ResultFile`, and `.RunContext` and `.ResultInstructions`, which **must** both be there (see [The prompt](#the-prompt)). The run context is where ochell tells the agent that a run is for a plan only.
+  - A hook's arguments: `.ID`, `.Source`, `.Key`, `.Repo`, `.Branch`. With the `systemd` launcher the command must be an absolute path; otherwise the hook is ignored and reported.
+- The file may have 64 KB.
+- **`ochell workflow-check --file WORKFLOW.md --config config.yaml`** reads a file as `serve` would and prints, for each tier of the policy, what would hold and what would be ignored. Use it in the review of a change, before the merge.
+- **Each run records the version** of the file it ran under (the hash that git gives the file's content), in its [audit record](#audit-trail-and-outcome-metrics) and in its log.
+- Without `workflow.enabled` no repository's file is looked at.
+
 ### Pauses and throttles
 The hard controls: an operator can hold what ochell starts, and the policy bounds how much it starts.
 
@@ -637,6 +700,7 @@ And for everyone:
 - **A label that would lower the tier is ignored.** A tier only goes up while ochell knows the ticket, so removing a label, or a label that the policy gives a lower tier, changes nothing. Lowering is the operator's `ochell reset <jira|linear> <KEY> --tier <name>` (see [Policy and risk tiers](#policy-and-risk-tiers)).
 - **A plan is approved only with `/approve` from someone who may** (see [The plan gate](#the-plan-gate)). No status and no label approves anything.
 - **A budget is renewed only by an operator**, and a tier's limits are in the policy file, which the agent cannot write.
+- **A repository's `WORKFLOW.md` can make a gate stricter, never looser** (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)). The agent can change that file on its own branch; ochell reads the default branch.
 
 Who the bot account is:
 - **Jira:** `bot_account_id` of `jira_webhook` and of `jira_automation`. Let the agent's `twg` use that same account.
@@ -769,6 +833,7 @@ workspace:
   - A hook gets the task's environment (`ORCH_TASK_ID`, `…_SOURCE`, `…_KEY`, `…_URL`, `…_REPO`, `…_BRANCH`), `ORCH_HOOK` with its name, and `agent.env`. Its output is in the run log.
   - Arguments are templates with `.ID`, `.Source`, `.Key`, `.Repo` and `.Branch`: nothing that holds ticket text. Prefer the environment variables inside a `sh -c` script, as above. Write `$NAME`, not `${NAME}`: the configuration file replaces `${NAME}` from ochell's own environment when it is loaded.
   - `hook_timeout` (10m) limits each hook.
+  - A repository can add hooks of its own, which run after these, when `workflow.allow_hooks` is set (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)).
 - **`branch`** (default `bot/{{.Key}}`) is the branch the ticket is worked on. Hooks and the agent get it as `ORCH_TASK_BRANCH`.
 - **A second run of a ticket reuses its working directory.** ochell remembers for which directory `after_create` has run.
 - **`cleanup: true`** removes a ticket's working directory when the tracker reports the ticket as closed. It needs `root`, and `{{.Key}}` in `agent.workdir`, so that a directory can only be that of one ticket. The root itself is never removed.
@@ -890,6 +955,8 @@ ochell sets the outcome from what it asked for, never from the exit code alone: 
 The prompt is rendered from `agent.prompt_template` and written to the agent's **stdin** (`prompt_via: stdin`, the default), which is how `claude -p` reads it when no prompt argument is given.
 
 The template sees the task (`.Source`, `.Key`, `.Title`, `.URL`, `.Repo`, `.Context`, `.Comment`, `.ID`, `.Attempt`) and what ochell adds: `.RunContext`, `.ResultInstructions` and `.ResultFile`. **A template must include `{{.RunContext}}` and `{{.ResultInstructions}}`**; ochell refuses to start without them. See [The result file](#the-result-file).
+
+A repository can bring its own prompt in its `WORKFLOW.md`, which then takes the place of `agent.prompt_template` for its tickets (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)).
 
 **The run context** is what only ochell knows about a run. The agent still reads the ticket itself. It is empty for a plain first attempt; otherwise it says:
 - which attempt this is, and whether it continues the agent session of the earlier attempt or starts a new one. In a new session the agent is told to look at the branch, the pull request and the ticket's comments before it repeats work;
@@ -1057,6 +1124,7 @@ Notes:
 - **Metrics:** the endpoint needs its own token on every scrape (see [Metrics](#metrics)).
 - **Status API:** it needs its token on every request, also from the same host (see [The status API](#the-status-api)).
 - **Policy:** the tiers and limits are in a file of ochell's own, which the agent must not be able to write (see [Policy and risk tiers](#policy-and-risk-tiers)). Nothing in a ticket or a repository widens them.
+- **A repository's `WORKFLOW.md`** is untrusted: it is read from the default branch only, it can only narrow the policy, and its templates are placeholders, not programs (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)). That the agent cannot push to the default branch is GitHub's branch protection to enforce.
 - **Agent OS user:** with the `direct` launcher the agent runs as the same OS user as ochell and can read ochell's files. Deploy with the `systemd` launcher (see [Launchers](#launchers)).
 - **Secrets:** never commit secrets or TLS keys. The repository's pre-commit hooks reject private keys.
 

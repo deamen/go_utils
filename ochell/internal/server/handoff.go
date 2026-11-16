@@ -221,7 +221,7 @@ func (s *Server) toReview(pr store.PullRequest, text string, log *slog.Logger) {
 	}
 	log.Info("ticket in review", "why", text)
 	s.tell(pr.Source, pr.Key, text, log)
-	if status := s.cfg.Sources.JiraAPI.ReviewStatus; status != "" && pr.Source == "jira" && s.jira != nil {
+	if status := s.reviewStatus(pr.Source, pr.Key); status != "" && pr.Source == "jira" && s.jira != nil {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), jiraCallBy)
 			defer cancel()

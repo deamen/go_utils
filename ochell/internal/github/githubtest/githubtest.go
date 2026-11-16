@@ -3,6 +3,9 @@
 package githubtest
 
 import (
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -54,7 +57,28 @@ type Server struct {
 	mu     sync.Mutex
 	pulls  []*PullRequest
 	checks map[string][]Check // by commit
+	files  map[string]string  // by owner/repo/path, on the default branch
+	repos  map[string]bool    // by owner/repo
 	calls  int
+}
+
+// SetFile puts a file on the default branch of a repository, as a merge
+// does. The repository exists from then on.
+func (s *Server) SetFile(owner, repo, path, content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.files == nil {
+		s.files, s.repos = map[string]string{}, map[string]bool{}
+	}
+	s.files[owner+"/"+repo+"/"+path] = content
+	s.repos[owner+"/"+repo] = true
+}
+
+// RemoveFile takes a file off the default branch; the repository stays.
+func (s *Server) RemoveFile(owner, repo, path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.files, owner+"/"+repo+"/"+path)
 }
 
 // SetChecks sets the check runs of a commit.
@@ -150,6 +174,8 @@ func (s *Server) Calls() int {
 var (
 	pullPath    = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/pulls/(\d+)$`)
 	commitPath  = regexp.MustCompile(`^/repos/[^/]+/[^/]+/commits/([^/]+)/(check-runs|status)$`)
+	contentPath = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/contents/(.+)$`)
+	repoPath    = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)$`)
 	commentPath = regexp.MustCompile(`^/repos/([^/]+)/([^/]+)/(issues|pulls)/(\d+)/(comments|reviews)$`)
 )
 
@@ -166,6 +192,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		// ochell only reads.
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	notFound := func() {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Not Found"})
+	}
+	if m := contentPath.FindStringSubmatch(r.URL.Path); m != nil {
+		content, ok := s.files[m[1]+"/"+m[2]+"/"+m[3]]
+		// A real GitHub answers from the default branch when no ref is
+		// named. The fake has no other branch, so a ref is refused: ochell
+		// must not name one.
+		if !ok || r.URL.Query().Has("ref") {
+			notFound()
+			return
+		}
+		sum := sha1.Sum([]byte("blob " + strconv.Itoa(len(content)) + "\x00" + content))
+		json.NewEncoder(w).Encode(map[string]any{"type": "file", "encoding": "base64", "size": len(content), "path": m[3],
+			"sha": hex.EncodeToString(sum[:]), "content": base64.StdEncoding.EncodeToString([]byte(content)) + "\n"})
+		return
+	}
+	if m := repoPath.FindStringSubmatch(r.URL.Path); m != nil {
+		if !s.repos[m[1]+"/"+m[2]] {
+			notFound()
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"full_name": m[1] + "/" + m[2], "default_branch": "main"})
 		return
 	}
 	if m := commitPath.FindStringSubmatch(r.URL.Path); m != nil {

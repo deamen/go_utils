@@ -35,6 +35,55 @@ func TestParseURL(t *testing.T) {
 	}
 }
 
+func TestParseRepo(t *testing.T) {
+	for _, ok := range []string{
+		"git@github.com:example/web.git", "git@github.com:example/web", "https://github.com/example/web.git", "https://GitHub.com/example/web/",
+		"ssh://git@github.com/example/web.git", "ssh://git@github.com:22/example/web.git", " https://token@github.com/example/web ",
+	} {
+		owner, repo, err := github.ParseRepo(ok, "github.com")
+		if err != nil || owner != "example" || repo != "web" {
+			t.Errorf("%q: %q %q, %v", ok, owner, repo, err)
+		}
+	}
+	for _, bad := range []string{
+		"", "example/web", "git@gitlab.com:example/web.git", "https://github.com.evil.example/example/web.git", "https://github.com/example",
+		"https://github.com/example/web/tree/main", "git@github.com:example/web/extra.git", "https://github.com/../web.git", "/srv/git/web.git",
+	} {
+		if owner, repo, err := github.ParseRepo(bad, "github.com"); err == nil {
+			t.Errorf("%q was taken for %s/%s", bad, owner, repo)
+		}
+	}
+	// A host with a port, as a test site and some GitHub Enterprise
+	// Servers have.
+	if owner, repo, err := github.ParseRepo("http://127.0.0.1:8080/example/web.git", "127.0.0.1:8080"); err != nil || owner != "example" || repo != "web" {
+		t.Errorf("a host with a port: %q %q, %v", owner, repo, err)
+	}
+}
+
+// A file is read from the default branch: ochell names no branch.
+func TestFile(t *testing.T) {
+	gh := githubtest.New(t)
+	c := github.New(gh.URL, githubtest.Token)
+	ctx := context.Background()
+	gh.SetFile("example", "web", "WORKFLOW.md", "line one\nline two\n")
+	f, err := c.File(ctx, "example", "web", "WORKFLOW.md", 1000)
+	if err != nil || string(f.Content) != "line one\nline two\n" || len(f.SHA) != 40 {
+		t.Fatalf("file: %+v, %v", f, err)
+	}
+	if _, err := c.File(ctx, "example", "web", "WORKFLOW.md", 5); err == nil || !strings.Contains(err.Error(), "at most 5") {
+		t.Errorf("a file over the limit: %v", err)
+	}
+	if _, err := c.File(ctx, "example", "web", "OTHER.md", 1000); !github.NotFound(err) {
+		t.Errorf("a missing file: %v", err)
+	}
+	if err := c.Repository(ctx, "example", "web"); err != nil {
+		t.Errorf("the repository: %v", err)
+	}
+	if err := c.Repository(ctx, "example", "nothing"); !github.NotFound(err) {
+		t.Errorf("a repository that is not there: %v", err)
+	}
+}
+
 func TestPullRequest(t *testing.T) {
 	gh := githubtest.New(t)
 	gh.Open(githubtest.PullRequest{Owner: "example", Repo: "web", Number: 7, HeadRef: "bot/DEV-1", Author: "digital-employee"})

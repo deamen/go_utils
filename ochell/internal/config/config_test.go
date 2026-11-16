@@ -635,3 +635,37 @@ func TestMetricsAndTokenSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkflowSettings(t *testing.T) {
+	base := func() *Config {
+		cfg := Default()
+		cfg.Sources.JiraAutomation.Enabled = true
+		cfg.Sources.JiraAutomation.Token = "t"
+		return cfg
+	}
+	cfg := base()
+	if cfg.Workflow.Enabled {
+		t.Error("a repository's WORKFLOW.md must not be read by default")
+	}
+	cfg.GitHub.Token = "token"
+	cfg.Workflow = Workflow{Enabled: true, AllowHooks: true, ReviewStatuses: []string{"In Review"}}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a valid workflow section: %v", err)
+	}
+	for name, c := range map[string]struct {
+		change func(*Config)
+		want   string
+	}{
+		"no access to GitHub":  {func(c *Config) { c.GitHub.Token = "" }, "workflow.enabled requires github.token"},
+		"an empty status":      {func(c *Config) { c.Workflow.ReviewStatuses = []string{" "} }, "workflow.review_statuses: an empty entry"},
+		"hooks without enable": {func(c *Config) { c.Workflow.Enabled = false }, "allow_hooks or review_statuses is set but enabled is not"},
+	} {
+		cfg := base()
+		cfg.GitHub.Token = "token"
+		cfg.Workflow = Workflow{Enabled: true, AllowHooks: true}
+		c.change(cfg)
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
+		}
+	}
+}

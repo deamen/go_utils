@@ -221,6 +221,9 @@ type Result struct {
 	// record of the run.
 	PromptHash string
 	Grants     string
+	// Workflow is the version of the repository's WORKFLOW.md that the
+	// run ran under; empty: none.
+	Workflow string
 	// AwaitChecks says that the work was handed over with a pull request
 	// whose checks ochell follows: the ticket is not in review yet.
 	AwaitChecks bool
