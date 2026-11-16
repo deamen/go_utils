@@ -2,6 +2,7 @@ package linear_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -111,5 +112,72 @@ func TestCreateSessionOnIssue(t *testing.T) {
 	}
 	if _, err := c.CreateSessionOnIssue(context.Background(), "ENG-404"); err == nil {
 		t.Error("a session on an unknown issue gave no error")
+	}
+}
+
+func TestScheduling(t *testing.T) {
+	c, api := client(t)
+	api.Add(lineartest.Issue{Key: "ENG-1", DelegatedBy: "u-anna", Creator: "u-carl", Priority: 2,
+		Labels:    []string{"agent-ready", "old", "own"},
+		LabelsBy:  map[string]string{"agent-ready": "u-anna", "own": lineartest.AppUserID},
+		BlockedBy: []string{"ENG-2", "ENG-3", "ELSE-9"}})
+	api.Add(lineartest.Issue{Key: "ENG-2", DelegatedBy: "u-anna", Priority: 1})
+	api.Add(lineartest.Issue{Key: "ENG-3"})
+	api.Add(lineartest.Issue{Key: "ENG-4"})
+	api.Close("ENG-3")
+	ctx := context.Background()
+
+	got, err := c.Scheduling(ctx, "ENG-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Priority != 2 {
+		t.Errorf("priority = %d, want 2", got.Priority)
+	}
+	// Who added each label: the actor of the last change that added it,
+	// the creator for one that the issue was created with.
+	want := []tracker.Label{
+		{Name: "agent-ready", By: []string{"u-anna", "u-anna@example.com"}},
+		{Name: "old", By: []string{"u-carl", "u-carl@example.com"}},
+		{Name: "own", By: []string{lineartest.AppUserID, lineartest.AppUserID + "@example.com"}, Bot: true},
+	}
+	if len(got.Labels) != len(want) {
+		t.Fatalf("labels = %+v, want %+v", got.Labels, want)
+	}
+	for i, l := range got.Labels {
+		if l.Name != want[i].Name || !slices.Equal(l.By, want[i].By) || l.Bot != want[i].Bot {
+			t.Errorf("label %d = %+v, want %+v", i, l, want[i])
+		}
+	}
+	// The open issues that block this one: not the completed one, and not
+	// a relation of another kind.
+	if want := []string{"ENG-2", "ELSE-9"}; !slices.Equal(got.BlockedBy, want) {
+		t.Errorf("blocked by %v, want %v", got.BlockedBy, want)
+	}
+
+	// An issue with nothing of all this, and one that Linear does not have.
+	if got, err := c.Scheduling(ctx, "ENG-4"); err != nil || got.Priority != 0 || len(got.Labels) != 0 || len(got.BlockedBy) != 0 {
+		t.Errorf("Scheduling(ENG-4) = %+v, %v", got, err)
+	}
+	if _, err := c.Scheduling(ctx, "ENG-404"); !errors.Is(err, tracker.ErrNotFound) {
+		t.Errorf("Scheduling of an unknown issue: %v, want ErrNotFound", err)
+	}
+	api.Fail(true)
+	if _, err := c.Scheduling(ctx, "ENG-1"); err == nil || errors.Is(err, tracker.ErrNotFound) {
+		t.Errorf("Scheduling with a failing API: %v", err)
+	}
+	api.Fail(false)
+
+	// The list of the agent's issues has the priority of each.
+	list, err := c.Assigned(ctx)
+	if err != nil || len(list) != 2 || list[0].Priority != 2 || list[1].Priority != 1 {
+		t.Errorf("Assigned = %+v, %v", list, err)
+	}
+
+	// Linear counts from 1 (urgent) to 4 (low); anything else is no rank.
+	for in, want := range map[float64]int{0: 0, 1: 1, 4: 4, 5: 0, -1: 0} {
+		if got := linear.Rank(in); got != want {
+			t.Errorf("Rank(%v) = %d, want %d", in, got, want)
+		}
 	}
 }

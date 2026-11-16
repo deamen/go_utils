@@ -155,12 +155,12 @@ ochell serve --config config.yaml                 # default command
 ochell ngrok-sync --config config.yaml [--dry-run] [--loop]
 ochell linear-install --config config.yaml        # prints the agent install URL
 ochell jira-check --config config.yaml [--comment-on KEY]   # check the Jira API access
-ochell policy-check --config config.yaml          # check the policy file and print its tiers
+ochell policy-check --config config.yaml          # check the policy file and print its tiers and scheduling
 ochell workflow-check --file WORKFLOW.md --config config.yaml   # check a repository's WORKFLOW.md against the policy
 ochell version
 
 # commands to the running ochell, over its admin socket (see "Guards and the admin channel")
-ochell status --config config.yaml                # paused or running; what is queued and running
+ochell status --config config.yaml                # paused or running; what is queued and running, and what is held
 ochell pause  --config config.yaml [--tier NAME]  # hold the queue: no new run starts
 ochell resume --config config.yaml [--tier NAME]
 ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts and the budget of a ticket; --tier NAME also sets its risk tier
@@ -210,7 +210,7 @@ The agent runs without a shell, with its working directory set to `workdir` (ren
 
 ### The store
 ochell keeps its durable state in one SQLite file, `store.path` (default `ochell.db` in the working directory). It is created when missing, readable by its owner only, and updated in place when a newer ochell needs more tables. It holds:
-- the **tickets** ochell has worked on: state (see [Ticket states](#ticket-states)), risk tier, number of attempts, working directory, and the agent's session id for a resume;
+- the **tickets** ochell has worked on: state (see [Ticket states](#ticket-states)), risk tier, priority, number of attempts, working directory, and the agent's session id for a resume;
 - the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, the risk tier and the policy version it ran under, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to, and what the agent adapter read from it (final message, session id, cost, token counts);
 - the **webhook deliveries** handled in the last 24 hours;
 - the last valid **`WORKFLOW.md`** of each repository (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)).
@@ -220,7 +220,7 @@ So a restart loses no queued task, and a retried or replayed delivery from befor
 Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user.
 
 ### Jira API access
-The webhooks only bring events in. For what ochell does on its own in Jira (commenting on a ticket when a run starts and ends, changing a status, and finding the bot's tickets for [the poller](#the-poller)) it needs the Jira REST API, with the API token of the digital employee's account:
+The webhooks only bring events in. For what ochell does on its own in Jira (commenting on a ticket when a run starts and ends, changing a status, finding the bot's tickets for [the poller](#the-poller), and reading a ticket's labels, blockers and priority for [scheduling](#scheduling)) it needs the Jira REST API, with the API token of the digital employee's account:
 
 ```yaml
 sources:
@@ -237,7 +237,7 @@ sources:
 - The token is ochell's own. It is not passed to the agent.
 - Without `base_url` ochell runs as before, and nothing that needs the API happens.
 
-Only [internal/tracker/jiraapi](internal/tracker/jiraapi/jiraapi.go) calls the Jira API. The rest of ochell uses the small interface in [internal/tracker](internal/tracker/tracker.go) (`Assigned`, `Comment`, `SetStatus`), so another way to reach Jira, such as `twg`, can be added behind it.
+Only [internal/tracker/jiraapi](internal/tracker/jiraapi/jiraapi.go) calls the Jira API. The rest of ochell uses the small interfaces in [internal/tracker](internal/tracker/tracker.go) (`Assigned`, `Comment`, `SetStatus`; for the poller and scheduling `Assigner`, `Lookup`, `Scheduling`), so another way to reach Jira, such as `twg`, can be added behind it.
 
 ### Repositories
 `repos` says which repository a ticket belongs to. ochell needs it to prepare a workspace; the agent is told the repository in its prompt and in `ORCH_TASK_REPO`.
@@ -442,7 +442,7 @@ api:
 
 | Endpoint | Shows |
 |---|---|
-| `GET /api/v1/state` | whether runs start and what holds them back; how many tickets are in each state; the tickets that are running, queued, and waiting for a person, each with its state, reason, tier and attempts; and for each repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) the version in force and what of the file is not |
+| `GET /api/v1/state` | whether runs start and what holds them back; how many tickets are in each state; the tickets that are running, queued, and waiting for a person, each with its state, reason, tier, priority and attempts, and a queued one with why [scheduling](#scheduling) holds it (`hold`); and for each repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) the version in force and what of the file is not |
 | `GET /api/v1/inbox` | **the attention inbox**: exactly the tickets that wait for a person, each with its reason |
 | `GET /api/v1/tasks/<key>` | one ticket with every run: when it started and ended, why it was queued, its outcome, its cost, and what the agent said. Add `?source=jira` or `?source=linear` when both trackers have the key |
 
@@ -513,6 +513,7 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
   | `allowed_assigners` | who may assign work of this tier | everyone whom the source allows |
   | `grants` | the tools and credentials of the tier's runs (see [Tools and credentials per tier](#tools-and-credentials-per-tier)) | none |
   | `approvers` | who may approve a plan of this tier (see [The plan gate](#the-plan-gate)) | everyone who may send follow-ups on the ticket |
+  | `max_concurrent` | how many tickets of this tier may have an agent running at the same time (see [Scheduling](#scheduling)) | `0`: no limit |
 
   `budget_usd` and `max_turns` are enforced (see [Cost and budgets](#cost-and-budgets) and [Escalation](#escalation)), and so is `plan_gate` (see [The plan gate](#the-plan-gate)). `pr_review` and `auto_merge` are checked and recorded; what acts on them comes with the handoff and with graduated autonomy.
 - **Who may assign work of a tier:** `allowed_assigners` of a tier lists Jira accountIds, and Linear user ids or email addresses.
@@ -526,7 +527,7 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
   - it must be valid: a tier or a setting that ochell does not know is an error, so a misspelt limit never silently means no limit;
   - it must belong to root or to the user ochell runs as, and must not be writable by its group or by others; its directory must not be writable by others.
 - **The agent must not be able to write it.** With the `systemd` launcher the agent is another OS user, and the checks above keep it out. With the `direct` launcher the agent runs as ochell's own user and can write whatever ochell can; ochell logs a warning at start.
-- **`ochell policy-check --config config.yaml`** reads the file as `serve` does and prints the tiers. Use it in the review of a change, or with `--policy-file` on a file that is not installed yet.
+- **`ochell policy-check --config config.yaml`** reads the file as `serve` does and prints the tiers and the scheduling settings. Use it in the review of a change, or with `--policy-file` on a file that is not installed yet.
 - **A change takes effect at the next start** of ochell. Tickets keep the tier they have until they are assigned again.
 - **Without `policy.file`** there is one built-in tier, `normal`, with the defaults above, and every ticket runs under it.
 
@@ -635,7 +636,7 @@ The file is YAML front matter between two lines of `---`, and after it the promp
 
   - The tier is the ticket's own (see [Policy and risk tiers](#policy-and-risk-tiers)): the same file can narrow one tier and be ignored in part for another.
   - **A setting that would widen the policy is ignored and reported; the rest of the file holds.** Where it is reported: a warning in ochell's log, a `# workflow:` line in the log of the run, `ochell status`, and `GET /api/v1/state` of [the status API](#the-status-api) (`workflows`, with the reason for each setting). The ticket is not told: it would be told at every run.
-  - **Nothing else can be set.** The budget, the grants, the labels, who may assign or approve, the pauses and the throttles are the policy file's alone. A file that names one of them, or any setting that ochell does not know, is invalid as a whole.
+  - **Nothing else can be set.** The budget, the grants, the labels, who may assign or approve, the pauses, the throttles and the [scheduling](#scheduling) are the policy file's alone. A file that names one of them, or any setting that ochell does not know, is invalid as a whole.
   - A run that reaches the `max_turns` of the file ends like one that reaches the tier's (see [Escalation](#escalation)).
 - **An invalid file keeps the last good one.** ochell keeps the last version that was valid in [the store](#the-store), and it stays in force, also across a restart, while the default branch has a file that is invalid or that ochell cannot read (GitHub does not answer, or the token cannot see the repository). The reason is reported in the same places. Without an earlier good version the host's settings hold alone.
   - A file that was **removed** from the default branch is no longer in force: the host's settings hold alone.
@@ -656,7 +657,7 @@ The hard controls: an operator can hold what ochell starts, and the policy bound
 | `ochell pause` | holds the queue: no new run starts. Running agents go on |
 | `ochell resume` | ends the pause; what is queued runs |
 | `ochell pause --tier NAME`, `ochell resume --tier NAME` | the same for the tickets of one tier. The other tiers are not touched |
-| `ochell status` | says whether runs start, how many are queued and running, and what holds runs back |
+| `ochell status` | says whether runs start, how many are queued and running, and what holds runs back: a pause, a throttle, and what [scheduling](#scheduling) holds |
 
 - **A pause stops nothing that runs.** To stop the agent of one ticket, use `ochell stop <jira|linear> <KEY>` (see [Guards and the admin channel](#guards-and-the-admin-channel)). ochell has no command that stops every running agent: that is not an orchestrator's work.
 - **Webhooks are still accepted** while ochell is paused; their tickets are queued.
@@ -681,8 +682,92 @@ throttles:
 
 - **`ochell status` names every throttle that holds** (`held: throttle …`), with the numbers.
 - **A held ticket stays `queued`**; it is not told. ochell looks at the queue again at least every 30 seconds.
+- Limits on how many agents run at the same time, per repository and per tier, are part of [scheduling](#scheduling).
 - **What counts as an open pull request:** one that a run named in its [result file](#the-result-file), for a ticket that is neither `done` nor `cancelled`. ochell does not ask the code host yet, so a pull request that was merged counts until its ticket is closed.
 - `0`, or leaving a throttle out, means no limit.
+
+### Scheduling
+Which queued ticket starts next, and which one waits. The settings are in the policy file, like the throttles: people decide them in the review of that file, and nothing in a ticket or a repository changes them.
+
+```yaml
+# policy.yaml
+scheduling:
+  max_concurrent_per_repo: 2
+  required_labels: [agent-ready]
+  blocked_by: wait
+  check_interval: 1m
+tiers:
+  - {name: high, max_concurrent: 1}
+```
+
+| Setting | What it does | Default |
+|---|---|---|
+| (none) | the queue is in the order of the tracker's priority | always |
+| `scheduling.max_concurrent_per_repo` | how many tickets of one repository (see [Repositories](#repositories)) may have an agent running at the same time | `0`: no limit |
+| `max_concurrent` of a tier | how many tickets of that tier may have an agent running at the same time | `0`: no limit |
+| `scheduling.required_labels` | a ticket starts only when it carries every one of these labels, each put there by a person | none |
+| `scheduling.blocked_by` | `wait`: a ticket that another, open ticket blocks waits until that one is done. `ignore`: it starts | `ignore` |
+| `scheduling.check_interval` | how often ochell asks the tracker about the tickets that the two gates hold | `1m` |
+| `scheduling.priorities` | the rank of a Jira priority by its name, for a site with names of its own: `{P0: 1, P1: 2}` | the names that Jira comes with |
+
+**The order of the queue.** When a worker is free (`agent.max_concurrent`), the ticket that may start and has the most urgent priority is next; among tickets of one priority, the one that was queued first. A ticket without a priority comes after every ticket that has one.
+
+| Rank | Linear | Jira |
+|---|---|---|
+| 1 | Urgent | `Highest`, `Blocker` |
+| 2 | High | `High`, `Critical` |
+| 3 | Medium | `Medium`, `Major` |
+| 4 | Low | `Low`, `Minor` |
+| 5 | | `Lowest`, `Trivial` |
+| none | No priority | no priority, or a name that ochell does not know (add it to `scheduling.priorities`) |
+
+- **Where the priority comes from:** the webhook, when its payload has it. The Jira system webhook has; for Jira Automation add `"priority": "{{issue.priority.name}}"` to the request body. When the payload has none (Linear's agent session, as far as is known), ochell asks the tracker's API before the ticket may start, if it can ask (see [The poller](#the-poller) for what that needs). A ticket whose tracker does not answer then starts without a priority, unless a gate holds it (below). [The poller](#the-poller) reads the priority with the list of the bot's tickets.
+- **A change of the priority moves a queued ticket**: the tracker's update event of the ticket brings the new one (`jira:issue_updated`; Linear `Issue` updates, which the app's webhook must subscribe to).
+- **Priority is an order, not a gate.** The bot account can change a priority with its own tool. Its update events are ignored, but the priority that a ticket has when it is assigned counts, whoever set it. That decides only which of the assigned tickets runs first.
+- A high priority does not pass a limit: a ticket that waits for a place, a label or a blocker is passed over, and the next one starts.
+- A low priority can wait for a long time while more urgent tickets keep arriving. Nothing ages a ticket up.
+
+**Concurrency.** `agent.max_concurrent` is the number of agents that run at the same time in all. The two limits here hold within it:
+- **Per repository:** with `max_concurrent_per_repo: 1`, the second ticket of a repository waits until the first one's run has ended, while tickets of other repositories run. A ticket without a repository is not limited.
+- **Per tier:** `max_concurrent` of a tier, for example one ticket of the tier `high` at a time.
+- **There is no limit per tracker state.** Symphony has one because it picks issues by their state in the tracker. ochell starts a ticket when it is assigned, whatever its status, and its own classes of work are the tiers; so the limit is per tier.
+- What counts is a running agent. A ticket that waits for a human or is in review holds no place.
+
+**The gates** hold the start of the work on a ticket: the run of an assignment, also one that [the poller](#the-poller) finds.
+- **`required_labels`:** the ticket must carry every label of the list (in Jira also: a component). Upper and lower case are not told apart.
+  - **A label that the bot account put on the ticket does not count** (see [Gate integrity](#gate-integrity)): the agent can label tickets with its own tool. ochell reads from the ticket's history who added each label: the author of the last change that added it, or the creator for a label that the ticket was created with.
+  - So the labels in a webhook's payload open nothing here; they still choose the repository and the tier.
+- **`blocked_by: wait`:** the ticket waits while the tracker says that an open ticket blocks it. In Jira that is a link whose description on the ticket's side is "is blocked by"; in Linear a relation of the type `blocks` that points at the issue. A blocker is done when its status category is *Done* in Jira, or its state is completed or cancelled in Linear. The blocker need not be a ticket of the digital employee.
+  - **It is an order of work, not an approval.** ochell takes the tracker's word for what blocks what: whoever can edit the links, or close the blocker, in the tracker can let the ticket go, the bot account included. Where a person must say yes, use `required_labels` or [the plan gate](#the-plan-gate).
+- **Both are read from the tracker's API**, at the time it matters, not from a payload. ochell refuses to start with a gate in the policy when a source that is turned on cannot be asked: the Jira sources need [`sources.jira_api`](#jira-api-access), Linear needs the installed app.
+- **A gate that cannot be checked stays shut.** While the tracker does not answer, a ticket that a gate could hold waits, and ochell asks again at the next interval. A Linear session outside an issue has no labels and no blockers.
+- **What continues the work is not held:** a retry, a follow-up, an approved plan, a run for failed checks. To stop work that has started, use the stop from the ticket.
+
+**A held ticket stays `queued`.**
+- **It is told once** why it waits, when ochell first finds it held: a comment on the Jira ticket, a `thought` in the Linear session. Not at every look, and not when the reason changes.
+- **`ochell status` says what waits and why**, and so does `GET /api/v1/state` of [the status API](#the-status-api) (`holds`, and `hold` of each queued ticket):
+
+  ```
+  $ ochell status --config config.yaml
+  running; 3 queued, 2 running
+  held: scheduling max_concurrent_per_repo: 2 ticket(s) are running in git@github.com:example/web.git, the limit is 2; 1 queued ticket(s) of the repository wait
+  held: scheduling: jira DEV-42 waits: it is blocked by DEV-40, which is not done
+  held: scheduling: linear ENG-7 waits: it needs the label agent-ready
+  ```
+
+  It names up to 20 held tickets.
+- **How ochell learns that a ticket may start, without a restart:**
+
+  | What changed | ochell looks |
+  |---|---|
+  | a run ended, so a place in a repository or a tier is free | at once |
+  | a person changed the held ticket, for example its labels | when the tracker's update event of the ticket arrives |
+  | some ticket was closed (it may have been a blocker) | at every held ticket, when the event of the close arrives |
+  | anything else: a blocker of another team was closed, a link was removed, a webhook was lost | at every held ticket, every `check_interval` |
+
+  The events help only where the tracker sends them: a Jira webhook with the filter `assignee = <bot>` sends none for a blocker that is someone else's. The interval is what is relied on. Each look is one request to the tracker per held ticket.
+- A held ticket counts in `agent.queue_size`. It is stopped like any queued ticket: from the ticket, by closing it, or with `ochell stop`.
+- A change of the policy file takes effect at the next start. A ticket that was held under the old settings is looked at again then.
 
 ### Gate integrity
 The agent can write to its tickets with its own tool (`twg`), as the bot account. So it could try to pass ochell's gates itself: approve its own plan, take a label off to get into a lower tier, assign itself a ticket again, or close the ticket as if the work had been accepted. None of that works: **what the bot account does on a ticket is never taken as a person's word.**
@@ -693,6 +778,8 @@ The agent can write to its tickets with its own tool (`twg`), as the bot account
 | assigns a Jira ticket to itself, or triggers the Automation rule | rejected with 403. [The poller](#the-poller) does not start such a ticket either |
 | delegates a Linear issue to itself, or opens a session | ignored, like the sessions ochell opens itself |
 | changes labels or the issue type | ignored: no tier moves |
+| puts a label of `required_labels` on a ticket | does not count: the ticket still waits for the label from a person (see [Scheduling](#scheduling)) |
+| changes the priority | ignored |
 | closes or completes the ticket | ignored: the ticket is not `done` for ochell, and its working directory stays |
 | takes the ticket away from itself | allowed: it stops the work, which passes no gate |
 
@@ -709,7 +796,9 @@ Who the bot account is:
 Limits of this:
 - **The actor comes from the webhook payload**: `user.accountId` in Jira, `actor.id` (issue events) and `agentActivity.user` (messages) in Linear. A Jira event without a user is taken as a person's.
 - **The poller does not know who closed a ticket.** When it finds a ticket closed whose agent is still running, it stops the agent, whoever closed it.
-- **A label that the bot adds counts at the next assignment**, like any label on the ticket then. It can only raise the tier.
+- **A label that the bot adds counts at the next assignment** for the tier, like any label on the ticket then. It can only raise the tier. For `required_labels` it never counts: there ochell asks the tracker who added the label.
+- **Who added a label is the tracker's history.** ochell reads the last hundred changes of a Linear issue, and what Jira returns with the ticket. A label whose change is not among them counts as the creator's.
+- **`blocked_by` and the priority are not gates.** The bot account can remove a link, close a blocker or set a priority in the tracker, and ochell takes the tracker's word for those (see [Scheduling](#scheduling)). They order the work that people assigned; they do not approve any.
 
 ### Escalation
 Some things stop a ticket and hand it to a human. Each of these triggers fires **before** the work goes on: the run is stopped, or not started, and ochell starts nothing in its place.
@@ -848,7 +937,7 @@ Every ticket ochell has seen is in one of these states. They are defined, with t
 
 | State | Meaning | Next |
 |---|---|---|
-| `queued` | a run waits for a free worker | `running`, `cancelled` |
+| `queued` | a run waits for a free worker, or for what [scheduling](#scheduling) holds it for | `running`, `cancelled` |
 | `running` | an agent is working on the ticket | any state below, or `queued` again (a retry) |
 | `checking` | the agent handed its work over, and ochell waits for the checks of the pull request (see [Handoff](#handoff-review-merge-done)) | `in_review`, `queued`, `done`, `cancelled` |
 | `waiting` | nothing happens until a human acts; always with a reason | `queued`, `done`, `cancelled` |
@@ -878,7 +967,7 @@ What a run leads to:
 | any, with an [escalation](#escalation) trigger | | `waiting`, reason `escalation` |
 | `stopped`, `interrupted` | not looked at | `queued` again, for a new attempt with the recovery note; `waiting`, reason `interrupted`, when the attempts are used up |
 
-Pausing is not a state: it holds the queue, and queued tickets stay queued.
+Pausing is not a state: it holds the queue, and queued tickets stay queued. The same goes for a throttle and for [scheduling](#scheduling): a ticket that waits for a place, a label or a blocker is `queued`.
 
 ### Agent adapters
 An adapter holds what differs between agent CLIs: how a run is started, how an earlier session is resumed, and how the output is read (final message, session id, cost). It only builds commands and parses output. Running and stopping the process is the launcher's job, so every adapter works with every launcher. `agent.adapter` selects it.
@@ -1124,6 +1213,7 @@ Notes:
 - **Metrics:** the endpoint needs its own token on every scrape (see [Metrics](#metrics)).
 - **Status API:** it needs its token on every request, also from the same host (see [The status API](#the-status-api)).
 - **Policy:** the tiers and limits are in a file of ochell's own, which the agent must not be able to write (see [Policy and risk tiers](#policy-and-risk-tiers)). Nothing in a ticket or a repository widens them.
+- **Scheduling:** a label of `required_labels` counts only when someone other than the bot account put it on the ticket; the priority and `blocked_by` order the work and are not approvals (see [Scheduling](#scheduling)).
 - **A repository's `WORKFLOW.md`** is untrusted: it is read from the default branch only, it can only narrow the policy, and its templates are placeholders, not programs (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)). That the agent cannot push to the default branch is GitHub's branch protection to enforce.
 - **Agent OS user:** with the `direct` launcher the agent runs as the same OS user as ochell and can read ochell's files. Deploy with the `systemd` launcher (see [Launchers](#launchers)).
 - **Secrets:** never commit secrets or TLS keys. The repository's pre-commit hooks reject private keys.

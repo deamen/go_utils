@@ -220,6 +220,12 @@ var migrations = []string{
 		ignored    TEXT NOT NULL DEFAULT ''
 	);
 	ALTER TABLE runs ADD COLUMN workflow TEXT NOT NULL DEFAULT '';`,
+
+	// Version 22: scheduling. The priority that the tracker gives a
+	// ticket, as a rank (0: none), and why scheduling keeps the ticket's
+	// queued run from starting ('': it does not).
+	`ALTER TABLE tickets ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE tickets ADD COLUMN hold TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is safe for concurrent use.
@@ -245,6 +251,12 @@ type Holds struct {
 	MaxOpenPRsPerRepo int
 	// DailySpendUSD is what the runs of one day (UTC) may cost in total.
 	DailySpendUSD float64
+	// MaxConcurrentPerRepo is how many tickets of one repository may be
+	// running at the same time.
+	MaxConcurrentPerRepo int
+	// MaxConcurrentPerTier is how many tickets of a tier may be running
+	// at the same time, by the name of the tier.
+	MaxConcurrentPerTier map[string]int
 }
 
 // SetHolds sets the pauses and throttles of the policy file. Claim keeps
@@ -617,19 +629,23 @@ func (s *Store) TicketOfSession(source, session string) (string, error) {
 }
 
 // upsert records the ticket of t, or brings its title, URL and repository
-// up to date, and its tier and who assigned it when t says so. A new ticket
-// is created in the state "none", and then moved like any other.
+// up to date, and its tier, its priority and who assigned it when t says
+// so. A new ticket is created in the state "none", and then moved like any
+// other. The ticket is held by scheduling when t.Hold says so, and not
+// otherwise.
 //
 // It is called for a new assignment, which is new work: an approval that an
 // earlier plan of the ticket got does not carry over.
 func (s *Store) upsert(tx *sql.Tx, t *task.Task, now int64) error {
-	_, err := tx.Exec(`INSERT INTO tickets (source, key, title, url, repo, assigner, tier, state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err := tx.Exec(`INSERT INTO tickets (source, key, title, url, repo, assigner, tier, priority, hold, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (source, key) DO UPDATE SET title = excluded.title, url = excluded.url, repo = excluded.repo,
 			assigner = CASE WHEN excluded.assigner != '' THEN excluded.assigner ELSE assigner END,
 			tier = CASE WHEN excluded.tier != '' THEN excluded.tier ELSE tier END,
+			priority = CASE WHEN excluded.priority > 0 THEN excluded.priority ELSE priority END,
+			hold = excluded.hold,
 			plan_approved = 0, plan_approved_by = ''`,
-		t.Source, t.Key, t.Title, t.URL, t.Repo, t.Actor, t.Tier, ticket.None, now, now)
+		t.Source, t.Key, t.Title, t.URL, t.Repo, t.Actor, t.Tier, t.Priority, t.Hold, ticket.None, now, now)
 	return err
 }
 
@@ -645,7 +661,10 @@ func (s *Store) Hold(t *task.Task, reason ticket.Reason) error {
 		if from.Active() {
 			return ErrBusy
 		}
-		if err := s.upsert(tx, t, ms(s.now())); err != nil {
+		// Scheduling holds a queued run, and this ticket gets none.
+		held := *t
+		held.Hold = ""
+		if err := s.upsert(tx, &held, ms(s.now())); err != nil {
 			return err
 		}
 		return s.move(tx, t.Source, t.Key, ticket.Waiting, reason)
@@ -958,6 +977,134 @@ func (s *Store) SetTier(source, key, tier string) error {
 const openPRs = `SELECT COUNT(DISTINCT o.pr_url) FROM tickets o
 	WHERE o.repo = t.repo AND o.pr_url != '' AND o.state NOT IN ('done', 'cancelled')`
 
+// runningInRepo and runningInTier count the tickets that have an agent
+// running in the repository, or in the tier, of the ticket t.
+const (
+	runningInRepo = `SELECT COUNT(*) FROM tickets o WHERE o.repo = t.repo AND o.state = 'running'`
+	runningInTier = `SELECT COUNT(*) FROM tickets o WHERE o.tier = t.tier AND o.state = 'running'`
+)
+
+// byPriority orders tickets by the rank of their priority: 1 first, and a
+// ticket that has none after every ticket that has one.
+const byPriority = `CASE WHEN t.priority > 0 THEN t.priority ELSE 1000 END`
+
+func sortedKeys(m map[string]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// HoldPending is the hold of a ticket that was queued and has not been
+// looked at yet: whether a gate of scheduling holds it is not known, so it
+// does not start.
+const HoldPending = "not checked against the tracker yet"
+
+// Held is a ticket whose queued run scheduling keeps from starting.
+type Held struct {
+	Source, Key string
+	// Hold says why.
+	Hold string
+}
+
+// Held returns the tickets whose queued run scheduling keeps from
+// starting, the one that has waited longest first.
+func (s *Store) Held() ([]Held, error) {
+	rows, err := s.db.Query(`SELECT source, key, hold FROM tickets WHERE state = ? AND hold != '' ORDER BY updated_at, source, key`, ticket.Queued)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Held
+	for rows.Next() {
+		var h Held
+		if err := rows.Scan(&h.Source, &h.Key, &h.Hold); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// SetHold changes why scheduling holds the queued run of a ticket; with an
+// empty hold the run may start. Only a ticket that is held is touched:
+// one that was stopped or has started since is left as it is, and changed
+// is then false.
+func (s *Store) SetHold(source, key, hold string) (changed bool, err error) {
+	r, err := s.db.Exec(`UPDATE tickets SET hold = ? WHERE source = ? AND key = ? AND state = ? AND hold != '' AND hold != ?`,
+		hold, source, key, ticket.Queued, hold)
+	if err != nil {
+		return false, err
+	}
+	n, _ := r.RowsAffected()
+	return n > 0, nil
+}
+
+// SetPriority records the priority that the tracker gives a ticket, as a
+// rank (0: none). A ticket that ochell does not know is left alone.
+func (s *Store) SetPriority(source, key string, priority int) error {
+	_, err := s.db.Exec(`UPDATE tickets SET priority = ? WHERE source = ? AND key = ? AND priority != ?`, priority, source, key, priority)
+	return err
+}
+
+// Full is a repository or a tier in which as many tickets are running as
+// may, while a queued ticket waits for a place.
+type Full struct {
+	// Name is the repository or the tier.
+	Name string
+	// Running is how many tickets are running there, and Waiting how
+	// many queued tickets wait for a place.
+	Running, Waiting int
+}
+
+// FullRepos returns the repositories in which max tickets are running
+// while a queued ticket of the repository waits.
+func (s *Store) FullRepos(max int) ([]Full, error) {
+	if max <= 0 {
+		return nil, nil
+	}
+	return s.full(`SELECT t.repo, (`+runningInRepo+`), COUNT(*) FROM runs r JOIN tickets t USING (source, key)
+		WHERE r.status = ? AND t.repo != '' AND (`+runningInRepo+`) >= ? GROUP BY t.repo ORDER BY t.repo`, runQueued, max)
+}
+
+// FullTiers returns the tiers of limits (the most tickets of a tier that
+// may be running, by tier) in which that many are running while a queued
+// ticket of the tier waits.
+func (s *Store) FullTiers(limits map[string]int) ([]Full, error) {
+	var out []Full
+	for _, tier := range sortedKeys(limits) {
+		if limits[tier] <= 0 {
+			continue
+		}
+		full, err := s.full(`SELECT t.tier, (`+runningInTier+`), COUNT(*) FROM runs r JOIN tickets t USING (source, key)
+			WHERE r.status = ? AND t.tier = ? AND (`+runningInTier+`) >= ? GROUP BY t.tier`, runQueued, tier, limits[tier])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, full...)
+	}
+	return out, nil
+}
+
+func (s *Store) full(query string, args ...any) ([]Full, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Full
+	for rows.Next() {
+		var f Full
+		if err := rows.Scan(&f.Name, &f.Running, &f.Waiting); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
 // HeldByPRs returns the repositories in which a queued ticket waits
 // because max pull requests of the bot are open there.
 func (s *Store) HeldByPRs(max int) ([]string, error) {
@@ -981,10 +1128,12 @@ func (s *Store) HeldByPRs(max int) ([]string, error) {
 	return repos, rows.Err()
 }
 
-// Claim takes the oldest queued run that may start and marks it, and its
-// ticket, as running. It returns nil when nothing is queued or every queued
-// run still waits for its time (a retry with backoff), and while the pause
-// flag is set. The task's Attempt says
+// Claim takes the queued run that is next and marks it, and its ticket, as
+// running: of the runs that may start, the one whose ticket has the most
+// urgent priority, and the oldest of those. It returns nil when nothing is
+// queued or every queued run still waits (for its time, as a retry with
+// backoff; for a gate of scheduling; for a free place in its repository or
+// its tier), and while the pause flag is set. The task's Attempt says
 // which run of the ticket this is, counting from 1; AgentSession, Workspace,
 // PRURL and Branch come from the ticket's earlier runs.
 //
@@ -998,11 +1147,11 @@ func (s *Store) Claim() (*task.Task, error) {
 		if err != nil || hold.All() {
 			return err
 		}
-		// The oldest queued run whose time has come, of a ticket that is
-		// not in a paused tier and would not open one pull request too many
-		// in its repository. A ticket that has a pull request already
-		// works on that one.
-		query := `SELECT r.id FROM runs r JOIN tickets t USING (source, key) WHERE r.status = ? AND r.not_before <= ?`
+		// A queued run whose time has come, of a ticket that scheduling
+		// does not hold, that is not in a paused tier and would not open
+		// one pull request too many in its repository. A ticket that has
+		// a pull request already works on that one.
+		query := `SELECT r.id FROM runs r JOIN tickets t USING (source, key) WHERE r.status = ? AND r.not_before <= ? AND t.hold = ''`
 		args := []any{runQueued, now}
 		for _, tier := range append(append([]string{}, hold.Tiers...), hold.PolicyTiers...) {
 			query += ` AND t.tier != ?`
@@ -1012,8 +1161,22 @@ func (s *Store) Claim() (*task.Task, error) {
 			query += ` AND (t.repo = '' OR t.pr_url != '' OR (` + openPRs + `) < ?)`
 			args = append(args, max)
 		}
+		// And of a ticket whose repository and whose tier have a place
+		// free. This is counted in the transaction that starts the run,
+		// so two workers cannot both take the last place.
+		pol := s.policyHolds()
+		if max := pol.MaxConcurrentPerRepo; max > 0 {
+			query += ` AND (t.repo = '' OR (` + runningInRepo + `) < ?)`
+			args = append(args, max)
+		}
+		for _, tier := range sortedKeys(pol.MaxConcurrentPerTier) {
+			query += ` AND (t.tier != ? OR (` + runningInTier + `) < ?)`
+			args = append(args, tier, pol.MaxConcurrentPerTier[tier])
+		}
+		// The most urgent first, and a ticket without a priority last;
+		// within one priority the oldest run.
 		var id string
-		err = tx.QueryRow(query+` ORDER BY r.received_at, r.rowid LIMIT 1`, args...).Scan(&id)
+		err = tx.QueryRow(query+` ORDER BY `+byPriority+`, r.received_at, r.rowid LIMIT 1`, args...).Scan(&id)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -1307,6 +1470,9 @@ func (s *Store) Stop(source, key string, why error) (queued *task.Task, err erro
 		if _, err := tx.Exec(`DELETE FROM followups WHERE source = ? AND key = ?`, source, key); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(`UPDATE tickets SET hold = '' WHERE source = ? AND key = ?`, source, key); err != nil {
+			return err
+		}
 		return s.move(tx, source, key, ticket.Cancelled, "")
 	})
 	return queued, err
@@ -1444,20 +1610,26 @@ type Ticket struct {
 	AgentSession string
 	// PRURL and Branch are the last pull request and branch that a run
 	// of the ticket named in its result file.
-	PRURL   string
-	Branch  string
+	PRURL  string
+	Branch string
+	// Priority is the rank of the priority that the tracker gives the
+	// ticket: 1 is the most urgent; 0: none.
+	Priority int
+	// Hold says why scheduling keeps the queued run of the ticket from
+	// starting; empty when it does not.
+	Hold    string
 	Created time.Time
 	Updated time.Time
 }
 
 const ticketColumns = `source, key, title, url, repo, tier, assigner, plan_approved, plan_approved_by, state, reason, attempts,
-	workspace, prepared_workspace, agent_session, pr_url, branch, created_at, updated_at`
+	workspace, prepared_workspace, agent_session, pr_url, branch, priority, hold, created_at, updated_at`
 
 func scanTicket(row interface{ Scan(...any) error }) (*Ticket, error) {
 	var t Ticket
 	var created, updated int64
 	if err := row.Scan(&t.Source, &t.Key, &t.Title, &t.URL, &t.Repo, &t.Tier, &t.Assigner, &t.PlanApproved, &t.PlanApprovedBy, &t.State, &t.Reason, &t.Attempts,
-		&t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &created, &updated); err != nil {
+		&t.Workspace, &t.PreparedWorkspace, &t.AgentSession, &t.PRURL, &t.Branch, &t.Priority, &t.Hold, &created, &updated); err != nil {
 		return nil, err
 	}
 	t.Created, t.Updated = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -143,6 +144,9 @@ type searchReply struct {
 			IssueType struct {
 				Name string `json:"name"`
 			} `json:"issuetype"`
+			Priority *struct {
+				Name string `json:"name"`
+			} `json:"priority"`
 		} `json:"fields"`
 	} `json:"issues"`
 	NextPageToken string `json:"nextPageToken"`
@@ -156,7 +160,7 @@ func (c *Client) Assigned(ctx context.Context) ([]tracker.Issue, error) {
 	for range maxPages {
 		in := map[string]any{
 			"jql":        c.JQL,
-			"fields":     []string{"summary", "labels", "components", "issuetype"},
+			"fields":     []string{"summary", "labels", "components", "issuetype", "priority"},
 			"maxResults": pageSize,
 		}
 		if token != "" {
@@ -176,13 +180,17 @@ func (c *Client) Assigned(ctx context.Context) ([]tracker.Issue, error) {
 					labels = append(labels, comp.Name)
 				}
 			}
-			issues = append(issues, tracker.Issue{
+			out := tracker.Issue{
 				Key:    is.Key,
 				Title:  is.Fields.Summary,
 				URL:    c.BaseURL + "/browse/" + is.Key,
 				Labels: labels,
 				Type:   is.Fields.IssueType.Name,
-			})
+			}
+			if p := is.Fields.Priority; p != nil {
+				out.PriorityName = p.Name
+			}
+			issues = append(issues, out)
 		}
 		if token = page.NextPageToken; token == "" {
 			return issues, nil
@@ -296,6 +304,128 @@ func (c *Client) Lookup(ctx context.Context, key string) (tracker.Status, error)
 		Closed:     is.Fields.Status.Category.Key == "done",
 		Unassigned: is.Fields.Assignee == nil || is.Fields.Assignee.AccountID != me,
 	}, nil
+}
+
+// blockedByLink is how Jira describes, from the side of the blocked ticket,
+// the link that says one ticket blocks another.
+const blockedByLink = "is blocked by"
+
+// Scheduling asks what decides when the work on a ticket starts: its
+// priority, its labels and components with who added each, and the open
+// tickets that it "is blocked by".
+//
+// Who added a label is the author of the last change in the ticket's
+// history that added it; a label without such a change was there when the
+// ticket was created, and is its creator's.
+func (c *Client) Scheduling(ctx context.Context, key string) (tracker.Scheduling, error) {
+	var out tracker.Scheduling
+	me, err := c.myself(ctx)
+	if err != nil {
+		return out, err
+	}
+	path, err := issuePath(key, "?fields=priority,labels,components,issuelinks,creator&expand=changelog")
+	if err != nil {
+		return out, err
+	}
+	var is struct {
+		Fields struct {
+			Priority *struct {
+				Name string `json:"name"`
+			} `json:"priority"`
+			Labels     []string `json:"labels"`
+			Components []struct {
+				Name string `json:"name"`
+			} `json:"components"`
+			Creator    *account `json:"creator"`
+			IssueLinks []struct {
+				Type struct {
+					Inward string `json:"inward"`
+				} `json:"type"`
+				InwardIssue *struct {
+					Key    string `json:"key"`
+					Fields struct {
+						Status struct {
+							Category struct {
+								Key string `json:"key"`
+							} `json:"statusCategory"`
+						} `json:"status"`
+					} `json:"fields"`
+				} `json:"inwardIssue"`
+			} `json:"issuelinks"`
+		} `json:"fields"`
+		Changelog struct {
+			Histories []struct {
+				Created string   `json:"created"`
+				Author  *account `json:"author"`
+				Items   []struct {
+					Field      string `json:"field"`
+					FromString string `json:"fromString"`
+					ToString   string `json:"toString"`
+				} `json:"items"`
+			} `json:"histories"`
+		} `json:"changelog"`
+	}
+	err = c.do(ctx, http.MethodGet, path, nil, &is)
+	var apiErr *Error
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+		return out, tracker.ErrNotFound
+	}
+	if err != nil {
+		return out, err
+	}
+	if p := is.Fields.Priority; p != nil {
+		out.PriorityName = p.Name
+	}
+	// by returns who added a label, or a component.
+	by := func(name string, component bool) string {
+		who, when := "", ""
+		for _, h := range is.Changelog.Histories {
+			for _, it := range h.Items {
+				added := false
+				switch {
+				case component:
+					added = it.Field == "Component" && it.ToString == name
+				case it.Field == "labels":
+					// Both sides are the labels of the ticket, with
+					// spaces between them.
+					added = slices.Contains(strings.Fields(it.ToString), name) && !slices.Contains(strings.Fields(it.FromString), name)
+				}
+				// The timestamps are in one format, so they compare as
+				// text.
+				if added && h.Author != nil && h.Created >= when {
+					who, when = h.Author.AccountID, h.Created
+				}
+			}
+		}
+		if who == "" && is.Fields.Creator != nil {
+			who = is.Fields.Creator.AccountID
+		}
+		return who
+	}
+	label := func(name string, component bool) tracker.Label {
+		l := tracker.Label{Name: name}
+		if who := by(name, component); who != "" {
+			l.By, l.Bot = []string{who}, who == me
+		}
+		return l
+	}
+	for _, name := range is.Fields.Labels {
+		out.Labels = append(out.Labels, label(name, false))
+	}
+	for _, comp := range is.Fields.Components {
+		if comp.Name != "" {
+			out.Labels = append(out.Labels, label(comp.Name, true))
+		}
+	}
+	for _, l := range is.Fields.IssueLinks {
+		if l.InwardIssue == nil || l.InwardIssue.Key == "" || !strings.EqualFold(strings.TrimSpace(l.Type.Inward), blockedByLink) {
+			continue
+		}
+		if l.InwardIssue.Fields.Status.Category.Key != "done" {
+			out.BlockedBy = append(out.BlockedBy, l.InwardIssue.Key)
+		}
+	}
+	return out, nil
 }
 
 func issuePath(key, rest string) (string, error) {

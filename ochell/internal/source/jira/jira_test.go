@@ -243,3 +243,35 @@ func TestParseUnassigned(t *testing.T) {
 		t.Errorf("ParseWebhook of an unassignment: %v", err)
 	}
 }
+
+func TestPriority(t *testing.T) {
+	hook := `{"webhookEvent":"jira:issue_updated","issue":{"key":"DEV-1","fields":{
+		"assignee":{"accountId":"bot"},"priority":{"name":"High","id":"2"}}},
+		"changelog":{"items":[{"field":"assignee","to":"bot"}]}}`
+	tk, err := ParseWebhook([]byte(hook), "bot")
+	if err != nil || tk.Priority != "High" {
+		t.Errorf("webhook priority = %+v, %v", tk, err)
+	}
+	if u, ok := ParseUpdated([]byte(hook)); !ok || u.Priority != "High" {
+		t.Errorf("updated priority = %+v, %v", u, ok)
+	}
+	// An issue without a priority, as a project without the field has it.
+	bare := `{"webhookEvent":"jira:issue_created","issue":{"key":"DEV-1","fields":{"assignee":{"accountId":"bot"},"priority":null}}}`
+	if tk, err := ParseWebhook([]byte(bare), "bot"); err != nil || tk.Priority != "" {
+		t.Errorf("webhook without a priority = %+v, %v", tk, err)
+	}
+	for body, want := range map[string]string{
+		`{"issueKey":"DEV-1","priority":" Highest "}`:                                      "Highest",
+		`{"issueKey":"DEV-1"}`:                                                             "",
+		`{"issue":{"key":"DEV-1","fields":{"priority":{"name":"Low"}}}}`:                   "Low",
+		`{"priority":"High","issue":{"key":"DEV-1","fields":{"priority":{"name":"Low"}}}}`: "High",
+	} {
+		tk, err := ParseAutomation([]byte(body), "")
+		if err != nil {
+			t.Fatalf("%s: %v", body, err)
+		}
+		if tk.Priority != want {
+			t.Errorf("%s: priority = %q, want %q", body, tk.Priority, want)
+		}
+	}
+}

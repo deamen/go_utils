@@ -54,6 +54,9 @@ type Issue struct {
 	Labels []struct {
 		Name string `json:"name"`
 	} `json:"labels"`
+	// Priority is used when the payload has it: 1 (urgent) to 4 (low),
+	// and 0 for none.
+	Priority *float64 `json:"priority"`
 }
 
 type AgentSession struct {
@@ -112,6 +115,8 @@ type Event struct {
 		Labels []struct {
 			Name string `json:"name"`
 		} `json:"labels"`
+		// Priority is used when the payload has it.
+		Priority *float64 `json:"priority"`
 	} `json:"data"`
 	// Actor is who made the change that a data event such as "Issue"
 	// reports, when the payload has it.
@@ -137,6 +142,10 @@ type Session struct {
 	Comment string
 	// Labels holds the labels of the issue, as far as the payload has them.
 	Labels []string
+	// Priority is the rank of the issue's priority (see Rank), and
+	// HasPriority says that the payload has one.
+	Priority    int
+	HasPriority bool
 	// Actor and ActorEmail identify the user who started the session, or
 	// who wrote the prompt, as far as the payload has them.
 	Actor      string
@@ -206,6 +215,9 @@ func Parse(body []byte) (*Event, *Session, error) {
 				s.Labels = append(s.Labels, l.Name)
 			}
 		}
+		if is.Priority != nil {
+			s.Priority, s.HasPriority = Rank(*is.Priority), true
+		}
 	}
 	if s.Key == "" && !s.Prompted {
 		// Sessions started outside an issue (e.g. a mention in a document)
@@ -274,6 +286,15 @@ func (e *Event) Updated() (key string, labels []string, ok bool) {
 		}
 	}
 	return e.Data.Identifier, labels, true
+}
+
+// Priority returns the rank of the priority that the issue of an "Issue"
+// event has now (see Rank), when the payload has one.
+func (e *Event) Priority() (rank int, ok bool) {
+	if e.Type != "Issue" || e.Data == nil || e.Data.Priority == nil {
+		return 0, false
+	}
+	return Rank(*e.Data.Priority), true
 }
 
 // PromptText returns the user's follow-up message of a "prompted" event.

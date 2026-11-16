@@ -175,3 +175,37 @@ func TestUndelegated(t *testing.T) {
 		}
 	}
 }
+
+func TestPriority(t *testing.T) {
+	session := func(issue string) string {
+		return `{"type":"AgentSessionEvent","action":"created","agentSession":{"id":"s1","issue":{"identifier":"ENG-1"` + issue + `}}}`
+	}
+	for _, c := range []struct {
+		issue string
+		rank  int
+		has   bool
+	}{
+		// Whether the payload of a session has the priority is not known:
+		// without it, the tracker is asked.
+		{``, 0, false},
+		{`,"priority":2`, 2, true},
+		// No priority is something the payload said, too.
+		{`,"priority":0`, 0, true},
+		{`,"priority":null`, 0, false},
+	} {
+		_, s, err := Parse([]byte(session(c.issue)))
+		if err != nil || s.Priority != c.rank || s.HasPriority != c.has {
+			t.Errorf("issue %q: priority = %d, %v, %v; want %d, %v", c.issue, s.Priority, s.HasPriority, err, c.rank, c.has)
+		}
+	}
+
+	// An "Issue" update names the priority that the issue has now.
+	ev, _, _ := Parse([]byte(`{"type":"Issue","action":"update","data":{"identifier":"ENG-1","priority":1}}`))
+	if rank, ok := ev.Priority(); !ok || rank != 1 {
+		t.Errorf("Priority of an update = %d, %v", rank, ok)
+	}
+	ev, _, _ = Parse([]byte(`{"type":"Issue","action":"update","data":{"identifier":"ENG-1"}}`))
+	if _, ok := ev.Priority(); ok {
+		t.Error("an update without a priority names one")
+	}
+}

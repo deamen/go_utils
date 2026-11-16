@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1757,5 +1758,189 @@ func TestWorkflows(t *testing.T) {
 	if err != nil || len(list) != 2 || list[0].Repo != "git@github.com:example/api.git" || !list[0].Loaded.IsZero() ||
 		list[1].Version != "sha:2" || list[1].Error != "" || list[1].Ignored != nil {
 		t.Errorf("all: %+v, %v", list, err)
+	}
+}
+
+func TestScheduling(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	now := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	seq := 0
+	queue := func(key string, change func(*task.Task)) string {
+		t.Helper()
+		seq++
+		tk := newTask("s"+strconv.Itoa(seq), key, now.Add(time.Duration(seq)*time.Millisecond))
+		if change != nil {
+			change(tk)
+		}
+		if err := s.Enqueue(tk, Limits{}); err != nil {
+			t.Fatal(err)
+		}
+		return tk.ID
+	}
+	// claim returns the keys of the runs that can be claimed now, in the
+	// order in which they are handed out.
+	claim := func() []string {
+		t.Helper()
+		var keys []string
+		for {
+			got, err := s.Claim()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil {
+				return keys
+			}
+			keys = append(keys, got.Key)
+		}
+	}
+	finish := func(ids ...string) {
+		t.Helper()
+		for _, id := range ids {
+			if err := s.Finish(id, task.Result{Outcome: task.OutcomeFinished, Signal: result.Done}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	priority := func(p int) func(*task.Task) { return func(tk *task.Task) { tk.Priority = p } }
+
+	// The most urgent first, the oldest first within one priority, and a
+	// ticket without a priority after every ticket that has one.
+	ids := []string{
+		queue("NONE-1", nil),
+		queue("LOW-1", priority(4)),
+		queue("URGENT-1", priority(1)),
+		queue("HIGH-1", priority(2)),
+		queue("URGENT-2", priority(1)),
+		queue("NONE-2", nil),
+	}
+	if got, want := claim(), []string{"URGENT-1", "URGENT-2", "HIGH-1", "LOW-1", "NONE-1", "NONE-2"}; !slices.Equal(got, want) {
+		t.Fatalf("claimed %v, want %v", got, want)
+	}
+	if tk, _ := s.Ticket("linear", "HIGH-1"); tk.Priority != 2 {
+		t.Errorf("stored priority = %d, want 2", tk.Priority)
+	}
+	finish(ids...)
+	// A priority that changes while the ticket waits moves it in the queue;
+	// a new assignment that names none keeps the one the ticket had.
+	a, b := queue("NONE-1", nil), queue("LOW-1", nil)
+	if err := s.SetPriority("linear", "NONE-1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := claim(), []string{"NONE-1", "LOW-1"}; !slices.Equal(got, want) {
+		t.Fatalf("claimed %v, want %v", got, want)
+	}
+	finish(a, b)
+
+	// Per repository: one ticket of a repository runs at a time, whatever
+	// its priority; other repositories, and tickets without one, go on.
+	s.SetHolds(Holds{MaxConcurrentPerRepo: 1})
+	repo := func(r string, p int) func(*task.Task) { return func(tk *task.Task) { tk.Repo, tk.Priority = r, p } }
+	a1 := queue("A-1", repo("git@example.com:a.git", 3))
+	queue("A-2", repo("git@example.com:a.git", 1))
+	b1 := queue("B-1", repo("git@example.com:b.git", 3))
+	free := queue("FREE-1", nil)
+	a2 := "s" + strconv.Itoa(seq-2)
+	if got, want := claim(), []string{"A-2", "B-1", "FREE-1"}; !slices.Equal(got, want) {
+		t.Fatalf("claimed %v, want %v: A-1 waits for a place in its repository", got, want)
+	}
+	if full, err := s.FullRepos(1); err != nil || len(full) != 1 || full[0] != (Full{Name: "git@example.com:a.git", Running: 1, Waiting: 1}) {
+		t.Errorf("FullRepos = %+v, %v", full, err)
+	}
+	finish(b1, free)
+	if got := claim(); len(got) != 0 {
+		t.Fatalf("claimed %v while A-2 runs in the repository", got)
+	}
+	finish(a2)
+	if got, want := claim(), []string{"A-1"}; !slices.Equal(got, want) {
+		t.Fatalf("claimed %v, want %v once the place is free", got, want)
+	}
+	if full, _ := s.FullRepos(1); len(full) != 0 {
+		t.Errorf("FullRepos = %+v with nothing waiting", full)
+	}
+	finish(a1)
+
+	// Per tier: two tickets of the tier "high" at a time; "low" has no
+	// limit.
+	s.SetHolds(Holds{MaxConcurrentPerTier: map[string]int{"high": 2}})
+	tier := func(name string) func(*task.Task) { return func(tk *task.Task) { tk.Tier = name } }
+	h1, h2 := queue("H-1", tier("high")), queue("H-2", tier("high"))
+	h3 := queue("H-3", tier("high"))
+	l1 := queue("L-1", tier("low"))
+	if got, want := claim(), []string{"H-1", "H-2", "L-1"}; !slices.Equal(got, want) {
+		t.Fatalf("claimed %v, want %v: H-3 waits for a place in its tier", got, want)
+	}
+	if full, err := s.FullTiers(map[string]int{"high": 2, "low": 0}); err != nil || len(full) != 1 || full[0] != (Full{Name: "high", Running: 2, Waiting: 1}) {
+		t.Errorf("FullTiers = %+v, %v", full, err)
+	}
+	finish(h1)
+	if got, want := claim(), []string{"H-3"}; !slices.Equal(got, want) {
+		t.Fatalf("claimed %v, want %v", got, want)
+	}
+	finish(h2, h3, l1)
+	s.SetHolds(Holds{})
+
+	// A hold: the ticket stays queued and is passed over until the hold is
+	// taken off.
+	held := queue("GATE-1", func(tk *task.Task) { tk.Hold, tk.Priority = HoldPending, 1 })
+	other := queue("GATE-2", nil)
+	if got, want := claim(), []string{"GATE-2"}; !slices.Equal(got, want) {
+		t.Fatalf("claimed %v, want %v: GATE-1 is held", got, want)
+	}
+	if st, _ := s.Ticket("linear", "GATE-1"); st.State != ticket.Queued || st.Hold != HoldPending {
+		t.Errorf("held ticket = %+v", st)
+	}
+	list, err := s.Held()
+	if err != nil || len(list) != 1 || list[0] != (Held{Source: "linear", Key: "GATE-1", Hold: HoldPending}) {
+		t.Fatalf("Held = %+v, %v", list, err)
+	}
+	if changed, err := s.SetHold("linear", "GATE-1", "it is blocked by GATE-0"); err != nil || !changed {
+		t.Fatalf("SetHold = %v, %v", changed, err)
+	}
+	// The same reason again changes nothing, and a ticket that is not held
+	// gets no hold.
+	if changed, _ := s.SetHold("linear", "GATE-1", "it is blocked by GATE-0"); changed {
+		t.Error("SetHold reports a change for the same reason")
+	}
+	if changed, _ := s.SetHold("linear", "GATE-2", "late"); changed {
+		t.Error("SetHold held a ticket that is running")
+	}
+	if got := claim(); len(got) != 0 {
+		t.Fatalf("claimed %v while the hold stands", got)
+	}
+	if changed, err := s.SetHold("linear", "GATE-1", ""); err != nil || !changed {
+		t.Fatalf("SetHold(\"\") = %v, %v", changed, err)
+	}
+	if got, want := claim(), []string{"GATE-1"}; !slices.Equal(got, want) {
+		t.Fatalf("claimed %v, want %v after the hold was taken off", got, want)
+	}
+	if list, _ := s.Held(); len(list) != 0 {
+		t.Errorf("Held = %+v after the release", list)
+	}
+	finish(held, other)
+
+	// A held ticket that is stopped is no longer held, and a new assignment
+	// starts without the old hold.
+	queue("GATE-1", func(tk *task.Task) { tk.Hold = HoldPending })
+	if _, err := s.Stop("linear", "GATE-1", errors.New("stopped")); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := s.Held(); len(list) != 0 {
+		t.Errorf("Held = %+v after the stop", list)
+	}
+	again := queue("GATE-1", nil)
+	if got, want := claim(), []string{"GATE-1"}; !slices.Equal(got, want) {
+		t.Fatalf("claimed %v, want %v", got, want)
+	}
+	finish(again)
+
+	// A ticket that waits for a human without a run carries no hold.
+	waits := newTask("s-wait", "GATE-3", now)
+	waits.Hold = HoldPending
+	if err := s.Hold(waits, ticket.ReasonNoRepoMapping); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := s.Ticket("linear", "GATE-3"); st.Hold != "" {
+		t.Errorf("a waiting ticket has the hold %q", st.Hold)
 	}
 }

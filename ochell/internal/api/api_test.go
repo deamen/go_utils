@@ -157,3 +157,25 @@ func TestInbox(t *testing.T) {
 		t.Errorf("an empty inbox: %d %s", w.Code, w.Body)
 	}
 }
+
+// A queued ticket that scheduling holds says why, in both forms of the
+// state page.
+func TestStateShowsWhatSchedulingHolds(t *testing.T) {
+	const token = "0123456789abcdef"
+	st := fakeStore{tickets: []store.Ticket{
+		{Source: "jira", Key: "DEV-2", Title: "Blocked", State: ticket.Queued, Priority: 2, Hold: "it is blocked by DEV-1, which is not done"},
+		{Source: "jira", Key: "DEV-3", Title: "Next", State: ticket.Queued},
+	}}
+	a := New(config.API{Enabled: true, Token: token}, st, fakeRunner{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	w := get(a, "/api/v1/state", token, "")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"hold": "it is blocked by DEV-1, which is not done"`) || !strings.Contains(w.Body.String(), `"priority": 2`) {
+		t.Errorf("state: %d %s", w.Code, w.Body)
+	}
+	// A ticket that is not held, and has no priority, has neither field.
+	if n := strings.Count(w.Body.String(), `"hold"`) + strings.Count(w.Body.String(), `"priority"`); n != 2 {
+		t.Errorf("state names a hold or a priority %d times, want once each: %s", n, w.Body)
+	}
+	if w := get(a, "/api/v1/state", token, "text/html"); w.Code != 200 || !strings.Contains(w.Body.String(), "held: it is blocked by DEV-1, which is not done") {
+		t.Errorf("state page: %d %s", w.Code, w.Body)
+	}
+}

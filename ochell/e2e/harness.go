@@ -126,6 +126,7 @@ type Step struct {
 	Spawn      *Spawn `json:"spawn,omitempty"`
 	WriteFile  *File  `json:"write_file,omitempty"`
 	TryRead    string `json:"try_read,omitempty"`
+	WaitFile   string `json:"wait_file,omitempty"`
 	IgnoreTerm bool   `json:"ignore_term,omitempty"`
 	Exit       *int   `json:"exit,omitempty"`
 	OnRun      int    `json:"on_run,omitempty"`
@@ -223,6 +224,9 @@ type Ochell struct {
 	// are sent from now on. A Linear issue has no type.
 	Labels    []string
 	IssueType string
+	// Priority is the name of the priority of the Jira tickets in the
+	// payloads that are sent from now on; empty: the payload has none.
+	Priority string
 
 	t         *testing.T
 	bin       string
@@ -569,6 +573,9 @@ func (o *Ochell) JiraAssigned(key, summary string) Response {
 	}
 	if o.IssueType != "" {
 		fields["issuetype"] = map[string]string{"name": o.IssueType}
+	}
+	if o.Priority != "" {
+		fields["priority"] = map[string]string{"name": o.Priority}
 	}
 	body, err := json.Marshal(map[string]any{
 		"timestamp":             time.Now().UnixMilli(),

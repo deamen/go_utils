@@ -133,6 +133,11 @@ type Ticket struct {
 	Tier     string `json:"tier,omitempty"`
 	Repo     string `json:"repo,omitempty"`
 	Attempts int    `json:"attempts"`
+	// Priority is the rank of the ticket's priority in the tracker: 1 is
+	// the most urgent; left out when it has none.
+	Priority int `json:"priority,omitempty"`
+	// Hold says why scheduling keeps a queued ticket from starting.
+	Hold string `json:"hold,omitempty"`
 	// PullRequest and Branch are the last ones that a run of the ticket
 	// named.
 	PullRequest string    `json:"pull_request,omitempty"`
@@ -203,6 +208,7 @@ func ticketOf(t store.Ticket) Ticket {
 	return Ticket{
 		Source: t.Source, Key: t.Key, Title: t.Title, URL: t.URL, State: string(t.State), Reason: string(t.Reason),
 		Tier: t.Tier, Repo: t.Repo, Attempts: t.Attempts, PullRequest: t.PRURL, Branch: t.Branch, Created: t.Created, Updated: t.Updated,
+		Priority: t.Priority, Hold: t.Hold,
 	}
 }
 
@@ -462,7 +468,7 @@ th { font-weight: 600; } .dim { color: #666; } pre { white-space: pre-wrap; marg
 </style>`
 
 const ticketRows = `{{define "tickets"}}{{if .}}<table><tr><th>Ticket</th><th>Title</th><th>State</th><th>Tier</th><th>Attempts</th><th>Changed</th></tr>
-{{range .}}<tr><td>{{.Source}} {{.Key}}</td><td>{{.Title}}</td><td>{{.State}}{{if .Reason}} ({{.Reason}}){{end}}</td><td>{{.Tier}}</td><td>{{.Attempts}}</td><td>{{when .Updated}}</td></tr>
+{{range .}}<tr><td>{{.Source}} {{.Key}}</td><td>{{.Title}}</td><td>{{.State}}{{if .Reason}} ({{.Reason}}){{end}}{{if .Hold}}<br><span class="dim">held: {{.Hold}}</span>{{end}}</td><td>{{.Tier}}</td><td>{{.Attempts}}</td><td>{{when .Updated}}</td></tr>
 {{end}}</table>{{else}}<p class="dim">None.</p>{{end}}{{end}}`
 
 var statePage = template.Must(template.New("state").Funcs(funcs).Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>ochell: state</title>` + style + `</head><body>

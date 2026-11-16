@@ -7,7 +7,10 @@
 // It is not how the agent reads a ticket; the agent has its own tool.
 package tracker
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Issue is one ticket, as far as ochell needs it.
 type Issue struct {
@@ -20,6 +23,11 @@ type Issue struct {
 	Labels []string
 	// Type is the Jira issue type, such as "Bug"; empty for Linear.
 	Type string
+	// Priority is the priority of the ticket: for Linear its rank, where 1
+	// is the most urgent and 0 none; for Jira its name, such as "High",
+	// which the policy turns into a rank.
+	Priority     int
+	PriorityName string
 }
 
 // Status is what a tracker says about one ticket that the bot had.
@@ -28,6 +36,34 @@ type Status struct {
 	Closed bool
 	// Unassigned: the ticket was the bot's, and no longer is.
 	Unassigned bool
+}
+
+// ErrNotFound: the tracker has no ticket with this key, or does not show
+// it to the bot account.
+var ErrNotFound = errors.New("the tracker has no such ticket")
+
+// Label is a label of a ticket, and who put it there.
+type Label struct {
+	Name string
+	// By holds the ways the tracker names who added the label (an account
+	// id, an email address); for a label that the ticket was created
+	// with, its creator. Empty when the tracker does not say.
+	By []string
+	// Bot: the account that ochell asks the tracker as added it.
+	Bot bool
+}
+
+// Scheduling is what a tracker says about one ticket that decides when
+// its work starts.
+type Scheduling struct {
+	// Priority and PriorityName are those of Issue.
+	Priority     int
+	PriorityName string
+	// Labels are the labels of the ticket; for Jira also its components.
+	Labels []Label
+	// BlockedBy are the keys of the tickets that the tracker says block
+	// this one and that are still open.
+	BlockedBy []string
 }
 
 // Source is what the poller needs to bring ochell in line with one
@@ -43,6 +79,9 @@ type Source interface {
 	Assigner(ctx context.Context, key string) ([]string, error)
 	// Lookup asks about one ticket.
 	Lookup(ctx context.Context, key string) (Status, error)
+	// Scheduling asks what decides when the work on one ticket starts. It
+	// returns ErrNotFound for a ticket that the tracker does not have.
+	Scheduling(ctx context.Context, key string) (Scheduling, error)
 }
 
 // Client is the access to one tracker, as the bot account.

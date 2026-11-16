@@ -93,6 +93,13 @@ type Submitter interface {
 	NotePullRequest(source, key, url, checkedSHA string, seenComment time.Time) error
 	ToReview(source, key string) error
 	WakeForChecks(t *task.Task) error
+	// Held returns the tickets whose queued run scheduling keeps from
+	// starting, and SetHold changes why one of them is held; with an
+	// empty hold it may start. SetPriority records the rank of a ticket's
+	// priority.
+	Held() ([]store.Held, error)
+	SetHold(source, key, hold string) (changed bool, err error)
+	SetPriority(source, key string, priority int) error
 	// Hold records a ticket as waiting for a human, without a task.
 	Hold(*task.Task, ticket.Reason) error
 	// Closed is called when the tracker reports a ticket as closed.
@@ -143,13 +150,19 @@ type Server struct {
 	pollMu      sync.Mutex
 	pollRefused map[string]bool
 
+	// gateKick tells the loop that checks the held tickets to look now,
+	// and gateNext at which of them (schedule.go).
+	gateKick chan struct{}
+	gateMu   sync.Mutex
+	gateNext look
+
 	// Allowlists, started by Run when ip_allowlist.enabled.
 	atlassianIPs *ipsync.Allowlist
 	linearIPs    *ipsync.Allowlist
 }
 
 func New(cfg *config.Config, log *slog.Logger, r Submitter, seen Deliveries) (*Server, error) {
-	s := &Server{cfg: cfg, log: log, runner: r, seen: seen, now: time.Now, policy: policy.Builtin()}
+	s := &Server{cfg: cfg, log: log, runner: r, seen: seen, now: time.Now, policy: policy.Builtin(), gateKick: make(chan struct{}, 1)}
 	lc := cfg.Sources.Linear
 	if lc.Enabled && lc.ClientID != "" {
 		s.linear = linear.NewClient(lc.ClientID, lc.ClientSecret, lc.TokenFile)
@@ -279,6 +292,7 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.cfg.Poller.Interval > 0 {
 		go s.runPoller(ctx)
 	}
+	go s.runGates(ctx)
 	if s.github != nil && s.cfg.GitHub.PollInterval > 0 {
 		go s.runPullRequestPoller(ctx)
 	}
@@ -548,6 +562,26 @@ type attrs struct {
 	// assigner holds the ways the source names the person who assigned the
 	// ticket (an account id, an email address), as far as it says.
 	assigner []string
+	// priority is the rank of the ticket's priority (0: none), and
+	// hasPriority says that the source named one.
+	priority    int
+	hasPriority bool
+}
+
+// jiraPriority returns the rank that the policy gives a Jira priority by
+// its name, and whether the source named one.
+func (s *Server) jiraPriority(name string) (rank int, has bool) {
+	if name == "" {
+		return 0, false
+	}
+	return s.policy.Scheduling.Rank(name), true
+}
+
+// jiraAttrs is what a Jira payload said about a ticket.
+func (s *Server) jiraAttrs(t *jira.Ticket) attrs {
+	a := attrs{labels: t.Labels, issueType: t.IssueType}
+	a.priority, a.hasPriority = s.jiraPriority(t.Priority)
+	return a
 }
 
 // submit queues t and writes the HTTP response.
@@ -613,6 +647,13 @@ func (s *Server) admit(t *task.Task, a attrs, log *slog.Logger) (submitResult, i
 		}
 		return submitRefused, code, "the assigner is not allowed to assign work of the tier " + tier
 	}
+	// The place in the queue, and whether the ticket may start at once:
+	// not before its gates were checked against the tracker, and not before
+	// the tracker was asked for a priority that the source did not name.
+	t.Priority = a.priority
+	if s.policy.Scheduling.Gated() || (!a.hasPriority && s.trackerFor(t.Source) != nil) {
+		t.Hold = store.HoldPending
+	}
 	if held {
 		err = s.runner.Hold(t, ticket.ReasonNoRepoMapping)
 	} else {
@@ -631,7 +672,10 @@ func (s *Server) admit(t *task.Task, a attrs, log *slog.Logger) (submitResult, i
 		log.Warn("ticket not started: no repository is mapped to it", "key", t.Key, "project", config.ProjectOf(t.Key), "labels", labels)
 		return submitHeld, http.StatusOK, "not started: no repository is mapped to " + t.Key
 	case err == nil:
-		log.Info("task queued", "task", t.ID, "key", t.Key, "repo", t.Repo, "tier", t.Tier, "tier_from", why)
+		log.Info("task queued", "task", t.ID, "key", t.Key, "repo", t.Repo, "tier", t.Tier, "tier_from", why, "priority", t.Priority)
+		if t.Hold != "" {
+			s.kickGates(false, "", "")
+		}
 		return submitQueued, http.StatusOK, "queued " + t.ID
 	case errors.Is(err, runner.ErrBusy):
 		log.Info("ticket already in progress", "key", t.Key)
@@ -646,13 +690,17 @@ func (s *Server) admit(t *task.Task, a attrs, log *slog.Logger) (submitResult, i
 // updated handles the tracker's report that a ticket changed, and writes
 // the HTTP response. What matters is whether the ticket now belongs in a
 // higher tier than ochell has for it, for example because someone added a
-// label. A ticket that ochell does not know is nobody's business here, and
-// nothing lowers a tier.
+// label, and whether its priority changed. A ticket that ochell does not
+// know is nobody's business here, and nothing lowers a tier.
+//
+// A change can also be what a held ticket waits for (a label), so a ticket
+// that scheduling holds is looked at again.
 func (s *Server) updated(w http.ResponseWriter, source, key string, a attrs, log *slog.Logger) {
 	if !validKey.MatchString(key) {
 		reply(w, http.StatusOK, "ignored")
 		return
 	}
+	s.kickGates(false, source, key)
 	had, err := s.runner.Tier(source, key)
 	if err != nil {
 		log.Error("cannot read the tier of the ticket", "key", key, "err", err)
@@ -663,6 +711,11 @@ func (s *Server) updated(w http.ResponseWriter, source, key string, a attrs, log
 		log.Debug("ignored: an update of a ticket that ochell does not hold", "key", key)
 		reply(w, http.StatusOK, "ignored")
 		return
+	}
+	if a.hasPriority {
+		if err := s.runner.SetPriority(source, key, a.priority); err != nil {
+			log.Error("cannot record the priority of the ticket", "key", key, "err", err)
+		}
 	}
 	t := &task.Task{Source: source, Key: key}
 	if len(s.cfg.Repos) > 0 {
@@ -719,11 +772,15 @@ func (s *Server) stop(w http.ResponseWriter, source, key, by string, keys []stri
 
 // closed handles the tracker's report that a ticket was closed, and writes
 // the HTTP response. It is safe to receive the same report twice.
+//
+// The closed ticket may be what blocked another one, whether ochell knows
+// it or not, so the held tickets are looked at again.
 func (s *Server) closed(w http.ResponseWriter, source, key string, log *slog.Logger) {
 	if !validKey.MatchString(key) {
 		reply(w, http.StatusOK, "ignored")
 		return
 	}
+	s.kickGates(true, "", "")
 	switch err := s.runner.Closed(source, key); {
 	case err == nil:
 		reply(w, http.StatusOK, "closed "+key)
@@ -796,7 +853,7 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 				reply(w, http.StatusOK, "ignored: changed by the bot")
 				return
 			}
-			s.updated(w, "jira", u.Key, attrs{labels: u.Labels, issueType: u.IssueType}, log)
+			s.updated(w, "jira", u.Key, s.jiraAttrs(u), log)
 			return
 		}
 		log.Debug("ignored", "reason", err)
@@ -826,7 +883,9 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	tk := s.newTask("jira", t.Key, t.Summary, t.URL, "", delivery)
 	tk.Actor = t.Actor
-	res := s.submit(w, tk, attrs{labels: t.Labels, issueType: t.IssueType, assigner: []string{t.Actor}}, log)
+	a := s.jiraAttrs(t)
+	a.assigner = []string{t.Actor}
+	res := s.submit(w, tk, a, log)
 	if res == submitFailed {
 		s.forgetDelivery(keys, log)
 	}
@@ -1054,7 +1113,9 @@ func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 	// prevents duplicate concurrent runs.
 	tk := s.newTask("jira", t.Key, t.Summary, t.URL, "", "")
 	tk.Actor = t.Actor
-	s.jiraNotStarted(s.submit(w, tk, attrs{labels: t.Labels, issueType: t.IssueType, assigner: []string{t.Actor}}, log), tk, log)
+	a := s.jiraAttrs(t)
+	a.assigner = []string{t.Actor}
+	s.jiraNotStarted(s.submit(w, tk, a, log), tk, log)
 }
 
 func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
@@ -1094,7 +1155,9 @@ func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
 				reply(w, http.StatusOK, "ignored: changed by the bot")
 				return
 			}
-			s.updated(w, "linear", key, attrs{labels: labels}, log)
+			a := attrs{labels: labels}
+			a.priority, a.hasPriority = ev.Priority()
+			s.updated(w, "linear", key, a, log)
 			return
 		}
 		log.Debug("ignored", "reason", err)
@@ -1293,7 +1356,8 @@ func waitsForRunText(key string) string {
 func (s *Server) linearSubmit(w http.ResponseWriter, t *task.Task, sess *linear.Session, keys []string, log *slog.Logger) {
 	// Linear marks a session unresponsive unless it sees an activity within
 	// ~10s of "created", so answer now rather than when the agent starts.
-	switch s.submit(w, t, attrs{labels: sess.Labels, assigner: []string{sess.Actor, sess.ActorEmail}}, log) {
+	a := attrs{labels: sess.Labels, assigner: []string{sess.Actor, sess.ActorEmail}, priority: sess.Priority, hasPriority: sess.HasPriority}
+	switch s.submit(w, t, a, log) {
 	case submitRefused:
 		s.linearActivity(sess.SessionID, linear.ActivityError,
 			"The digital employee did not start work on "+sess.Key+": "+tierRefusalText(t.Tier), log)

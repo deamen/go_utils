@@ -41,6 +41,15 @@ type Issue struct {
 	DelegatedBy string
 	// Creator is the user id of who created the issue.
 	Creator string
+	// Priority is the priority of the issue: 1 (urgent) to 4 (low); 0:
+	// none.
+	Priority int
+	// LabelsBy says who added a label, by its name, as a user id. One
+	// that is not in it was there when the issue was created.
+	LabelsBy map[string]string
+	// BlockedBy are the keys of the issues that block this one. A blocker
+	// counts as done once it was closed in the workspace.
+	BlockedBy []string
 
 	closed, undelegated bool
 }
@@ -76,6 +85,16 @@ func (s *Server) Add(is Issue) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.issues = append(s.issues, &is)
+}
+
+// Change changes an issue of the workspace in place, as a person who edits
+// it does: its labels, its priority, what blocks it.
+func (s *Server) Change(key string, change func(*Issue)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if is := s.find(key); is != nil {
+		change(is)
+	}
 }
 
 // Close completes an issue, and Undelegate takes it away from the agent.
@@ -183,6 +202,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.Contains(req.Query, "OchellAssigned"):
 		data = s.assigned(req.Variables.After)
+	case strings.Contains(req.Query, "OchellScheduling"):
+		data = s.scheduling(req.Variables.ID)
 	case strings.Contains(req.Query, "OchellIssue"):
 		data = s.issue(req.Variables.ID)
 	case strings.Contains(req.Query, "OchellSessionCreate"):
@@ -231,7 +252,8 @@ func (s *Server) assigned(after string) map[string]any {
 		}
 		nodes = append(nodes, map[string]any{
 			"identifier": is.Key, "title": is.Title, "url": "https://linear.app/example/issue/" + is.Key,
-			"labels": map[string]any{"nodes": labels},
+			"priority": is.Priority,
+			"labels":   map[string]any{"nodes": labels},
 		})
 	}
 	return map[string]any{"issues": map[string]any{"nodes": nodes, "pageInfo": page}}
@@ -263,6 +285,50 @@ func (s *Server) issue(key string) map[string]any {
 		}
 	}
 	issue["history"] = map[string]any{"nodes": history}
+	out["issue"] = issue
+	return out
+}
+
+// scheduling answers the query for what decides when the work on an issue
+// starts.
+func (s *Server) scheduling(key string) map[string]any {
+	out := map[string]any{"viewer": map[string]string{"id": AppUserID}, "issue": nil}
+	is := s.find(key)
+	if is == nil {
+		return out
+	}
+	issue := map[string]any{"priority": is.Priority, "creator": nil}
+	if is.Creator != "" {
+		issue["creator"] = person(is.Creator)
+	}
+	labels := []map[string]string{}
+	history := []map[string]any{
+		// A change that adds no label, which must be passed over.
+		{"createdAt": "2026-11-01T09:00:00.000Z", "actor": person("u-earlier"), "addedLabels": nil},
+	}
+	for _, l := range is.Labels {
+		labels = append(labels, map[string]string{"name": l})
+		if by := is.LabelsBy[l]; by != "" {
+			history = append(history,
+				// An earlier time at which someone else added the label.
+				map[string]any{"createdAt": "2026-11-02T09:00:00.000Z", "actor": person("u-earlier"), "addedLabels": []map[string]string{{"name": l}}},
+				map[string]any{"createdAt": "2026-11-15T09:00:00.000Z", "actor": person(by), "addedLabels": []map[string]string{{"name": l}}})
+		}
+	}
+	issue["labels"] = map[string]any{"nodes": labels}
+	issue["history"] = map[string]any{"nodes": history}
+	relations := []map[string]any{
+		// A relation of another kind, which must be passed over.
+		{"type": "related", "issue": map[string]any{"identifier": "OTHER-1", "state": map[string]string{"type": "started"}}},
+	}
+	for _, b := range is.BlockedBy {
+		state := "started"
+		if blocker := s.find(b); blocker != nil && blocker.closed {
+			state = "completed"
+		}
+		relations = append(relations, map[string]any{"type": "blocks", "issue": map[string]any{"identifier": b, "state": map[string]string{"type": state}}})
+	}
+	issue["inverseRelations"] = map[string]any{"nodes": relations}
 	out["issue"] = issue
 	return out
 }

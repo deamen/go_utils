@@ -31,6 +31,8 @@ owners:
 #                 mint, revoke      commands that make credentials for one
 #                                   run, and take them back after it
 #   paused:     true holds the tickets of this tier
+#   max_concurrent: how many tickets of this tier may have an agent running
+#               at the same time; 0 or left out: no limit of its own
 #   approvers:  who may approve a plan of this tier, with "/approve" on the
 #               ticket. Left out: everyone who may send follow-ups
 #   allowed_assigners: who may assign work of this tier (Jira accountIds,
@@ -55,6 +57,7 @@ tiers:
     budget_usd: 50
     labels: [risk-high, security]
     allowed_assigners: ["557058:team-lead", team.lead@example.com]
+    max_concurrent: 1
 
 # Hard controls. "paused: true" here holds every ticket, and in a tier the
 # tickets of that tier, until the file is changed and ochell restarted. The
@@ -67,6 +70,30 @@ throttles:
   max_runs_per_hour: 20        # runs that may start within one hour
   max_open_prs_per_repo: 5     # open pull requests of the bot in one repository
   daily_spend_usd: 100         # what the runs of one day (UTC) may cost; needs agent.adapter claude
+
+# Scheduling: which queued ticket starts next, and which waits. The queue is
+# always in the order of the tracker's priority (the most urgent first, a
+# ticket without a priority last), and by age within one priority.
+scheduling:
+  # How many tickets of one repository may have an agent running at the
+  # same time. 0 or left out: no limit.
+  max_concurrent_per_repo: 2
+  # wait: a ticket that the tracker calls blocked by another, open ticket
+  # (Jira: the link "is blocked by"; Linear: the relation "blocks") waits
+  # until that one is done. ignore (the default): it starts.
+  blocked_by: wait
+  # Labels that a ticket must carry before its work starts: every one of
+  # them, each put there by a person. A label that the bot account added
+  # does not count. Left out: none.
+  # required_labels: [agent-ready]
+  # How often ochell asks the tracker about the tickets that blocked_by or
+  # required_labels hold. Both are read from the tracker's API, so Jira
+  # needs sources.jira_api.
+  check_interval: 1m
+  # The rank of a Jira priority by its name, from 1 (the most urgent) to 5,
+  # for a site with names of its own. Highest, High, Medium, Low and Lowest
+  # (and Blocker, Critical, Major, Minor, Trivial) are known already.
+  # priorities: {P0: 1, P1: 2, P2: 3}
 
 # The tier of a ticket that no rule matches.
 default_tier: normal
