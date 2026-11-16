@@ -181,10 +181,14 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 // other agent the budget would silently be no limit, so that is refused.
 func (r *Runner) UsePolicy(p *policy.Policy) error {
 	holds := store.Holds{Paused: p.Paused, MaxRunsPerHour: p.Throttles.MaxRunsPerHour,
-		MaxOpenPRsPerRepo: p.Throttles.MaxOpenPRsPerRepo, DailySpendUSD: p.Throttles.DailySpendUSD}
+		MaxOpenPRsPerRepo: p.Throttles.MaxOpenPRsPerRepo, DailySpendUSD: p.Throttles.DailySpendUSD,
+		MaxConcurrentPerRepo: p.Scheduling.MaxConcurrentPerRepo, MaxConcurrentPerTier: map[string]int{}}
 	for _, t := range p.Tiers {
 		if t.Paused {
 			holds.PausedTiers = append(holds.PausedTiers, t.Name)
+		}
+		if t.MaxConcurrent > 0 {
+			holds.MaxConcurrentPerTier[t.Name] = t.MaxConcurrent
 		}
 	}
 	if holds.DailySpendUSD > 0 && !agent.LimitsBudget(r.adapter) {
@@ -538,8 +542,10 @@ type Status struct {
 	Queued  int  `json:"queued"`
 	Running int  `json:"running"`
 	// Holds says what keeps runs from starting besides a plain "ochell
-	// pause", one line each: a pause in the policy file or of a tier, and
-	// each throttle that has reached its limit.
+	// pause", one line each: a pause in the policy file or of a tier,
+	// each throttle that has reached its limit, each repository and tier
+	// in which as many tickets run as may, and each ticket that a gate of
+	// scheduling holds.
 	Holds []string `json:"holds,omitempty"`
 	// Workflows are the repositories whose WORKFLOW.md ochell has read.
 	Workflows []WorkflowStatus `json:"workflows,omitempty"`
@@ -577,11 +583,81 @@ func (r *Runner) Status() (Status, error) {
 	for _, repo := range repos {
 		st.Holds = append(st.Holds, fmt.Sprintf("throttle max_open_prs_per_repo: %d pull requests of the bot are open in %s; tickets that would open another wait", max, repo))
 	}
+	if err := r.scheduling(&st); err != nil {
+		return st, err
+	}
 	if st.Workflows, err = r.workflows(); err != nil {
 		return st, err
 	}
 	st.Queued, st.Running, err = r.store.Counts()
 	return st, err
+}
+
+// maxHeldListed is how many held tickets the status names one by one.
+const maxHeldListed = 20
+
+// scheduling adds to st what scheduling holds back: the repositories and
+// tiers that are full, and the tickets that wait at a gate.
+func (r *Runner) scheduling(st *Status) error {
+	max := r.policy.Scheduling.MaxConcurrentPerRepo
+	repos, err := r.store.FullRepos(max)
+	if err != nil {
+		return err
+	}
+	for _, f := range repos {
+		st.Holds = append(st.Holds, fmt.Sprintf("scheduling max_concurrent_per_repo: %d ticket(s) are running in %s, the limit is %d; %d queued ticket(s) of the repository wait", f.Running, f.Name, max, f.Waiting))
+	}
+	limits := map[string]int{}
+	for _, t := range r.policy.Tiers {
+		limits[t.Name] = t.MaxConcurrent
+	}
+	tiers, err := r.store.FullTiers(limits)
+	if err != nil {
+		return err
+	}
+	for _, f := range tiers {
+		st.Holds = append(st.Holds, fmt.Sprintf("scheduling max_concurrent of the tier %s: %d ticket(s) are running, the limit is %d; %d queued ticket(s) of the tier wait", f.Name, f.Running, limits[f.Name], f.Waiting))
+	}
+	held, err := r.store.Held()
+	if err != nil {
+		return err
+	}
+	listed := 0
+	for _, h := range held {
+		// A ticket that was not looked at yet is about to be.
+		if h.Hold == store.HoldPending {
+			continue
+		}
+		if listed++; listed > maxHeldListed {
+			continue
+		}
+		st.Holds = append(st.Holds, fmt.Sprintf("scheduling: %s %s waits: %s", h.Source, h.Key, h.Hold))
+	}
+	if listed > maxHeldListed {
+		st.Holds = append(st.Holds, fmt.Sprintf("scheduling: %d more ticket(s) wait", listed-maxHeldListed))
+	}
+	return nil
+}
+
+// Held returns the tickets whose queued run scheduling keeps from
+// starting.
+func (r *Runner) Held() ([]store.Held, error) { return r.store.Held() }
+
+// SetHold changes why scheduling holds the queued run of a ticket. With an
+// empty hold the run may start, and a worker is told.
+func (r *Runner) SetHold(source, key, hold string) (changed bool, err error) {
+	changed, err = r.store.SetHold(source, key, hold)
+	if err == nil && changed && hold == "" {
+		r.log.Info("scheduling: the ticket no longer waits", "source", source, "key", key)
+		r.wakeWorker()
+	}
+	return changed, err
+}
+
+// SetPriority records the priority that the tracker gives a ticket, as a
+// rank: 1 is the most urgent; 0: none.
+func (r *Runner) SetPriority(source, key string, priority int) error {
+	return r.store.SetPriority(source, key, priority)
 }
 
 // Outcomes returns the outcome metrics per tier, for the period from

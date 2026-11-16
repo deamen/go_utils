@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -77,6 +78,9 @@ type Tier struct {
 	// the setting in the file; "ochell pause --tier" does the same on a
 	// running ochell.
 	Paused bool `yaml:"paused"`
+	// MaxConcurrent is how many tickets of this tier may have an agent
+	// running at the same time; 0: no limit of its own.
+	MaxConcurrent int `yaml:"max_concurrent"`
 }
 
 // Grants are the tools and credentials of the runs of one tier.
@@ -280,6 +284,8 @@ type Policy struct {
 	Paused bool `yaml:"paused"`
 	// Throttles bound what ochell starts, over all tiers.
 	Throttles Throttles `yaml:"throttles"`
+	// Scheduling says which queued ticket starts next, and which waits.
+	Scheduling Scheduling `yaml:"scheduling"`
 
 	// File is where the policy was read from; empty for the built-in one.
 	File string `yaml:"-"`
@@ -297,6 +303,120 @@ type Throttles struct {
 	DailySpendUSD float64 `yaml:"daily_spend_usd"`
 }
 
+// Values of scheduling.blocked_by.
+const (
+	BlockedByIgnore = "ignore"
+	BlockedByWait   = "wait"
+)
+
+// DefaultCheckInterval is how often ochell asks the tracker about the
+// tickets that scheduling holds, unless the policy says otherwise.
+const DefaultCheckInterval = time.Minute
+
+// Scheduling says which queued ticket starts next, and which waits. The
+// queue is always ordered by the priority that the tracker gives a ticket,
+// and by age within one priority.
+//
+// The gates (required_labels, blocked_by) hold the start of the work on a
+// ticket: the run of an assignment. A run that continues the work (a
+// retry, a follow-up, an approved plan) is not held by them.
+type Scheduling struct {
+	// MaxConcurrentPerRepo is how many tickets of one repository may have
+	// an agent running at the same time; 0: no limit.
+	MaxConcurrentPerRepo int `yaml:"max_concurrent_per_repo"`
+	// RequiredLabels are labels that a ticket must carry before its work
+	// starts: every one of them, each put there by someone other than
+	// the bot account.
+	RequiredLabels []string `yaml:"required_labels"`
+	// BlockedBy is "wait" when a ticket that the tracker calls blocked
+	// by another, open ticket waits until that one is done, and "ignore"
+	// otherwise.
+	BlockedBy string `yaml:"blocked_by"`
+	// CheckInterval is how often ochell asks the tracker about the
+	// tickets that a gate holds.
+	CheckInterval time.Duration `yaml:"check_interval"`
+	// Priorities maps the name of a priority in Jira to its rank, from 1
+	// (the most urgent) to 5. It adds to the names that ochell knows, and
+	// takes the place of one of them.
+	Priorities map[string]int `yaml:"priorities"`
+}
+
+// Gated reports whether a ticket has to pass a gate before its work
+// starts. A gate is checked against the tracker.
+func (s Scheduling) Gated() bool {
+	return len(s.RequiredLabels) > 0 || s.BlockedBy == BlockedByWait
+}
+
+// jiraPriorities are the ranks of the priority names that Jira comes with,
+// today's and the older ones.
+var jiraPriorities = map[string]int{
+	"highest": 1, "high": 2, "medium": 3, "low": 4, "lowest": 5,
+	"blocker": 1, "critical": 2, "major": 3, "minor": 4, "trivial": 5,
+}
+
+// Rank returns the rank of a priority by its name in Jira, from 1 (the
+// most urgent) to 5, and 0 for a name that is not known: such a ticket
+// has no priority for ochell.
+func (s Scheduling) Rank(name string) int {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for n, rank := range s.Priorities {
+		if strings.ToLower(strings.TrimSpace(n)) == name {
+			return rank
+		}
+	}
+	return jiraPriorities[name]
+}
+
+// Missing returns the required labels that are not among have.
+func (s Scheduling) Missing(have []string) []string {
+	var missing []string
+	for _, want := range s.RequiredLabels {
+		if !slices.ContainsFunc(have, func(l string) bool { return strings.EqualFold(strings.TrimSpace(l), strings.TrimSpace(want)) }) {
+			missing = append(missing, strings.TrimSpace(want))
+		}
+	}
+	return missing
+}
+
+// validate checks the scheduling settings.
+func (s Scheduling) validate() []error {
+	var errs []error
+	if s.MaxConcurrentPerRepo < 0 {
+		errs = append(errs, errors.New("scheduling.max_concurrent_per_repo must not be negative; 0 means no limit"))
+	}
+	if s.BlockedBy != BlockedByIgnore && s.BlockedBy != BlockedByWait {
+		errs = append(errs, errors.New("scheduling.blocked_by must be ignore or wait"))
+	}
+	if s.CheckInterval <= 0 {
+		errs = append(errs, errors.New("scheduling.check_interval must be more than 0"))
+	}
+	seen := map[string]bool{}
+	for _, l := range s.RequiredLabels {
+		key := strings.ToLower(strings.TrimSpace(l))
+		switch {
+		case key == "":
+			errs = append(errs, errors.New("scheduling.required_labels: an empty label"))
+		case seen[key]:
+			errs = append(errs, fmt.Errorf("scheduling.required_labels: the label %q is listed twice", l))
+		}
+		seen[key] = true
+	}
+	names := map[string]bool{}
+	for name, rank := range s.Priorities {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" || rank < 1 || rank > 5 {
+			errs = append(errs, fmt.Errorf("scheduling.priorities: %q: a priority has a name and a rank from 1 (the most urgent) to 5", name))
+		}
+		// Upper and lower case are not told apart, so two spellings of
+		// one name could say two things.
+		if names[key] {
+			errs = append(errs, fmt.Errorf("scheduling.priorities: the priority %q is listed twice", name))
+		}
+		names[key] = true
+	}
+	return errs
+}
+
 // Builtin is the policy of an ochell that has no policy file: one tier,
 // under which every ticket runs as it did before there were tiers.
 func Builtin() *Policy {
@@ -304,6 +424,7 @@ func Builtin() *Policy {
 		Version:     "builtin",
 		Tiers:       []Tier{{Name: DefaultTierName, PlanGate: PlanGateSkip, PRReview: PRReviewRequired, AutoMerge: AutoMergeNever}},
 		DefaultTier: DefaultTierName,
+		Scheduling:  Scheduling{BlockedBy: BlockedByIgnore, CheckInterval: DefaultCheckInterval},
 	}
 }
 
@@ -350,6 +471,12 @@ func Parse(raw []byte) (*Policy, error) {
 			t.AutoMerge = AutoMergeNever
 		}
 	}
+	if p.Scheduling.BlockedBy == "" {
+		p.Scheduling.BlockedBy = BlockedByIgnore
+	}
+	if p.Scheduling.CheckInterval == 0 {
+		p.Scheduling.CheckInterval = DefaultCheckInterval
+	}
 	if p.Version == "" {
 		sum := sha256.Sum256(raw)
 		p.Version = "sha256:" + hex.EncodeToString(sum[:6])
@@ -376,6 +503,7 @@ func (p *Policy) Validate() error {
 	if th := p.Throttles; th.MaxRunsPerHour < 0 || th.MaxOpenPRsPerRepo < 0 || th.DailySpendUSD < 0 {
 		errs = append(errs, errors.New("throttles: a limit must not be negative; 0 means no limit"))
 	}
+	errs = append(errs, p.Scheduling.validate()...)
 	seen := map[string]bool{}
 	labels := map[string]string{}
 	for i, t := range p.Tiers {
@@ -404,6 +532,9 @@ func (p *Policy) Validate() error {
 		}
 		if t.MaxTurns < 0 {
 			errs = append(errs, fmt.Errorf("%s: max_turns must not be negative; 0 means no limit", at))
+		}
+		if t.MaxConcurrent < 0 {
+			errs = append(errs, fmt.Errorf("%s: max_concurrent must not be negative; 0 means no limit", at))
 		}
 		for _, l := range t.Labels {
 			key := strings.ToLower(strings.TrimSpace(l))
@@ -607,6 +738,9 @@ func (p *Policy) Describe() []string {
 		if n := len(t.Approvers); n > 0 {
 			line += fmt.Sprintf(" approvers=%d", n)
 		}
+		if t.MaxConcurrent > 0 {
+			line += fmt.Sprintf(" max_concurrent=%d", t.MaxConcurrent)
+		}
 		if t.Paused {
 			line += " paused"
 		}
@@ -614,6 +748,26 @@ func (p *Policy) Describe() []string {
 			line += " (default)"
 		}
 		out = append(out, line)
+	}
+	return out
+}
+
+// DescribeScheduling is one line per scheduling setting that is set, for
+// the log and for "ochell policy-check".
+func (p *Policy) DescribeScheduling() []string {
+	s := p.Scheduling
+	var out []string
+	if s.MaxConcurrentPerRepo > 0 {
+		out = append(out, fmt.Sprintf("max_concurrent_per_repo=%d", s.MaxConcurrentPerRepo))
+	}
+	if len(s.RequiredLabels) > 0 {
+		out = append(out, "required_labels="+strings.Join(s.RequiredLabels, ","))
+	}
+	if s.BlockedBy == BlockedByWait {
+		out = append(out, "blocked_by=wait")
+	}
+	if s.Gated() {
+		out = append(out, "check_interval="+s.CheckInterval.String())
 	}
 	return out
 }

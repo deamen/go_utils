@@ -177,6 +177,12 @@ func serve(args []string) error {
 		return err
 	}
 	srv.UsePolicy(pol)
+	if err := srv.CheckScheduling(); err != nil {
+		return fmt.Errorf("invalid policy:\n%w", err)
+	}
+	if sch := pol.DescribeScheduling(); len(sch) > 0 {
+		log.Info("scheduling", "settings", strings.Join(sch, " "))
+	}
 	if cfg.API.Enabled {
 		status := api.New(cfg.API, st, r, log)
 		srv.UseAPI(api.Prefix, status, status.Link)
@@ -371,6 +377,9 @@ func policyCheck(args []string) error {
 	fmt.Printf("version %s, %d rule(s); tiers from the lowest to the highest:\n", pol.Version, len(pol.Rules))
 	for _, line := range pol.Describe() {
 		fmt.Println("  " + line)
+	}
+	if sch := pol.DescribeScheduling(); len(sch) > 0 {
+		fmt.Println("scheduling: " + strings.Join(sch, " "))
 	}
 	return nil
 }

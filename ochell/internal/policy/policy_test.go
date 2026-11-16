@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const three = `
@@ -85,24 +86,33 @@ func TestMatch(t *testing.T) {
 
 func TestInvalidPolicies(t *testing.T) {
 	for name, c := range map[string]struct{ in, want string }{
-		"empty":             {"", "at least one tier is required"},
-		"no default":        {"tiers: [{name: a}]", "default_tier is required"},
-		"unknown default":   {"tiers: [{name: a}]\ndefault_tier: b", `there is no tier "b"`},
-		"duplicate tier":    {"tiers: [{name: a}, {name: a}]\ndefault_tier: a", "defined twice"},
-		"bad name":          {"tiers: [{name: Has Space}]\ndefault_tier: a", "a tier name is"},
-		"bad plan gate":     {"tiers: [{name: a, plan_gate: maybe}]\ndefault_tier: a", "plan_gate must be skip or required"},
-		"bad review":        {"tiers: [{name: a, pr_review: never}]\ndefault_tier: a", "pr_review must be required or sampled"},
-		"bad merge":         {"tiers: [{name: a, auto_merge: always}]\ndefault_tier: a", "auto_merge must be never or after_ci"},
-		"negative budget":   {"tiers: [{name: a, budget_usd: -1}]\ndefault_tier: a", "budget_usd must not be negative"},
-		"misspelt setting":  {"tiers: [{name: a, budget: 5}]\ndefault_tier: a", "field budget not found"},
-		"unknown top level": {"tiers: [{name: a}]\ndefault_tier: a\nteirs: []", "field teirs not found"},
-		"rule without tier": {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{project: X}]", "rules[0].tier is required"},
-		"rule unknown tier": {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{project: X, tier: b}]", `there is no tier "b"`},
-		"rule for all":      {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{tier: a}]", "matches every ticket"},
-		"rule bad source":   {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{source: github, tier: a}]", "source must be jira, linear or empty"},
-		"linear issue type": {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{source: linear, issue_type: Bug, tier: a}]", "a Linear issue has no issue type"},
-		"label twice":       {"tiers: [{name: a, labels: [x]}, {name: b, labels: [X]}]\ndefault_tier: a", "also belongs to the tier a"},
-		"not yaml":          {"tiers: [", "yaml"},
+		"empty":                {"", "at least one tier is required"},
+		"no default":           {"tiers: [{name: a}]", "default_tier is required"},
+		"unknown default":      {"tiers: [{name: a}]\ndefault_tier: b", `there is no tier "b"`},
+		"duplicate tier":       {"tiers: [{name: a}, {name: a}]\ndefault_tier: a", "defined twice"},
+		"bad name":             {"tiers: [{name: Has Space}]\ndefault_tier: a", "a tier name is"},
+		"bad plan gate":        {"tiers: [{name: a, plan_gate: maybe}]\ndefault_tier: a", "plan_gate must be skip or required"},
+		"bad review":           {"tiers: [{name: a, pr_review: never}]\ndefault_tier: a", "pr_review must be required or sampled"},
+		"bad merge":            {"tiers: [{name: a, auto_merge: always}]\ndefault_tier: a", "auto_merge must be never or after_ci"},
+		"negative budget":      {"tiers: [{name: a, budget_usd: -1}]\ndefault_tier: a", "budget_usd must not be negative"},
+		"misspelt setting":     {"tiers: [{name: a, budget: 5}]\ndefault_tier: a", "field budget not found"},
+		"unknown top level":    {"tiers: [{name: a}]\ndefault_tier: a\nteirs: []", "field teirs not found"},
+		"rule without tier":    {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{project: X}]", "rules[0].tier is required"},
+		"rule unknown tier":    {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{project: X, tier: b}]", `there is no tier "b"`},
+		"rule for all":         {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{tier: a}]", "matches every ticket"},
+		"rule bad source":      {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{source: github, tier: a}]", "source must be jira, linear or empty"},
+		"linear issue type":    {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{source: linear, issue_type: Bug, tier: a}]", "a Linear issue has no issue type"},
+		"label twice":          {"tiers: [{name: a, labels: [x]}, {name: b, labels: [X]}]\ndefault_tier: a", "also belongs to the tier a"},
+		"negative tier limit":  {"tiers: [{name: a, max_concurrent: -1}]\ndefault_tier: a", "max_concurrent must not be negative"},
+		"negative repo limit":  {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {max_concurrent_per_repo: -1}", "max_concurrent_per_repo must not be negative"},
+		"bad blocked_by":       {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {blocked_by: maybe}", "blocked_by must be ignore or wait"},
+		"empty required label": {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {required_labels: [\" \"]}", "required_labels: an empty label"},
+		"required label twice": {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {required_labels: [ready, Ready]}", "listed twice"},
+		"negative interval":    {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {check_interval: -1s}", "check_interval must be more than 0"},
+		"priority rank":        {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {priorities: {P0: 0}}", "a rank from 1 (the most urgent) to 5"},
+		"priority twice":       {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {priorities: {P0: 1, p0: 2}}", "listed twice"},
+		"misspelt scheduling":  {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {required_label: [x]}", "field required_label not found"},
+		"not yaml":             {"tiers: [", "yaml"},
 	} {
 		_, err := Parse([]byte(c.in))
 		if err == nil || !strings.Contains(err.Error(), c.want) {
@@ -311,6 +321,81 @@ func TestGrants(t *testing.T) {
 	for name, text := range map[string]string{"no value": "A=", "ochell's": "ORCH_X=abcdef", "control": "A=ab\tcd"} {
 		if _, err := ParseCredentials(text, "test"); err == nil {
 			t.Errorf("%s: %q was accepted", name, text)
+		}
+	}
+}
+
+func TestScheduling(t *testing.T) {
+	// Without the section nothing is gated, and nothing is limited.
+	p, err := Parse([]byte(three))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := p.Scheduling; s.Gated() || s.BlockedBy != BlockedByIgnore || s.CheckInterval != DefaultCheckInterval || s.MaxConcurrentPerRepo != 0 {
+		t.Errorf("scheduling without the section = %+v", s)
+	}
+	if got := p.DescribeScheduling(); len(got) != 0 {
+		t.Errorf("DescribeScheduling = %q", got)
+	}
+	if b := Builtin(); b.Validate() != nil || b.Scheduling.Gated() {
+		t.Errorf("the built-in policy: %v, %+v", b.Validate(), b.Scheduling)
+	}
+
+	p, err = Parse([]byte(`
+tiers:
+  - {name: low}
+  - {name: high, max_concurrent: 1}
+default_tier: low
+scheduling:
+  max_concurrent_per_repo: 2
+  required_labels: [agent-ready, Triaged]
+  blocked_by: wait
+  check_interval: 30s
+  priorities: {P0: 1, High: 1}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := p.Scheduling
+	if !s.Gated() || s.MaxConcurrentPerRepo != 2 || s.CheckInterval != 30*time.Second || p.Tier("high").MaxConcurrent != 1 {
+		t.Errorf("scheduling = %+v", s)
+	}
+	if got, want := strings.Join(p.DescribeScheduling(), " "), "max_concurrent_per_repo=2 required_labels=agent-ready,Triaged blocked_by=wait check_interval=30s"; got != want {
+		t.Errorf("DescribeScheduling = %q, want %q", got, want)
+	}
+	if got := strings.Join(p.Describe(), "\n"); !strings.Contains(got, "high: plan_gate=skip pr_review=required auto_merge=never max_concurrent=1") {
+		t.Errorf("Describe = %q", got)
+	}
+	// A gate alone is enough.
+	for _, one := range []Scheduling{{RequiredLabels: []string{"x"}}, {BlockedBy: BlockedByWait}} {
+		if !one.Gated() {
+			t.Errorf("%+v is not gated", one)
+		}
+	}
+
+	// The rank of a priority, by its name in Jira: the names that Jira
+	// comes with, and the ones of the policy, which win.
+	for name, want := range map[string]int{
+		"Highest": 1, "high": 1, " Medium ": 3, "Low": 4, "Lowest": 5,
+		"Blocker": 1, "Critical": 2, "Major": 3, "Minor": 4, "Trivial": 5,
+		"p0": 1, "Sev-9": 0, "": 0,
+	} {
+		if got := s.Rank(name); got != want {
+			t.Errorf("Rank(%q) = %d, want %d", name, got, want)
+		}
+	}
+
+	// Every required label must be there; case and spaces do not matter.
+	for _, c := range []struct {
+		have []string
+		want string
+	}{
+		{nil, "agent-ready,Triaged"},
+		{[]string{"Agent-Ready"}, "Triaged"},
+		{[]string{"triaged ", "agent-ready", "other"}, ""},
+	} {
+		if got := strings.Join(s.Missing(c.have), ","); got != c.want {
+			t.Errorf("Missing(%q) = %q, want %q", c.have, got, c.want)
 		}
 	}
 }

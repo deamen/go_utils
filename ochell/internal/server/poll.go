@@ -155,6 +155,13 @@ func (s *Server) pollStart(ctx context.Context, p polled, is tracker.Issue, log 
 		t.Actor = who[0]
 	}
 	a := attrs{labels: is.Labels, issueType: is.Type, assigner: who}
+	switch p.source {
+	case "jira":
+		a.priority, a.hasPriority = s.jiraPriority(is.PriorityName)
+	case "linear":
+		// The list of the issues has the priority of each.
+		a.priority, a.hasPriority = is.Priority, true
+	}
 	// The tier's own list holds as well. It is checked here, before a
 	// session is opened for a ticket that is then not started.
 	if len(s.cfg.Repos) > 0 {

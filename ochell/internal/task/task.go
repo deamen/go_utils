@@ -60,6 +60,14 @@ type Task struct {
 	Repo string
 	// Tier is the risk tier of the policy that the ticket runs under.
 	Tier string
+	// Priority is the priority that the tracker gives the ticket, as a
+	// rank: 1 is the most urgent, 5 the least; 0: none, or not known. The
+	// queue hands out the lower rank first, and a ticket without one last.
+	Priority int
+	// Hold, when set on a task that is submitted, says why scheduling
+	// keeps the ticket from starting for now. The run stays queued until
+	// the hold is taken off.
+	Hold string
 	// Context is optional extra text from the source (e.g. Linear promptContext).
 	Context string
 	// Comment is the comment that triggered this run, when a person asked

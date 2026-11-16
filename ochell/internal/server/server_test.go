@@ -72,6 +72,56 @@ type fakeRunner struct {
 	// approved the approvals that were recorded, as "source:key by who".
 	plans    map[string]bool
 	approved []string
+	// holds is why scheduling holds each queued ticket, as "source:key",
+	// and priorities the rank that was recorded for a ticket.
+	holds      map[string]string
+	priorities map[string]int
+}
+
+func (f *fakeRunner) Held() ([]store.Held, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.Held
+	for k, hold := range f.holds {
+		source, key, _ := strings.Cut(k, ":")
+		out = append(out, store.Held{Source: source, Key: key, Hold: hold})
+	}
+	slices.SortFunc(out, func(a, b store.Held) int { return strings.Compare(a.Key, b.Key) })
+	return out, f.err
+}
+
+func (f *fakeRunner) SetHold(source, key, hold string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := source + ":" + key
+	had, held := f.holds[k]
+	if !held || had == hold {
+		return false, f.err
+	}
+	if hold == "" {
+		delete(f.holds, k)
+	} else {
+		f.holds[k] = hold
+	}
+	return true, f.err
+}
+
+func (f *fakeRunner) SetPriority(source, key string, priority int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.priorities == nil {
+		f.priorities = map[string]int{}
+	}
+	f.priorities[source+":"+key] = priority
+	return f.err
+}
+
+// hold returns why scheduling holds a ticket, and whether it does.
+func (f *fakeRunner) hold(source, key string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	hold, held := f.holds[source+":"+key]
+	return hold, held
 }
 
 func (f *fakeRunner) OpenPullRequests() ([]store.PullRequest, error) {
@@ -302,6 +352,12 @@ func (f *fakeRunner) Submit(t *task.Task) error {
 	}
 	f.tasks = append(f.tasks, t)
 	f.set(t.Source, t.Key, ticket.Running)
+	if t.Hold != "" {
+		if f.holds == nil {
+			f.holds = map[string]string{}
+		}
+		f.holds[t.Source+":"+t.Key] = t.Hold
+	}
 	return nil
 }
 

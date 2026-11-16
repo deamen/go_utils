@@ -56,6 +56,17 @@ type Fields struct {
 	IssueType *struct {
 		Name string `json:"name"`
 	} `json:"issuetype"`
+	Priority *struct {
+		Name string `json:"name"`
+	} `json:"priority"`
+}
+
+// priority returns the name of the priority, or "".
+func (f Fields) priority() string {
+	if f.Priority == nil {
+		return ""
+	}
+	return f.Priority.Name
 }
 
 // issueType returns the name of the issue type, or "".
@@ -116,6 +127,9 @@ type Ticket struct {
 	// IssueType is the name of the issue type, such as "Bug", when the
 	// payload has it.
 	IssueType string
+	// Priority is the name of the priority, such as "High", when the
+	// payload has it.
+	Priority string
 	// Actor is the accountId of the user who assigned the issue: the user
 	// of the webhook event, or the initiator of the Automation rule. Empty
 	// when the payload does not say.
@@ -160,6 +174,7 @@ func ParseWebhook(body []byte, botAccountID string) (*Ticket, error) {
 		URL:       BrowseURL(ev.Issue.Self, ev.Issue.Key),
 		Labels:    ev.Issue.Fields.labels(),
 		IssueType: ev.Issue.Fields.issueType(),
+		Priority:  ev.Issue.Fields.priority(),
 		Actor:     actor(ev.User),
 	}, nil
 }
@@ -182,8 +197,9 @@ func ActorOf(body []byte) string {
 }
 
 // ParseUpdated returns the issue of a jira:issue_updated event, with the
-// labels and the issue type it has now. Such an event can mean that the
-// ticket belongs in another tier.
+// labels, the issue type and the priority it has now. Such an event can
+// mean that the ticket belongs in another tier, or in another place in the
+// queue.
 func ParseUpdated(body []byte) (*Ticket, bool) {
 	var ev WebhookEvent
 	if json.Unmarshal(body, &ev) != nil || ev.WebhookEvent != "jira:issue_updated" || ev.Issue == nil || ev.Issue.Key == "" {
@@ -195,6 +211,7 @@ func ParseUpdated(body []byte) (*Ticket, bool) {
 		URL:       BrowseURL(ev.Issue.Self, ev.Issue.Key),
 		Labels:    ev.Issue.Fields.labels(),
 		IssueType: ev.Issue.Fields.issueType(),
+		Priority:  ev.Issue.Fields.priority(),
 		Actor:     actor(ev.User),
 	}, true
 }
@@ -335,6 +352,9 @@ type AutomationPayload struct {
 	// IssueType is optional: {{issue.issueType.name}}. A policy rule with
 	// issue_type needs it.
 	IssueType string `json:"issueType"`
+	// Priority is optional: {{issue.priority.name}}. The order of the
+	// queue uses it.
+	Priority string `json:"priority"`
 	// Issue is set when the rule sends "Work item data (Jira format)".
 	Issue *Issue `json:"issue"`
 }
@@ -374,7 +394,7 @@ func ParseAutomation(body []byte, botAccountID string) (*Ticket, error) {
 	if err := json.Unmarshal(body, &p); err != nil {
 		return nil, fmt.Errorf("decode jira automation payload: %w", err)
 	}
-	t := &Ticket{Key: p.IssueKey, Summary: p.Summary, URL: p.URL, Labels: p.Labels, IssueType: strings.TrimSpace(p.IssueType), Actor: strings.TrimSpace(p.Initiator)}
+	t := &Ticket{Key: p.IssueKey, Summary: p.Summary, URL: p.URL, Labels: p.Labels, IssueType: strings.TrimSpace(p.IssueType), Priority: strings.TrimSpace(p.Priority), Actor: strings.TrimSpace(p.Initiator)}
 	assignee := p.Assignee
 	if p.Issue != nil {
 		if t.Key == "" {
@@ -389,6 +409,9 @@ func ParseAutomation(body []byte, botAccountID string) (*Ticket, error) {
 		t.Labels = append(t.Labels, p.Issue.Fields.labels()...)
 		if t.IssueType == "" {
 			t.IssueType = p.Issue.Fields.issueType()
+		}
+		if t.Priority == "" {
+			t.Priority = p.Issue.Fields.priority()
 		}
 		if assignee == "" && p.Issue.Fields.Assignee != nil {
 			assignee = p.Issue.Fields.Assignee.AccountID

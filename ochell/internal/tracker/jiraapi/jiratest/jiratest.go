@@ -33,6 +33,15 @@ type Issue struct {
 	// of who assigned it to the bot; empty: it was created that way.
 	Creator    string
 	AssignedBy string
+	// Priority is the name of the priority, such as "High"; empty: none.
+	Priority string
+	// LabelsBy says who added a label or a component, by its name, as an
+	// accountId. One that is not in it was there when the ticket was
+	// created.
+	LabelsBy map[string]string
+	// BlockedBy are the keys of the tickets that this one "is blocked
+	// by". A blocker counts as done once it was closed on the site.
+	BlockedBy []string
 
 	// unassigned and closed tickets are no longer among the bot's open
 	// tickets, but can still be read.
@@ -84,6 +93,16 @@ func (s *Server) Remove(key string) {
 			s.issues = append(s.issues[:i], s.issues[i+1:]...)
 			return
 		}
+	}
+}
+
+// Change changes a ticket of the site in place, as a person who edits it
+// does: its labels, its priority, what blocks it.
+func (s *Server) Change(key string, change func(*Issue)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if is := s.find(key); is != nil {
+		change(is)
 	}
 }
 
@@ -253,9 +272,57 @@ func (s *Server) issue(w http.ResponseWriter, is *Issue, changelog bool) {
 	if is.Creator != "" {
 		fields["creator"] = account{is.Creator}
 	}
+	fields["priority"] = nil
+	if is.Priority != "" {
+		fields["priority"] = map[string]string{"name": is.Priority}
+	}
+	fields["labels"] = append([]string{}, is.Labels...)
+	components := []map[string]string{}
+	for _, c := range is.Components {
+		components = append(components, map[string]string{"name": c})
+	}
+	fields["components"] = components
+	links := []map[string]any{
+		// A link of another kind, and one in the other direction, which
+		// must both be passed over.
+		{"type": map[string]string{"name": "Relates", "inward": "relates to", "outward": "relates to"},
+			"inwardIssue": map[string]any{"key": "OTHER-1", "fields": map[string]any{"status": map[string]any{"statusCategory": map[string]string{"key": "new"}}}}},
+		{"type": map[string]string{"name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+			"outwardIssue": map[string]any{"key": "OTHER-2", "fields": map[string]any{"status": map[string]any{"statusCategory": map[string]string{"key": "new"}}}}},
+	}
+	for _, key := range is.BlockedBy {
+		category := "indeterminate"
+		if b := s.find(key); b != nil && b.closed {
+			category = "done"
+		}
+		links = append(links, map[string]any{
+			"type":        map[string]string{"name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+			"inwardIssue": map[string]any{"key": key, "fields": map[string]any{"status": map[string]any{"statusCategory": map[string]string{"key": category}}}},
+		})
+	}
+	fields["issuelinks"] = links
 	out := map[string]any{"key": is.Key, "fields": fields}
 	if changelog {
 		histories := []map[string]any{}
+		for _, l := range is.Labels {
+			if by := is.LabelsBy[l]; by != "" {
+				// An earlier time at which someone else added and removed
+				// the label, which must be passed over.
+				histories = append(histories,
+					map[string]any{"created": "2026-11-02T09:00:00.000+0000", "author": account{"557058:earlier"},
+						"items": []map[string]string{{"field": "labels", "fromString": "", "toString": l}}},
+					map[string]any{"created": "2026-11-03T09:00:00.000+0000", "author": account{"557058:earlier"},
+						"items": []map[string]string{{"field": "labels", "fromString": l, "toString": ""}}},
+					map[string]any{"created": "2026-11-15T09:00:00.000+0000", "author": account{by},
+						"items": []map[string]string{{"field": "labels", "fromString": "other", "toString": "other " + l}}})
+			}
+		}
+		for _, c := range is.Components {
+			if by := is.LabelsBy[c]; by != "" {
+				histories = append(histories, map[string]any{"created": "2026-11-15T09:00:00.000+0000", "author": account{by},
+					"items": []map[string]string{{"field": "Component", "fromString": "", "toString": c}}})
+			}
+		}
 		if is.AssignedBy != "" {
 			histories = append(histories,
 				// An older assignment to someone else, and a change that is
@@ -305,6 +372,7 @@ func (s *Server) search(w http.ResponseWriter, body []byte) {
 		Labels     []string `json:"labels"`
 		Components []name   `json:"components"`
 		IssueType  name     `json:"issuetype"`
+		Priority   *name    `json:"priority"`
 	}
 	type issue struct {
 		Key    string `json:"key"`
@@ -322,6 +390,9 @@ func (s *Server) search(w http.ResponseWriter, body []byte) {
 		f := fields{Summary: is.Summary, Labels: is.Labels, IssueType: name{is.Type}}
 		for _, c := range is.Components {
 			f.Components = append(f.Components, name{c})
+		}
+		if is.Priority != "" {
+			f.Priority = &name{is.Priority}
 		}
 		list = append(list, issue{Key: is.Key, Fields: f})
 	}

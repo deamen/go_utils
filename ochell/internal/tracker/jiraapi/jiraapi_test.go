@@ -2,6 +2,7 @@ package jiraapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"slices"
 	"strings"
@@ -191,5 +192,70 @@ func TestLookup(t *testing.T) {
 	site.Fail(http.StatusServiceUnavailable)
 	if got, err := c.Lookup(ctx, "DEV-1"); err == nil {
 		t.Errorf("Lookup against a failing site = %+v, no error", got)
+	}
+}
+
+func TestScheduling(t *testing.T) {
+	site := jiratest.New(t)
+	site.Add(jiratest.Issue{Key: "DEV-1", Creator: "557058:creator", Priority: "High",
+		Labels: []string{"agent-ready", "old", "own"}, Components: []string{"web", "api"},
+		LabelsBy:  map[string]string{"agent-ready": "557058:anna", "own": jiratest.AccountID, "api": jiratest.AccountID},
+		BlockedBy: []string{"DEV-2", "DEV-3", "ELSE-9"}})
+	site.Add(jiratest.Issue{Key: "DEV-2"})
+	site.Add(jiratest.Issue{Key: "DEV-3"})
+	site.Add(jiratest.Issue{Key: "DEV-4"})
+	site.Close("DEV-3")
+	c := client(site)
+	ctx := context.Background()
+
+	got, err := c.Scheduling(ctx, "DEV-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PriorityName != "High" || got.Priority != 0 {
+		t.Errorf("priority = %d %q, want the name High", got.Priority, got.PriorityName)
+	}
+	// Who added each label: the author of the last change that added it,
+	// the creator for one that the ticket was created with. Components
+	// count as labels.
+	want := []tracker.Label{
+		{Name: "agent-ready", By: []string{"557058:anna"}},
+		{Name: "old", By: []string{"557058:creator"}},
+		{Name: "own", By: []string{jiratest.AccountID}, Bot: true},
+		{Name: "web", By: []string{"557058:creator"}},
+		{Name: "api", By: []string{jiratest.AccountID}, Bot: true},
+	}
+	if len(got.Labels) != len(want) {
+		t.Fatalf("labels = %+v, want %+v", got.Labels, want)
+	}
+	for i, l := range got.Labels {
+		if l.Name != want[i].Name || !slices.Equal(l.By, want[i].By) || l.Bot != want[i].Bot {
+			t.Errorf("label %d = %+v, want %+v", i, l, want[i])
+		}
+	}
+	// The open tickets that this one "is blocked by": not the one that is
+	// done, not a link of another kind or in the other direction. A
+	// blocker that the site does not show counts as open.
+	if want := []string{"DEV-2", "ELSE-9"}; !slices.Equal(got.BlockedBy, want) {
+		t.Errorf("blocked by %v, want %v", got.BlockedBy, want)
+	}
+
+	// A ticket with nothing of all this, and one that Jira does not have.
+	if got, err := c.Scheduling(ctx, "DEV-4"); err != nil || got.PriorityName != "" || len(got.Labels) != 0 || len(got.BlockedBy) != 0 {
+		t.Errorf("Scheduling(DEV-4) = %+v, %v", got, err)
+	}
+	if _, err := c.Scheduling(ctx, "DEV-404"); !errors.Is(err, tracker.ErrNotFound) {
+		t.Errorf("Scheduling of an unknown ticket: %v, want ErrNotFound", err)
+	}
+	site.Fail(http.StatusServiceUnavailable)
+	if _, err := c.Scheduling(ctx, "DEV-1"); err == nil || errors.Is(err, tracker.ErrNotFound) {
+		t.Errorf("Scheduling with a failing site: %v", err)
+	}
+	site.Fail(0)
+
+	// The list of the bot's tickets has the priority of each.
+	list, err := c.Assigned(ctx)
+	if err != nil || len(list) != 3 || list[0].PriorityName != "High" || list[1].PriorityName != "" {
+		t.Errorf("Assigned = %+v, %v", list, err)
 	}
 }

@@ -41,6 +41,10 @@ type Step struct {
 	WriteFile *File `json:"write_file,omitempty"`
 	// TryRead reads a file and notes in the record whether that worked.
 	TryRead string `json:"try_read,omitempty"`
+	// WaitFile waits until a file exists, so that a test decides when the
+	// run goes on. $NAME in the path is replaced from the environment
+	// (e.g. $ORCH_TASK_KEY).
+	WaitFile string `json:"wait_file,omitempty"`
 	// IgnoreTerm makes the agent survive SIGTERM from here on.
 	IgnoreTerm bool `json:"ignore_term,omitempty"`
 	// Exit ends the run with this status.
@@ -140,6 +144,12 @@ func main() {
 			_, err := os.ReadFile(st.TryRead)
 			rec.Reads[st.TryRead] = result(err)
 			writeRecord(rec)
+		case st.WaitFile != "":
+			for path := os.ExpandEnv(st.WaitFile); ; time.Sleep(20 * time.Millisecond) {
+				if _, err := os.Stat(path); err == nil {
+					break
+				}
+			}
 		case st.IgnoreTerm:
 			signal.Ignore(syscall.SIGTERM)
 		case st.Exit != nil:

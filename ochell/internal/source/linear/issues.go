@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"ochell/internal/tracker"
 )
@@ -25,7 +26,7 @@ const assignedQuery = `query OchellAssigned($first: Int!, $after: String) {
     delegate: { isMe: { eq: true } },
     state: { type: { nin: ["completed", "canceled"] } }
   }) {
-    nodes { identifier title url labels { nodes { name } } }
+    nodes { identifier title url priority labels { nodes { name } } }
     pageInfo { hasNextPage endCursor }
   }
 }`
@@ -38,9 +39,10 @@ func (c *Client) Assigned(ctx context.Context) ([]tracker.Issue, error) {
 		var out struct {
 			Issues struct {
 				Nodes []struct {
-					Identifier string `json:"identifier"`
-					Title      string `json:"title"`
-					URL        string `json:"url"`
+					Identifier string  `json:"identifier"`
+					Title      string  `json:"title"`
+					URL        string  `json:"url"`
+					Priority   float64 `json:"priority"`
 					Labels     struct {
 						Nodes []struct {
 							Name string `json:"name"`
@@ -60,7 +62,7 @@ func (c *Client) Assigned(ctx context.Context) ([]tracker.Issue, error) {
 			if n.Identifier == "" {
 				continue
 			}
-			is := tracker.Issue{Key: n.Identifier, Title: n.Title, URL: n.URL}
+			is := tracker.Issue{Key: n.Identifier, Title: n.Title, URL: n.URL, Priority: Rank(n.Priority)}
 			for _, l := range n.Labels.Nodes {
 				if l.Name != "" {
 					is.Labels = append(is.Labels, l.Name)
@@ -171,6 +173,121 @@ func (c *Client) Lookup(ctx context.Context, key string) (tracker.Status, error)
 	}
 	st.Unassigned = was && !mine
 	return st, nil
+}
+
+// Rank turns the priority of a Linear issue into a rank. Linear counts
+// from 1 (urgent) to 4 (low), which is a rank already; 0 is no priority,
+// and so is anything else.
+func Rank(priority float64) int {
+	if priority >= 1 && priority <= 4 {
+		return int(priority)
+	}
+	return 0
+}
+
+const schedulingQuery = `query OchellScheduling($id: String!) {
+  viewer { id }
+  issue(id: $id) {
+    priority
+    creator { id email }
+    labels { nodes { name } }
+    inverseRelations { nodes { type issue { identifier state { type } } } }
+    history(first: 100) { nodes { createdAt actor { id email } addedLabels { name } } }
+  }
+}`
+
+// Scheduling asks what decides when the work on an issue starts: its
+// priority, its labels with who added each, and the open issues that
+// block it (a relation of the type "blocks" that points at this issue).
+//
+// Who added a label is the actor of the last change in the issue's
+// history that added it; a label without such a change was there when the
+// issue was created, and is its creator's.
+//
+// It is a query of its own, so that a field that Linear does not have
+// breaks neither Assigner nor Lookup.
+func (c *Client) Scheduling(ctx context.Context, key string) (tracker.Scheduling, error) {
+	var out tracker.Scheduling
+	var reply struct {
+		Viewer struct {
+			ID string `json:"id"`
+		} `json:"viewer"`
+		Issue *struct {
+			Priority float64 `json:"priority"`
+			Creator  *person `json:"creator"`
+			Labels   struct {
+				Nodes []struct {
+					Name string `json:"name"`
+				} `json:"nodes"`
+			} `json:"labels"`
+			InverseRelations struct {
+				Nodes []struct {
+					Type  string `json:"type"`
+					Issue *struct {
+						Identifier string `json:"identifier"`
+						State      *struct {
+							Type string `json:"type"`
+						} `json:"state"`
+					} `json:"issue"`
+				} `json:"nodes"`
+			} `json:"inverseRelations"`
+			History struct {
+				Nodes []struct {
+					CreatedAt   string  `json:"createdAt"`
+					Actor       *person `json:"actor"`
+					AddedLabels []struct {
+						Name string `json:"name"`
+					} `json:"addedLabels"`
+				} `json:"nodes"`
+			} `json:"history"`
+		} `json:"issue"`
+	}
+	if err := c.Do(ctx, schedulingQuery, map[string]any{"id": key}, &reply); err != nil {
+		if strings.Contains(err.Error(), "Entity not found") {
+			return out, tracker.ErrNotFound
+		}
+		return out, err
+	}
+	is := reply.Issue
+	if is == nil {
+		return out, tracker.ErrNotFound
+	}
+	out.Priority = Rank(is.Priority)
+	for _, l := range is.Labels.Nodes {
+		if l.Name == "" {
+			continue
+		}
+		who, when := is.Creator, ""
+		for _, n := range is.History.Nodes {
+			for _, added := range n.AddedLabels {
+				// The timestamps are in one format, so they compare as
+				// text.
+				if added.Name == l.Name && n.Actor != nil && n.CreatedAt >= when {
+					who, when = n.Actor, n.CreatedAt
+				}
+			}
+		}
+		label := tracker.Label{Name: l.Name}
+		if who != nil {
+			for _, id := range []string{who.ID, who.Email} {
+				if id != "" {
+					label.By = append(label.By, id)
+				}
+			}
+			label.Bot = who.ID != "" && who.ID == reply.Viewer.ID
+		}
+		out.Labels = append(out.Labels, label)
+	}
+	for _, r := range is.InverseRelations.Nodes {
+		if r.Type != "blocks" || r.Issue == nil || r.Issue.Identifier == "" {
+			continue
+		}
+		if s := r.Issue.State; s != nil && (s.Type == "completed" || s.Type == "canceled") {
+			continue
+		}
+		out.BlockedBy = append(out.BlockedBy, r.Issue.Identifier)
+	}
+	return out, nil
 }
 
 const sessionCreateMutation = `mutation OchellSessionCreate($input: AgentSessionCreateOnIssue!) {

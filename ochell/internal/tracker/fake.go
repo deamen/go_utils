@@ -15,9 +15,11 @@ type Fake struct {
 	Err error
 
 	// Assigners is what Assigner returns, by ticket key, and States what
-	// Lookup returns.
-	Assigners map[string][]string
-	States    map[string]Status
+	// Lookup returns. Schedulings is what Scheduling returns; a ticket
+	// that is not in it is not found.
+	Assigners   map[string][]string
+	States      map[string]Status
+	Schedulings map[string]Scheduling
 
 	comments []FakeComment
 	statuses map[string]string
@@ -38,6 +40,19 @@ func (f *Fake) Lookup(_ context.Context, key string) (Status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.States[key], f.Err
+}
+
+func (f *Fake) Scheduling(_ context.Context, key string) (Scheduling, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Err != nil {
+		return Scheduling{}, f.Err
+	}
+	sch, ok := f.Schedulings[key]
+	if !ok {
+		return Scheduling{}, ErrNotFound
+	}
+	return sch, nil
 }
 
 // Set changes what the fake answers, under its lock.

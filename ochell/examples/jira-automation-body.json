@@ -6,5 +6,6 @@
   "initiatorAccountId": "{{initiator.accountId}}",
   "labels": "{{issue.labels}}",
   "issueType": "{{issue.issueType.name}}",
+  "priority": "{{issue.priority.name}}",
   "event": "assigned"
 }

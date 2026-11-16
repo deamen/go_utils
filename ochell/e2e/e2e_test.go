@@ -4569,3 +4569,289 @@ func TestRepoWorkflowHooksAndReviewStatus(t *testing.T) {
 	}
 	o.waitFor(10*time.Second, "DEV-310 to be moved to the repository's review status", func() bool { return o.Jira.Status("DEV-310") == "Code Review" })
 }
+
+// Scheduling (MMZ-66): with more tickets than slots the more urgent one
+// runs first; the limit per repository and per tier holds while other
+// work goes on; a blocked ticket starts once its blocker is done; and a
+// ticket waits for a required label that a person, not the bot, put on it.
+func TestScheduling(t *testing.T) {
+	// Each run waits until the test lets its ticket go, and then reports
+	// its work as done.
+	script := []Step{{WaitFile: "{{dir}}/release/$ORCH_TASK_KEY"}, Report("done", "Done.")}
+	start := func(t *testing.T, policy string, configure func(*config.Config)) (*Ochell, *store.Store) {
+		t.Helper()
+		o := Start(t, Options{Script: script, Policy: policy, Configure: configure})
+		if err := os.MkdirAll(filepath.Join(o.Dir, "release"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		st, err := store.Open(o.Config.Store.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		return o, st
+	}
+	release := func(t *testing.T, o *Ochell, keys ...string) {
+		t.Helper()
+		for _, key := range keys {
+			if err := os.WriteFile(filepath.Join(o.Dir, "release", key), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	state := func(t *testing.T, st *store.Store, source, key string) string {
+		t.Helper()
+		tk, err := st.Ticket(source, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tk == nil {
+			return ""
+		}
+		return string(tk.State)
+	}
+	waitState := func(t *testing.T, o *Ochell, st *store.Store, source, key, want string) {
+		t.Helper()
+		o.waitFor(15*time.Second, key+" to be "+want, func() bool { return state(t, st, source, key) == want })
+	}
+	// status waits until "ochell status" has every one of want in it, and
+	// checks that it still does a moment later: the hold is not a state
+	// that passes by itself.
+	status := func(t *testing.T, o *Ochell, want ...string) {
+		t.Helper()
+		has := func() (string, bool) {
+			out, _ := o.Admin("status")
+			for _, w := range want {
+				if !strings.Contains(out, w) {
+					return out, false
+				}
+			}
+			return out, true
+		}
+		var out string
+		deadline := time.Now().Add(10 * time.Second)
+		for ok := false; !ok; time.Sleep(50 * time.Millisecond) {
+			if out, ok = has(); !ok && time.Now().After(deadline) {
+				t.Fatalf("ochell status = %q, want %q in it", out, want)
+			}
+		}
+		time.Sleep(400 * time.Millisecond)
+		if out, ok := has(); !ok {
+			t.Errorf("ochell status a moment later = %q, want %q in it", out, want)
+		}
+	}
+	const web, api = "git@example.com:org/web.git", "git@example.com:org/api.git"
+
+	t.Run("priority", func(t *testing.T) {
+		// One slot. Linear's payload has no priority, so ochell asks the
+		// API; Jira's has it.
+		o, st := start(t, "", nil)
+		for key, priority := range map[string]int{"ENG-200": 0, "ENG-201": 4, "ENG-202": 0, "ENG-203": 1, "ENG-204": 2, "ENG-205": 1} {
+			o.Linear.Add(lineartest.Issue{Key: key, Title: "Title of " + key, DelegatedBy: HumanAccountID, Priority: priority})
+		}
+		// The first ticket takes the slot; the others arrive while it runs.
+		o.LinearCreated("ENG-200", "s-200", "")
+		waitState(t, o, st, "linear", "ENG-200", "running")
+		o.LinearCreated("ENG-201", "s-201", "")
+		o.LinearCreated("ENG-202", "s-202", "")
+		o.LinearCreated("ENG-203", "s-203", "")
+		o.Priority = "Highest"
+		o.JiraAssigned("DEV-201", "As urgent as it gets")
+		o.Priority = ""
+		o.LinearCreated("ENG-204", "s-204", "")
+		o.LinearCreated("ENG-205", "s-205", "")
+		// Every one of them is queued and has its priority.
+		o.waitFor(10*time.Second, "the tracker to be asked about every queued ticket", func() bool {
+			held, err := st.Held()
+			if err != nil {
+				t.Fatal(err)
+			}
+			queued, _, _ := st.Counts()
+			return queued == 6 && len(held) == 0
+		})
+		for key, want := range map[string]int{"ENG-201": 4, "ENG-202": 0, "ENG-203": 1, "ENG-204": 2, "ENG-205": 1} {
+			if tk, _ := st.Ticket("linear", key); tk == nil || tk.Priority != want {
+				t.Errorf("%s: stored ticket %+v, want the priority %d", key, tk, want)
+			}
+		}
+		if tk, _ := st.Ticket("jira", "DEV-201"); tk == nil || tk.Priority != 1 {
+			t.Errorf("DEV-201: stored ticket %+v, want the priority 1", tk)
+		}
+		// The slot is handed on, one ticket at a time: the most urgent
+		// first, the oldest first among equals, the ones without a
+		// priority last.
+		release(t, o, "ENG-200")
+		var order []string
+		for len(order) < 6 {
+			var key string
+			o.waitFor(15*time.Second, "the next ticket to start", func() bool {
+				running, err := st.Tickets(0, "running")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(running) > 1 {
+					t.Fatalf("%d tickets are running with one slot", len(running))
+				}
+				if len(running) == 1 && !slices.Contains(order, running[0].Key) && running[0].Key != "ENG-200" {
+					key = running[0].Key
+				}
+				return key != ""
+			})
+			order = append(order, key)
+			release(t, o, key)
+		}
+		if want := []string{"ENG-203", "DEV-201", "ENG-205", "ENG-204", "ENG-201", "ENG-202"}; !slices.Equal(order, want) {
+			t.Errorf("the tickets started in the order %v, want %v", order, want)
+		}
+	})
+
+	t.Run("per repository", func(t *testing.T) {
+		o, st := start(t, "tiers: [{name: normal}]\ndefault_tier: normal\nscheduling: {max_concurrent_per_repo: 1}\n", func(c *config.Config) {
+			c.Agent.MaxConcurrent = 3
+			c.Repos = []config.Repo{{Source: "jira", Project: "DEV", Repo: web}, {Source: "jira", Project: "OPS", Repo: api}}
+		})
+		o.Priority = "Medium"
+		o.JiraAssigned("DEV-210", "First in web")
+		waitState(t, o, st, "jira", "DEV-210", "running")
+		// A second ticket of the repository waits, though slots are free
+		// and it is the more urgent one; a ticket of another repository
+		// runs next to the first.
+		o.Priority = "Highest"
+		o.JiraAssigned("DEV-211", "Second in web")
+		o.Priority = "Medium"
+		o.JiraAssigned("OPS-210", "First in api")
+		waitState(t, o, st, "jira", "OPS-210", "running")
+		status(t, o, "running; 1 queued, 2 running",
+			"held: scheduling max_concurrent_per_repo: 1 ticket(s) are running in "+web+", the limit is 1; 1 queued ticket(s) of the repository wait")
+		if got := state(t, st, "jira", "DEV-211"); got != "queued" {
+			t.Fatalf("DEV-211 is %s while DEV-210 runs in the same repository, want queued", got)
+		}
+		// The other repository's ticket ends: that frees no place in web.
+		release(t, o, "OPS-210")
+		waitState(t, o, st, "jira", "OPS-210", "in_review")
+		time.Sleep(300 * time.Millisecond)
+		if got := state(t, st, "jira", "DEV-211"); got != "queued" {
+			t.Fatalf("DEV-211 is %s after a run in another repository ended, want queued", got)
+		}
+		// The first ticket of web ends: the second starts.
+		release(t, o, "DEV-210")
+		waitState(t, o, st, "jira", "DEV-211", "running")
+		if out, _ := o.Admin("status"); strings.Contains(out, "held:") {
+			t.Errorf("ochell status with nothing held: %q", out)
+		}
+		release(t, o, "DEV-211")
+		waitState(t, o, st, "jira", "DEV-211", "in_review")
+	})
+
+	t.Run("per tier", func(t *testing.T) {
+		o, st := start(t, "tiers: [{name: low}, {name: high, max_concurrent: 1, labels: [risk-high]}]\ndefault_tier: low\n", func(c *config.Config) {
+			c.Agent.MaxConcurrent = 3
+		})
+		o.Priority = "Medium"
+		o.Labels = []string{"risk-high"}
+		o.JiraAssigned("DEV-220", "First of the tier high")
+		waitState(t, o, st, "jira", "DEV-220", "running")
+		o.JiraAssigned("DEV-221", "Second of the tier high")
+		o.Labels = nil
+		o.JiraAssigned("DEV-222", "Of the tier low")
+		waitState(t, o, st, "jira", "DEV-222", "running")
+		status(t, o, "running; 1 queued, 2 running",
+			"held: scheduling max_concurrent of the tier high: 1 ticket(s) are running, the limit is 1; 1 queued ticket(s) of the tier wait")
+		if got := state(t, st, "jira", "DEV-221"); got != "queued" {
+			t.Fatalf("DEV-221 is %s while DEV-220 runs in the same tier, want queued", got)
+		}
+		release(t, o, "DEV-220")
+		waitState(t, o, st, "jira", "DEV-221", "running")
+		release(t, o, "DEV-221", "DEV-222")
+		waitState(t, o, st, "jira", "DEV-221", "in_review")
+	})
+
+	t.Run("blocked", func(t *testing.T) {
+		// No webhook tells ochell that the blocker was closed: it asks
+		// the tracker again at every check_interval.
+		o, st := start(t, "tiers: [{name: normal}]\ndefault_tier: normal\nscheduling: {blocked_by: wait, check_interval: 200ms}\n", func(c *config.Config) {
+			c.Agent.MaxConcurrent = 3
+		})
+		o.Jira.Add(jiratest.Issue{Key: "DEV-230", Summary: "The blocker"})
+		o.Jira.Add(jiratest.Issue{Key: "DEV-231", Summary: "Blocked", BlockedBy: []string{"DEV-230"}})
+		o.Jira.Add(jiratest.Issue{Key: "DEV-232", Summary: "Free"})
+		o.JiraAssigned("DEV-231", "Blocked")
+		status(t, o, "running; 1 queued, 0 running", "held: scheduling: jira DEV-231 waits: it is blocked by DEV-230, which is not done")
+		// A ticket that nothing blocks runs, and so does the blocker
+		// itself. The blocked ticket waits on: a blocker that is in
+		// review is not done.
+		o.JiraAssigned("DEV-232", "Free")
+		o.JiraAssigned("DEV-230", "The blocker")
+		waitState(t, o, st, "jira", "DEV-232", "running")
+		waitState(t, o, st, "jira", "DEV-230", "running")
+		release(t, o, "DEV-230", "DEV-232")
+		waitState(t, o, st, "jira", "DEV-230", "in_review")
+		time.Sleep(600 * time.Millisecond)
+		if got := state(t, st, "jira", "DEV-231"); got != "queued" {
+			t.Fatalf("DEV-231 is %s while its blocker is open, want queued", got)
+		}
+		// The ticket was told once why it waits, not at every look.
+		var told int
+		for _, c := range o.Jira.Comments("DEV-231") {
+			if strings.Contains(c, "has not started work on DEV-231 yet: it is blocked by DEV-230, which is not done") {
+				told++
+			}
+		}
+		if told != 1 {
+			t.Errorf("DEV-231 was told %d times that it waits, want once: %q", told, o.Jira.Comments("DEV-231"))
+		}
+		if n := len(o.Records()); n != 2 {
+			t.Errorf("the agent was started %d times, want 2", n)
+		}
+		// The blocker is closed in Jira: the blocked ticket starts.
+		o.Jira.Close("DEV-230")
+		waitState(t, o, st, "jira", "DEV-231", "running")
+		if out, _ := o.Admin("status"); strings.Contains(out, "held:") {
+			t.Errorf("ochell status with nothing held: %q", out)
+		}
+		release(t, o, "DEV-231")
+		waitState(t, o, st, "jira", "DEV-231", "in_review")
+	})
+
+	t.Run("required label", func(t *testing.T) {
+		// The interval is long: what lets a ticket go here is the webhook
+		// of a change.
+		o, st := start(t, "tiers: [{name: normal}]\ndefault_tier: normal\nscheduling: {required_labels: [agent-ready], check_interval: 1h}\n", func(c *config.Config) {
+			c.Agent.MaxConcurrent = 3
+		})
+		// A Linear issue that a person labelled runs at once.
+		o.Linear.Add(lineartest.Issue{Key: "ENG-240", DelegatedBy: HumanAccountID, Creator: HumanAccountID, Labels: []string{"agent-ready"}})
+		o.LinearCreated("ENG-240", "s-240", "")
+		waitState(t, o, st, "linear", "ENG-240", "running")
+		release(t, o, "ENG-240")
+		// A Jira ticket without the label waits. What the payload says
+		// about labels does not count: ochell asks Jira.
+		o.Jira.Add(jiratest.Issue{Key: "DEV-240", Summary: "Not ready", Creator: HumanAccountID})
+		o.Labels = []string{"agent-ready"}
+		o.JiraAssigned("DEV-240", "Not ready")
+		status(t, o, "running; 1 queued, 0 running", "held: scheduling: jira DEV-240 waits: it needs the label agent-ready")
+		// The bot account labels the ticket itself, as the agent could
+		// with its own tool. That opens no gate, also when a person then
+		// changes something else on the ticket.
+		o.Jira.Change("DEV-240", func(is *jiratest.Issue) {
+			is.Labels, is.LabelsBy = []string{"agent-ready"}, map[string]string{"agent-ready": BotAccountID}
+		})
+		o.Actor = BotAccountID
+		if r := o.JiraUpdated("DEV-240"); r.Status != 200 || !strings.Contains(r.Body, "changed by the bot") {
+			t.Fatalf("an update by the bot: %d %q", r.Status, r.Body)
+		}
+		o.Actor = ""
+		o.JiraUpdated("DEV-240")
+		status(t, o, "running; 1 queued, 0 running",
+			"held: scheduling: jira DEV-240 waits: it needs the label agent-ready from a person (a label that the bot account added does not count)")
+		if n := len(o.Records()); n != 1 {
+			t.Errorf("the agent was started %d times, want 1: DEV-240 has no label from a person", n)
+		}
+		// A person puts the label on: the ticket starts.
+		o.Jira.Change("DEV-240", func(is *jiratest.Issue) { is.LabelsBy = map[string]string{"agent-ready": HumanAccountID} })
+		o.JiraUpdated("DEV-240")
+		waitState(t, o, st, "jira", "DEV-240", "running")
+		release(t, o, "DEV-240")
+		waitState(t, o, st, "jira", "DEV-240", "in_review")
+	})
+}
