@@ -388,6 +388,26 @@ type GitHub struct {
 // Enabled reports whether the GitHub access is configured.
 func (g GitHub) Enabled() bool { return g.Token != "" }
 
+// Workflow lets a repository say how its tickets are worked, in a file
+// WORKFLOW.md on its default branch (package workflow): the prompt, hooks,
+// the status of the hand-over, and limits that are stricter than the
+// tier's. The file can only narrow the policy; what it may add at all is
+// set here.
+type Workflow struct {
+	// Enabled makes ochell read the file of each ticket's repository, at
+	// the start of every run. It needs the GitHub access (github.token,
+	// with read access to the contents of the repositories).
+	Enabled bool `yaml:"enabled"`
+	// AllowHooks lets a repository add hooks of its own, which run after
+	// the host's. They are commands that run as the agent's OS user for
+	// every ticket of the repository, so the host has to say yes.
+	AllowHooks bool `yaml:"allow_hooks"`
+	// ReviewStatuses are the Jira statuses that a repository may choose
+	// from for the hand-over, in the place of
+	// sources.jira_api.review_status. Empty: a repository cannot choose.
+	ReviewStatuses []string `yaml:"review_statuses"`
+}
+
 // Retention says how long ochell keeps what its runs leave behind. Run
 // logs hold prompts and ticket text, so they should not stay for ever.
 type Retention struct {
@@ -444,6 +464,7 @@ type Config struct {
 	// empty, tickets run without a repository.
 	Repos       []Repo      `yaml:"repos"`
 	Workspace   Workspace   `yaml:"workspace"`
+	Workflow    Workflow    `yaml:"workflow"`
 	Poller      Poller      `yaml:"poller"`
 	Retention   Retention   `yaml:"retention"`
 	Backup      Backup      `yaml:"backup"`
@@ -823,6 +844,20 @@ func (c *Config) Validate() error {
 		}
 	} else if g.APIURL != "" || g.BotLogin != "" {
 		errs = append(errs, errors.New("github: api_url or bot_login is set but token is not"))
+	}
+	if wf := c.Workflow; wf.Enabled {
+		// The file is read from the default branch through GitHub's API,
+		// never from a working directory.
+		if !c.GitHub.Enabled() {
+			errs = append(errs, errors.New("workflow.enabled requires github.token: a repository's WORKFLOW.md is read from its default branch through ochell's access to GitHub"))
+		}
+		for _, s := range wf.ReviewStatuses {
+			if strings.TrimSpace(s) == "" {
+				errs = append(errs, errors.New("workflow.review_statuses: an empty entry"))
+			}
+		}
+	} else if wf.AllowHooks || len(wf.ReviewStatuses) > 0 {
+		errs = append(errs, errors.New("workflow: allow_hooks or review_statuses is set but enabled is not"))
 	}
 	if c.Retention.Logs < 0 {
 		errs = append(errs, errors.New("retention.logs must not be negative; 0s keeps the logs for ever"))

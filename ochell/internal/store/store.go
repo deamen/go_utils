@@ -206,6 +206,20 @@ var migrations = []string{
 	`ALTER TABLE runs ADD COLUMN prompt_hash TEXT NOT NULL DEFAULT '';
 	ALTER TABLE runs ADD COLUMN grants TEXT NOT NULL DEFAULT '';
 	ALTER TABLE runs ADD COLUMN reopened INTEGER NOT NULL DEFAULT 0;`,
+
+	// Version 21: the WORKFLOW.md of each repository: the last version
+	// that was valid, which is the one in force, and what ochell found at
+	// its last look. And for each run the version it ran under.
+	`CREATE TABLE workflows (
+		repo       TEXT PRIMARY KEY,
+		version    TEXT NOT NULL DEFAULT '',
+		content    TEXT NOT NULL DEFAULT '',
+		loaded_at  INTEGER NOT NULL DEFAULT 0,
+		checked_at INTEGER NOT NULL DEFAULT 0,
+		error      TEXT NOT NULL DEFAULT '',
+		ignored    TEXT NOT NULL DEFAULT ''
+	);
+	ALTER TABLE runs ADD COLUMN workflow TEXT NOT NULL DEFAULT '';`,
 }
 
 // Store is safe for concurrent use.
@@ -1202,12 +1216,12 @@ func (s *Store) end(tx *sql.Tx, id string, res task.Result) error {
 			workdir = ?, resumed = ?, agent_session = ?, message = ?, cost_usd = ?,
 			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
 			signal = ?, signal_message = ?, pr_url = ?, branch = ?, session_cost_usd = ?, escalation = ?, phase = ?,
-			prompt_hash = ?, grants = ?
+			prompt_hash = ?, grants = ?, workflow = ?
 		WHERE id = ? AND status != ?`, runEnded, now, string(res.Outcome), exit, msg, res.LogFile,
 		res.Workdir, res.Resumed, res.SessionID, res.Message, res.CostUSD,
 		res.Usage.InputTokens, res.Usage.OutputTokens, res.Usage.CacheReadTokens, res.Usage.CacheWriteTokens,
 		res.Signal, res.SignalMessage, res.PRURL, res.Branch, res.SessionCostUSD, res.Escalation, res.Phase,
-		res.PromptHash, res.Grants,
+		res.PromptHash, res.Grants, res.Workflow,
 		id, runEnded)
 	if err != nil {
 		return err
@@ -1515,7 +1529,7 @@ type RunInfo struct {
 func (s *Store) Runs(source, key string) ([]RunInfo, error) {
 	rows, err := s.db.Query(`SELECT id, status, attempt, tier, policy_version, cause, received_at, started_at, ended_at,
 			outcome, exit_code, error, log_file, resumed, agent_session, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			signal, signal_message, pr_url, branch, escalation, phase, prompt_hash, grants
+			signal, signal_message, pr_url, branch, escalation, phase, prompt_hash, grants, workflow
 		FROM runs WHERE source = ? AND key = ? ORDER BY received_at, rowid`, source, key)
 	if err != nil {
 		return nil, err
@@ -1531,7 +1545,7 @@ func (s *Store) Runs(source, key string) ([]RunInfo, error) {
 		if err := rows.Scan(&r.ID, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &r.Cause, &received, &started, &ended,
 			&outcome, &exit, &msg, &res.LogFile, &res.Resumed, &res.SessionID, &res.CostUSD,
 			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
-			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.Escalation, &res.Phase, &res.PromptHash, &res.Grants); err != nil {
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.Escalation, &res.Phase, &res.PromptHash, &res.Grants, &res.Workflow); err != nil {
 			return nil, err
 		}
 		r.Received = time.UnixMilli(received).UTC()
@@ -1746,6 +1760,91 @@ func (s *Store) ClearWorkspace(source, key string) error {
 	return err
 }
 
+// Workflow is what ochell knows about the WORKFLOW.md of one repository.
+type Workflow struct {
+	// Repo is the repository, as the repos setting names it.
+	Repo string
+	// Version and Content are those of the last file that was valid: the
+	// one in force. Both are empty when there is none.
+	Version string
+	Content string
+	// Loaded is when the version in force was first read, and Checked when
+	// ochell last looked at the default branch.
+	Loaded, Checked time.Time
+	// Error says why what the default branch has now is not in force: the
+	// file is invalid, or could not be read. Empty: it is in force.
+	Error string
+	// Ignored are the settings of the file in force that the last run did
+	// not use, each with the reason.
+	Ignored []string
+}
+
+// Workflow returns what is stored about the WORKFLOW.md of a repository,
+// or nil when ochell has never looked.
+func (s *Store) Workflow(repo string) (*Workflow, error) {
+	list, err := s.workflows(`WHERE repo = ?`, repo)
+	if err != nil || len(list) == 0 {
+		return nil, err
+	}
+	return &list[0], nil
+}
+
+// Workflows returns what is stored about every repository's WORKFLOW.md,
+// by repository.
+func (s *Store) Workflows() ([]Workflow, error) {
+	return s.workflows(`ORDER BY repo`)
+}
+
+func (s *Store) workflows(where string, args ...any) ([]Workflow, error) {
+	rows, err := s.db.Query(`SELECT repo, version, content, loaded_at, checked_at, error, ignored FROM workflows `+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Workflow
+	for rows.Next() {
+		var w Workflow
+		var loaded, checked int64
+		var ignored string
+		if err := rows.Scan(&w.Repo, &w.Version, &w.Content, &loaded, &checked, &w.Error, &ignored); err != nil {
+			return nil, err
+		}
+		if loaded > 0 {
+			w.Loaded = time.UnixMilli(loaded).UTC()
+		}
+		if checked > 0 {
+			w.Checked = time.UnixMilli(checked).UTC()
+		}
+		if ignored != "" {
+			w.Ignored = strings.Split(ignored, "\n")
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// SaveWorkflow stores what ochell knows about the WORKFLOW.md of a
+// repository, in the place of what was stored.
+func (s *Store) SaveWorkflow(w Workflow) error {
+	var loaded, checked int64
+	if !w.Loaded.IsZero() {
+		loaded = ms(w.Loaded)
+	}
+	if !w.Checked.IsZero() {
+		checked = ms(w.Checked)
+	}
+	// One line each: a reason never has a line break of its own.
+	ignored := make([]string, len(w.Ignored))
+	for i, line := range w.Ignored {
+		ignored[i] = strings.Join(strings.Fields(line), " ")
+	}
+	_, err := s.db.Exec(`INSERT INTO workflows (repo, version, content, loaded_at, checked_at, error, ignored) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (repo) DO UPDATE SET version = excluded.version, content = excluded.content, loaded_at = excluded.loaded_at,
+			checked_at = excluded.checked_at, error = excluded.error, ignored = excluded.ignored`,
+		w.Repo, w.Version, w.Content, loaded, checked, w.Error, strings.Join(ignored, "\n"))
+	return err
+}
+
 // Run is the stored record of one run.
 type Run struct {
 	ID          string
@@ -1771,12 +1870,12 @@ func (s *Store) Run(id string) (*Run, error) {
 	res := &r.Result
 	err := s.db.QueryRow(`SELECT source, key, status, attempt, tier, policy_version, outcome, exit_code, error, log_file,
 			workdir, resumed, agent_session, message, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			signal, signal_message, pr_url, branch, session_cost_usd, escalation, phase, prompt_hash, grants
+			signal, signal_message, pr_url, branch, session_cost_usd, escalation, phase, prompt_hash, grants, workflow
 		FROM runs WHERE id = ?`, id).
 		Scan(&r.Source, &r.Key, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &outcome, &exit, &msg, &res.LogFile,
 			&res.Workdir, &res.Resumed, &res.SessionID, &res.Message, &res.CostUSD,
 			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
-			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD, &res.Escalation, &res.Phase, &res.PromptHash, &res.Grants)
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD, &res.Escalation, &res.Phase, &res.PromptHash, &res.Grants, &res.Workflow)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

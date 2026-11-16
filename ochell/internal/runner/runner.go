@@ -34,6 +34,7 @@ import (
 	"ochell/internal/store"
 	"ochell/internal/task"
 	"ochell/internal/ticket"
+	"ochell/internal/workflow"
 )
 
 var (
@@ -101,6 +102,10 @@ type Runner struct {
 	// (it has access to GitHub): a ticket whose run handed a pull request
 	// over waits for them before it is in review.
 	followChecks bool
+	// wfCfg says what a repository's WORKFLOW.md may add, and wfSrc reads
+	// the file; nil: no repository's file is looked at (workflow.go).
+	wfCfg config.Workflow
+	wfSrc WorkflowSource
 	// grants holds what each run in progress was granted, by task id, for
 	// the workspace hooks of that run. Guarded by mu.
 	grants map[string]*granted
@@ -536,6 +541,8 @@ type Status struct {
 	// pause", one line each: a pause in the policy file or of a tier, and
 	// each throttle that has reached its limit.
 	Holds []string `json:"holds,omitempty"`
+	// Workflows are the repositories whose WORKFLOW.md ochell has read.
+	Workflows []WorkflowStatus `json:"workflows,omitempty"`
 }
 
 func (r *Runner) Status() (Status, error) {
@@ -569,6 +576,9 @@ func (r *Runner) Status() (Status, error) {
 	}
 	for _, repo := range repos {
 		st.Holds = append(st.Holds, fmt.Sprintf("throttle max_open_prs_per_repo: %d pull requests of the bot are open in %s; tickets that would open another wait", max, repo))
+	}
+	if st.Workflows, err = r.workflows(); err != nil {
+		return st, err
 	}
 	st.Queued, st.Running, err = r.store.Counts()
 	return st, err
@@ -946,15 +956,18 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	}
 	r.mu.Unlock()
 
+	// What holds for this run: the ticket's tier, narrowed by the
+	// WORKFLOW.md of its repository as the default branch has it now.
+	wf := r.flow(ctx, t, log)
 	// A ticket whose tier requires an approved plan, and has none, gets a
 	// run that only plans.
-	if r.policy.Tier(t.Tier).PlanGate == policy.PlanGateRequired && !t.PlanApproved {
+	if wf.Tier.PlanGate == policy.PlanGateRequired && !t.PlanApproved {
 		t.Phase = task.PhasePlan
 	}
 	// A ticket that has used up the budget of its tier is not started, by
 	// whatever asked for this run. Otherwise the run gets what is left.
 	var res task.Result
-	if spent, budget, over := r.budget(t, log); over {
+	if spent, budget, over := r.budget(t, wf.Tier, log); over {
 		res = task.Result{Outcome: task.OutcomeOverBudget, ExitCode: -1,
 			Err: fmt.Errorf("the run was not started: the ticket has cost %s of its budget of %s (tier %s)", usd(spent), usd(budget), t.Tier)}
 	} else {
@@ -963,8 +976,9 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 				log.Warn("start notification failed", "err", err)
 			}
 		}
-		res = r.Run(ctx, t)
+		res = r.run(ctx, t, wf)
 	}
+	res.Workflow = wf.version
 	r.mu.Lock()
 	by, stopped := r.stops[k]
 	closed := r.closing[k]
@@ -1037,8 +1051,10 @@ func usd(v float64) string { return fmt.Sprintf("%.2f USD", v) }
 // budget sets the limits of the run of t from the ticket's tier:
 // t.MaxTurns, and t.BudgetUSD, which is what the ticket has left of the
 // tier's budget. over says that nothing is left.
-func (r *Runner) budget(t *task.Task, log *slog.Logger) (spent, budget float64, over bool) {
-	tier := r.policy.Tier(t.Tier)
+//
+// tier is the ticket's tier as it holds for this run. A repository's
+// WORKFLOW.md can have lowered its turns; the budget is the policy's alone.
+func (r *Runner) budget(t *task.Task, tier policy.Tier, log *slog.Logger) (spent, budget float64, over bool) {
 	t.MaxTurns = tier.MaxTurns
 	budget = tier.BudgetUSD
 	if budget <= 0 {
@@ -1144,10 +1160,13 @@ type promptView struct {
 // command renders the prompt and the arguments of a run, and asks the
 // adapter for the command. With resume it continues the ticket's session,
 // and the prompt says so; the adapter may answer agent.ErrNoResume.
-func (r *Runner) command(t *task.Task, view promptView, resume bool, mcpConfig string) (agent.Command, error) {
+//
+// prompt is the template of the run: the host's, or that of the
+// repository's WORKFLOW.md.
+func (r *Runner) command(t *task.Task, prompt *template.Template, view promptView, resume bool, mcpConfig string) (agent.Command, error) {
 	view.RunContext = runContext(t, resume)
 	var err error
-	if t.Prompt, err = render(r.prompt, view); err != nil {
+	if t.Prompt, err = render(prompt, view); err != nil {
 		return agent.Command{}, fmt.Errorf("render prompt: %w", err)
 	}
 	args := make([]string, 0, len(r.args))
@@ -1177,6 +1196,11 @@ type waitResult struct {
 // Run renders the prompt and executes the agent synchronously. Cancelling
 // ctx stops the agent with all its processes.
 func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
+	return r.run(ctx, t, r.flow(ctx, t, r.log))
+}
+
+// run is Run under what wf says holds for the run.
+func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Result) {
 	start := time.Now()
 	res.ExitCode = -1
 	res.Outcome = task.OutcomeNotStarted
@@ -1219,14 +1243,18 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	res.Grants = g.describe()
 
 	view := promptView{Task: t, ResultFile: resultFile, ResultInstructions: result.Instructions}
+	prompt := r.prompt
+	if wf.prompt != nil {
+		prompt = wf.prompt
+	}
 	var cmd agent.Command
 	err = agent.ErrNoResume
 	if t.AgentSession != "" && t.Workspace == dir {
-		cmd, err = r.command(t, view, true, g.mcpConfig)
+		cmd, err = r.command(t, prompt, view, true, g.mcpConfig)
 		res.Resumed = err == nil
 	}
 	if errors.Is(err, agent.ErrNoResume) {
-		cmd, err = r.command(t, view, false, g.mcpConfig)
+		cmd, err = r.command(t, prompt, view, false, g.mcpConfig)
 	}
 	if err != nil {
 		res.Err = fmt.Errorf("build the agent command: %w", err)
@@ -1256,8 +1284,15 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	if res.Resumed {
 		session = "resumed " + t.AgentSession
 	}
-	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s tier=%s phase=%s\n# command=%s (%d args) workdir=%s session=%s\n# prompt:\n%s\n",
-		t.ID, t.Source, t.Key, t.URL, t.Tier, phaseName(t.Phase), r.cfg.Command, len(cmd.Args), dir, session, t.Prompt)
+	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s tier=%s phase=%s\n# command=%s (%d args) workdir=%s session=%s\n",
+		t.ID, t.Source, t.Key, t.URL, t.Tier, phaseName(t.Phase), r.cfg.Command, len(cmd.Args), dir, session)
+	if wf.version != "" {
+		fmt.Fprintf(lf, "# workflow=%s (%s of %s, from its default branch)\n", wf.version, workflow.FileName, t.Repo)
+	}
+	for _, note := range wf.notes {
+		fmt.Fprintf(lf, "# workflow: %s\n", note)
+	}
+	fmt.Fprintf(lf, "# prompt:\n%s\n", t.Prompt)
 	// signal is what the footer of the log says about the result file.
 	signal := "none"
 	defer func() {
@@ -1270,7 +1305,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 
 	// The workspace hooks come first. If one fails, the agent is not
 	// started in a directory that is not ready.
-	if err := r.prepare(ctx, t, dir, runName, lf); err != nil {
+	if err := r.prepare(ctx, t, dir, runName, lf, wf); err != nil {
 		res.Err = err
 		if ctx.Err() != nil {
 			res.Outcome = task.OutcomeStopped
@@ -1362,6 +1397,9 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	case rep.OverTurns:
 		res.Outcome = task.OutcomeOverTurns
 		res.Err = fmt.Errorf("the run was stopped: it reached the limit of %d turns of the tier %s", t.MaxTurns, t.Tier)
+		if t.MaxTurns != r.policy.Tier(t.Tier).MaxTurns {
+			res.Err = fmt.Errorf("the run was stopped: it reached the limit of %d turns that the %s of the repository sets (tier %s)", t.MaxTurns, workflow.FileName, t.Tier)
+		}
 	case w.err != nil:
 		res.Outcome = task.OutcomeFailed
 		res.Err = w.err
@@ -1379,7 +1417,7 @@ func (r *Runner) Run(ctx context.Context, t *task.Task) (res task.Result) {
 	// after_run follows every run in which the agent was started, but not
 	// one that a shutdown cut short. It does not change how the run ended.
 	if res.Outcome != task.OutcomeNotStarted && ctx.Err() == nil {
-		if err := r.hook(ctx, "after_run", t, dir, runName, lf); err != nil {
+		if err := r.hooks(ctx, "after_run", t, dir, runName, lf, wf); err != nil {
 			r.log.Warn("after_run hook failed", "task", t.ID, "err", err)
 		}
 	}

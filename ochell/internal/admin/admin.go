@@ -362,8 +362,9 @@ func OutcomesText(list []store.Outcomes, since, until time.Time) string {
 }
 
 // describe is what pause, resume and status answer with: one line
-// that says whether runs start and how many are queued and running, and a
-// line for everything that holds runs back.
+// that says whether runs start and how many are queued and running, a
+// line for everything that holds runs back, and a line for everything in
+// a repository's WORKFLOW.md that is not in force.
 func describe(st runner.Status) string {
 	state := "running"
 	if st.Paused {
@@ -372,6 +373,15 @@ func describe(st runner.Status) string {
 	out := fmt.Sprintf("%s; %d queued, %d running", state, st.Queued, st.Running)
 	for _, h := range st.Holds {
 		out += "\nheld: " + h
+	}
+	// What of a repository's WORKFLOW.md is not in force.
+	for _, w := range st.Workflows {
+		if w.Error != "" {
+			out += "\nworkflow " + w.Repo + ": " + w.Error
+		}
+		for _, line := range w.Ignored {
+			out += "\nworkflow " + w.Repo + ": " + line
+		}
 	}
 	return out
 }

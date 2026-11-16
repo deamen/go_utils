@@ -116,6 +116,22 @@ workspace:
   # ticket as closed. Needs root, and {{.Key}} in agent.workdir.
   cleanup: true
 
+# WORKFLOW.md: a repository can say how its tickets are worked, in a file
+# of that name on its default branch (see examples/WORKFLOW.md): the prompt,
+# hooks, the status of the hand-over, and limits stricter than the tier's.
+# ochell reads it through its GitHub access (github.token, which then needs
+# read access to the contents of the repositories) at the start of every
+# run. The file can only narrow the policy; what would widen it is ignored
+# and reported.
+workflow:
+  enabled: false
+  # Let a repository add hooks, which run after the ones above, as the
+  # agent's OS user.
+  allow_hooks: false
+  # The Jira statuses a repository may choose for the hand-over, in the
+  # place of sources.jira_api.review_status. Empty: it cannot choose.
+  review_statuses: []
+
 # The safety net behind the webhooks: at start and then at this interval,
 # ochell asks Jira (needs sources.jira_api) and Linear for the bot's open
 # tickets. It starts a ticket it has never seen, and stops the agent of one

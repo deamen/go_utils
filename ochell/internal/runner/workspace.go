@@ -15,6 +15,7 @@ import (
 	"ochell/internal/config"
 	"ochell/internal/launcher"
 	"ochell/internal/task"
+	"ochell/internal/workflow"
 )
 
 // workspace is the configured life of a ticket's working directory: where
@@ -107,23 +108,42 @@ func (w *workspace) view(t *task.Task) hookView {
 // names the run for the launcher. It returns nil when there is no such
 // hook, and an error that names the hook when it does not succeed.
 func (r *Runner) hook(ctx context.Context, name string, t *task.Task, dir, unit string, out io.Writer) error {
-	tmpl := r.ws.hooks[name]
+	return r.runHook(ctx, name, false, r.ws.hooks[name], t, dir, unit, out)
+}
+
+// hooks runs the host's hook with this name, and after it the one that the
+// WORKFLOW.md of the ticket's repository adds. The repository's hook never
+// takes the place of the host's, and does not run when the host's failed.
+func (r *Runner) hooks(ctx context.Context, name string, t *task.Task, dir, unit string, out io.Writer, wf *flow) error {
+	if err := r.hook(ctx, name, t, dir, unit, out); err != nil {
+		return err
+	}
+	return r.runHook(ctx, name, true, wf.hooks[name], t, dir, unit, out)
+}
+
+// runHook runs the command of one hook. repo says that it is the
+// repository's and not the host's.
+func (r *Runner) runHook(ctx context.Context, name string, repo bool, tmpl []*template.Template, t *task.Task, dir, unit string, out io.Writer) error {
 	if len(tmpl) == 0 {
 		return nil
+	}
+	label, id := name, unit+"."+name
+	if repo {
+		label, id = name+" of "+workflow.FileName, id+".repo"
 	}
 	view := r.ws.view(t)
 	argv := make([]string, len(tmpl))
 	for i, a := range tmpl {
 		s, err := render(a, view)
 		if err != nil {
-			return fmt.Errorf("workspace hook %s: %w", name, err)
+			return fmt.Errorf("workspace hook %s: %w", label, err)
 		}
 		argv[i] = s
 	}
 	start := time.Now()
-	fmt.Fprintf(out, "# ---- hook %s: %s (%d args) ----\n", name, argv[0], len(argv)-1)
+	fmt.Fprintf(out, "# ---- hook %s: %s (%d args) ----\n", label, argv[0], len(argv)-1)
 	spec := launcher.Spec{
-		TaskID:  unit + "." + name,
+		TaskID:  id,
 		Command: argv[0],
 		Args:    argv[1:],
 		Dir:     dir,
@@ -147,18 +167,18 @@ func (r *Runner) hook(ctx context.Context, name string, t *task.Task, dir, unit 
 	case w.code != 0:
 		err = fmt.Errorf("exit status %d", w.code)
 	}
-	fmt.Fprintf(out, "\n# ---- hook %s: err=%v duration=%s ----\n", name, err, time.Since(start).Round(time.Millisecond))
+	fmt.Fprintf(out, "\n# ---- hook %s: err=%v duration=%s ----\n", label, err, time.Since(start).Round(time.Millisecond))
 	if err != nil {
-		return fmt.Errorf("workspace hook %s: %w", name, err)
+		return fmt.Errorf("workspace hook %s: %w", label, err)
 	}
 	return nil
 }
 
 // prepare runs the hooks that come before the agent: after_create once for
 // a working directory, before_run every time.
-func (r *Runner) prepare(ctx context.Context, t *task.Task, dir, unit string, out io.Writer) error {
-	if len(r.ws.hooks["after_create"]) > 0 && t.PreparedWorkspace != dir {
-		if err := r.hook(ctx, "after_create", t, dir, unit, out); err != nil {
+func (r *Runner) prepare(ctx context.Context, t *task.Task, dir, unit string, out io.Writer, wf *flow) error {
+	if len(r.ws.hooks["after_create"])+len(wf.hooks["after_create"]) > 0 && t.PreparedWorkspace != dir {
+		if err := r.hooks(ctx, "after_create", t, dir, unit, out, wf); err != nil {
 			return err
 		}
 		t.PreparedWorkspace = dir
@@ -166,7 +186,7 @@ func (r *Runner) prepare(ctx context.Context, t *task.Task, dir, unit string, ou
 			return fmt.Errorf("record the prepared working directory: %w", err)
 		}
 	}
-	return r.hook(ctx, "before_run", t, dir, unit, out)
+	return r.hooks(ctx, "before_run", t, dir, unit, out, wf)
 }
 
 // ticketLocks serialises what happens in the working directory of one

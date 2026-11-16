@@ -30,7 +30,7 @@ type workspaceRunner struct {
 	marks string
 }
 
-func newWorkspaceRunner(t *testing.T, ws config.Workspace) *workspaceRunner {
+func newWorkspaceRunner(t *testing.T, ws config.Workspace, setup ...func(*Runner)) *workspaceRunner {
 	t.Helper()
 	dir := t.TempDir()
 	w := &workspaceRunner{root: filepath.Join(dir, "work"), marks: filepath.Join(dir, "marks"), st: testStore(t)}
@@ -53,6 +53,9 @@ func newWorkspaceRunner(t *testing.T, ws config.Workspace) *workspaceRunner {
 	}
 	w.Runner, w.done = r, &finished{done: make(chan string, 8)}
 	r.SetNotifier(w.done)
+	for _, f := range setup {
+		f(r)
+	}
 	if err := r.Start(); err != nil {
 		t.Fatal(err)
 	}

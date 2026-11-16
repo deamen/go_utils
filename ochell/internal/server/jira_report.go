@@ -130,7 +130,7 @@ func (s *Server) jiraRunFinished(ctx context.Context, t *task.Task, res task.Res
 		return err
 	}
 	// Only finished work is handed to the reviewers.
-	status := s.cfg.Sources.JiraAPI.ReviewStatus
+	status := s.reviewStatus(t.Source, t.Key)
 	if status == "" || res.Err != nil || res.Signal != result.Done || res.AwaitChecks {
 		return nil
 	}
@@ -138,4 +138,14 @@ func (s *Server) jiraRunFinished(ctx context.Context, t *task.Task, res task.Res
 		return fmt.Errorf("move %s to %q: %w", t.Key, status, err)
 	}
 	return nil
+}
+
+// reviewStatus is the Jira status a ticket is moved to at the hand-over:
+// the one that the WORKFLOW.md of its repository chooses, when the host
+// lets it, and else sources.jira_api.review_status.
+func (s *Server) reviewStatus(source, key string) string {
+	if status := s.runner.ReviewStatus(source, key); status != "" {
+		return status
+	}
+	return s.cfg.Sources.JiraAPI.ReviewStatus
 }

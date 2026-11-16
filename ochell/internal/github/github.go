@@ -7,6 +7,7 @@ package github
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,6 +83,87 @@ func ParseURL(raw, host string) (Ref, error) {
 	}
 	n, _ := strconv.Atoi(m[3])
 	return Ref{Owner: m[1], Repo: strings.TrimSuffix(m[2], ".git"), Number: n}, nil
+}
+
+var (
+	scpRepo  = regexp.MustCompile(`^(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9.-]+):([^/:]+)/([^/]+)$`)
+	repoPath = regexp.MustCompile(`^/([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+)$`)
+)
+
+// ParseRepo reads the owner and the name of a repository out of its
+// address, as git clone takes it: https://host/owner/repo.git,
+// ssh://git@host/owner/repo.git or git@host:owner/repo.git. It is an error
+// when the address is not a repository on host.
+func ParseRepo(raw, host string) (owner, repo string, err error) {
+	raw = strings.TrimSpace(raw)
+	var at, path string
+	if m := scpRepo.FindStringSubmatch(raw); m != nil && !strings.Contains(raw, "://") {
+		at, path = m[1], "/"+m[2]+"/"+m[3]
+	} else if u, perr := url.Parse(raw); perr == nil && u.Host != "" {
+		at, path = u.Hostname(), u.Path
+	} else {
+		return "", "", fmt.Errorf("%q is not the address of a repository", raw)
+	}
+	want := host
+	if u, perr := url.Parse("//" + host); perr == nil && u.Hostname() != "" {
+		want = u.Hostname()
+	}
+	if !strings.EqualFold(at, want) {
+		return "", "", fmt.Errorf("%q is not on %s", raw, host)
+	}
+	m := repoPath.FindStringSubmatch(strings.TrimSuffix(strings.TrimSuffix(path, "/"), ".git"))
+	if m == nil {
+		return "", "", fmt.Errorf("%q is not the address of a repository", raw)
+	}
+	return m[1], m[2], nil
+}
+
+// File is a file of a repository, as its default branch has it.
+type File struct {
+	Content []byte
+	// SHA is the hash that git gives the content.
+	SHA string
+}
+
+// File reads one file from the default branch of a repository: no branch
+// is named, and GitHub then answers from the default one. A file of more
+// than limit bytes, and anything that is not a file, is an error.
+func (c *Client) File(ctx context.Context, owner, repo, path string, limit int) (*File, error) {
+	var in struct {
+		Type     string `json:"type"`
+		Encoding string `json:"encoding"`
+		Size     int    `json:"size"`
+		Content  string `json:"content"`
+		SHA      string `json:"sha"`
+	}
+	ref := Ref{Owner: owner, Repo: repo}
+	if err := c.get(ctx, ref.path("/contents/"+url.PathEscape(path)), &in); err != nil {
+		return nil, err
+	}
+	switch {
+	case in.Type != "file":
+		return nil, fmt.Errorf("github api: %s in %s/%s is not a file", path, owner, repo)
+	case in.Size > limit:
+		return nil, fmt.Errorf("github api: %s in %s/%s has %d bytes; at most %d are read", path, owner, repo, in.Size, limit)
+	case in.Encoding != "base64":
+		return nil, fmt.Errorf("github api: %s in %s/%s: unknown encoding %q", path, owner, repo, in.Encoding)
+	}
+	// GitHub breaks the encoded content into lines.
+	content, err := base64.StdEncoding.DecodeString(strings.NewReplacer("\n", "", "\r", "").Replace(in.Content))
+	if err != nil {
+		return nil, fmt.Errorf("github api: %s in %s/%s: %w", path, owner, repo, err)
+	}
+	if len(content) > limit {
+		return nil, fmt.Errorf("github api: %s in %s/%s has %d bytes; at most %d are read", path, owner, repo, len(content), limit)
+	}
+	return &File{Content: content, SHA: in.SHA}, nil
+}
+
+// Repository asks whether the token can see a repository. NotFound tells
+// the error for one that it cannot see, or that does not exist.
+func (c *Client) Repository(ctx context.Context, owner, repo string) error {
+	var in struct{}
+	return c.get(ctx, Ref{Owner: owner, Repo: repo}.path(""), &in)
 }
 
 // PullRequest is what ochell wants to know about a pull request.
