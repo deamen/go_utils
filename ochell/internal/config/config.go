@@ -79,11 +79,33 @@ type Agent struct {
 	// result file for ochell. The agent must be able to write there and
 	// ochell to read; it must not be inside a working directory.
 	RunDir string `yaml:"run_dir"`
+	// TokenExpires is the day on which the agent's own credential stops
+	// working, as YYYY-MM-DD: for Claude Code, a token from "claude
+	// setup-token" lasts one year. ochell cannot read the token; this is
+	// where the operator notes its end. Empty: not known.
+	TokenExpires string `yaml:"token_expires"`
+	// TokenWarnDays is how many days before TokenExpires ochell starts to
+	// warn in its log.
+	TokenWarnDays int `yaml:"token_warn_days"`
 	// SecretsDir is a directory of ochell's own in which the systemd
 	// launcher puts, for the time of a run, the file with the run's
 	// credentials (the grants of its tier). Nobody but ochell and root may
 	// read it; the agent must not.
 	SecretsDir string `yaml:"secrets_dir"`
+}
+
+// TokenExpiry returns the day on which the agent's credential stops
+// working, as the configuration notes it: the end of that day, UTC. The
+// zero time means that it is not noted.
+func (a Agent) TokenExpiry() (time.Time, error) {
+	if a.TokenExpires == "" {
+		return time.Time{}, nil
+	}
+	day, err := time.Parse("2006-01-02", a.TokenExpires)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("agent.token_expires must be a date such as 2027-11-13, not %q", a.TokenExpires)
+	}
+	return day.Add(24 * time.Hour), nil
 }
 
 // Retry configures the retry of runs that failed for a reason outside the
@@ -390,6 +412,16 @@ type Backup struct {
 	Keep int `yaml:"keep"`
 }
 
+// Metrics configures the metrics endpoint: counters and gauges about the
+// runs, in the Prometheus text format, at GET /metrics on the listeners of
+// the webhooks.
+type Metrics struct {
+	Enabled bool `yaml:"enabled"`
+	// Token is what a scrape must send as "Authorization: Bearer <token>".
+	// The agent runs on the same host and can reach any local port.
+	Token string `yaml:"token"`
+}
+
 // Poller configures the safety net behind the webhooks: ochell asks each
 // tracker for the bot's open tickets, at start and then at this interval.
 type Poller struct {
@@ -415,6 +447,7 @@ type Config struct {
 	Poller      Poller      `yaml:"poller"`
 	Retention   Retention   `yaml:"retention"`
 	Backup      Backup      `yaml:"backup"`
+	Metrics     Metrics     `yaml:"metrics"`
 	Agent       Agent       `yaml:"agent"`
 	Sources     Sources     `yaml:"sources"`
 	IPAllowlist IPAllowlist `yaml:"ip_allowlist"`
@@ -514,6 +547,7 @@ func Default() *Config {
 			QueueSize:     100,
 			LogDir:        "logs",
 			RunDir:        "runs",
+			TokenWarnDays: 30,
 			SecretsDir:    "secrets",
 		},
 		Sources: Sources{
@@ -801,6 +835,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Backup.Keep < 0 {
 		errs = append(errs, errors.New("backup.keep must not be negative; 0 keeps every backup"))
+	}
+	if c.Metrics.Enabled && len(c.Metrics.Token) < 16 {
+		errs = append(errs, errors.New("metrics.token is required when the metrics endpoint is enabled, with at least 16 characters"))
+	}
+	if _, err := c.Agent.TokenExpiry(); err != nil {
+		errs = append(errs, err)
+	}
+	if c.Agent.TokenWarnDays < 0 {
+		errs = append(errs, errors.New("agent.token_warn_days must not be negative"))
 	}
 	if c.Poller.Interval < 0 {
 		errs = append(errs, errors.New("poller.interval must not be negative; 0s turns the poller off"))

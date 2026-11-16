@@ -4256,3 +4256,102 @@ func TestBackupAndRestore(t *testing.T) {
 		t.Errorf("a second restore: exit %d, %q", code, out)
 	}
 }
+
+// The metrics endpoint reports its values during a run, needs its token,
+// and a token of the agent that expires within the warning period
+// produces a warning in the log.
+func TestMetricsEndpoint(t *testing.T) {
+	const metricsToken = "e2e-metrics-token-01"
+	soon := time.Now().UTC().Add(10 * 24 * time.Hour).Format("2006-01-02")
+	script := append(OnRun(1, Report("done", "Done.")), OnRun(2, Step{Eprint: "broken"}, Exit(1))...)
+	script = append(script, OnRun(3, Step{Print: "working"}, Step{Sleep: "10m"})...)
+	o := Start(t, Options{Script: script, Configure: func(c *config.Config) {
+		c.Metrics = config.Metrics{Enabled: true, Token: metricsToken}
+		c.Agent.TokenExpires, c.Agent.TokenWarnDays = soon, 30
+	}})
+	scrape := func() map[string]float64 {
+		t.Helper()
+		code, body := o.get("/metrics", metricsToken, false)
+		if code != 200 {
+			t.Fatalf("GET /metrics: %d %s", code, body)
+		}
+		out := map[string]float64{}
+		for _, line := range strings.Split(body, "\n") {
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			i := strings.LastIndexByte(line, ' ')
+			v, err := strconv.ParseFloat(line[i+1:], 64)
+			if err != nil {
+				t.Fatalf("the line %q is no sample", line)
+			}
+			out[line[:i]] = v
+		}
+		return out
+	}
+	expect := func(m map[string]float64, want map[string]float64) {
+		t.Helper()
+		for name, v := range want {
+			if got, ok := m[name]; !ok || got != v {
+				t.Errorf("%s = %v (there: %v), want %v", name, got, ok, v)
+			}
+		}
+	}
+
+	// Before anything ran.
+	expect(scrape(), map[string]float64{
+		"ochell_queue_length": 0, "ochell_runs_running": 0, "ochell_paused": 0, "ochell_run_failures_total": 0,
+		`ochell_runs_ended_total{outcome="finished"}`: 0, "ochell_run_duration_seconds_count": 0,
+	})
+	// A run that succeeds, one that fails, one that is running, and one
+	// that waits behind it.
+	o.WaitRun(o.LinearCreated("ENG-230", "s-1", "").TaskID(t), 15*time.Second)
+	o.WaitRun(o.LinearCreated("ENG-231", "s-2", "").TaskID(t), 15*time.Second)
+	o.LinearCreated("ENG-232", "s-3", "")
+	o.WaitRecords(3, 15*time.Second)
+	o.LinearCreated("ENG-233", "s-4", "")
+	var m map[string]float64
+	o.waitFor(10*time.Second, "the metrics to show the queue", func() bool {
+		m = scrape()
+		return m["ochell_queue_length"] == 1 && m["ochell_runs_running"] == 1
+	})
+	expect(m, map[string]float64{
+		`ochell_runs_started_total{cause="assigned"}`: 3,
+		`ochell_runs_ended_total{outcome="finished"}`: 1, `ochell_runs_ended_total{outcome="failed"}`: 1,
+		"ochell_run_failures_total": 1, "ochell_run_retries_total": 0,
+		"ochell_run_duration_seconds_count": 2, `ochell_run_duration_seconds_bucket{le="60"}`: 2, `ochell_run_duration_seconds_bucket{le="+Inf"}`: 2,
+		`ochell_tickets{state="in_review"}`: 1, `ochell_tickets{state="failed"}`: 1, `ochell_tickets{state="running"}`: 1, `ochell_tickets{state="queued"}`: 1,
+		"ochell_cost_usd_total": 0, "ochell_agent_token_days_left": 10,
+	})
+	if m["ochell_run_duration_seconds_sum"] <= 0 || m["ochell_agent_token_expiry_timestamp_seconds"] < float64(time.Now().Unix()) {
+		t.Errorf("duration sum %v, token expiry %v", m["ochell_run_duration_seconds_sum"], m["ochell_agent_token_expiry_timestamp_seconds"])
+	}
+	// A pause shows.
+	o.Admin("pause")
+	expect(scrape(), map[string]float64{"ochell_paused": 1})
+
+	// The endpoint needs its own token.
+	for _, token := range []string{"", "not-the-token-000000", LinearToken} {
+		if code, body := o.get("/metrics", token, false); code != 401 || strings.Contains(body, "ochell_") {
+			t.Errorf("GET /metrics with the token %q: %d", token, code)
+		}
+	}
+
+	// The agent's token expires in ten days, within the warning period.
+	if !strings.Contains(o.Output(), "level=WARN") || !strings.Contains(o.Output(), "the agent's token expires in 11 day(s), on "+soon) && !strings.Contains(o.Output(), "the agent's token expires in 10 day(s), on "+soon) {
+		t.Errorf("ochell's log has no warning about the token that expires on %s", soon)
+	}
+}
+
+// Without metrics.enabled there is no endpoint, and a token that is far
+// from its end produces no warning.
+func TestMetricsEndpointIsOffByDefault(t *testing.T) {
+	far := time.Now().UTC().Add(200 * 24 * time.Hour).Format("2006-01-02")
+	o := Start(t, Options{Configure: func(c *config.Config) { c.Agent.TokenExpires = far }})
+	if code, _ := o.get("/metrics", "e2e-metrics-token-01", false); code != 404 {
+		t.Errorf("GET /metrics without the endpoint: %d", code)
+	}
+	if strings.Contains(o.Output(), "the agent's token") {
+		t.Error("a warning about a token that is far from its end")
+	}
+}

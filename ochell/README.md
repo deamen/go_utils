@@ -296,6 +296,48 @@ The agent opens a pull request and hands the ticket over; a person reviews and m
   - ochell looks at the first hundred comments of each kind on a pull request.
 - All of this is by polling, every `github.poll_interval`; ochell needs no webhook from GitHub.
 
+### Metrics
+Counters and gauges about the runs, in the Prometheus text format, at `GET /metrics` on the listeners of the webhooks.
+
+```yaml
+metrics:
+  enabled: true
+  token: ${OCHELL_METRICS_TOKEN}
+agent:
+  token_expires: 2027-11-13     # the last day the agent's own token works
+  token_warn_days: 30
+```
+
+| Metric | Type | What it counts |
+|---|---|---|
+| `ochell_runs_started_total{cause}` | counter | runs that were started, by why they were queued: `assigned`, `retry`, `stalled`, `recovery`, `follow_up`, `poll`, … |
+| `ochell_runs_ended_total{outcome}` | counter | runs that have ended, by outcome |
+| `ochell_run_failures_total` | counter | runs that failed, timed out, stalled or could not be started |
+| `ochell_run_retries_total` | counter | runs that ochell started by itself after a temporary failure or a stall |
+| `ochell_run_duration_seconds` | histogram | how long the runs took (buckets of 1, 5, 15, 30, 60 and 120 minutes) |
+| `ochell_cost_usd_total`, `ochell_tokens_total{kind}` | counter | what the runs cost, as the agent reports it |
+| `ochell_queue_length`, `ochell_runs_running` | gauge | runs that wait, and runs that are going on |
+| `ochell_tickets{state}` | gauge | tickets by state |
+| `ochell_paused` | gauge | 1 while ochell is paused |
+| `ochell_agent_token_expiry_timestamp_seconds`, `ochell_agent_token_days_left` | gauge | the end of the agent's token, with `agent.token_expires` |
+| `ochell_build_info{version}` | gauge | always 1 |
+
+- **Every scrape needs the token** (`Authorization: Bearer <metrics.token>`, at least 16 characters), because the agent runs on the same host and can reach any local port. It is a token of its own: a scraper does not need [the status API](#the-status-api)'s, which opens ticket text.
+
+  ```yaml
+  # prometheus.yml
+  scrape_configs:
+    - job_name: ochell
+      authorization: {credentials_file: /etc/prometheus/ochell-metrics-token}
+      static_configs: [{targets: ["127.0.0.1:8080"]}]
+  ```
+- **The numbers are counted from the store at each scrape.** They are the same after a restart, and a counter never goes back.
+- **The agent's token.** ochell cannot read the agent's own credential (it is in the launcher's root-only environment file), so the operator notes its last day in `agent.token_expires`. A token from `claude setup-token` lasts one year, and every run fails once it has expired.
+  - From `agent.token_warn_days` (30) before that day, ochell logs a warning at start and then once a day; after it, an error.
+  - Alert on `ochell_agent_token_days_left`.
+  - Set the new date when you renew the token.
+- Without `metrics.enabled` there is no endpoint.
+
 ### Backup and restore
 The store holds what cannot be rebuilt from the trackers: the agents' session ids, the messages that wait for a run, and the record of every run. ochell backs it up itself.
 
@@ -1012,6 +1054,7 @@ Notes:
   - Ticket keys must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` before they are used in file names or templates.
   - Signatures and tokens are compared in constant time.
 - **Agent environment:** the agent gets an allowlisted environment, not ochell's own (see [Agent environment](#agent-environment)).
+- **Metrics:** the endpoint needs its own token on every scrape (see [Metrics](#metrics)).
 - **Status API:** it needs its token on every request, also from the same host (see [The status API](#the-status-api)).
 - **Policy:** the tiers and limits are in a file of ochell's own, which the agent must not be able to write (see [Policy and risk tiers](#policy-and-risk-tiers)). Nothing in a ticket or a repository widens them.
 - **Agent OS user:** with the `direct` launcher the agent runs as the same OS user as ochell and can read ochell's files. Deploy with the `systemd` launcher (see [Launchers](#launchers)).

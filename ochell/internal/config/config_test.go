@@ -599,3 +599,39 @@ func TestBackupSettings(t *testing.T) {
 		t.Errorf("a negative keep: %v", err)
 	}
 }
+
+func TestMetricsAndTokenSettings(t *testing.T) {
+	base := func() *Config {
+		cfg := Default()
+		cfg.Sources.JiraAutomation.Enabled = true
+		cfg.Sources.JiraAutomation.Token = "t"
+		return cfg
+	}
+	cfg := base()
+	cfg.Metrics = Metrics{Enabled: true, Token: "0123456789abcdef"}
+	cfg.Agent.TokenExpires = "2027-11-13"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid settings: %v", err)
+	}
+	// The token works through that day.
+	if at, err := cfg.Agent.TokenExpiry(); err != nil || !at.Equal(time.Date(2027, 11, 14, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("TokenExpiry = %v, %v", at, err)
+	}
+	if at, err := base().Agent.TokenExpiry(); err != nil || !at.IsZero() || base().Agent.TokenWarnDays != 30 {
+		t.Errorf("without a date: %v, %v", at, err)
+	}
+	for name, c := range map[string]struct {
+		change func(*Config)
+		want   string
+	}{
+		"no metrics token": {func(c *Config) { c.Metrics.Enabled = true }, "metrics.token is required"},
+		"bad date":         {func(c *Config) { c.Agent.TokenExpires = "13/11/2027" }, "agent.token_expires must be a date"},
+		"negative days":    {func(c *Config) { c.Agent.TokenWarnDays = -1 }, "agent.token_warn_days must not be negative"},
+	} {
+		cfg := base()
+		c.change(cfg)
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
+		}
+	}
+}

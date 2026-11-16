@@ -39,6 +39,13 @@ api:
   token: ${OCHELL_API_TOKEN}
   public_url: ""            # e.g. https://ochell.example.com
 
+# The metrics endpoint: counters and gauges about the runs, in the
+# Prometheus text format, at GET /metrics on the same listener as the
+# webhooks. Every scrape needs the token.
+metrics:
+  enabled: false
+  token: ${OCHELL_METRICS_TOKEN}
+
 # The scheduled backup of the store: a consistent copy at every interval,
 # the newest "keep" of them kept. Put "dir" where the agent cannot read,
 # and copy the backups off the host. Leave "dir" empty for none; "ochell
@@ -156,6 +163,12 @@ agent:
   # {{.ResultInstructions}}, which tells the agent what to write, and
   # {{.RunContext}}, which tells a later attempt about the earlier ones.
   run_dir: /work/runs
+  # The last day on which the agent's own token works. ochell cannot read
+  # the token, so note its end here: a token from "claude setup-token"
+  # lasts one year, and every run fails once it has expired. ochell warns
+  # in its log from token_warn_days before that day.
+  token_expires: ""         # e.g. 2027-11-13
+  token_warn_days: 30
   # A directory of ochell's own, which the agent cannot read. With the
   # systemd launcher, the credentials that a tier grants its runs are in a
   # file here for the time of a run.
