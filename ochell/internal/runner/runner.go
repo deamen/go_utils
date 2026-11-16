@@ -29,6 +29,7 @@ import (
 	"ochell/internal/agent"
 	"ochell/internal/config"
 	"ochell/internal/launcher"
+	"ochell/internal/mcp"
 	"ochell/internal/policy"
 	"ochell/internal/result"
 	"ochell/internal/store"
@@ -113,6 +114,12 @@ type Runner struct {
 	// grants holds what each run in progress was granted, by task id, for
 	// the workspace hooks of that run. Guarded by mu.
 	grants map[string]*granted
+	// tools is ochell's own MCP server with the ticket tools, toolsURL its
+	// address for an agent, and ownSecrets what ochell itself reaches the
+	// trackers with; nil: the host has the tools turned off (tools.go).
+	tools      *mcp.Server
+	toolsURL   string
+	ownSecrets []string
 	// raised holds, for a ticket whose run is being stopped because the
 	// ticket moved to a higher tier, that tier. Guarded by mu.
 	raised map[string]string
@@ -207,6 +214,17 @@ func (r *Runner) UsePolicy(p *policy.Policy) error {
 			if t.MaxTurns > 0 {
 				return fmt.Errorf("the policy sets max_turns for the tier %s, but agent.adapter %s cannot stop a run at a limit: use agent.adapter claude, or take max_turns out of the policy", t.Name, r.cfg.Adapter)
 			}
+		}
+	}
+	for _, t := range p.Tiers {
+		if !t.Grants.TicketTools {
+			continue
+		}
+		if r.tools == nil {
+			return fmt.Errorf("the policy grants the tier %s the ticket tools (grants.ticket_tools), but the host has them turned off: set ticket_tools.enabled in the configuration, or take the grant out of the policy", t.Name)
+		}
+		if r.cfg.Adapter == "claude" && t.Grants.MCPConfig == "" {
+			return fmt.Errorf("the policy grants the tier %s the ticket tools, but no grants.mcp_config: Claude Code finds ochell's server in that file (see examples/mcp-ticket-tools.json)", t.Name)
 		}
 	}
 	r.policy = p
@@ -1256,6 +1274,10 @@ type promptView struct {
 	// RunContext says what only ochell knows about this run (runContext).
 	// It is empty when there is nothing to say.
 	RunContext string
+	// TicketTools says that the run has ochell's ticket tools, so that a
+	// template can leave out what it says about another ticket tool. The
+	// run context says how to use them.
+	TicketTools bool
 }
 
 // command renders the prompt and the arguments of a run, and asks the
@@ -1266,6 +1288,9 @@ type promptView struct {
 // repository's WORKFLOW.md.
 func (r *Runner) command(t *task.Task, prompt *template.Template, view promptView, resume bool, mcpConfig string) (agent.Command, error) {
 	view.RunContext = runContext(t, resume)
+	if view.TicketTools {
+		view.RunContext = withNote(view.RunContext, toolsNote)
+	}
 	var err error
 	if t.Prompt, err = render(prompt, view); err != nil {
 		return agent.Command{}, fmt.Errorf("render prompt: %w", err)
@@ -1342,8 +1367,16 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	// No secret of the run goes into the log or to the ticket.
 	rd := newRedactor(g.secrets)
 	res.Grants = g.describe()
+	if g.toolsToken != "" {
+		// From here until the run has ended, its token opens its ticket.
+		if err := r.tools.Open(g.toolsToken, mcp.Run{TaskID: t.ID, Source: t.Source, Key: t.Key, Redact: rd.text}); err != nil {
+			res.Err = fmt.Errorf("%w: %v", errGrant, err)
+			return res
+		}
+		defer r.tools.Close(g.toolsToken)
+	}
 
-	view := promptView{Task: t, ResultFile: resultFile, ResultInstructions: result.Instructions}
+	view := promptView{Task: t, ResultFile: resultFile, ResultInstructions: result.Instructions, TicketTools: g.toolsToken != ""}
 	prompt := r.prompt
 	if wf.prompt != nil {
 		prompt = wf.prompt

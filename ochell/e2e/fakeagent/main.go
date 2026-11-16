@@ -9,13 +9,16 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -47,6 +50,10 @@ type Step struct {
 	WaitFile string `json:"wait_file,omitempty"`
 	// IgnoreTerm makes the agent survive SIGTERM from here on.
 	IgnoreTerm bool `json:"ignore_term,omitempty"`
+	// MCP sends one request to the MCP server "ochell" of the run's MCP
+	// configuration, as an agent CLI does, and notes the answer in the
+	// record.
+	MCP *MCP `json:"mcp,omitempty"`
 	// Exit ends the run with this status.
 	Exit *int `json:"exit,omitempty"`
 	// OnRun limits the step to one run of the fake agent: 1 is the first
@@ -58,6 +65,28 @@ type Step struct {
 type File struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+}
+
+// MCP is one request to ochell's MCP server.
+type MCP struct {
+	// Method is the method of the protocol, such as "tools/list". With
+	// Tool set it is "tools/call" for that tool, with Args.
+	Method string         `json:"method,omitempty"`
+	Tool   string         `json:"tool,omitempty"`
+	Args   map[string]any `json:"args,omitempty"`
+	// TokenFile, when set, holds the token to send in the place of the
+	// run's own. $NAME in the path is replaced from the environment.
+	TokenFile string `json:"token_file,omitempty"`
+}
+
+// Answer is what the server said to one MCP step.
+type Answer struct {
+	Request string `json:"request"`
+	// Status is the HTTP status, and Body the answer as it came.
+	Status int    `json:"status"`
+	Body   string `json:"body"`
+	// Err says why no request was sent, or why it got no answer.
+	Err string `json:"err,omitempty"`
 }
 
 type Spawn struct {
@@ -84,6 +113,8 @@ type Record struct {
 	// step, by path: "ok" or the error.
 	Reads  map[string]string `json:"reads,omitempty"`
 	Writes map[string]string `json:"writes,omitempty"`
+	// MCP holds the answer to each mcp step, in order.
+	MCP []Answer `json:"mcp,omitempty"`
 }
 
 func main() {
@@ -150,12 +181,98 @@ func main() {
 					break
 				}
 			}
+		case st.MCP != nil:
+			rec.MCP = append(rec.MCP, mcpCall(*st.MCP, len(rec.MCP)+1))
+			writeRecord(rec)
 		case st.IgnoreTerm:
 			signal.Ignore(syscall.SIGTERM)
 		case st.Exit != nil:
 			os.Exit(*st.Exit)
 		}
 	}
+}
+
+// mcpServer finds the server "ochell" as an agent CLI does: in the file
+// that follows --mcp-config in the arguments (or $ORCH_MCP_CONFIG), with
+// ${NAME} replaced from the environment. Without such a file it takes the
+// address and the token from the environment directly.
+func mcpServer() (url, authorization string, err error) {
+	file := os.Getenv("ORCH_MCP_CONFIG")
+	for i, a := range os.Args {
+		if a == "--mcp-config" && i+1 < len(os.Args) {
+			file = os.Args[i+1]
+		}
+	}
+	if file == "" {
+		return os.Getenv("ORCH_TOOLS_URL"), "Bearer " + os.Getenv("ORCH_TOOLS_TOKEN"), nil
+	}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return "", "", err
+	}
+	var cfg struct {
+		Servers map[string]struct {
+			Type    string            `json:"type"`
+			URL     string            `json:"url"`
+			Headers map[string]string `json:"headers"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return "", "", fmt.Errorf("%s: %w", file, err)
+	}
+	srv, ok := cfg.Servers["ochell"]
+	if !ok || srv.Type != "http" {
+		return "", "", fmt.Errorf("%s has no http server \"ochell\"", file)
+	}
+	expand := func(s string) string {
+		return os.Expand(s, func(name string) string { return os.Getenv(name) })
+	}
+	return expand(srv.URL), expand(srv.Headers["Authorization"]), nil
+}
+
+// mcpCall sends one JSON-RPC request to ochell's MCP server.
+func mcpCall(m MCP, id int) Answer {
+	method, params := m.Method, any(map[string]any{})
+	if m.Tool != "" {
+		method = "tools/call"
+		args := m.Args
+		if args == nil {
+			args = map[string]any{}
+		}
+		params = map[string]any{"name": m.Tool, "arguments": args}
+	}
+	out := Answer{Request: method + " " + m.Tool}
+	url, authorization, err := mcpServer()
+	if err == nil && m.TokenFile != "" {
+		var raw []byte
+		raw, err = os.ReadFile(os.ExpandEnv(m.TokenFile))
+		authorization = "Bearer " + strings.TrimSpace(string(raw))
+	}
+	if err != nil {
+		out.Err = err.Error()
+		return out
+	}
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		out.Err = err.Error()
+		return out
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", authorization)
+	if method != "initialize" {
+		req.Header.Set("MCP-Protocol-Version", "2025-06-18")
+	}
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		out.Err = err.Error()
+		return out
+	}
+	defer resp.Body.Close()
+	answer, _ := io.ReadAll(resp.Body)
+	out.Status, out.Body = resp.StatusCode, string(answer)
+	return out
 }
 
 func result(err error) string {

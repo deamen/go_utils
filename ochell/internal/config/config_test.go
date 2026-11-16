@@ -527,6 +527,66 @@ func TestAPISettings(t *testing.T) {
 	}
 }
 
+func TestTicketToolsSettings(t *testing.T) {
+	base := func() *Config {
+		cfg := Default()
+		cfg.Sources.JiraWebhook = JiraWebhook{Enabled: true, Path: "/webhooks/jira", Secret: "s", BotAccountID: "712020:bot", MaxSkew: time.Hour}
+		cfg.Sources.JiraAPI = JiraAPI{BaseURL: "https://example.atlassian.net", Email: "bot@example.com", Token: "t"}
+		cfg.TicketTools.Enabled = true
+		return cfg
+	}
+	cfg := base()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid ticket tools: %v", err)
+	}
+	// The address for an agent: the HTTP listener, on the loopback address
+	// when it takes every address.
+	for name, c := range map[string]struct {
+		change func(*Config)
+		want   string
+	}{
+		"every address": {func(*Config) {}, "http://127.0.0.1:8080/mcp"},
+		"one address":   {func(c *Config) { c.HTTP.Address, c.HTTP.Port = "10.0.0.5", 9000 }, "http://10.0.0.5:9000/mcp"},
+		"IPv6":          {func(c *Config) { c.HTTP.Address = "::" }, "http://127.0.0.1:8080/mcp"},
+		"a name":        {func(c *Config) { c.HTTP.Address = "localhost" }, "http://localhost:8080/mcp"},
+		"set":           {func(c *Config) { c.TicketTools.URL = "https://ochell.example.com/mcp" }, "https://ochell.example.com/mcp"},
+	} {
+		cfg := base()
+		c.change(cfg)
+		if err := cfg.Validate(); err != nil || cfg.TicketToolsURL() != c.want {
+			t.Errorf("%s: %q, %v; want %q", name, cfg.TicketToolsURL(), err, c.want)
+		}
+	}
+	for name, c := range map[string]struct {
+		change func(*Config)
+		want   string
+	}{
+		"no http listener": {func(c *Config) {
+			c.HTTP.Enabled = false
+			c.HTTPS = Listener{Enabled: true, Address: "0.0.0.0", Port: 8443, CertFile: "c", KeyFile: "k"}
+		}, "ticket_tools.url is required when the http listener is off"},
+		"another path":  {func(c *Config) { c.TicketTools.URL = "http://127.0.0.1:8080/tools" }, "with the path /mcp"},
+		"not a URL":     {func(c *Config) { c.TicketTools.URL = "127.0.0.1:8080/mcp" }, "ticket_tools.url must be"},
+		"a password":    {func(c *Config) { c.TicketTools.URL = "http://u:p@127.0.0.1:8080/mcp" }, "ticket_tools.url must be"},
+		"no Jira API":   {func(c *Config) { c.Sources.JiraAPI = JiraAPI{} }, "ticket_tools needs sources.jira_api"},
+		"no bot":        {func(c *Config) { c.Sources.JiraWebhook.BotAccountID = "" }, "ticket_tools needs sources.jira_webhook.bot_account_id"},
+		"no Linear app": {func(c *Config) { c.Sources.Linear.Enabled, c.Sources.Linear.Secret = true, "s" }, "ticket_tools needs the Linear app"},
+		"address, off": {func(c *Config) {
+			c.TicketTools = TicketTools{URL: "http://127.0.0.1:8080/mcp"}
+		}, "ticket_tools.enabled is not"},
+	} {
+		cfg := base()
+		c.change(cfg)
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
+		}
+	}
+	// The default prompt names the ticket tool that the run has.
+	if !strings.Contains(DefaultPromptTemplate, `{{if .TicketTools}}Read the full ticket with the tool get_ticket of the MCP server "ochell"{{else}}Use twg`) {
+		t.Error("the default prompt does not tell a run with the ticket tools to use them")
+	}
+}
+
 func TestGitHubSettings(t *testing.T) {
 	base := func() *Config {
 		cfg := Default()

@@ -7,9 +7,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Credentials that the server accepts, and the account behind them.
@@ -22,8 +25,10 @@ const (
 // Issue is one ticket of the fake site.
 type Issue struct {
 	Key, Summary string
-	Labels       []string
-	Components   []string
+	// Description is the text of the ticket.
+	Description string
+	Labels      []string
+	Components  []string
 	// Type is the issue type, such as "Bug".
 	Type string
 	// Status is the current status; Statuses are the ones it can move to.
@@ -48,9 +53,12 @@ type Issue struct {
 	unassigned, closed bool
 }
 
-// Comment is one comment that was posted.
+// Comment is one comment on a ticket: one that was posted through the
+// API, by the bot, or one that a test put there for a person (Say).
 type Comment struct {
 	Key, Body string
+	// Author is the accountId of who wrote it, and Name their name.
+	Author, Name string
 }
 
 // Server is a fake Jira site.
@@ -122,6 +130,13 @@ func (s *Server) Close(key string) {
 	if is := s.find(key); is != nil {
 		is.closed = true
 	}
+}
+
+// Say puts a comment of a person on a ticket.
+func (s *Server) Say(key, author, name, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.comments = append(s.comments, Comment{Key: key, Body: body, Author: author, Name: name})
 }
 
 // Fail makes every request from now on fail with this HTTP status; 0 ends
@@ -217,8 +232,29 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			answer(w, http.StatusBadRequest, map[string]any{"errorMessages": []string{"Comment body can not be empty!"}})
 			return
 		}
-		s.comments = append(s.comments, Comment{key, in.Body})
+		s.comments = append(s.comments, Comment{Key: key, Body: in.Body, Author: AccountID, Name: "Digital Employee"})
 		answer(w, http.StatusCreated, map[string]string{"id": "10000"})
+	case what == "comment" && r.Method == http.MethodGet:
+		// The newest first, as ochell asks for them, and one page of them.
+		var all []map[string]any
+		for i, c := range s.comments {
+			if c.Key == key {
+				all = append(all, map[string]any{
+					"author": map[string]string{"accountId": c.Author, "displayName": c.Name},
+					"body":   c.Body, "created": time.Date(2026, 11, 16, 9, 0, i, 0, time.UTC).Format("2006-01-02T15:04:05.000-0700"),
+				})
+			}
+		}
+		slices.Reverse(all)
+		limit, _ := strconv.Atoi(r.URL.Query().Get("maxResults"))
+		page := all
+		if limit > 0 && len(page) > limit {
+			page = page[:limit]
+		}
+		if page == nil {
+			page = []map[string]any{}
+		}
+		answer(w, http.StatusOK, map[string]any{"total": len(all), "comments": page})
 	case what == "transitions" && r.Method == http.MethodGet:
 		type to struct {
 			Name string `json:"name"`
@@ -262,6 +298,7 @@ func (s *Server) issue(w http.ResponseWriter, is *Issue, changelog bool) {
 		category = "done"
 	}
 	fields := map[string]any{
+		"summary": is.Summary, "description": is.Description,
 		"status": map[string]any{"name": is.Status, "statusCategory": map[string]string{"key": category}},
 	}
 	if !is.unassigned {

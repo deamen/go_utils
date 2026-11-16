@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ochell": {
+      "type": "http",
+      "url": "${ORCH_TOOLS_URL}",
+      "headers": {"Authorization": "Bearer ${ORCH_TOOLS_TOKEN}"}
+    }
+  }
+}
