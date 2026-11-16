@@ -6,6 +6,8 @@ import (
 	"slices"
 	"time"
 
+	"ochell/internal/config"
+	ghsource "ochell/internal/source/github"
 	"ochell/internal/source/linear"
 	"ochell/internal/task"
 	"ochell/internal/ticket"
@@ -58,6 +60,14 @@ func (s *Server) polledSources() []polled {
 	if s.linear != nil && src.Linear.Enabled {
 		out = append(out, polled{source: "linear", api: s.linear, assigners: src.Linear.AllowedAssigners, stops: true})
 	}
+	// The sources behind the interface, in the order of their names.
+	for _, name := range config.SourceNames {
+		if b := s.sources[name]; b != nil {
+			if api := b.src.Tracker(); api != nil {
+				out = append(out, polled{source: name, api: api, assigners: b.assigners, stops: true})
+			}
+		}
+	}
 	return out
 }
 
@@ -65,7 +75,7 @@ func (s *Server) polledSources() []polled {
 func (s *Server) runPoller(ctx context.Context) {
 	sources := s.polledSources()
 	if len(sources) == 0 {
-		s.log.Info("poller: no tracker can be asked; it needs sources.jira_api, or the Linear app with its token")
+		s.log.Info("poller: no tracker can be asked; it needs sources.jira_api, the Linear app with its token, or sources.github.token")
 		return
 	}
 	s.log.Info("poller started", "interval", s.cfg.Poller.Interval, "trackers", len(sources))
@@ -137,7 +147,7 @@ func (s *Server) pollStart(ctx context.Context, p polled, is tracker.Issue, log 
 		who = nil
 	}
 	// The bot account cannot give itself work, through the poller either.
-	if (p.source == "jira" && slices.ContainsFunc(who, s.jiraBot)) || (p.source == "linear" && s.linearBot("", who...)) {
+	if (p.source == "jira" && slices.ContainsFunc(who, s.jiraBot)) || (p.source == "linear" && s.linearBot("", who...)) || s.sourceBot(p.source, who...) {
 		if s.refusedOnce(p.source, is.Key) {
 			log.Warn("poller: ticket not started: the bot account assigned it to itself", "key", is.Key)
 		}
@@ -154,24 +164,34 @@ func (s *Server) pollStart(ctx context.Context, p polled, is tracker.Issue, log 
 	if len(who) > 0 {
 		t.Actor = who[0]
 	}
-	a := attrs{labels: is.Labels, issueType: is.Type, assigner: who}
+	a := attrs{labels: is.Labels, issueType: is.Type, assigner: who, repo: is.Repo}
 	switch p.source {
 	case "jira":
 		a.priority, a.hasPriority = s.jiraPriority(is.PriorityName)
 	case "linear":
 		// The list of the issues has the priority of each.
 		a.priority, a.hasPriority = is.Priority, true
+	case ghsource.Name:
+		// A GitHub issue has no priority, so there is none to ask for.
+		a.hasPriority = true
+	}
+	// A pull request that a ticket opened is that ticket's work.
+	if s.ownPullRequest(is.PullRequest) {
+		if s.refusedOnce(p.source, is.Key) {
+			log.Warn("poller: ticket not started: the pull request is the work of a ticket, which ochell follows", "key", is.Key, "pull_request", is.PullRequest)
+		}
+		return false
 	}
 	// The tier's own list holds as well. It is checked here, before a
 	// session is opened for a ticket that is then not started.
-	if len(s.cfg.Repos) > 0 {
-		t.Repo, _ = s.cfg.RepoFor(t.Source, t.Key, is.Labels)
-	}
+	t.Repo, _ = s.repoFor(t.Source, t.Key, a)
 	if tier, _, err := s.tierFor(t, a); err == nil && !s.policy.Tier(tier).MayAssign(who...) {
 		if s.refusedOnce(p.source, is.Key) {
 			log.Warn("poller: ticket not started: the assigner may not assign work of this tier, or is not known", "key", is.Key, "tier", tier, "assigner", who)
 			if p.source == "jira" {
 				s.jiraComment(is.Key, "The digital employee did not start work on this ticket: "+tierRefusalText(tier), log)
+			} else if b := s.sources[p.source]; b != nil {
+				s.sourceTell(b, is.Key, "The digital employee did not start work on this ticket: "+tierRefusalText(tier), log)
 			}
 		}
 		return false
@@ -197,7 +217,7 @@ func (s *Server) pollStart(ctx context.Context, p polled, is tracker.Issue, log 
 		if t.TrackerSession != "" {
 			s.linearActivity(t.TrackerSession, linear.ActivityElicitation, noRepoText(is.Key), log)
 		} else {
-			s.jiraNotStarted(res, t, log)
+			s.notStarted(res, t, log)
 		}
 	}
 	return false

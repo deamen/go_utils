@@ -1,0 +1,16 @@
+{
+  "action": "assigned",
+  "issue": {
+    "number": 12,
+    "title": "The login page shows a blank screen",
+    "html_url": "https://github.com/acme/shop/issues/12",
+    "state": "open",
+    "user": { "login": "alice" },
+    "labels": [{ "name": "bug" }],
+    "assignee": { "login": "digital-employee" },
+    "assignees": [{ "login": "digital-employee" }]
+  },
+  "assignee": { "login": "digital-employee" },
+  "repository": { "name": "shop", "full_name": "acme/shop" },
+  "sender": { "login": "alice" }
+}

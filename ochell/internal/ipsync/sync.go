@@ -11,8 +11,8 @@ import (
 	"ochell/internal/config"
 )
 
-// SyncPolicies reconciles the configured ngrok IP policies with the Atlassian
-// and Linear feeds. With dryRun only the plan is logged.
+// SyncPolicies reconciles the configured ngrok IP policies with the
+// Atlassian, Linear and GitHub feeds. With dryRun only the plan is logged.
 func SyncPolicies(ctx context.Context, cfg config.NgrokSync, f *Fetcher, log *slog.Logger, dryRun bool) error {
 	if cfg.APIKey == "" {
 		return errors.New("ngrok_sync.api_key is required")
@@ -23,6 +23,7 @@ func SyncPolicies(ctx context.Context, cfg config.NgrokSync, f *Fetcher, log *sl
 	}{
 		{"atlassian", cfg.AtlassianPolicyID, f.Atlassian},
 		{"linear", cfg.LinearPolicyID, f.Linear},
+		{"github", cfg.GitHubPolicyID, f.GitHub},
 	}
 	n := NewNgrok(cfg.APIURL, cfg.APIKey)
 	var errs []error
@@ -59,7 +60,7 @@ func SyncPolicies(ctx context.Context, cfg config.NgrokSync, f *Fetcher, log *sl
 		}
 	}
 	if configured == 0 {
-		return errors.New("no ngrok policy configured (ngrok_sync.atlassian_policy_id / linear_policy_id)")
+		return errors.New("no ngrok policy configured (ngrok_sync.atlassian_policy_id / linear_policy_id / github_policy_id)")
 	}
 	return errors.Join(errs...)
 }

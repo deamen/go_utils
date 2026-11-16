@@ -21,11 +21,17 @@ func TestFeeds(t *testing.T) {
 			  {"cidr":"12.0.0.0/8","product":["jira"],"direction":["egress"],"perimeter":"fedramp-moderate"}]}`))
 		case "/linear":
 			w.Write([]byte(`{"ips":["35.231.147.226/32","34.38.87.206"],"codingSessionIps":["1.2.3.4/32"]}`))
+		case "/github":
+			w.Write([]byte(`{"hooks":["192.30.252.0/22","2a0a:a440::/29"],"web":["140.82.112.0/20"],"actions":["4.148.0.0/16"]}`))
 		}
 	}))
 	defer srv.Close()
 	f := NewFetcher()
-	f.AtlassianURL, f.LinearURL = srv.URL+"/atlassian", srv.URL+"/linear"
+	f.AtlassianURL, f.LinearURL, f.GitHubURL = srv.URL+"/atlassian", srv.URL+"/linear", srv.URL+"/github"
+	// Only the ranges of the webhooks, not GitHub's other ones.
+	if gh, err := f.GitHub(context.Background()); err != nil || len(gh) != 2 || gh[0].String() != "192.30.252.0/22" {
+		t.Fatalf("github: %v %v", gh, err)
+	}
 
 	atl, err := f.Atlassian(context.Background())
 	if err != nil || len(atl) != 2 {

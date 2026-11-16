@@ -232,8 +232,8 @@ func (s *Server) toReview(pr store.PullRequest, text string, log *slog.Logger) {
 	}
 }
 
-// tell posts a text on a ticket: a comment in Jira, a response in the
-// Linear session of the ticket's last run.
+// tell posts a text on a ticket: a comment in Jira and on a GitHub issue,
+// a response in the Linear session of the ticket's last run.
 func (s *Server) tell(source, key, text string, log *slog.Logger) {
 	switch source {
 	case "jira":
@@ -241,6 +241,10 @@ func (s *Server) tell(source, key, text string, log *slog.Logger) {
 	case "linear":
 		if session, err := s.runner.Session(source, key); err == nil && session != "" {
 			s.linearActivity(session, linear.ActivityResponse, text, log)
+		}
+	default:
+		if b := s.sources[source]; b != nil {
+			s.sourceTell(b, key, text, log)
 		}
 	}
 }
@@ -346,6 +350,12 @@ func (s *Server) passOnComments(ctx context.Context, pr store.PullRequest, ref g
 			continue
 		}
 		marked = append(marked, mark)
+		// A ticket that is itself a pull request gets the conversation of
+		// that pull request from the webhook of its source, as comments on
+		// the ticket. It must not get them here a second time.
+		if c.Kind == "issue" && s.ticketIsPullRequest(pr.Source, pr.Key, pr.URL) {
+			continue
+		}
 		if !s.reviewer(c) {
 			log.Debug("a comment on the pull request is not passed on: its author is not a reviewer", "author", c.Author, "association", c.Association)
 			continue
@@ -388,4 +398,20 @@ func (s *Server) passOnComments(ctx context.Context, pr store.PullRequest, ref g
 	if err := s.runner.NotePullRequest(pr.Source, pr.Key, pr.URL, "", newest); err != nil {
 		log.Error("cannot record which comments were passed on", "err", err)
 	}
+}
+
+// ticketIsPullRequest reports whether the pull request at url is the
+// ticket itself: a pull request that was assigned to the digital employee
+// as a ticket of a source, and that the agent then named as its own.
+func (s *Server) ticketIsPullRequest(source, key, url string) bool {
+	b := s.sources[source]
+	if b == nil {
+		return false
+	}
+	pulls, ok := b.src.(interface {
+		// PullRequestOf returns the page that the ticket has when it is a
+		// pull request.
+		PullRequestOf(key string) string
+	})
+	return ok && samePull(pulls.PullRequestOf(key), url)
 }

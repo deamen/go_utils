@@ -49,7 +49,7 @@ func NewID(now time.Time, source, key string) string {
 type Task struct {
 	// ID is unique per task and used for log file names.
 	ID string
-	// Source is "jira" or "linear".
+	// Source is "jira", "linear" or "github".
 	Source string
 	// Key is the human readable ticket key, e.g. "ENG-123".
 	Key   string

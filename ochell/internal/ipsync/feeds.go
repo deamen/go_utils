@@ -1,5 +1,5 @@
-// Package ipsync fetches the published source IP ranges of Atlassian and
-// Linear, enforces them as an optional in-process allowlist, and syncs them
+// Package ipsync fetches the published source IP ranges of Atlassian,
+// Linear and GitHub, enforces them as an optional in-process allowlist, and syncs them
 // into ngrok IP policies.
 //
 // IP filtering only reduces noise: Atlassian's egress ranges also carry
@@ -21,12 +21,14 @@ import (
 const (
 	AtlassianFeedURL = "https://ip-ranges.atlassian.com/"
 	LinearFeedURL    = "https://linear.app/.well-known/appspecific/app.linear.ips.json"
+	GitHubFeedURL    = "https://api.github.com/meta"
 )
 
 type Fetcher struct {
 	HTTP         *http.Client
 	AtlassianURL string
 	LinearURL    string
+	GitHubURL    string
 }
 
 func NewFetcher() *Fetcher {
@@ -34,6 +36,7 @@ func NewFetcher() *Fetcher {
 		HTTP:         &http.Client{Timeout: 30 * time.Second},
 		AtlassianURL: AtlassianFeedURL,
 		LinearURL:    LinearFeedURL,
+		GitHubURL:    GitHubFeedURL,
 	}
 }
 
@@ -101,6 +104,25 @@ func (f *Fetcher) Linear(ctx context.Context) ([]netip.Prefix, error) {
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("linear feed: no addresses found")
+	}
+	return out, nil
+}
+
+// GitHub returns the ranges that github.com sends webhooks from ("hooks"
+// in the feed).
+func (f *Fetcher) GitHub(ctx context.Context) ([]netip.Prefix, error) {
+	var feed struct {
+		Hooks []string `json:"hooks"`
+	}
+	if err := f.getJSON(ctx, f.GitHubURL, &feed); err != nil {
+		return nil, err
+	}
+	out, err := ParsePrefixes(feed.Hooks)
+	if err != nil {
+		return nil, fmt.Errorf("github feed: %w", err)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("github feed: no ranges for webhooks found")
 	}
 	return out, nil
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"ochell/internal/config"
 	"ochell/internal/policy"
 	"ochell/internal/source/linear"
 	"ochell/internal/store"
@@ -72,6 +73,14 @@ func (s *Server) CheckScheduling() error {
 	}
 	if src.Linear.Enabled && s.trackerFor("linear") == nil {
 		errs = append(errs, errors.New("the policy sets scheduling.required_labels or scheduling.blocked_by, which ochell checks against the tracker: sources.linear needs the app (client_id) and its token"))
+	}
+	// A source behind the interface says itself what it can check.
+	for _, name := range config.SourceNames {
+		if b := s.sources[name]; b != nil {
+			if err := b.src.CheckGates(len(s.policy.Scheduling.RequiredLabels) > 0, s.policy.Scheduling.BlockedBy == policy.BlockedByWait); err != nil {
+				errs = append(errs, err)
+			}
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -223,6 +232,8 @@ func (s *Server) holdFor(source string, sch tracker.Scheduling) string {
 				}
 			case "linear":
 				bot = bot || s.linearBot("", l.By...)
+			default:
+				bot = bot || s.sourceBot(source, l.By...)
 			}
 			if bot {
 				byBot = append(byBot, l.Name)
@@ -250,7 +261,8 @@ func (s *Server) holdFor(source string, sch tracker.Scheduling) string {
 }
 
 // tellHeld says on a ticket that its work has not started, and why: a
-// comment in Jira, a thought in the Linear session of its queued run.
+// comment in Jira and on a GitHub issue, a thought in the Linear session
+// of its queued run.
 func (s *Server) tellHeld(source, key, hold string, log *slog.Logger) {
 	text := fmt.Sprintf("The digital employee has not started work on %s yet: %s. The work starts by itself once that has changed.", key, hold)
 	switch source {
@@ -259,6 +271,10 @@ func (s *Server) tellHeld(source, key, hold string, log *slog.Logger) {
 	case "linear":
 		if session, err := s.runner.Session(source, key); err == nil && session != "" {
 			s.linearActivity(session, linear.ActivityThought, text, log)
+		}
+	default:
+		if b := s.sources[source]; b != nil {
+			s.sourceTell(b, key, text, log)
 		}
 	}
 }

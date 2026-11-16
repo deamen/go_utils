@@ -201,7 +201,7 @@ func TestRepoValidation(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("valid repos: %v", err)
 	}
-	cfg.Repos = []Repo{{Source: "github", Project: "DEV", Repo: "x"}, {Repo: "x"}, {Project: "DEV"}, {Project: "DEV", Repo: "x y"}}
+	cfg.Repos = []Repo{{Source: "gitlab", Project: "DEV", Repo: "x"}, {Repo: "x"}, {Project: "DEV"}, {Project: "DEV", Repo: "x y"}}
 	err := cfg.Validate()
 	for _, want := range []string{"repos[0].source", "repos[1].project", "repos[2].repo", "repos[3].repo"} {
 		if err == nil || !strings.Contains(err.Error(), want) {
@@ -814,5 +814,70 @@ func TestWorkflowSettings(t *testing.T) {
 		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
 		}
+	}
+}
+
+func TestGitHubSource(t *testing.T) {
+	base := func() *Config {
+		cfg := Default()
+		cfg.GitHub.BotLogin = "digital-employee"
+		cfg.Sources.GitHub = GitHubSource{Enabled: true, Path: "/webhooks/github", Secret: "s", Token: "issues-token",
+			Repos: []GitHubRepo{{Repo: "acme/shop"}, {Repo: "acme/web.site"}, {Repo: "other/shop", Project: "OTHER"}}}
+		return cfg
+	}
+	cfg := base()
+	// The source is enough by itself, and needs no token of the handoff.
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a valid GitHub source: %v", err)
+	}
+	for i, want := range []string{"shop", "web_site", "OTHER"} {
+		if got := cfg.Sources.GitHub.Repos[i].ProjectKey(); got != want {
+			t.Errorf("project of %s = %q, want %q", cfg.Sources.GitHub.Repos[i].Repo, got, want)
+		}
+	}
+	// The project is what the repos setting and the policy see.
+	cfg.Repos = []Repo{{Source: "github", Project: "shop", Repo: "git@github.com:acme/shop.git"}}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a repos entry for the source: %v", err)
+	}
+	if got, ok := cfg.RepoFor("github", "shop-12", nil); !ok || got != "git@github.com:acme/shop.git" {
+		t.Errorf("RepoFor = %q, %v", got, ok)
+	}
+	for name, c := range map[string]struct {
+		change func(*Config)
+		want   string
+	}{
+		"no secret":       {func(c *Config) { c.Sources.GitHub.Secret = "" }, "sources.github.secret is required"},
+		"no bot":          {func(c *Config) { c.GitHub.BotLogin = "" }, "sources.github requires github.bot_login"},
+		"no repositories": {func(c *Config) { c.Sources.GitHub.Repos = nil }, "sources.github.repos is required"},
+		"the read token":  {func(c *Config) { c.GitHub.Token = "issues-token" }, "must not be github.token"},
+		"not owner/name":  {func(c *Config) { c.Sources.GitHub.Repos[0].Repo = "shop" }, "repos[0].repo must be a repository as owner/name"},
+		"an address":      {func(c *Config) { c.Sources.GitHub.Repos[0].Repo = "https://github.com/acme/shop" }, "repos[0].repo must be a repository as owner/name"},
+		"twice":           {func(c *Config) { c.Sources.GitHub.Repos[1].Repo = "ACME/Shop" }, "is repos[0] as well"},
+		"one project":     {func(c *Config) { c.Sources.GitHub.Repos[2].Project = "" }, "has the project shop, as repos[0] has"},
+		"a bad project":   {func(c *Config) { c.Sources.GitHub.Repos[0].Project = "my shop" }, "cannot be the project of ticket keys"},
+		"a name with a _": {func(c *Config) { c.Sources.GitHub.Repos[0].Repo = "acme/_private" }, "cannot be the project of ticket keys"},
+		"a long name":     {func(c *Config) { c.Sources.GitHub.Repos[0].Repo = "acme/" + strings.Repeat("a", 51) }, "cannot be the project of ticket keys"},
+		"a shared path": {func(c *Config) {
+			c.Sources.GitHub.Path = c.Sources.Linear.Path
+			c.Sources.Linear.Enabled = true
+			c.Sources.Linear.Secret = "s"
+		}, "share path"},
+		"tools, no token":   {func(c *Config) { c.TicketTools.Enabled = true; c.Sources.GitHub.Token = "" }, "ticket_tools needs sources.github.token"},
+		"bad api address":   {func(c *Config) { c.GitHub.APIURL = "ghe.example.com" }, "github.api_url must be the address of the API"},
+		"repos, bad source": {func(c *Config) { c.Repos = []Repo{{Source: "gitlab", Project: "*", Repo: "x"}} }, "repos[0].source must be jira, linear, github or empty"},
+	} {
+		cfg := base()
+		c.change(cfg)
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
+		}
+	}
+	// Off: its settings are not looked at, and it is no source.
+	cfg = base()
+	cfg.Sources.GitHub.Enabled = false
+	cfg.GitHub.BotLogin = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "no source enabled") {
+		t.Errorf("without a source: %v", err)
 	}
 }

@@ -5110,7 +5110,7 @@ func TestGuardrailFlag(t *testing.T) {
 	o.waitFor(10*time.Second, "ENG-310 to be in review", func() bool { tk, _ := st.Ticket("linear", "ENG-310"); return tk.State == "in_review" })
 
 	// A flag needs a reason and a ticket that ochell knows.
-	if out, code := o.Admin("flag", "linear", "ENG-310"); code == 0 || !strings.Contains(out, "usage: ochell flag <jira|linear> <KEY> --reason TEXT") {
+	if out, code := o.Admin("flag", "linear", "ENG-310"); code == 0 || !strings.Contains(out, "usage: ochell flag <jira|linear|github> <KEY> --reason TEXT") {
 		t.Errorf("ochell flag without a reason: exit %d, %q", code, out)
 	}
 	if out, code := o.Admin("flag", "linear", "NOPE-1", "--reason", "x"); code == 0 || !strings.Contains(out, "ochell knows no linear ticket NOPE-1") {
@@ -6256,5 +6256,287 @@ func TestPodmanSandboxTicketTools(t *testing.T) {
 	}
 	if strings.Contains(run.Log, token) || strings.Contains(o.Output(), token) {
 		t.Error("the run's token is in a log")
+	}
+}
+
+const githubPolicy = `
+version: e2e-github
+owners: [policy.owner@example.com]
+tiers:
+  - {name: normal}
+  - {name: careful, labels: [risk-high]}
+default_tier: normal
+rules:
+  - {source: github, project: shop, issue_type: Issue, tier: careful}
+`
+
+// A GitHub issue that is assigned to the digital employee starts a run in
+// the same way as a Jira or Linear ticket: the same task, working
+// directory and environment, the tier of the policy, a comment on the
+// issue at the start and at the end, follow-ups in the same session, and
+// the same gates.
+func TestGitHubIssueStartsARun(t *testing.T) {
+	const session = "0b6c2a51-7d3e-4f18-9a40-2e5d8c1f7a63"
+	stream := func(result string) Step {
+		return Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"` + result + `","session_id":"` + session + `"}`}
+	}
+	script := append(OnRun(1, stream("Which page?"), Report("needs_input", "Which of the two login pages do you mean?")),
+		OnRun(2, stream("Fixed."), Report("done", "Fixed the second login page."))...)
+	o := Start(t, Options{GitHub: true, Script: script, Policy: githubPolicy, Configure: func(c *config.Config) {
+		c.Agent.Adapter = "claude"
+		c.Sources.GitHub.AllowedAssigners = []string{GitHubHuman}
+	}})
+	o.GitHub.AddIssue(githubtest.Issue{Owner: "acme", Repo: "shop", Number: 12, Title: "Fix the login page", Author: GitHubHuman})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	first := o.GitHubAssigned(12, "Fix the login page").TaskID(t)
+	if !strings.HasSuffix(first, "-github-shop-12") && !strings.Contains(first, "github-shop-12") {
+		t.Errorf("task id = %q, want one of the ticket github shop-12", first)
+	}
+	// A retry of the same delivery, byte for byte, starts nothing.
+	if r := o.Replay(); r.Status != 200 || r.Body != "duplicate delivery" {
+		t.Errorf("a duplicate delivery: %d %q", r.Status, r.Body)
+	}
+	run := o.WaitStored(st, first, 15*time.Second)
+	if run.Source != "github" || run.Key != "shop-12" || run.Tier != "careful" || run.Attempt != 1 || run.PolicyVersion != "e2e-github" {
+		t.Errorf("run = %+v", run)
+	}
+	tk, _ := st.Ticket("github", "shop-12")
+	wantRepo := "https://" + o.GitHub.Host() + "/acme/shop.git"
+	if tk == nil || tk.Title != "Fix the login page" || tk.URL != "https://github.com/acme/shop/issues/12" || tk.Repo != wantRepo || tk.Tier != "careful" || tk.Assigner != GitHubHuman {
+		t.Errorf("ticket = %+v", tk)
+	}
+	recs := o.WaitRecords(1, 5*time.Second)
+	rec := recs[0]
+	for name, want := range map[string]string{
+		"ORCH_TASK_ID": first, "ORCH_TASK_SOURCE": "github", "ORCH_TASK_KEY": "shop-12", "ORCH_TASK_TIER": "careful",
+		"ORCH_TASK_REPO": wantRepo, "ORCH_TASK_URL": "https://github.com/acme/shop/issues/12",
+	} {
+		if got, _ := rec.Getenv(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	if want := filepath.Join(o.Dir, "work", "github-shop-12"); rec.Dir != want {
+		t.Errorf("working directory = %q, want %q", rec.Dir, want)
+	}
+	if !strings.Contains(rec.Stdin, "github ticket shop-12 (https://github.com/acme/shop/issues/12)") || !strings.Contains(rec.Stdin, "The ticket is the issue #12 of the GitHub repository acme/shop.") {
+		t.Errorf("the prompt does not name the issue:\n%s", rec.Stdin)
+	}
+	// The issue hears about the run, from the bot account.
+	comments := o.WaitIssueComments(12, 2, 10*time.Second)
+	if !strings.Contains(comments[0], "started work on this ticket") || !strings.Contains(comments[1], "Which of the two login pages do you mean?") || !strings.Contains(comments[1], "Reply in a comment") {
+		t.Fatalf("comments = %q", comments)
+	}
+
+	// What does not start a run.
+	bad := o.Post(o.Config.Sources.GitHub.Path, []byte(`{"action":"assigned"}`), map[string]string{"X-GitHub-Event": "issues", "X-Hub-Signature-256": "sha256=" + strings.Repeat("0", 64)})
+	if bad.Status != 401 {
+		t.Errorf("a bad signature: %d %q", bad.Status, bad.Body)
+	}
+	o.Actor = GitHubBot
+	if r := o.GitHubAssigned(13, "Give myself work"); r.Status != 403 || !strings.Contains(r.Body, "cannot assign work to itself") {
+		t.Errorf("an assignment by the bot: %d %q", r.Status, r.Body)
+	}
+	o.Actor = "mallory"
+	if r := o.GitHubAssigned(13, "Not allowed"); r.Status != 403 || !strings.Contains(r.Body, "not allowed to assign work") {
+		t.Errorf("an assignment by someone not allowed: %d %q", r.Status, r.Body)
+	}
+	o.Actor = ""
+	other := o.GitHubEvent("issues", "assigned", "acme/secrets", 1, map[string]any{"assignee": map[string]string{"login": GitHubBot}})
+	if other.Status != 200 || !strings.Contains(other.Body, "ignored: the repository acme/secrets is not one of sources.github.repos") {
+		t.Errorf("a repository that is not configured: %d %q", other.Status, other.Body)
+	}
+	for _, key := range []string{"shop-13", "secrets-1"} {
+		if tk, _ := st.Ticket("github", key); tk != nil {
+			t.Errorf("ochell recorded the ticket %s: %+v", key, tk)
+		}
+	}
+
+	// GitHub reports the bot's own two comments back. They start nothing,
+	// and neither does a command in one.
+	for _, c := range append(comments, "/approve", "/stop") {
+		if r := o.GitHubCommented(12, GitHubBot, c); r.Status != 200 || !strings.Contains(r.Body, "comment by the bot") {
+			t.Errorf("a comment by the bot: %d %q", r.Status, r.Body)
+		}
+	}
+	// A person answers: a follow-up, in the agent session of the first run.
+	second := o.GitHubCommented(12, "", "The second one, under /account.").TaskID(t)
+	run = o.WaitStored(st, second, 15*time.Second)
+	if !run.Result.Resumed || run.Attempt != 2 || run.Tier != "careful" {
+		t.Errorf("the run of the comment = %+v, want a resumed second attempt", run)
+	}
+	recs = o.WaitRecords(2, 5*time.Second)
+	if len(recs) != 2 {
+		t.Fatalf("the agent was started %d times, want 2", len(recs))
+	}
+	var reply Record
+	for _, rec := range recs {
+		if slices.Contains(rec.Args, "--resume") {
+			reply = rec
+		}
+	}
+	if !slices.Contains(reply.Args, session) || !strings.Contains(reply.Stdin, "<comment>\nThe second one, under /account.\n</comment>") {
+		t.Errorf("the second run did not resume the session with the comment: %+v", reply.Args)
+	}
+	comments = o.WaitIssueComments(12, 4, 10*time.Second)
+	if !strings.Contains(comments[2], "again (attempt 2)") || !strings.Contains(comments[3], "Fixed the second login page.") {
+		t.Errorf("comments of the second run = %q", comments[2:])
+	}
+
+	// The admin commands take the source.
+	if out, code := o.Admin("cost", "github", "shop-12"); code != 0 || !strings.Contains(out, "shop-12") {
+		t.Errorf("ochell cost github shop-12: %d %s", code, out)
+	}
+	if out, code := o.Admin("cost", "gitlab", "shop-12"); code == 0 || !strings.Contains(out, "<jira|linear|github>") {
+		t.Errorf("ochell cost gitlab: %d %s", code, out)
+	}
+
+	// A close by the bot is no acceptance; a close by a person makes the
+	// ticket done, and people go on talking without starting anything.
+	o.Actor = GitHubBot
+	if r := o.GitHubClosed(12); r.Status != 200 || !strings.Contains(r.Body, "closed by the bot") {
+		t.Errorf("closed by the bot: %d %q", r.Status, r.Body)
+	}
+	o.Actor = ""
+	if tk, _ := st.Ticket("github", "shop-12"); tk == nil || tk.State == "done" {
+		t.Errorf("after a close by the bot the ticket is %+v", tk)
+	}
+	if r := o.GitHubClosed(12); r.Status != 200 || r.Body != "closed shop-12" {
+		t.Fatalf("closed: %d %q", r.Status, r.Body)
+	}
+	if tk, _ := st.Ticket("github", "shop-12"); tk == nil || tk.State != "done" {
+		t.Errorf("ticket = %+v, want done", tk)
+	}
+	if r := o.GitHubCommented(12, "", "Thanks, deployed."); r.Status != 200 || r.Body != "ignored" {
+		t.Errorf("a comment on a closed issue: %d %q", r.Status, r.Body)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := len(o.Records()); n != 2 {
+		t.Errorf("the agent was started %d times, want 2", n)
+	}
+	if o.GitHub.Refused() != 0 {
+		t.Errorf("ochell tried to write %d things on GitHub that are not a comment on an issue", o.GitHub.Refused())
+	}
+}
+
+// /stop in a comment and taking the issue away stop the run of a GitHub
+// issue, and the issue says so.
+func TestGitHubIssueIsStopped(t *testing.T) {
+	start := func(t *testing.T) (*Ochell, *store.Store) {
+		o := Start(t, Options{GitHub: true, Script: spawning(Step{Spawn: &Spawn{Count: 2}}), Configure: func(c *config.Config) {
+			c.Agent.StopGrace = time.Second
+			c.Sources.GitHub.AllowedFollowUps = []string{"assigner"}
+		}})
+		o.GitHub.AddIssue(githubtest.Issue{Owner: "acme", Repo: "shop", Number: 20})
+		st, err := store.Open(o.Config.Store.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		return o, st
+	}
+	stopped := func(t *testing.T, o *Ochell, st *store.Store, id string, rec Record) {
+		t.Helper()
+		if run := o.WaitStored(st, id, 15*time.Second); run.Result.Outcome != "cancelled" {
+			t.Errorf("run = %+v, want cancelled", run.Result)
+		}
+		expectAllGone(t, rec, 2)
+		if tk, _ := st.Ticket("github", "shop-20"); tk == nil || tk.State != "cancelled" {
+			t.Errorf("ticket = %+v, want cancelled", tk)
+		}
+	}
+
+	t.Run("the command in a comment", func(t *testing.T) {
+		o, st := start(t)
+		id := o.GitHubAssigned(20, "Rework the page").TaskID(t)
+		rec := waitChildren(t, o, 2)
+		// Someone who may not send follow-ups cannot stop the run.
+		if r := o.GitHubCommented(20, "outsider", "/stop"); r.Status != 200 || !strings.Contains(r.Body, "not allowed") {
+			t.Fatalf("/stop by an outsider: %d %q", r.Status, r.Body)
+		}
+		time.Sleep(300 * time.Millisecond)
+		if !Alive(rec.PID) {
+			t.Fatal("an outsider stopped the agent")
+		}
+		if r := o.GitHubCommented(20, "", "/stop\nWrong issue, sorry."); r.Status != 200 || r.Body != "stopped shop-20" {
+			t.Fatalf("/stop: %d %q", r.Status, r.Body)
+		}
+		stopped(t, o, st, id, rec)
+		// The start, the refusal for the outsider, the stop.
+		comments := o.WaitIssueComments(20, 3, 10*time.Second)
+		if last := comments[len(comments)-1]; !strings.Contains(last, "The run was stopped by "+GitHubHuman+", with /stop in a comment") || !strings.Contains(last, "Assign it again") {
+			t.Errorf("the issue got %q, want that it was stopped and by whom", last)
+		}
+		if r := o.GitHubCommented(20, "", "Actually, one more thing."); r.Status != 200 || r.Body != "ignored" {
+			t.Errorf("a comment on a stopped issue: %d %q", r.Status, r.Body)
+		}
+		// Assigning it again starts it again.
+		if r := o.GitHubAssigned(20, "Rework the page"); r.Status != 200 || !strings.HasPrefix(r.Body, "queued ") {
+			t.Errorf("assigned again: %d %q", r.Status, r.Body)
+		}
+	})
+
+	t.Run("taking the issue away", func(t *testing.T) {
+		o, st := start(t)
+		id := o.GitHubAssigned(20, "Rework the page").TaskID(t)
+		rec := waitChildren(t, o, 2)
+		o.Actor = "carol"
+		if r := o.GitHubUnassigned(20); r.Status != 200 || r.Body != "stopped shop-20" {
+			t.Fatalf("unassigned: %d %q", r.Status, r.Body)
+		}
+		stopped(t, o, st, id, rec)
+		comments := o.WaitIssueComments(20, 2, 10*time.Second)
+		if last := comments[len(comments)-1]; !strings.Contains(last, "stopped by carol, who took the ticket away from the digital employee") {
+			t.Errorf("the issue got %q", last)
+		}
+	})
+}
+
+// The poller finds an issue whose webhook was missed, with who assigned it
+// from the history of the issue; and ochell does not start with a gate
+// that it cannot check for GitHub.
+func TestGitHubPollerAndGates(t *testing.T) {
+	o := Start(t, Options{GitHub: true, Configure: func(c *config.Config) {
+		polling(c)
+		c.Sources.GitHub.AllowedAssigners = []string{GitHubHuman}
+	}})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	// Two issues were given to the digital employee, and no webhook came.
+	o.GitHub.AddIssue(githubtest.Issue{Owner: "acme", Repo: "shop", Number: 31, Title: "Self-assigned", Author: GitHubHuman})
+	o.GitHub.Assign("acme", "shop", 31, GitHubBot, GitHubBot)
+	o.GitHub.AddIssue(githubtest.Issue{Owner: "acme", Repo: "shop", Number: 30, Title: "Missed", Author: GitHubHuman})
+	o.GitHub.Assign("acme", "shop", 30, GitHubBot, GitHubHuman)
+	recs := o.WaitRecords(1, 15*time.Second)
+	if key, _ := recs[0].Getenv("ORCH_TASK_KEY"); key != "shop-30" {
+		t.Errorf("the poller started %q, want shop-30", key)
+	}
+	if tk, _ := st.Ticket("github", "shop-30"); tk == nil || tk.Assigner != GitHubHuman || tk.Title != "Missed" {
+		t.Errorf("ticket = %+v", tk)
+	}
+	o.WaitIssueComments(30, 2, 10*time.Second)
+	time.Sleep(700 * time.Millisecond)
+	if tk, _ := st.Ticket("github", "shop-31"); tk != nil || len(o.Records()) != 1 {
+		t.Errorf("an issue that the bot assigned to itself was started: %+v", tk)
+	}
+	if !strings.Contains(o.Output(), "the bot account assigned it to itself") {
+		t.Error("the log does not say why shop-31 was not started")
+	}
+
+	// A second ochell does not start with a gate that cannot be checked
+	// for GitHub issues.
+	file := filepath.Join(o.Dir, "gates.yaml")
+	if err := os.WriteFile(file, []byte("version: gates\nowners: [o@example.com]\ntiers: [{name: normal}]\ndefault_tier: normal\nscheduling: {blocked_by: wait}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, code := o.Admin("serve", "--policy-file", file); code == 0 || !strings.Contains(out, "invalid policy") || !strings.Contains(out, "ochell cannot check for GitHub issues") {
+		t.Errorf("serve with blocked_by: %d %s", code, out)
 	}
 }

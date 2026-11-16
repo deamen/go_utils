@@ -85,13 +85,14 @@ retention:
 github:
   token: ${GITHUB_READ_TOKEN}
   poll_interval: 2m
-  bot_login: ""             # the digital employee's GitHub login: a merge by it is no acceptance
+  bot_login: ""             # the digital employee's GitHub login: a merge by it is no acceptance.
+                            # For sources.github it is the account whose issues are the tickets.
   # ochell also reads the checks and the comments of these pull requests.
   # A ticket is in review when the checks have passed; failed checks and
   # review comments wake the agent.
   checks_grace: 2m          # a pull request with no check after this long has none
   allowed_reviewers: []     # GitHub logins whose comments reach the agent; empty: owners, members and collaborators
-  # api_url: https://ghe.example.com/api/v3
+  # api_url: https://ghe.example.com/api/v3   # also for sources.github
 
 # The policy file: the risk tiers, and which tier a ticket runs under (see
 # examples/policy.yaml). It must not be writable by the agent's OS user.
@@ -99,11 +100,13 @@ github:
 policy:
   file: /etc/ochell/policy.yaml
 
-# Which repository a ticket belongs to. "project" is the Jira project key or
-# the Linear team key (DEV in DEV-42); "*" matches every project. "label" is
-# optional. The first entry that matches wins. A ticket that no entry
-# matches is not started and waits for a human. Leave "repos" out to run
-# every ticket without a repository.
+# Which repository a ticket belongs to. "project" is the Jira project key,
+# the Linear team key (DEV in DEV-42) or the project of a repository of
+# sources.github; "*" matches every project. "source" is jira, linear or
+# github; "label" is optional. The first entry that matches wins. A ticket
+# that no entry matches is not started and waits for a human; a GitHub
+# ticket then runs in the repository that its issue is in. Leave "repos"
+# out to run every ticket without a repository.
 repos:
   - {source: jira, project: DEV, label: frontend, repo: "git@github.com:example/web.git"}
   - {source: jira, project: DEV, repo: "git@github.com:example/backend.git"}
@@ -299,7 +302,7 @@ agent:
     max_backoff: 30m
   max_concurrent: 1
   # How many runs one ticket may have (0: no limit). A ticket that has used
-  # them up waits for a human; "ochell reset <jira|linear> <KEY>" sets the
+  # them up waits for a human; "ochell reset <jira|linear|github> <KEY>" sets the
   # count back.
   max_attempts: 5
   queue_size: 100
@@ -385,20 +388,56 @@ sources:
     organization_id: ""     # optional: only accept installs into this workspace
     external_url: ""        # optional: e.g. https://runs.example.com/{{.ID}}
 
+  # GitHub issues and pull requests as tickets: one that is assigned to the
+  # digital employee's GitHub account (github.bot_login, required here)
+  # starts work. The webhook is one of the repository or the organization,
+  # with the content type application/json and the events Issues, Issue
+  # comments and Pull requests.
+  github:
+    enabled: false
+    path: /webhooks/github
+    secret: ${GITHUB_WEBHOOK_SECRET}
+    # Optional: a token of the digital employee's own account with read and
+    # write access to issues (and to pull requests, when those are assigned
+    # to it), and nothing else: never contents, never the right to merge.
+    # With it ochell comments on the issue when a run starts and ends, and
+    # asks GitHub about issues for the poller, scheduling.required_labels
+    # and the ticket tools. It is not github.token, which only reads, and
+    # not the agent's. Empty: the issue gets no answer from ochell.
+    token: ${GITHUB_ISSUES_TOKEN}
+    # The repositories whose issues may become tickets, as owner/name. A
+    # delivery about any other repository starts nothing. The issue 12 of
+    # acme/shop is the ticket shop-12: the project of its key is the name
+    # of the repository ("_" for each "."), or "project".
+    repos:
+      - repo: acme/shop
+      - {repo: acme/web.site, project: WEB}
+    # Optional: the GitHub logins of the people who may assign work. Empty:
+    # everyone whom GitHub lets assign an issue.
+    allowed_assigners: []
+    # Optional: who may send follow-ups, /stop and /approve in comments.
+    # GitHub logins, and the words "assigner" (who assigned this issue to
+    # the bot) and "reporter" (who opened it). Empty: the same people as
+    # allowed_assigners.
+    allowed_follow_ups: []      # e.g. [assigner, reporter]
+
 # In-process source IP filtering. Use it when the orchestrator is reached
 # directly; behind ngrok prefer ngrok's restrict-ips (see ngrok-policy.yaml).
 ip_allowlist:
   enabled: false
   atlassian_feed: true
   linear_feed: true
+  github_feed: true         # github.com's webhook addresses; for GitHub Enterprise Server use extra_cidrs
   extra_cidrs: []
   refresh: 1h
   trust_proxy_header: false
 
-# Keeps ngrok IP policies in sync with the Atlassian and Linear feeds.
+# Keeps ngrok IP policies in sync with the Atlassian, Linear and GitHub
+# feeds. A policy id that is left out is not synced.
 ngrok_sync:
   enabled: false
   api_key: ${NGROK_API_KEY}
   atlassian_policy_id: ipp_xxxxxxxxxxxxxxxxxxxxxxxxxxx
   linear_policy_id: ipp_yyyyyyyyyyyyyyyyyyyyyyyyyyy
+  # github_policy_id: ipp_zzzzzzzzzzzzzzzzzzzzzzzzzzz
   interval: 6h

@@ -101,7 +101,7 @@ func TestInvalidPolicies(t *testing.T) {
 		"rule without tier":    {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{project: X}]", "rules[0].tier is required"},
 		"rule unknown tier":    {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{project: X, tier: b}]", `there is no tier "b"`},
 		"rule for all":         {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{tier: a}]", "matches every ticket"},
-		"rule bad source":      {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{source: github, tier: a}]", "source must be jira, linear or empty"},
+		"rule bad source":      {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{source: gitlab, tier: a}]", "source must be jira, linear, github or empty"},
 		"linear issue type":    {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{source: linear, issue_type: Bug, tier: a}]", "a Linear issue has no issue type"},
 		"label twice":          {"tiers: [{name: a, labels: [x]}, {name: b, labels: [X]}]\ndefault_tier: a", "also belongs to the tier a"},
 		"negative tier limit":  {"tiers: [{name: a, max_concurrent: -1}]\ndefault_tier: a", "max_concurrent must not be negative"},

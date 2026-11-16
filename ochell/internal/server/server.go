@@ -28,6 +28,7 @@ import (
 	"ochell/internal/policy"
 	"ochell/internal/result"
 	"ochell/internal/runner"
+	ghsource "ochell/internal/source/github"
 	"ochell/internal/source/jira"
 	"ochell/internal/source/linear"
 	"ochell/internal/store"
@@ -124,6 +125,9 @@ type Server struct {
 	jira tracker.Client
 	// github is ochell's read access to GitHub; nil without github.token.
 	github *github.Client
+	// sources are the sources behind the Source interface, by name
+	// (source.go). GitHub is one.
+	sources map[string]*bound
 	// branch is workspace.branch: the branch a ticket is worked on.
 	branch *template.Template
 	// policy holds the risk tiers; the built-in one without a policy file.
@@ -159,6 +163,7 @@ type Server struct {
 	// Allowlists, started by Run when ip_allowlist.enabled.
 	atlassianIPs *ipsync.Allowlist
 	linearIPs    *ipsync.Allowlist
+	githubIPs    *ipsync.Allowlist
 }
 
 func New(cfg *config.Config, log *slog.Logger, r Submitter, seen Deliveries) (*Server, error) {
@@ -178,6 +183,9 @@ func New(cfg *config.Config, log *slog.Logger, r Submitter, seen Deliveries) (*S
 	}
 	if gh := cfg.GitHub; gh.Enabled() {
 		s.github = github.New(gh.APIURL, gh.Token)
+	}
+	if gs := cfg.Sources.GitHub; gs.Enabled {
+		s.bind(ghsource.New(gs, cfg.GitHub), gs.Path, gs.AllowedAssigners, gs.AllowedFollowUps)
 	}
 	if b, err := template.New("workspace.branch").Option("missingkey=error").Parse(cfg.Workspace.Branch); err == nil {
 		s.branch = b
@@ -206,15 +214,21 @@ func (s *Server) buildAllowlists() error {
 		return fmt.Errorf("ip_allowlist.extra_cidrs: %w", err)
 	}
 	f := ipsync.NewFetcher()
-	var atl, lin func(context.Context) ([]netip.Prefix, error)
+	var atl, lin, gh func(context.Context) ([]netip.Prefix, error)
 	if ipc.AtlassianFeed {
 		atl = f.Atlassian
 	}
 	if ipc.LinearFeed {
 		lin = f.Linear
 	}
+	// The feed is that of github.com. A GitHub Enterprise Server sends
+	// from its own address, which extra_cidrs names.
+	if ipc.GitHubFeed && s.cfg.GitHub.APIURL == "" {
+		gh = f.GitHub
+	}
 	s.atlassianIPs = ipsync.NewAllowlist("atlassian", atl, extra)
 	s.linearIPs = ipsync.NewAllowlist("linear", lin, extra)
+	s.githubIPs = ipsync.NewAllowlist("github", gh, extra)
 	return nil
 }
 
@@ -280,6 +294,13 @@ func (s *Server) routes() http.Handler {
 			mux.HandleFunc("GET "+src.Linear.CallbackPath, s.handleLinearCallback)
 		}
 	}
+	for name, b := range s.sources {
+		var ips *ipsync.Allowlist
+		if name == ghsource.Name {
+			ips = s.githubIPs
+		}
+		mux.Handle("POST "+b.path, guard(s.handleSource(b), ips))
+	}
 	return mux
 }
 
@@ -288,6 +309,9 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.atlassianIPs != nil {
 		go s.atlassianIPs.Run(ctx, s.cfg.IPAllowlist.Refresh, s.log)
 		go s.linearIPs.Run(ctx, s.cfg.IPAllowlist.Refresh, s.log)
+		if s.cfg.Sources.GitHub.Enabled {
+			go s.githubIPs.Run(ctx, s.cfg.IPAllowlist.Refresh, s.log)
+		}
 	}
 	if s.cfg.Poller.Interval > 0 {
 		go s.runPoller(ctx)
@@ -566,6 +590,23 @@ type attrs struct {
 	// hasPriority says that the source named one.
 	priority    int
 	hasPriority bool
+	// repo is the repository that the source itself names for the ticket:
+	// for a GitHub issue, the repository it is in. "" for Jira and Linear.
+	repo string
+}
+
+// repoFor returns the repository of a ticket. The repos setting decides.
+// A ticket that no entry matches has the repository that its source names
+// for it, if it names one; mapped is false when nobody said where the
+// work on the ticket belongs.
+func (s *Server) repoFor(source, key string, a attrs) (repo string, mapped bool) {
+	if len(s.cfg.Repos) == 0 {
+		return a.repo, true
+	}
+	if repo, ok := s.cfg.RepoFor(source, key, a.labels); ok {
+		return repo, true
+	}
+	return a.repo, a.repo != ""
 }
 
 // jiraPriority returns the rank that the policy gives a Jira priority by
@@ -623,11 +664,9 @@ func (s *Server) admit(t *task.Task, a attrs, log *slog.Logger) (submitResult, i
 	labels := a.labels
 	// With a repository mapping, a ticket that no entry matches is not
 	// started: nobody said where its work belongs.
-	held := false
-	if len(s.cfg.Repos) > 0 {
-		repo, ok := s.cfg.RepoFor(t.Source, t.Key, labels)
-		t.Repo, held = repo, !ok
-	}
+	repo, mapped := s.repoFor(t.Source, t.Key, a)
+	t.Repo = repo
+	held := !mapped
 	// Every ticket runs under a tier of the policy.
 	tier, why, err := s.tierFor(t, a)
 	if err != nil {
@@ -718,9 +757,7 @@ func (s *Server) updated(w http.ResponseWriter, source, key string, a attrs, log
 		}
 	}
 	t := &task.Task{Source: source, Key: key}
-	if len(s.cfg.Repos) > 0 {
-		t.Repo, _ = s.cfg.RepoFor(source, key, a.labels)
-	}
+	t.Repo, _ = s.repoFor(source, key, a)
 	tier, why, err := s.tierFor(t, a)
 	if err != nil || tier == had {
 		reply(w, http.StatusOK, "ignored")
@@ -889,7 +926,7 @@ func (s *Server) handleJiraWebhook(w http.ResponseWriter, r *http.Request) {
 	if res == submitFailed {
 		s.forgetDelivery(keys, log)
 	}
-	s.jiraNotStarted(res, tk, log)
+	s.notStarted(res, tk, log)
 }
 
 // stopCommand, as the first line of a comment on a Jira ticket, stops the
@@ -1049,23 +1086,6 @@ func (s *Server) jiraCommented(w http.ResponseWriter, c *jira.Comment, err error
 	}
 }
 
-// jiraNotStarted tells a Jira ticket that it was accepted but is not
-// started, and what has to happen first.
-func (s *Server) jiraNotStarted(res submitResult, t *task.Task, log *slog.Logger) {
-	key := t.Key
-	switch res {
-	case submitRefused:
-		// Once a day: the same person may try again and again.
-		if s.firstRefusal("jira", key, "tier:"+t.Tier) {
-			s.jiraComment(key, "The digital employee did not start work on this ticket: "+tierRefusalText(t.Tier), log)
-		}
-	case submitCapped:
-		s.jiraComment(key, fmt.Sprintf("The digital employee did not start work on this ticket: it has used its %d attempts. Someone who looks after the orchestrator has to look at it and reset it (ochell reset jira %s); then assign the ticket again.", s.cfg.Agent.MaxAttempts, key), log)
-	case submitHeld:
-		s.jiraComment(key, "The digital employee did not start work on this ticket: no repository is configured for it. Someone who looks after the orchestrator has to add one; then assign the ticket again.", log)
-	}
-}
-
 func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Sources.JiraAutomation
 	log := s.log.With("source", "jira_automation")
@@ -1115,7 +1135,7 @@ func (s *Server) handleJiraAutomation(w http.ResponseWriter, r *http.Request) {
 	tk.Actor = t.Actor
 	a := s.jiraAttrs(t)
 	a.assigner = []string{t.Actor}
-	s.jiraNotStarted(s.submit(w, tk, a, log), tk, log)
+	s.notStarted(s.submit(w, tk, a, log), tk, log)
 }
 
 func (s *Server) handleLinear(w http.ResponseWriter, r *http.Request) {
@@ -1420,6 +1440,9 @@ func (s *Server) Started(ctx context.Context, t *task.Task) error {
 	if s.reportsToJira(t) {
 		return s.jiraRunStarted(ctx, t)
 	}
+	if b := s.sources[t.Source]; b != nil {
+		return s.sourceStarted(ctx, b, t)
+	}
 	if !s.reportsToLinear(t) {
 		return nil
 	}
@@ -1503,6 +1526,9 @@ func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) er
 	}
 	if s.reportsToJira(t) {
 		return s.jiraRunFinished(ctx, t, res)
+	}
+	if b := s.sources[t.Source]; b != nil {
+		return s.sourceFinished(ctx, b, t, res)
 	}
 	if !s.reportsToLinear(t) {
 		return nil

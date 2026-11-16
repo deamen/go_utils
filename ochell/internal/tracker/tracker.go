@@ -30,6 +30,13 @@ type Issue struct {
 	// which the policy turns into a rank.
 	Priority     int
 	PriorityName string
+	// Repo is the repository that the tracker itself names for the ticket,
+	// as git clone takes it: for a GitHub issue, the repository it is in.
+	// Empty for Jira and Linear.
+	Repo string
+	// PullRequest is the page of the ticket when the ticket is itself a
+	// pull request, and "" otherwise.
+	PullRequest string
 }
 
 // Status is what a tracker says about one ticket that the bot had.
