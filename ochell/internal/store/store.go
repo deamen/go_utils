@@ -1935,3 +1935,70 @@ func (s *Store) Outcomes(since, until time.Time) ([]Outcomes, error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].Tier < out[j].Tier })
 	return out, nil
 }
+
+// Backup writes a consistent copy of the store to dest, which must not
+// exist. It can run while ochell works: the copy is the state of one
+// moment. The file is readable by its owner only, like the store.
+func (s *Store) Backup(dest string) error {
+	if _, err := os.Lstat(dest); err == nil {
+		return fmt.Errorf("store backup: %s exists", dest)
+	}
+	// VACUUM INTO writes a whole, compact database file in one read
+	// transaction. It goes to a name of its own first, so that a backup
+	// that broke off is never taken for a whole one.
+	tmp := dest + ".partial"
+	os.Remove(tmp)
+	if _, err := s.db.Exec(`VACUUM INTO '` + strings.ReplaceAll(tmp, "'", "''") + `'`); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("store backup: %w", err)
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("store backup: %w", err)
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("store backup: %w", err)
+	}
+	return nil
+}
+
+// Verify checks that the file at path is a store that this ochell can
+// use: a whole SQLite database, of a schema version that it knows. It
+// does not change the file.
+func Verify(path string) error {
+	if info, err := os.Stat(path); err != nil {
+		return err
+	} else if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	q := url.Values{}
+	q.Add("mode", "ro")
+	q.Add("_pragma", "busy_timeout(5000)")
+	db, err := sql.Open("sqlite", "file:"+(&url.URL{Path: path}).EscapedPath()+"?"+q.Encode())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var check string
+	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&check); err != nil {
+		return fmt.Errorf("%s is not a store: %w", path, err)
+	}
+	if check != "ok" {
+		return fmt.Errorf("%s is damaged: %s", path, check)
+	}
+	var version, tables int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('tickets', 'runs')`).Scan(&tables); err != nil {
+		return err
+	}
+	switch {
+	case version == 0 || tables != 2:
+		return fmt.Errorf("%s is not a store of ochell", path)
+	case version > len(migrations):
+		return fmt.Errorf("%s has schema version %d, this ochell knows up to %d: it was written by a newer ochell", path, version, len(migrations))
+	}
+	return nil
+}

@@ -1591,3 +1591,82 @@ func TestOutcomes(t *testing.T) {
 		t.Errorf("outcomes of the last minutes = %+v", last)
 	}
 }
+
+// A backup is a whole copy of the store at one moment, which can be
+// opened as a store.
+func TestBackupAndVerify(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, filepath.Join(dir, "ochell.db"))
+	t0 := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	if err := s.Enqueue(newTask("r1", "ENG-1", t0), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	s.Claim()
+	if err := s.Finish("r1", task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput, SessionID: "sess-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(newTask("r2", "ENG-2", t0), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(dir, "it's a backup.db")
+	if err := s.Backup(backup); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(backup); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("the backup file: %v, %v; want mode 0600", info, err)
+	}
+	if err := s.Backup(backup); err == nil || !strings.Contains(err.Error(), "exists") {
+		t.Errorf("a backup over an existing file: %v", err)
+	}
+	if _, err := os.Stat(backup + ".partial"); err == nil {
+		t.Error("the partial file was left behind")
+	}
+	// What happens after the backup is not in it.
+	if err := s.Enqueue(newTask("r3", "ENG-3", t0), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Verify(backup); err != nil {
+		t.Fatalf("Verify of a backup: %v", err)
+	}
+	restored := open(t, backup)
+	if tk, _ := restored.Ticket("linear", "ENG-1"); tk == nil || tk.State != ticket.Waiting || tk.AgentSession != "sess-1" {
+		t.Errorf("ENG-1 in the backup = %+v", tk)
+	}
+	if tk, _ := restored.Ticket("linear", "ENG-2"); tk == nil || tk.State != ticket.Queued {
+		t.Errorf("ENG-2 in the backup = %+v", tk)
+	}
+	if tk, _ := restored.Ticket("linear", "ENG-3"); tk != nil {
+		t.Errorf("the backup has a ticket from after it was made: %+v", tk)
+	}
+
+	// What is no store of ochell.
+	text := filepath.Join(dir, "notes.db")
+	os.WriteFile(text, []byte("this is not a database"), 0o600)
+	if err := Verify(text); err == nil {
+		t.Error("a text file passed for a store")
+	}
+	if err := Verify(filepath.Join(dir, "missing.db")); err == nil {
+		t.Error("a missing file passed for a store")
+	}
+	if err := Verify(dir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("a directory: %v", err)
+	}
+	empty := filepath.Join(dir, "empty.db")
+	db, _ := sql.Open("sqlite", "file:"+empty)
+	db.Exec(`CREATE TABLE other (x)`)
+	db.Close()
+	if err := Verify(empty); err == nil || !strings.Contains(err.Error(), "not a store of ochell") {
+		t.Errorf("another database: %v", err)
+	}
+	newer := filepath.Join(dir, "newer.db")
+	if err := s.Backup(newer); err != nil {
+		t.Fatal(err)
+	}
+	db, _ = sql.Open("sqlite", "file:"+newer)
+	db.Exec(`PRAGMA user_version = 9999`)
+	db.Close()
+	if err := Verify(newer); err == nil || !strings.Contains(err.Error(), "written by a newer ochell") {
+		t.Errorf("a store of a newer ochell: %v", err)
+	}
+}

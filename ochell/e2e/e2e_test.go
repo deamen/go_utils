@@ -4141,3 +4141,118 @@ func TestRetention(t *testing.T) {
 		t.Errorf("the record of the old run: %+v", run.Result)
 	}
 }
+
+// The backup of the store: a restore from a backup brings back the
+// tickets, the agent's session and the queue.
+func TestBackupAndRestore(t *testing.T) {
+	const session = "8f7e6d5c-4b3a-4921-8a0b-9c8d7e6f5a4b"
+	script := []Step{{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`}}
+	script = append(script, OnRun(1, Report("needs_input", "Which page do you mean?"))...)
+	script = append(script, OnRun(2, Report("done", "Queued work done."))...)
+	script = append(script, OnRun(3, Report("done", "Fixed the second page."))...)
+	backups := filepath.Join(t.TempDir(), "backups")
+	o := Start(t, Options{Script: script, Configure: func(c *config.Config) {
+		claudeAdapter(c)
+		c.Backup = config.Backup{Dir: backups, Interval: 300 * time.Millisecond, Keep: 2}
+	}})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-220"})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-221"})
+
+	// A ticket that waits for an answer, with its agent session; then a
+	// pause, and a ticket in the queue.
+	o.WaitRun(o.JiraAssigned("DEV-220", "Fix the page").TaskID(t), 15*time.Second)
+	o.Admin("pause")
+	queued := o.JiraAssigned("DEV-221", "Waits in the queue").TaskID(t)
+
+	// A backup on demand, of the running ochell.
+	file := filepath.Join(o.Dir, "manual-backup.db")
+	if out, code := o.Admin("backup", "--to", file); code != 0 || out != "the store is backed up to "+file {
+		t.Fatalf("ochell backup --to: exit %d, %q", code, out)
+	}
+	if out, code := o.Admin("backup", "--to", file); code == 0 || !strings.Contains(out, "exists") {
+		t.Errorf("a backup over an existing file: exit %d, %q", code, out)
+	}
+	if err := store.Verify(file); err != nil {
+		t.Fatalf("the backup is no store: %v", err)
+	}
+	// The scheduled backups: a new one at every interval, the newest two
+	// kept, each of them a whole store.
+	o.waitFor(10*time.Second, "scheduled backups to be made and old ones removed", func() bool {
+		return strings.Count(o.Output(), `msg="store backed up"`) >= 4
+	})
+	names, _ := filepath.Glob(filepath.Join(backups, "ochell-*.db"))
+	if len(names) < 1 || len(names) > 2 {
+		t.Errorf("%d scheduled backups are kept, want 2 at most: %v", len(names), names)
+	}
+	for _, n := range names {
+		if err := store.Verify(n); err != nil {
+			t.Errorf("the scheduled backup %s: %v", filepath.Base(n), err)
+		}
+	}
+	if out, code := o.Admin("backup"); code != 0 || !strings.HasPrefix(out, "the store is backed up to "+backups) {
+		t.Errorf("ochell backup: exit %d, %q", code, out)
+	}
+
+	// A restore is refused while ochell runs, and for a file that is no
+	// store.
+	if out, code := o.Admin("restore", "--from", file); code == 0 || !strings.Contains(out, "stop it before a restore") {
+		t.Fatalf("ochell restore while ochell runs: exit %d, %q", code, out)
+	}
+	// After the backup, more happens, which the backup does not have.
+	o.JiraAssigned("DEV-222", "Arrives after the backup")
+
+	// The store is lost.
+	o.Signal(syscall.SIGTERM)
+	o.WaitExit(20 * time.Second)
+	for _, ext := range []string{"", "-wal", "-shm"} {
+		os.Remove(o.Config.Store.Path + ext)
+	}
+	garbage := filepath.Join(o.Dir, "garbage.db")
+	os.WriteFile(garbage, []byte("not a database"), 0o600)
+	if out, code := o.Admin("restore", "--from", garbage); code == 0 || !strings.Contains(out, "the backup cannot be used") {
+		t.Errorf("ochell restore of a file that is no store: exit %d, %q", code, out)
+	}
+	if out, code := o.Admin("restore", "--from", file); code != 0 || !strings.Contains(out, "restored "+file+" to "+o.Config.Store.Path) {
+		t.Fatalf("ochell restore: exit %d, %q", code, out)
+	}
+	o.Restart()
+
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	// What the backup had is back: the waiting ticket with its session,
+	// the queued ticket, and the pause. What came later is not.
+	if tk, _ := st.Ticket("jira", "DEV-220"); tk == nil || tk.State != "waiting" || tk.Reason != "input" || tk.AgentSession != session {
+		t.Fatalf("DEV-220 after the restore = %+v", tk)
+	}
+	if tk, _ := st.Ticket("jira", "DEV-221"); tk == nil || tk.State != "queued" {
+		t.Fatalf("DEV-221 after the restore = %+v", tk)
+	}
+	if tk, _ := st.Ticket("jira", "DEV-222"); tk != nil {
+		t.Errorf("a ticket from after the backup is there: %+v", tk)
+	}
+	if out, _ := o.Admin("status"); out != "paused: no new run starts; 1 queued, 0 running" {
+		t.Errorf("ochell status after the restore: %q", out)
+	}
+	// And ochell works on from there: the queue runs, and an answer
+	// continues the agent's session.
+	o.Admin("resume")
+	o.WaitRun(queued, 15*time.Second)
+	answer := o.JiraCommented("DEV-220", "", "The second one.").TaskID(t)
+	if run := o.WaitStored(st, answer, 15*time.Second); !run.Result.Resumed || run.Result.Signal != "done" {
+		t.Errorf("the run of the answer after the restore: %+v", run.Result)
+	}
+	recs := o.WaitRecords(3, 5*time.Second)
+	if args := strings.Join(recs[2].Args, " "); !strings.HasSuffix(args, "--resume "+session) {
+		t.Errorf("the run after the restore: arguments %q, want the session from the backup", args)
+	}
+
+	// A restore keeps the store that was there under another name.
+	o.Signal(syscall.SIGTERM)
+	o.WaitExit(20 * time.Second)
+	if out, code := o.Admin("restore", "--from", file); code != 0 || !strings.Contains(out, "the store that was there is kept as "+o.Config.Store.Path+".before-restore-") {
+		t.Errorf("a second restore: exit %d, %q", code, out)
+	}
+}

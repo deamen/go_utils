@@ -165,6 +165,10 @@ ochell resume --config config.yaml [--tier NAME]
 ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts and the budget of a ticket; --tier NAME also sets its risk tier
 ochell cost [<jira|linear> <KEY>] --config config.yaml  # what the tickets have cost, or one ticket with its runs
 ochell outcomes [--since D] [--until D] --config config.yaml   # outcome metrics per tier for a period
+ochell backup [--to FILE] --config config.yaml          # back the store up, while ochell runs
+
+# while ochell is stopped
+ochell restore --from FILE --config config.yaml         # put a backup in the place of the store
 ochell stop  <jira|linear> <KEY> --config config.yaml   # stop the run of a ticket and release it
 ```
 
@@ -209,7 +213,7 @@ ochell keeps its durable state in one SQLite file, `store.path` (default `ochell
 - the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, the risk tier and the policy version it ran under, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to, and what the agent adapter read from it (final message, session id, cost, token counts);
 - the **webhook deliveries** handled in the last 24 hours.
 
-So a restart loses no queued task, and a retried or replayed delivery from before the restart is still recognised. SQLite keeps two more files next to it while ochell runs (`-wal` and `-shm`); copy all three, or stop ochell first, when you back it up.
+So a restart loses no queued task, and a retried or replayed delivery from before the restart is still recognised. SQLite keeps two more files next to it while ochell runs (`-wal` and `-shm`). Do not copy the file of a running ochell by hand; use the [backup](#backup-and-restore).
 
 Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user.
 
@@ -291,6 +295,34 @@ The agent opens a pull request and hands the ticket over; a person reviews and m
   - **Whose comments count:** `github.allowed_reviewers` (GitHub logins); without that list, the people whom GitHub calls owner, member or collaborator of the repository. Never the digital employee's own account (`bot_login`).
   - ochell looks at the first hundred comments of each kind on a pull request.
 - All of this is by polling, every `github.poll_interval`; ochell needs no webhook from GitHub.
+
+### Backup and restore
+The store holds what cannot be rebuilt from the trackers: the agents' session ids, the messages that wait for a run, and the record of every run. ochell backs it up itself.
+
+```yaml
+backup:
+  dir: /var/backups/ochell      # where the agent cannot read; best on another disk
+  interval: 24h
+  keep: 7
+```
+
+- **Scheduled:** with `backup.dir`, ochell writes a backup when the newest one is older than `backup.interval` (so also at start, after a long stop), and then at every interval. The file is `ochell-<time>.db`, readable by ochell's user only. The newest `backup.keep` stay; `0` keeps all.
+- **On demand:** `ochell backup --config config.yaml` writes one more to `backup.dir`; `ochell backup --to /path/file.db` writes to a file of your choice, which must not exist.
+- **A backup is consistent:** it is the state of the store at one moment, made by SQLite itself (`VACUUM INTO`) while ochell goes on working. It is one file, without `-wal` and `-shm`.
+- **Copy the backups off the host.** ochell does not; `backup.dir` on the same disk does not survive the disk.
+
+**Restore:**
+
+```
+systemctl stop ochell                                      # ochell must not run
+ochell restore --from /var/backups/ochell/ochell-20261116T020000.000Z.db --config config.yaml
+systemctl start ochell
+```
+
+- `ochell restore` refuses while an ochell answers on the admin socket of this configuration, and refuses a file that is not a whole store of ochell, or that a newer ochell wrote.
+- It puts the backup at `store.path`. **The store that was there is kept** next to it as `<store.path>.before-restore-<time>`; its `-wal` and `-shm` files are removed, because they belong to it and not to the backup.
+- **After the restore ochell is where it was when the backup was made:** tickets, sessions, the queue, a pause. A run that was going on then is queued again with the recovery note, like after a crash.
+- **What happened after the backup is gone from ochell**, though not from the trackers: a ticket that was assigned since is found again by [the poller](#the-poller); a webhook delivery from the last 24 hours that ochell had handled may be accepted a second time if the tracker sends it again.
 
 ### Retention
 What runs leave behind does not stay for ever.
@@ -665,7 +697,7 @@ Limits on what starts a run, and one way to talk to the running ochell.
   - A ticket whose assigner ochell does not know (a Jira Automation rule that sends no initiator) has no `assigner`.
   - Message text is never a way in: what a comment says does not change who may send one, or what the agent may do.
 
-**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `cost`, `outcomes`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
+**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `cost`, `outcomes`, `backup`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
 - Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port: the agent runs on the same host and can reach any local port. With the `systemd` launcher the agent is another user and cannot open the socket; with the `direct` launcher it is the same user and can.
 - Keep the socket in a directory that the agent user cannot write to.
 
