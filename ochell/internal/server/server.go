@@ -125,8 +125,10 @@ type Server struct {
 	api        http.Handler
 	apiPrefix  string
 	statusLink func(source, key string) string
-	handler    http.Handler
-	now        func() time.Time
+	// mounted are further handlers on the listeners, by pattern.
+	mounted map[string]http.Handler
+	handler http.Handler
+	now     func() time.Time
 
 	// tools holds, by Linear session, when tool use was last shown there
 	// and how much was left out since.
@@ -213,6 +215,18 @@ func (s *Server) UseAPI(prefix string, h http.Handler, link func(source, key str
 	s.handler = s.routes()
 }
 
+// Mount serves h for a pattern such as "GET /metrics", on the same
+// listeners as the webhooks and without their source IP filter: it is for
+// what authenticates its own requests. Call it before the server handles
+// requests.
+func (s *Server) Mount(pattern string, h http.Handler) {
+	if s.mounted == nil {
+		s.mounted = map[string]http.Handler{}
+	}
+	s.mounted[pattern] = h
+	s.handler = s.routes()
+}
+
 // Handler returns the HTTP handler (used by tests).
 func (s *Server) Handler() http.Handler { return s.handler }
 
@@ -221,6 +235,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, "ok\n")
 	})
+	for pattern, h := range s.mounted {
+		mux.Handle(pattern, h)
+	}
 	if s.api != nil {
 		// For people, not for a tracker: no source IP filter. The API
 		// checks its own token.

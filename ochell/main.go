@@ -29,6 +29,7 @@ import (
 	"ochell/internal/api"
 	"ochell/internal/config"
 	"ochell/internal/ipsync"
+	"ochell/internal/metrics"
 	"ochell/internal/policy"
 	"ochell/internal/runner"
 	"ochell/internal/server"
@@ -185,6 +186,14 @@ func serve(args []string) error {
 	r.SetNotifier(srv)
 	if err := r.UseWorkspace(cfg.Workspace); err != nil {
 		return err
+	}
+	expiry, _ := cfg.Agent.TokenExpiry()
+	if cfg.Metrics.Enabled {
+		srv.Mount("GET "+metrics.Path, &metrics.Handler{Token: cfg.Metrics.Token, Version: version, TokenExpiry: expiry, Store: st, Runner: r, Log: log})
+		log.Info("metrics endpoint", "path", metrics.Path)
+	}
+	if !expiry.IsZero() {
+		go watchTokenExpiry(ctx, expiry, cfg.Agent.TokenWarnDays, log)
 	}
 	if cfg.NgrokSync.Enabled {
 		go ipsync.RunSync(ctx, cfg.NgrokSync, ipsync.NewFetcher(), log)
@@ -352,6 +361,39 @@ func policyCheck(args []string) error {
 		fmt.Println("  " + line)
 	}
 	return nil
+}
+
+// tokenWarning says what the log should say about the end of the agent's
+// credential on a given day, or "" when it is further away than warnDays.
+func tokenWarning(expiry, now time.Time, warnDays int) (msg string, expired bool) {
+	left := expiry.Sub(now)
+	day := expiry.Add(-24 * time.Hour).Format("2006-01-02")
+	switch {
+	case left <= 0:
+		return "the agent's token has expired (agent.token_expires " + day + "): runs fail until it is renewed; make a new one (claude setup-token), put it in the agent's environment file and set the new date", true
+	case left <= time.Duration(warnDays)*24*time.Hour:
+		return fmt.Sprintf("the agent's token expires in %d day(s), on %s (agent.token_expires): make a new one (claude setup-token) before then, put it in the agent's environment file and set the new date", int(left.Hours()/24)+1, day), false
+	}
+	return "", false
+}
+
+// watchTokenExpiry warns in the log, at start and then once a day, when
+// the agent's credential is about to stop working or has.
+func watchTokenExpiry(ctx context.Context, expiry time.Time, warnDays int, log *slog.Logger) {
+	tick := time.NewTicker(24 * time.Hour)
+	defer tick.Stop()
+	for {
+		if msg, expired := tokenWarning(expiry, time.Now(), warnDays); expired {
+			log.Error(msg)
+		} else if msg != "" {
+			log.Warn(msg)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // adminCommand sends a command to the running ochell over its admin socket.

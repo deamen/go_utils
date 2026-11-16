@@ -1670,3 +1670,55 @@ func TestBackupAndVerify(t *testing.T) {
 		t.Errorf("a store of a newer ochell: %v", err)
 	}
 }
+
+func TestMetrics(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
+	now := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	seq := 0
+	run := func(key string, cause task.Cause, took time.Duration, res task.Result) {
+		t.Helper()
+		seq++
+		tk := newTask("r"+strconv.Itoa(seq), key, now)
+		tk.Cause = cause
+		if err := s.Enqueue(tk, Limits{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Claim(); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(took)
+		if err := s.Finish(tk.ID, res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("ENG-1", "", 30*time.Second, task.Result{Outcome: task.OutcomeFinished, Signal: result.Done, CostUSD: 1, Usage: agent.Usage{InputTokens: 10, OutputTokens: 20, CacheReadTokens: 30, CacheWriteTokens: 40}})
+	run("ENG-2", "", 10*time.Minute, task.Result{Outcome: task.OutcomeFailed, ExitCode: 1, Err: errors.New("exit status 1"), CostUSD: 0.5})
+	run("ENG-2", task.CauseRetry, 3*time.Hour, task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput, CostUSD: 2})
+	if err := s.Enqueue(newTask("q1", "ENG-3", now), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Enqueue(newTask("q2", "ENG-4", now), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	s.Claim()
+
+	m, err := s.Metrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Queued != 1 || m.Running != 1 || m.Tickets[ticket.InReview] != 1 || m.Tickets[ticket.Waiting] != 1 || m.Tickets[ticket.Queued] != 1 || m.Tickets[ticket.Running] != 1 {
+		t.Errorf("gauges: %+v", m)
+	}
+	if m.Started["assigned"] != 3 || m.Started["retry"] != 1 || m.Ended[task.OutcomeFinished] != 2 || m.Ended[task.OutcomeFailed] != 1 {
+		t.Errorf("counters: started %v, ended %v", m.Started, m.Ended)
+	}
+	// 30s, 10m and 3h: one run within a minute, two within 15 minutes, and
+	// the long one in no bucket but the last, which is the count.
+	if m.DurationCount != 3 || m.DurationSum != 30+600+10800 || m.DurationBucket[0] != 1 || m.DurationBucket[1] != 1 || m.DurationBucket[2] != 2 || m.DurationBucket[5] != 2 {
+		t.Errorf("durations: count %d, sum %v, buckets %v", m.DurationCount, m.DurationSum, m.DurationBucket)
+	}
+	if m.CostUSD != 3.5 || m.Usage != (agent.Usage{InputTokens: 10, OutputTokens: 20, CacheReadTokens: 30, CacheWriteTokens: 40}) {
+		t.Errorf("cost %v, usage %+v", m.CostUSD, m.Usage)
+	}
+}

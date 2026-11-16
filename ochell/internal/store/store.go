@@ -2002,3 +2002,83 @@ func Verify(path string) error {
 	}
 	return nil
 }
+
+// DurationBuckets are the upper bounds, in seconds, of the buckets in
+// which Metrics counts how long runs took.
+var DurationBuckets = []float64{60, 300, 900, 1800, 3600, 7200}
+
+// Metrics are counts over everything in the store, for the metrics
+// endpoint. The counters only grow: a run is never removed.
+type Metrics struct {
+	// Tickets is the number of tickets in each state.
+	Tickets map[ticket.State]int
+	// Queued and Running are the runs that wait and that are going on.
+	Queued, Running int
+	// Started is the number of runs that were started, by why they were
+	// queued ("assigned" for a plain assignment), and Ended the number
+	// that have ended, by outcome.
+	Started map[string]int
+	Ended   map[task.Outcome]int
+	// DurationCount and DurationSum are the number of ended runs that ran
+	// and the seconds they took together; DurationBucket[i] is how many of
+	// them took at most DurationBuckets[i] seconds.
+	DurationCount  int
+	DurationSum    float64
+	DurationBucket []int
+	// CostUSD and Usage are what all runs cost.
+	CostUSD float64
+	Usage   agent.Usage
+}
+
+// Metrics counts what is in the store.
+func (s *Store) Metrics() (*Metrics, error) {
+	m := &Metrics{Tickets: map[ticket.State]int{}, Started: map[string]int{}, Ended: map[task.Outcome]int{}, DurationBucket: make([]int, len(DurationBuckets))}
+	err := s.tx(func(tx *sql.Tx) error {
+		group := func(query string, add func(name string, n int)) error {
+			rows, err := tx.Query(query)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var name string
+				var n int
+				if err := rows.Scan(&name, &n); err != nil {
+					return err
+				}
+				add(name, n)
+			}
+			return rows.Err()
+		}
+		if err := group(`SELECT state, COUNT(*) FROM tickets GROUP BY state`, func(name string, n int) { m.Tickets[ticket.State(name)] = n }); err != nil {
+			return err
+		}
+		if err := group(`SELECT CASE WHEN cause = '' THEN 'assigned' ELSE cause END, COUNT(*) FROM runs WHERE started_at IS NOT NULL GROUP BY 1`,
+			func(name string, n int) { m.Started[name] = n }); err != nil {
+			return err
+		}
+		if err := group(`SELECT outcome, COUNT(*) FROM runs WHERE status = 'ended' GROUP BY outcome`, func(name string, n int) { m.Ended[task.Outcome(name)] = n }); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(`SELECT COUNT(*) FILTER (WHERE status = ?), COUNT(*) FILTER (WHERE status = ?), COALESCE(SUM(cost_usd), 0),
+				COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0)
+			FROM runs`, runQueued, runRunning).Scan(&m.Queued, &m.Running, &m.CostUSD,
+			&m.Usage.InputTokens, &m.Usage.OutputTokens, &m.Usage.CacheReadTokens, &m.Usage.CacheWriteTokens); err != nil {
+			return err
+		}
+		// How long the runs took that ran and have ended.
+		const took = `(ended_at - started_at) / 1000.0`
+		query := `SELECT COUNT(*), COALESCE(SUM(` + took + `), 0)`
+		for range DurationBuckets {
+			query += `, COUNT(*) FILTER (WHERE ` + took + ` <= ?)`
+		}
+		args := make([]any, len(DurationBuckets))
+		dest := []any{&m.DurationCount, &m.DurationSum}
+		for i, b := range DurationBuckets {
+			args[i] = b
+			dest = append(dest, &m.DurationBucket[i])
+		}
+		return tx.QueryRow(query+` FROM runs WHERE status = 'ended' AND started_at IS NOT NULL AND ended_at IS NOT NULL`, args...).Scan(dest...)
+	})
+	return m, err
+}
