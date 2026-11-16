@@ -311,6 +311,80 @@ func TestPromptOnStdinByDefault(t *testing.T) {
 	}
 }
 
+// podmanLauncher makes c a valid configuration with the podman launcher.
+func podmanLauncher(c *Config) {
+	c.Agent.Launcher = "podman"
+	c.Agent.Podman.Image = "registry.example.com/agent:7"
+	c.Agent.Workdir = "/work/{{.Source}}/{{.Key}}"
+}
+
+func TestPodmanLauncherValidation(t *testing.T) {
+	base := func() *Config {
+		cfg := Default()
+		cfg.Sources.JiraAutomation.Enabled = true
+		cfg.Sources.JiraAutomation.Token = "t"
+		cfg.Agent.Launcher = "podman"
+		cfg.Agent.Podman.Image = "registry.example.com/agent:7"
+		cfg.Agent.Workdir = "/work/{{.Source}}/{{.Key}}"
+		return cfg
+	}
+	// What the systemd launcher forbids is allowed here: podman changes
+	// nothing in the arguments, and the command is found in the image.
+	cfg := base()
+	cfg.Agent.PromptVia = "arg"
+	cfg.Agent.Args = []string{"-p", "{{.Prompt}}"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid podman configuration: %v", err)
+	}
+	cases := map[string]struct {
+		change func(c *Config)
+		want   string
+	}{
+		"no image":             {func(c *Config) { c.Agent.Podman.Image = "" }, "agent.podman.image"},
+		"no command":           {func(c *Config) { c.Agent.Podman.Command = "" }, "agent.podman.command"},
+		"no state directory":   {func(c *Config) { c.Agent.Podman.StateDir = "" }, "agent.podman.state_dir"},
+		"unknown pull policy":  {func(c *Config) { c.Agent.Podman.Pull = "sometimes" }, "agent.podman.pull must be"},
+		"default workdir":      {func(c *Config) { c.Agent.Workdir = Default().Agent.Workdir }, "agent.workdir to be an absolute path"},
+		"relative workdir":     {func(c *Config) { c.Agent.Workdir = "work/{{.Key}}" }, "agent.workdir to be an absolute path"},
+		"one workdir for all":  {func(c *Config) { c.Agent.Workdir = "/work/all" }, "agent.workdir to contain {{.Key}}"},
+		"empty extra argument": {func(c *Config) { c.Agent.Podman.Args = []string{"--memory=1g", ""} }, "agent.podman.args"},
+	}
+	for name, c := range cases {
+		cfg := base()
+		c.change(cfg)
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want an error with %q", name, err, c.want)
+		}
+	}
+
+	p := writeYAML(t, `
+agent:
+  launcher: podman
+  workdir: /work/{{.Source}}/{{.Key}}
+  podman:
+    image: localhost/agent:1
+    pull: missing
+    env_file: /etc/ochell/agent.env
+    args: [--memory=4g, --cpus=2]
+`)
+	cfg, err := Load("serve", []string{"--config", p}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm := cfg.Agent.Podman
+	if pm.Command != "podman" || pm.StateDir != "state" {
+		t.Errorf("defaults lost: %+v", pm)
+	}
+	if pm.Image != "localhost/agent:1" || pm.Pull != "missing" || pm.EnvFile != "/etc/ochell/agent.env" || strings.Join(pm.Args, " ") != "--memory=4g --cpus=2" {
+		t.Errorf("podman settings = %+v", pm)
+	}
+	// A setting that ochell does not know stays an error.
+	p = writeYAML(t, "agent:\n  podman:\n    volumes: [/etc:/etc]\n")
+	if _, err := Load("serve", []string{"--config", p}, nil); err == nil {
+		t.Error("an unknown setting of agent.podman was accepted")
+	}
+}
+
 func TestSystemdLauncherValidation(t *testing.T) {
 	base := func() *Config {
 		cfg := Default()
@@ -356,7 +430,7 @@ func TestSystemdLauncherValidation(t *testing.T) {
 	}
 	cfg = base()
 	cfg.Agent.Launcher = "docker"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "direct or systemd") {
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "direct, systemd or podman") {
 		t.Errorf("unknown launcher: got %v", err)
 	}
 
@@ -553,6 +627,14 @@ func TestTicketToolsSettings(t *testing.T) {
 		"IPv6":          {func(c *Config) { c.HTTP.Address = "::" }, "http://127.0.0.1:8080/mcp"},
 		"a name":        {func(c *Config) { c.HTTP.Address = "localhost" }, "http://localhost:8080/mcp"},
 		"set":           {func(c *Config) { c.TicketTools.URL = "https://ochell.example.com/mcp" }, "https://ochell.example.com/mcp"},
+		// In a container the loopback address is the container's own.
+		"podman, every address": {func(c *Config) { podmanLauncher(c) }, "http://host.containers.internal:8080/mcp"},
+		"podman, one address":   {func(c *Config) { podmanLauncher(c); c.HTTP.Address = "10.0.0.5" }, "http://10.0.0.5:8080/mcp"},
+		"podman, set": {func(c *Config) {
+			podmanLauncher(c)
+			c.HTTP.Address, c.TicketTools.URL = "127.0.0.1", "http://10.0.2.2:8080/mcp"
+		},
+			"http://10.0.2.2:8080/mcp"},
 	} {
 		cfg := base()
 		c.change(cfg)
@@ -568,12 +650,14 @@ func TestTicketToolsSettings(t *testing.T) {
 			c.HTTP.Enabled = false
 			c.HTTPS = Listener{Enabled: true, Address: "0.0.0.0", Port: 8443, CertFile: "c", KeyFile: "k"}
 		}, "ticket_tools.url is required when the http listener is off"},
-		"another path":  {func(c *Config) { c.TicketTools.URL = "http://127.0.0.1:8080/tools" }, "with the path /mcp"},
-		"not a URL":     {func(c *Config) { c.TicketTools.URL = "127.0.0.1:8080/mcp" }, "ticket_tools.url must be"},
-		"a password":    {func(c *Config) { c.TicketTools.URL = "http://u:p@127.0.0.1:8080/mcp" }, "ticket_tools.url must be"},
-		"no Jira API":   {func(c *Config) { c.Sources.JiraAPI = JiraAPI{} }, "ticket_tools needs sources.jira_api"},
-		"no bot":        {func(c *Config) { c.Sources.JiraWebhook.BotAccountID = "" }, "ticket_tools needs sources.jira_webhook.bot_account_id"},
-		"no Linear app": {func(c *Config) { c.Sources.Linear.Enabled, c.Sources.Linear.Secret = true, "s" }, "ticket_tools needs the Linear app"},
+		"podman, a loopback listener": {func(c *Config) { podmanLauncher(c); c.HTTP.Address = "127.0.0.1" }, "which a container does not reach"},
+		"podman, localhost":           {func(c *Config) { podmanLauncher(c); c.HTTP.Address = "localhost" }, "which a container does not reach"},
+		"another path":                {func(c *Config) { c.TicketTools.URL = "http://127.0.0.1:8080/tools" }, "with the path /mcp"},
+		"not a URL":                   {func(c *Config) { c.TicketTools.URL = "127.0.0.1:8080/mcp" }, "ticket_tools.url must be"},
+		"a password":                  {func(c *Config) { c.TicketTools.URL = "http://u:p@127.0.0.1:8080/mcp" }, "ticket_tools.url must be"},
+		"no Jira API":                 {func(c *Config) { c.Sources.JiraAPI = JiraAPI{} }, "ticket_tools needs sources.jira_api"},
+		"no bot":                      {func(c *Config) { c.Sources.JiraWebhook.BotAccountID = "" }, "ticket_tools needs sources.jira_webhook.bot_account_id"},
+		"no Linear app":               {func(c *Config) { c.Sources.Linear.Enabled, c.Sources.Linear.Secret = true, "s" }, "ticket_tools needs the Linear app"},
 		"address, off": {func(c *Config) {
 			c.TicketTools = TicketTools{URL: "http://127.0.0.1:8080/mcp"}
 		}, "ticket_tools.enabled is not"},

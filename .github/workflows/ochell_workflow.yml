@@ -30,6 +30,12 @@ jobs:
         run: make test
         working-directory: ./ochell
 
+      # The container sandbox with the runner's own rootless podman: no
+      # registry, the image is made from the fake agent.
+      - name: Test the podman launcher with a real podman
+        run: podman --version && OCHELL_E2E_PODMAN=1 go test ./e2e/ -run TestPodmanSandbox -count=1 -v
+        working-directory: ./ochell
+
       - name: Build ochell binaries
         run: make
         working-directory: ./ochell
