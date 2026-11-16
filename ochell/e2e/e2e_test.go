@@ -4099,3 +4099,45 @@ func TestAuditTrail(t *testing.T) {
 		t.Errorf("ochell outcomes with a bad date: exit %d, %q", code, out)
 	}
 }
+
+// Retention: logs older than the limit are removed, and the limit is in
+// the config.
+func TestRetention(t *testing.T) {
+	o := Start(t, Options{Configure: func(c *config.Config) {
+		c.Retention = config.Retention{Logs: 2 * time.Second, Interval: 200 * time.Millisecond}
+	}})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	first := o.JiraAssigned("DEV-210", "An old run").TaskID(t)
+	o.WaitRun(first, 15*time.Second)
+	runDir := filepath.Join(o.Config.Agent.RunDir, first)
+	for _, p := range []string{o.LogFile(first), filepath.Join(runDir, "result.json")} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("after the run: %v", err)
+		}
+	}
+	time.Sleep(1500 * time.Millisecond)
+	second := o.JiraAssigned("DEV-211", "A newer run").TaskID(t)
+	o.WaitRun(second, 15*time.Second)
+
+	// The first run's log and run directory go when they are 2s old; the
+	// second run's are younger and stay.
+	o.waitFor(10*time.Second, "the old log and run directory to be removed", func() bool {
+		_, logErr := os.Stat(o.LogFile(first))
+		_, dirErr := os.Stat(runDir)
+		return os.IsNotExist(logErr) && os.IsNotExist(dirErr)
+	})
+	if _, err := os.Stat(o.LogFile(second)); err != nil {
+		t.Errorf("the log of the newer run was removed with the old one: %v", err)
+	}
+	if !strings.Contains(o.Output(), `msg="retention: removed what is older than retention.logs"`) {
+		t.Error("the removal is not in ochell's log")
+	}
+	// What the store knows about the run stays.
+	if run := o.WaitStored(st, first, 5*time.Second); run.Result.Outcome != "finished" || run.Result.LogFile == "" {
+		t.Errorf("the record of the old run: %+v", run.Result)
+	}
+}

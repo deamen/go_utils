@@ -39,6 +39,15 @@ api:
   token: ${OCHELL_API_TOKEN}
   public_url: ""            # e.g. https://ochell.example.com
 
+# How long ochell keeps what runs leave behind. A run's log (which holds
+# the prompt and ticket text) and its run directory are removed when they
+# were last written longer ago than "logs"; 0s keeps them for ever. At
+# every interval ochell also removes the working directory of a closed
+# ticket that is still there (with workspace.cleanup).
+retention:
+  logs: 720h
+  interval: 1h
+
 # ochell's own, read-only access to GitHub. With it, ochell follows the
 # pull requests that its tickets opened, and a ticket is done when a person
 # has merged or closed its pull request. The token needs read access to

@@ -1731,6 +1731,13 @@ func (s *Store) CloseTicket(source, key string) (*Ticket, error) {
 	return s.Ticket(source, key)
 }
 
+// ClosedWithWorkspace returns the tickets that are done and still have a
+// working directory recorded: its removal did not happen, or did not
+// succeed.
+func (s *Store) ClosedWithWorkspace() ([]Ticket, error) {
+	return s.tickets(`SELECT `+ticketColumns+` FROM tickets WHERE state = ? AND (workspace != '' OR prepared_workspace != '') ORDER BY updated_at`, ticket.Done)
+}
+
 // ClearWorkspace forgets the working directory of a ticket, after it was
 // removed. The agent session goes with it: its files were in there.
 func (s *Store) ClearWorkspace(source, key string) error {
