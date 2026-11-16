@@ -377,6 +377,19 @@ type Retention struct {
 	Interval time.Duration `yaml:"interval"`
 }
 
+// Backup configures the scheduled backup of the store. The store holds what
+// cannot be rebuilt from the trackers: the agents' session ids, queued
+// follow-ups and the record of every run.
+type Backup struct {
+	// Dir is where the backups go: a directory that the agent cannot read,
+	// best on another disk than the store. Empty: no scheduled backup.
+	Dir string `yaml:"dir"`
+	// Interval is the time between two backups.
+	Interval time.Duration `yaml:"interval"`
+	// Keep is how many backups stay; older ones are removed. 0: all.
+	Keep int `yaml:"keep"`
+}
+
 // Poller configures the safety net behind the webhooks: ochell asks each
 // tracker for the bot's open tickets, at start and then at this interval.
 type Poller struct {
@@ -401,6 +414,7 @@ type Config struct {
 	Workspace   Workspace   `yaml:"workspace"`
 	Poller      Poller      `yaml:"poller"`
 	Retention   Retention   `yaml:"retention"`
+	Backup      Backup      `yaml:"backup"`
 	Agent       Agent       `yaml:"agent"`
 	Sources     Sources     `yaml:"sources"`
 	IPAllowlist IPAllowlist `yaml:"ip_allowlist"`
@@ -472,6 +486,7 @@ func Default() *Config {
 		Workspace: Workspace{Branch: "bot/{{.Key}}", HookTimeout: 10 * time.Minute},
 		Poller:    Poller{Interval: 5 * time.Minute},
 		Retention: Retention{Logs: 30 * 24 * time.Hour, Interval: time.Hour},
+		Backup:    Backup{Interval: 24 * time.Hour, Keep: 7},
 		GitHub:    GitHub{PollInterval: 2 * time.Minute, ChecksGrace: 2 * time.Minute},
 		Agent: Agent{
 			Command:        "claude",
@@ -780,6 +795,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Retention.Interval <= 0 {
 		errs = append(errs, errors.New("retention.interval must be positive"))
+	}
+	if c.Backup.Dir != "" && c.Backup.Interval <= 0 {
+		errs = append(errs, errors.New("backup.interval must be positive"))
+	}
+	if c.Backup.Keep < 0 {
+		errs = append(errs, errors.New("backup.keep must not be negative; 0 keeps every backup"))
 	}
 	if c.Poller.Interval < 0 {
 		errs = append(errs, errors.New("poller.interval must not be negative; 0s turns the poller off"))

@@ -39,6 +39,15 @@ api:
   token: ${OCHELL_API_TOKEN}
   public_url: ""            # e.g. https://ochell.example.com
 
+# The scheduled backup of the store: a consistent copy at every interval,
+# the newest "keep" of them kept. Put "dir" where the agent cannot read,
+# and copy the backups off the host. Leave "dir" empty for none; "ochell
+# backup --to FILE" still works. "ochell restore --from FILE" puts one back.
+backup:
+  dir: /var/backups/ochell
+  interval: 24h
+  keep: 7
+
 # How long ochell keeps what runs leave behind. A run's log (which holds
 # the prompt and ticket text) and its run directory are removed when they
 # were last written longer ago than "logs"; 0s keeps them for ever. At

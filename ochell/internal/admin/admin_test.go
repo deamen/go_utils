@@ -82,6 +82,13 @@ func (f *fakeControl) Outcomes(since, until time.Time) ([]store.Outcomes, error)
 		TimeToPR: []time.Duration{10 * time.Minute, 30 * time.Minute, 20 * time.Minute}}}, nil
 }
 
+func (f *fakeControl) Backup(dest string) (string, error) {
+	if dest == "" {
+		return "", runner.ErrNoBackupDir
+	}
+	return dest, nil
+}
+
 func (f *fakeControl) SetTier(source, key, tier string) error {
 	if tier != "low" && tier != "high" {
 		return runner.ErrNoTier
@@ -157,6 +164,13 @@ func TestCommands(t *testing.T) {
 	}
 	if got, err = Call(path, "POST", "resume", url.Values{"tier": {"high"}}); err != nil || strings.Contains(got, "held:") {
 		t.Errorf("resume of a tier = %q, %v", got, err)
+	}
+	// A backup of the store.
+	if got, err = Call(path, "POST", "backup", url.Values{"to": {"/var/backups/ochell.db"}}); err != nil || got != "the store is backed up to /var/backups/ochell.db" {
+		t.Errorf("backup = %q, %v", got, err)
+	}
+	if _, err := Call(path, "POST", "backup", nil); err == nil || !strings.Contains(err.Error(), "no backup directory is configured") {
+		t.Errorf("backup without a directory: %v", err)
 	}
 	// The outcome metrics per tier, for a period.
 	period := url.Values{"since": {"2026-11-01T00:00:00Z"}, "until": {"2026-11-15T00:00:00Z"}}

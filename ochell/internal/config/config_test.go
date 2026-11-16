@@ -578,3 +578,24 @@ func TestRetentionSettings(t *testing.T) {
 		t.Errorf("no interval: %v", err)
 	}
 }
+
+func TestBackupSettings(t *testing.T) {
+	cfg := Default()
+	cfg.Sources.JiraAutomation.Enabled = true
+	cfg.Sources.JiraAutomation.Token = "t"
+	if cfg.Backup.Dir != "" || cfg.Backup.Interval != 24*time.Hour || cfg.Backup.Keep != 7 {
+		t.Errorf("default = %+v", cfg.Backup)
+	}
+	cfg.Backup.Dir = "/var/backups/ochell"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a valid backup: %v", err)
+	}
+	cfg.Backup.Interval = 0
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "backup.interval must be positive") {
+		t.Errorf("no interval: %v", err)
+	}
+	cfg.Backup = Backup{Keep: -1}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "backup.keep must not be negative") {
+		t.Errorf("a negative keep: %v", err)
+	}
+}

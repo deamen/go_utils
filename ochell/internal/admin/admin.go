@@ -42,6 +42,10 @@ type Control interface {
 	Cost(source, key string) (*runner.CostReport, error)
 	// Outcomes returns the outcome metrics per tier for a period.
 	Outcomes(since, until time.Time) ([]store.Outcomes, error)
+	// Backup writes a consistent copy of the store: to the file dest, or
+	// with an empty dest to the configured backup directory. It returns
+	// the path of the copy.
+	Backup(dest string) (string, error)
 	// SetTier puts a ticket under another risk tier.
 	SetTier(source, key, tier string) error
 	// Stop ends the work on a ticket for the operator named in by.
@@ -190,6 +194,17 @@ func routes(c Control, log *slog.Logger) http.Handler {
 			return
 		}
 		answer(w, http.StatusOK, strings.TrimRight(OutcomesText(list, since, until), "\n"))
+	})
+	mux.HandleFunc("POST /backup", func(w http.ResponseWriter, r *http.Request) {
+		switch path, err := c.Backup(r.URL.Query().Get("to")); {
+		case err == nil:
+			answer(w, http.StatusOK, "the store is backed up to "+path)
+		case errors.Is(err, runner.ErrNoBackupDir):
+			answer(w, http.StatusBadRequest, "no backup directory is configured (backup.dir); name a file with --to")
+		default:
+			log.Error("admin: backup failed", "err", err)
+			answer(w, http.StatusInternalServerError, err.Error())
+		}
 	})
 	mux.HandleFunc("POST /reset", func(w http.ResponseWriter, r *http.Request) {
 		source, key, tier := r.URL.Query().Get("source"), r.URL.Query().Get("key"), r.URL.Query().Get("tier")

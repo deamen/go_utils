@@ -13,11 +13,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
 	"os/signal"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -49,6 +51,8 @@ var availCmds = [][2]string{
 	{"resume", "end a pause; --tier NAME ends the pause of one tier"},
 	{"status", "say whether the running ochell is paused, and what is queued and running"},
 	{"reset", "reset the attempts of a ticket, and with --tier set its risk tier: ochell reset <jira|linear> <KEY> [--tier NAME]"},
+	{"backup", "back the store of the running ochell up: to backup.dir, or to a file with --to"},
+	{"restore", "put a backup in the place of the store, while ochell is stopped: ochell restore --from FILE"},
 	{"outcomes", "show the outcome metrics per tier for a period: ochell outcomes [--since 2026-11-01] [--until 2026-11-15]"},
 	{"cost", "show what the tickets have cost, or one ticket with its runs: ochell cost [<jira|linear> <KEY>]"},
 	{"stop", "stop the run of a ticket and release the ticket: ochell stop <jira|linear> <KEY>"},
@@ -94,7 +98,9 @@ func main() {
 		err = jiraCheck(args)
 	case "policy-check":
 		err = policyCheck(args)
-	case "pause", "resume", "status", "reset", "stop", "cost", "outcomes":
+	case "restore":
+		err = restore(args)
+	case "pause", "resume", "status", "reset", "stop", "cost", "outcomes", "backup":
 		err = adminCommand(cmd, args)
 	case "version":
 		fmt.Printf("%s-%s\n", version, build)
@@ -175,6 +181,7 @@ func serve(args []string) error {
 	}
 	r.FollowChecks(cfg.GitHub.Enabled())
 	r.UseRetention(cfg.Retention)
+	r.UseBackup(cfg.Backup)
 	r.SetNotifier(srv)
 	if err := r.UseWorkspace(cfg.Workspace); err != nil {
 		return err
@@ -216,6 +223,82 @@ func serve(args []string) error {
 	r.Shutdown(drain)
 	log.Info("stopped")
 	return err
+}
+
+// restore puts a backup in the place of the store. ochell must be stopped:
+// a running ochell has the store open and would write over it.
+func restore(args []string) error {
+	var from string
+	cfg, err := config.Load("restore", args, func(fs *flag.FlagSet) {
+		fs.StringVar(&from, "from", "", "the backup file to restore")
+	})
+	if err != nil {
+		return err
+	}
+	if from == "" {
+		return errors.New("usage: ochell restore --from FILE [flags]")
+	}
+	if cfg.Admin.Socket != "" {
+		if _, err := admin.Call(cfg.Admin.Socket, "GET", "status", nil); err == nil {
+			return errors.New("ochell is running with this configuration; stop it before a restore")
+		}
+	}
+	if err := store.Verify(from); err != nil {
+		return fmt.Errorf("the backup cannot be used: %w", err)
+	}
+	dest := cfg.Store.Path
+	// What is there now is kept under another name, not removed.
+	kept := ""
+	if _, err := os.Stat(dest); err == nil {
+		kept = dest + ".before-restore-" + time.Now().UTC().Format("20060102T150405Z")
+		if err := os.Rename(dest, kept); err != nil {
+			return fmt.Errorf("cannot move the present store out of the way: %w", err)
+		}
+	}
+	// The write-ahead files belong to the store that was moved away; with
+	// the restored file they would be read as its newest changes.
+	for _, ext := range []string{"-wal", "-shm"} {
+		if err := os.Remove(dest + ext); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("cannot remove %s: %w", dest+ext, err)
+		}
+	}
+	if err := copyFile(from, dest); err != nil {
+		return fmt.Errorf("cannot put the backup in place: %w", err)
+	}
+	fmt.Printf("restored %s to %s\n", from, dest)
+	if kept != "" {
+		fmt.Printf("the store that was there is kept as %s\n", kept)
+	}
+	fmt.Println("start ochell; runs that were going on when the backup was made are queued again")
+	return nil
+}
+
+// copyFile copies a file to a new file that only its owner can read.
+func copyFile(from, to string) error {
+	in, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if dir := filepath.Dir(to); dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	out, err := os.OpenFile(to, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(to)
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // moment reads a point in time as an operator writes it: a date, a time,
@@ -280,9 +363,11 @@ func adminCommand(cmd string, args []string) error {
 	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		rest, args = append(rest, args[0]), args[1:]
 	}
-	var tier, since, until string
+	var tier, since, until, to string
 	cfg, err := config.Load(cmd, args, func(fs *flag.FlagSet) {
 		switch cmd {
+		case "backup":
+			fs.StringVar(&to, "to", "", "the file to write the backup to; it must not exist (default: a new file in backup.dir)")
 		case "reset":
 			fs.StringVar(&tier, "tier", "", "also put the ticket under this risk tier; the one way to lower a tier")
 		case "outcomes":
@@ -302,6 +387,15 @@ func adminCommand(cmd string, args []string) error {
 	case "pause", "resume":
 		if tier != "" {
 			query.Set("tier", tier)
+		}
+	case "backup":
+		if to != "" {
+			// The running ochell may have another working directory.
+			abs, err := filepath.Abs(to)
+			if err != nil {
+				return err
+			}
+			query.Set("to", abs)
 		}
 	case "outcomes":
 		method = "GET"
