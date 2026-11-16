@@ -292,6 +292,27 @@ The agent opens a pull request and hands the ticket over; a person reviews and m
   - ochell looks at the first hundred comments of each kind on a pull request.
 - All of this is by polling, every `github.poll_interval`; ochell needs no webhook from GitHub.
 
+### Retention
+What runs leave behind does not stay for ever.
+
+```yaml
+retention:
+  logs: 720h        # 30 days; 0s keeps everything
+  interval: 1h
+```
+
+| What | Removed when |
+|---|---|
+| the log of a run (`agent.log_dir`): the prompt, the hooks' and the agent's output | it was last written more than `retention.logs` ago |
+| the run directory (`agent.run_dir`), with the agent's result file | the same |
+| the working directory of a ticket | the ticket is closed, with `workspace.cleanup` (see [Workspaces](#workspaces)). ochell looks again at every interval for a closed ticket whose directory is still there, because the removal failed or ochell was not running |
+
+- **Logs hold prompts and ticket text.** That is the reason for a limit, and the default is 30 days.
+- ochell looks at start and then every `retention.interval`.
+- **The store keeps the record of every run** (see [Audit trail and outcome metrics](#audit-trail-and-outcome-metrics)); only the files go. The `log_file` of an old run then names a file that is gone.
+- With the `systemd` launcher the run directories belong to the agent user, so they are removed as that user, like a working directory.
+- Only `*.log` files in `log_dir` are touched; nothing else there, and nothing outside `log_dir` and `run_dir`.
+
 ### Audit trail and outcome metrics
 **Every run has a record** in the store, which answers afterwards under which rules it ran and what came of it.
 
@@ -841,7 +862,7 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 - **No file, or an invalid one:** the run has no result, and the ticket waits for a human with the reason `no_result`. The last line of the run log says `result=none` or `result=invalid`, and ochell's log says what was wrong with the file.
 - **Only a run that ended by itself with status 0 is believed.** For a run that failed, timed out or was stopped, the file is stored but does not change what happens to the ticket.
 - **The file is untrusted.** ochell reads at most 64 KB of a regular file, and does not follow a link out of `run_dir`.
-- Result files are not removed yet.
+- Result files are removed with their run directory after `retention.logs` (see [Retention](#retention)).
 
 ### Agent environment
 The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:

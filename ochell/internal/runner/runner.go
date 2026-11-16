@@ -93,6 +93,8 @@ type Runner struct {
 	cancels map[string]context.CancelFunc
 	stops   map[string]string
 	closing map[string]bool
+	// retention says how long run logs are kept (retention.go).
+	retention config.Retention
 	// followChecks says that ochell follows the checks of pull requests
 	// (it has access to GitHub): a ticket whose run handed a pull request
 	// over waits for them before it is in review.
@@ -829,6 +831,10 @@ func (r *Runner) Start() error {
 		}
 	}
 
+	if r.retention.Interval > 0 {
+		r.wg.Add(1)
+		go r.runRetention()
+	}
 	n := max(r.cfg.MaxConcurrent, 1)
 	for range n {
 		r.wg.Add(1)

@@ -557,3 +557,24 @@ func TestGitHubSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestRetentionSettings(t *testing.T) {
+	cfg := Default()
+	cfg.Sources.JiraAutomation.Enabled = true
+	cfg.Sources.JiraAutomation.Token = "t"
+	if cfg.Retention.Logs != 30*24*time.Hour || cfg.Retention.Interval != time.Hour {
+		t.Errorf("default = %+v", cfg.Retention)
+	}
+	cfg.Retention.Logs = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("no limit: %v", err)
+	}
+	cfg.Retention.Logs = -time.Hour
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "retention.logs must not be negative") {
+		t.Errorf("a negative limit: %v", err)
+	}
+	cfg.Retention = Retention{Logs: time.Hour}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "retention.interval must be positive") {
+		t.Errorf("no interval: %v", err)
+	}
+}

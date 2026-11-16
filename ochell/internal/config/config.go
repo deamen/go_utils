@@ -366,6 +366,17 @@ type GitHub struct {
 // Enabled reports whether the GitHub access is configured.
 func (g GitHub) Enabled() bool { return g.Token != "" }
 
+// Retention says how long ochell keeps what its runs leave behind. Run
+// logs hold prompts and ticket text, so they should not stay for ever.
+type Retention struct {
+	// Logs is how long a run's log file and its run directory (with the
+	// result file) are kept after they were last written. 0: for ever.
+	Logs time.Duration `yaml:"logs"`
+	// Interval is how often ochell looks for what is too old, and for
+	// working directories of closed tickets that are still there.
+	Interval time.Duration `yaml:"interval"`
+}
+
 // Poller configures the safety net behind the webhooks: ochell asks each
 // tracker for the bot's open tickets, at start and then at this interval.
 type Poller struct {
@@ -389,6 +400,7 @@ type Config struct {
 	Repos       []Repo      `yaml:"repos"`
 	Workspace   Workspace   `yaml:"workspace"`
 	Poller      Poller      `yaml:"poller"`
+	Retention   Retention   `yaml:"retention"`
 	Agent       Agent       `yaml:"agent"`
 	Sources     Sources     `yaml:"sources"`
 	IPAllowlist IPAllowlist `yaml:"ip_allowlist"`
@@ -459,6 +471,7 @@ func Default() *Config {
 		Store:     Store{Path: "ochell.db"},
 		Workspace: Workspace{Branch: "bot/{{.Key}}", HookTimeout: 10 * time.Minute},
 		Poller:    Poller{Interval: 5 * time.Minute},
+		Retention: Retention{Logs: 30 * 24 * time.Hour, Interval: time.Hour},
 		GitHub:    GitHub{PollInterval: 2 * time.Minute, ChecksGrace: 2 * time.Minute},
 		Agent: Agent{
 			Command:        "claude",
@@ -761,6 +774,12 @@ func (c *Config) Validate() error {
 		}
 	} else if g.APIURL != "" || g.BotLogin != "" {
 		errs = append(errs, errors.New("github: api_url or bot_login is set but token is not"))
+	}
+	if c.Retention.Logs < 0 {
+		errs = append(errs, errors.New("retention.logs must not be negative; 0s keeps the logs for ever"))
+	}
+	if c.Retention.Interval <= 0 {
+		errs = append(errs, errors.New("retention.interval must be positive"))
 	}
 	if c.Poller.Interval < 0 {
 		errs = append(errs, errors.New("poller.interval must not be negative; 0s turns the poller off"))
