@@ -23,6 +23,9 @@ type fakeControl struct {
 	reset   []string
 	stopped []string
 	tier    string
+	// levels are the levels of autonomy by tier; nil: the policy has none.
+	levels  map[string]string
+	changes []store.LevelChange
 }
 
 func (f *fakeControl) Pause(tier string) error {
@@ -288,5 +291,123 @@ func TestSocketLifecycle(t *testing.T) {
 	}
 	if raw, _ := os.ReadFile(path); string(raw) != "precious" {
 		t.Error("a regular file at the socket path was changed")
+	}
+}
+
+func (f *fakeControl) Autonomy() ([]runner.Class, []store.LevelChange, error) {
+	if f.levels == nil {
+		return nil, nil, runner.ErrNoLevels
+	}
+	since := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	rec := store.Record{Since: since, PullRequests: 4, SentBack: 1, Merged: 2, MergedUntouched: 2}
+	return []runner.Class{{Tier: "low", Level: f.levels["low"], Since: &since, By: "the operator ada", Record: &rec}, {Tier: "high", Level: "observe", Record: &store.Record{}}}, f.changes, nil
+}
+
+func (f *fakeControl) step(tier, by, reason string, to map[string]string) (store.LevelChange, error) {
+	switch {
+	case f.levels == nil:
+		return store.LevelChange{}, runner.ErrNoLevels
+	case tier != "low":
+		return store.LevelChange{}, runner.ErrNoTier
+	case to[f.levels[tier]] == "":
+		return store.LevelChange{}, runner.ErrTopLevel
+	}
+	c := store.LevelChange{Class: tier, From: f.levels[tier], To: to[f.levels[tier]], By: by, Reason: reason, At: time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC),
+		Record: store.Record{Since: time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC), PullRequests: 4, SentBack: 1}}
+	f.levels[tier] = c.To
+	f.changes = append([]store.LevelChange{c}, f.changes...)
+	return c, nil
+}
+
+func (f *fakeControl) Promote(tier, by, reason string) (store.LevelChange, error) {
+	return f.step(tier, by, reason, map[string]string{"observe": "assisted", "assisted": "autonomous"})
+}
+
+func (f *fakeControl) Demote(tier, by, reason string) (store.LevelChange, error) {
+	return f.step(tier, by, reason, map[string]string{"autonomous": "assisted", "assisted": "observe"})
+}
+
+func (f *fakeControl) Flag(source, key, by, reason string) (store.LevelChange, error) {
+	if key == "NOPE-1" {
+		return store.LevelChange{}, store.ErrUnknown
+	}
+	c, err := f.step("low", by, "a guardrail flagged the run: "+reason, map[string]string{"autonomous": "assisted", "assisted": "observe", "observe": "observe"})
+	if err == nil {
+		f.changes[0].Source, f.changes[0].Key, f.changes[0].Run = source, key, "run-1"
+	}
+	return c, err
+}
+
+// The commands of graduated autonomy: the levels, a promotion, a demotion
+// and a guardrail's flag.
+func TestAutonomyCommands(t *testing.T) {
+	path := socketPath(t)
+	c := &fakeControl{}
+	s, err := Listen(path, c, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// A policy without levels has nothing to show or to change.
+	for _, cmd := range [][2]string{{"GET", "autonomy"}, {"POST", "promote"}, {"POST", "demote"}} {
+		if _, err := Call(path, cmd[0], cmd[1], url.Values{"tier": {"low"}}); err == nil || !strings.Contains(err.Error(), "no autonomy section") {
+			t.Errorf("%s without levels: %v", cmd[1], err)
+		}
+	}
+	c.levels = map[string]string{"low": "assisted"}
+
+	got, err := Call(path, "POST", "promote", url.Values{"tier": {"low"}, "user": {"ada"}, "reason": {"four weeks\nwithout a problem"}})
+	if err != nil || !strings.Contains(got, "the tier low is now at the level autonomous (it was at assisted)") ||
+		!strings.Contains(got, "recorded: by the operator ada, with 4 ticket(s) with a pull request since 2026-11-02 10:00, sent back: 1 of 4 (25%)") {
+		t.Errorf("promote = %q, %v", got, err)
+	}
+	// The reason is kept as one line.
+	if c.changes[0].Reason != "four weeks without a problem" {
+		t.Errorf("recorded reason = %q", c.changes[0].Reason)
+	}
+	for _, bad := range []url.Values{{"tier": {"low"}}, {"tier": {"nope"}}} {
+		if _, err := Call(path, "POST", "promote", bad); err == nil || !strings.Contains(err.Error(), "nothing was changed") {
+			t.Errorf("promote %v: %v", bad, err)
+		}
+	}
+	if got, err = Call(path, "POST", "demote", url.Values{"tier": {"low"}}); err != nil || !strings.Contains(got, "now at the level assisted (it was at autonomous)") || !strings.Contains(got, "by an operator") {
+		t.Errorf("demote = %q, %v", got, err)
+	}
+
+	// A flag needs a reason and a ticket that ochell knows.
+	if _, err := Call(path, "POST", "flag", url.Values{"source": {"jira"}, "key": {"DEV-1"}}); err == nil || !strings.Contains(err.Error(), "needs a reason") {
+		t.Errorf("flag without a reason: %v", err)
+	}
+	if _, err := Call(path, "POST", "flag", url.Values{"source": {"jira"}, "key": {"NOPE-1"}, "reason": {"x"}}); err == nil || !strings.Contains(err.Error(), "knows no jira ticket NOPE-1") {
+		t.Errorf("flag of an unknown ticket: %v", err)
+	}
+	got, err = Call(path, "POST", "flag", url.Values{"source": {"jira"}, "key": {"DEV-1"}, "reason": {"CI failed three times"}, "user": {"ci-watch"}})
+	if err != nil || !strings.Contains(got, "the flag on jira DEV-1 is recorded; its tier low is now at the level observe (it was at assisted)") {
+		t.Errorf("flag = %q, %v", got, err)
+	}
+	if got, err = Call(path, "POST", "flag", url.Values{"source": {"jira"}, "key": {"DEV-1"}, "reason": {"again"}}); err != nil || !strings.Contains(got, "at the lowest level already (observe)") {
+		t.Errorf("flag at the lowest level = %q, %v", got, err)
+	}
+
+	got, err = Call(path, "GET", "autonomy", nil)
+	for _, want := range []string{
+		"low   observe  2026-11-16 09:00  the operator ada               4              1 of 4 (25%)  2       2 of 2 (100%)",
+		"high  observe  -                 the policy file (start_level)  0              -             0       -",
+		"2026-11-16 10:00  low: stays at observe, by an operator; flagged: jira DEV-1, run run-1; a guardrail flagged the run: again [",
+		"2026-11-16 10:00  low: assisted -> observe, by the operator ci-watch; flagged: jira DEV-1, run run-1; a guardrail flagged the run: CI failed three times [",
+		"2026-11-16 10:00  low: assisted -> autonomous, by the operator ada; four weeks without a problem [4 ticket(s) with a pull request since 2026-11-02 10:00, sent back: 1 of 4 (25%), merged untouched: -]",
+	} {
+		if err != nil || !strings.Contains(got, want) {
+			t.Errorf("autonomy lacks %q (%v):\n%s", want, err, got)
+		}
+	}
+
+	// The status names the level of each tier.
+	since := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	c.st.Autonomy = []runner.Class{{Tier: "low", Level: "observe", Since: &since, By: runner.ByOchell}, {Tier: "high", Level: "assisted"}}
+	if got, err = Call(path, "GET", "status", nil); err != nil ||
+		!strings.Contains(got, "\nautonomy: the tier low is at the level observe since 2026-11-16 09:00 UTC, by ochell itself\nautonomy: the tier high is at the level assisted") {
+		t.Errorf("status = %q, %v", got, err)
 	}
 }

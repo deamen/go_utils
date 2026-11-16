@@ -1944,3 +1944,53 @@ func TestScheduling(t *testing.T) {
 		t.Errorf("a waiting ticket has the hold %q", st.Hold)
 	}
 }
+
+// The levels of autonomy: every change is kept, and the level of a class
+// is where its last change left it.
+func TestLevels(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ochell.db")
+	s := open(t, path)
+	now := time.Date(2026, 11, 16, 9, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return now }
+	if last, err := s.Level("low"); err != nil || last != nil {
+		t.Fatalf("Level of a class that nobody changed = %+v, %v", last, err)
+	}
+	if list, err := s.LevelChanges(0); err != nil || len(list) != 0 {
+		t.Fatalf("LevelChanges of a new store = %+v, %v", list, err)
+	}
+	rec := Record{Since: now.Add(-24 * time.Hour), Until: now, Tickets: 5, Runs: 7, CostUSD: 2.5, PullRequests: 4, SentBack: 1, TimeToPR: 9 * time.Minute, Merged: 2, MergedUntouched: 1}
+	up, err := s.ChangeLevel(LevelChange{Class: "low", From: "observe", To: "assisted", By: "the operator ada", Reason: "a good month", Record: rec})
+	if err != nil || up.ID == 0 || !up.At.Equal(now) {
+		t.Fatalf("ChangeLevel = %+v, %v", up, err)
+	}
+	now = now.Add(time.Hour)
+	if _, err := s.ChangeLevel(LevelChange{Class: "high", From: "assisted", To: "observe", By: "ochell itself"}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Hour)
+	if _, err := s.ChangeLevel(LevelChange{Class: "low", From: "assisted", To: "observe", By: "the operator ci", Reason: "flag", Source: "jira", Key: "DEV-1", Run: "r1"}); err != nil {
+		t.Fatal(err)
+	}
+	// It survives a restart.
+	s.Close()
+	s = open(t, path)
+	last, err := s.Level("low")
+	if err != nil || last == nil || last.To != "observe" || last.From != "assisted" || last.By != "the operator ci" || last.Source != "jira" || last.Key != "DEV-1" || last.Run != "r1" ||
+		!last.At.Equal(time.Date(2026, 11, 16, 11, 0, 0, 0, time.UTC)) {
+		t.Errorf("Level(low) = %+v, %v", last, err)
+	}
+	list, err := s.LevelChanges(0)
+	if err != nil || len(list) != 3 || list[0].Class != "low" || list[1].Class != "high" || list[2].To != "assisted" {
+		t.Fatalf("LevelChanges = %+v, %v", list, err)
+	}
+	// The numbers that the first decision was made on.
+	if got := list[2]; got.Record != rec || got.Reason != "a good month" || got.By != "the operator ada" || got.Record.Rate() != 0.25 {
+		t.Errorf("the first change = %+v", got)
+	}
+	if list, _ := s.LevelChanges(2); len(list) != 2 || list[0].Key != "DEV-1" {
+		t.Errorf("LevelChanges(2) = %+v", list)
+	}
+	if (Record{}).Rate() != 0 {
+		t.Error("the rate of a class without a pull request is not 0")
+	}
+}

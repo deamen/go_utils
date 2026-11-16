@@ -95,6 +95,28 @@ scheduling:
   # (and Blocker, Critical, Major, Minor, Trivial) are known already.
   # priorities: {P0: 1, P1: 2, P2: 3}
 
+# Graduated autonomy: each tier has a level, which holds back what the tier
+# allows until an operator has promoted it ("ochell promote <tier>"). The
+# level a tier has now is not in this file; ochell keeps it in its store.
+#   observe     every ticket gets a run that only plans, and waits for /approve
+#   assisted    the tier's own plan_gate; pr_review counts as required
+#   autonomous  pr_review: sampled of the tier counts
+#   auto-merge  auto_merge: after_ci counts; only for the lowest tier, and
+#               only by a promotion
+# Left out: there are no levels, and every tier holds as it is written.
+autonomy:
+  # The level of a tier whose level nobody has changed yet: observe,
+  # assisted or autonomous.
+  start_level: assisted
+  # When ochell takes one level away by itself: more than sent_back_rate of
+  # the tier's tickets with a pull request were sent back by a person with a
+  # follow-up ("sent back" of "ochell outcomes"), counted over the window
+  # and since the level last changed, with at least min_sample such tickets.
+  demote:
+    sent_back_rate: 0.3      # above 0, at most 1 (1: never); default 0.3
+    window: 336h             # default 336h (14 days)
+    min_sample: 5            # default 5
+
 # The tier of a ticket that no rule matches.
 default_tier: normal
 

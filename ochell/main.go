@@ -49,7 +49,7 @@ var availCmds = [][2]string{
 	{"ngrok-sync", "sync Atlassian/Linear IP ranges into ngrok IP policies"},
 	{"linear-install", "print the Linear agent app install URL"},
 	{"jira-check", "check the Jira API access: list the bot's open tickets, and comment on one with --comment-on"},
-	{"policy-check", "check the policy file and print its tiers"},
+	{"policy-check", "check the policy file and print its tiers, its scheduling and its autonomy settings"},
 	{"workflow-check", "check a repository's WORKFLOW.md against the policy: ochell workflow-check --file WORKFLOW.md"},
 	{"pause", "hold the queue of the running ochell: no new run starts; --tier NAME holds one tier"},
 	{"resume", "end a pause; --tier NAME ends the pause of one tier"},
@@ -60,6 +60,10 @@ var availCmds = [][2]string{
 	{"outcomes", "show the outcome metrics per tier for a period: ochell outcomes [--since 2026-11-01] [--until 2026-11-15]"},
 	{"cost", "show what the tickets have cost, or one ticket with its runs: ochell cost [<jira|linear> <KEY>]"},
 	{"stop", "stop the run of a ticket and release the ticket: ochell stop <jira|linear> <KEY>"},
+	{"autonomy", "show the level of autonomy of each tier, with its numbers and the last changes"},
+	{"promote", "raise the level of autonomy of a tier by one step: ochell promote <TIER> [--reason TEXT]"},
+	{"demote", "lower the level of autonomy of a tier by one step: ochell demote <TIER> [--reason TEXT]"},
+	{"flag", "for a guardrail outside ochell: record a flag on a ticket's run and lower the level of its tier: ochell flag <jira|linear> <KEY> --reason TEXT"},
 	{"version", "print the version"},
 }
 
@@ -106,7 +110,7 @@ func main() {
 		err = workflowCheck(args)
 	case "restore":
 		err = restore(args)
-	case "pause", "resume", "status", "reset", "stop", "cost", "outcomes", "backup":
+	case "pause", "resume", "status", "reset", "stop", "cost", "outcomes", "backup", "autonomy", "promote", "demote", "flag":
 		err = adminCommand(cmd, args)
 	case "version":
 		fmt.Printf("%s-%s\n", version, build)
@@ -182,6 +186,9 @@ func serve(args []string) error {
 	}
 	if sch := pol.DescribeScheduling(); len(sch) > 0 {
 		log.Info("scheduling", "settings", strings.Join(sch, " "))
+	}
+	if a := pol.DescribeAutonomy(); a != "" {
+		log.Info("autonomy: each tier has a level; an operator raises it (ochell promote), ochell lowers it by itself", "settings", a)
 	}
 	if cfg.API.Enabled {
 		status := api.New(cfg.API, st, r, log)
@@ -381,6 +388,12 @@ func policyCheck(args []string) error {
 	if sch := pol.DescribeScheduling(); len(sch) > 0 {
 		fmt.Println("scheduling: " + strings.Join(sch, " "))
 	}
+	if a := pol.DescribeAutonomy(); a != "" {
+		fmt.Println("autonomy: " + a)
+		for _, t := range pol.Tiers {
+			fmt.Printf("  %s: starts at %s, can be promoted up to %s\n", t.Name, pol.Level(t.Name, ""), pol.MaxLevel(t.Name))
+		}
+	}
 	return nil
 }
 
@@ -476,12 +489,12 @@ func watchTokenExpiry(ctx context.Context, expiry time.Time, warnDays int, log *
 // The socket is found in the same configuration that the server uses.
 func adminCommand(cmd string, args []string) error {
 	var rest []string
-	// The ticket of "reset" and "stop" comes before the flags:
-	// ochell reset jira DEV-1 --config …
+	// The ticket of "reset", "stop" and "flag", and the tier of "promote"
+	// and "demote", come before the flags: ochell reset jira DEV-1 --config …
 	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		rest, args = append(rest, args[0]), args[1:]
 	}
-	var tier, since, until, to string
+	var tier, since, until, to, why string
 	cfg, err := config.Load(cmd, args, func(fs *flag.FlagSet) {
 		switch cmd {
 		case "backup":
@@ -493,15 +506,42 @@ func adminCommand(cmd string, args []string) error {
 			fs.StringVar(&until, "until", "", "end of the period, in the same forms; default: now")
 		case "pause", "resume":
 			fs.StringVar(&tier, "tier", "", "only the tickets of this risk tier")
+		case "promote", "demote":
+			fs.StringVar(&why, "reason", "", "why, for the record of the decision")
+		case "flag":
+			fs.StringVar(&why, "reason", "", "what the guardrail found; required")
 		}
 	})
 	if err != nil {
 		return err
 	}
 	method, query := "POST", url.Values{}
+	// Who decided, for the record: the OS user that runs the command.
+	me := func() {
+		if u, err := user.Current(); err == nil {
+			query.Set("user", u.Username)
+		}
+	}
 	switch cmd {
-	case "status":
+	case "status", "autonomy":
 		method = "GET"
+	case "promote", "demote":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: ochell %s <TIER> [--reason TEXT] [flags]", cmd)
+		}
+		query.Set("tier", rest[0])
+		query.Set("reason", why)
+		rest = nil
+		me()
+	case "flag":
+		if len(rest) != 2 || (rest[0] != "jira" && rest[0] != "linear") || strings.TrimSpace(why) == "" {
+			return errors.New("usage: ochell flag <jira|linear> <KEY> --reason TEXT [flags]")
+		}
+		query.Set("source", rest[0])
+		query.Set("key", rest[1])
+		query.Set("reason", why)
+		rest = nil
+		me()
 	case "pause", "resume":
 		if tier != "" {
 			query.Set("tier", tier)
@@ -550,9 +590,7 @@ func adminCommand(cmd string, args []string) error {
 		rest = nil
 		if cmd == "stop" {
 			// For the note on the ticket.
-			if u, err := user.Current(); err == nil {
-				query.Set("user", u.Username)
-			}
+			me()
 		}
 	}
 	if len(rest) > 0 {
