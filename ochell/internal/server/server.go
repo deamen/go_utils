@@ -1522,6 +1522,10 @@ func (s *Server) Finished(ctx context.Context, t *task.Task, res task.Result) er
 		// The ticket waits for a human: a question, not an error.
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityElicitation, escalationText(t, res))
 	}
+	if res.Outcome == task.OutcomeNoProgress {
+		// The same: a reply lets the agent go on.
+		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityElicitation, noProgressText(t, res))
+	}
 	if res.Err != nil {
 		return s.linear.CreateActivity(ctx, t.TrackerSession, linear.ActivityError,
 			strings.TrimSpace(failureText(res)+"\n\n"+codeBlock(lastN(res.Message, replyMax))))
@@ -1659,6 +1663,25 @@ func escalationText(t *task.Task, res task.Result) string {
 	case task.EscalationRetries:
 		b.WriteString("\n\nA message from a person starts the ticket's count of attempts anew.")
 	}
+	return b.String()
+}
+
+// noProgressText is what a ticket is told when the watchdog stopped its
+// run: what was seen (res.Err: which tool calls, how often), that nothing
+// was started in its place, and what a human can do.
+func noProgressText(t *task.Task, res task.Result) string {
+	what := "The agent made no progress and was stopped"
+	if res.Err != nil {
+		what = strings.ToUpper(res.Err.Error()[:1]) + res.Err.Error()[1:]
+	}
+	b := strings.Builder{}
+	fmt.Fprintf(&b, "%s.\n\nThe digital employee was going round in a circle on %s, so the orchestrator stopped the run and started nothing in its place: another run would do the same. %s now waits for a human.", what, t.Key, t.Key)
+	reply, cancel := "comment on this ticket", "write "+stopCommand+" as the first line of a comment, or take the ticket away from the digital employee"
+	if t.Source == "linear" {
+		reply, cancel = "reply here", "send the stop signal, or take the issue away from the digital employee"
+	}
+	fmt.Fprintf(&b, "\n- To let it go on: %s, and say what it should do differently if you know. The agent's session is kept, and the agent is told why it was stopped.", reply)
+	fmt.Fprintf(&b, "\n- To stop: %s.", cancel)
 	return b.String()
 }
 

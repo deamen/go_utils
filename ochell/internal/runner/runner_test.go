@@ -59,6 +59,15 @@ func TestHelperAgent(t *testing.T) {
 			fmt.Println("still working")
 			time.Sleep(100 * time.Millisecond)
 		}
+	case "loop":
+		// Claude Code's event stream, with the same tool call twenty
+		// times; the secret is in the part of its input that is not shown.
+		fmt.Println(`{"type":"system","subtype":"init","session_id":"sess-loop"}`)
+		for range 20 {
+			fmt.Println(`{"type":"assistant","session_id":"sess-loop","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"gh pr checks 7 --token hunter2"}}]}}`)
+			time.Sleep(20 * time.Millisecond)
+		}
+		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"Done.","session_id":"sess-loop"}`)
 	case "nap":
 		time.Sleep(300 * time.Millisecond)
 		fmt.Println("rested")

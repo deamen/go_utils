@@ -2,6 +2,8 @@ package agent
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -205,7 +207,7 @@ func (o *claudeOutput) event(line []byte) {
 				text = append(text, c.Text)
 			}
 			if c.Type == "tool_use" && c.Name != "" && o.on != nil {
-				o.on(Event{Tool: toolName(c.Name), Param: toolParam(c.Input)})
+				o.on(Event{Tool: toolName(c.Name), Param: toolParam(c.Input), Call: toolCall(c.Name, c.Input)})
 			}
 		}
 		if len(text) > 0 {
@@ -222,6 +224,28 @@ func (o *claudeOutput) event(line []byte) {
 			o.rep.Usage = Usage{InputTokens: u.Input, OutputTokens: u.Output, CacheReadTokens: u.CacheRead, CacheWriteTokens: u.CacheWrite}
 		}
 	}
+}
+
+// ReportsTools: the event stream names each tool the agent starts to use.
+func (Claude) ReportsTools() bool { return true }
+
+// toolCall identifies a tool call by a hash of the tool's name and its
+// whole input, so that two calls can be compared without keeping the
+// input, which can hold ticket text and secrets. The input is written anew
+// first: the same input with its keys in another order is the same call.
+func toolCall(name string, input json.RawMessage) string {
+	h := sha256.New()
+	h.Write([]byte(name))
+	h.Write([]byte{0})
+	var in any
+	if err := json.Unmarshal(input, &in); err == nil {
+		// Maps are written with their keys in order.
+		if same, err := json.Marshal(in); err == nil {
+			input = same
+		}
+	}
+	h.Write(bytes.TrimSpace(input))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // maxToolParam is how much of a tool's input is shown.

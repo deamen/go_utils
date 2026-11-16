@@ -70,8 +70,10 @@ type Agent struct {
 	// stops it and starts the ticket again. 0: never.
 	StallTimeout time.Duration `yaml:"stall_timeout"`
 	// Retry says which failed runs are started again by ochell itself.
-	Retry         Retry `yaml:"retry"`
-	MaxConcurrent int   `yaml:"max_concurrent"`
+	Retry Retry `yaml:"retry"`
+	// Watchdog stops a run that makes the same tool calls over and over.
+	Watchdog      Watchdog `yaml:"watchdog"`
+	MaxConcurrent int      `yaml:"max_concurrent"`
 	// MaxAttempts is how many runs one ticket may have. A ticket that
 	// reaches it is not started again until someone resets it. 0: no limit.
 	MaxAttempts int    `yaml:"max_attempts"`
@@ -123,6 +125,17 @@ type Retry struct {
 	// doubles with each further attempt, up to MaxBackoff.
 	Backoff    time.Duration `yaml:"backoff"`
 	MaxBackoff time.Duration `yaml:"max_backoff"`
+}
+
+// Watchdog configures the check of a run's progress: ochell looks at the
+// tool calls that the agent's adapter reports, and stops a run that goes
+// round in a circle. Such a run is not started again; its ticket waits for
+// a human.
+type Watchdog struct {
+	// Repeats is how many times in a row the agent may make the same tool
+	// call, or the same few calls in the same order, before the run is
+	// stopped. 0: the watchdog is off.
+	Repeats int `yaml:"repeats"`
 }
 
 // DefaultRetryPatterns match what an agent CLI prints when the model's API
@@ -740,6 +753,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
 	fs.DurationVar(&c.Agent.Timeout, "agent-timeout", c.Agent.Timeout, "maximum agent run time")
 	fs.DurationVar(&c.Agent.StallTimeout, "agent-stall-timeout", c.Agent.StallTimeout, "stop an agent that wrote no output for this long, and start the ticket again (0: never)")
+	fs.IntVar(&c.Agent.Watchdog.Repeats, "agent-watchdog-repeats", c.Agent.Watchdog.Repeats, "stop an agent that made the same tool call, or the same few calls in a row, this many times, and leave the ticket to a human (0: never)")
 	fs.DurationVar(&c.Agent.StopGrace, "agent-stop-grace", c.Agent.StopGrace, "time between SIGTERM and SIGKILL when an agent is stopped")
 	fs.DurationVar(&c.Agent.DrainTimeout, "agent-drain-timeout", c.Agent.DrainTimeout, "how long a shutdown waits for running agents before it stops them")
 	fs.IntVar(&c.Agent.MaxConcurrent, "agent-max-concurrent", c.Agent.MaxConcurrent, "maximum concurrent agent runs")
@@ -1024,6 +1038,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Agent.StallTimeout < 0 {
 		errs = append(errs, errors.New("agent.stall_timeout must not be negative"))
+	}
+	if n := c.Agent.Watchdog.Repeats; n < 0 || n == 1 {
+		errs = append(errs, errors.New("agent.watchdog.repeats must be 0 (off) or at least 2: one call repeats nothing"))
 	}
 	for i, p := range c.Agent.Retry.Patterns {
 		if _, err := regexp.Compile(p); err != nil || p == "" {

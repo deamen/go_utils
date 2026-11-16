@@ -5522,3 +5522,234 @@ func TestTicketToolsThroughTheSystemdLauncher(t *testing.T) {
 		t.Error("the run's token is in a log")
 	}
 }
+
+// The done-when of the watchdog: a run that makes no progress, here one
+// that repeats the same tool call, is flagged and stopped with all its
+// processes; its outcome and the reason the ticket waits for are recorded;
+// the ticket is told what was seen and what a person can do; nothing is
+// queued in its place; and a reply continues the same agent session. A run
+// that makes varied tool calls, or repeats one below the limit, is not
+// touched.
+//
+// The issue asks for an H2 escalation. Escalation was set aside, so the
+// ticket waits for a human with a reason of its own and stays in its tier.
+func TestWatchdogStopsARunThatMakesNoProgress(t *testing.T) {
+	const (
+		linearSession = "3c9e2b10-7f4d-4a6b-9c1e-5d8f0a2b4c6e"
+		jiraSession   = "8a1f6d32-0b5c-4e7a-a9d3-2c4e6f8a0b1d"
+		metricsToken  = "e2e-metrics-token-02"
+	)
+	tool := func(session, name, input string) Step {
+		return Step{Print: `{"type":"assistant","session_id":"` + session + `","message":{"content":[{"type":"tool_use","name":"` + name + `","input":` + input + `}]}}`}
+	}
+	// The call that goes nowhere. Its arguments are not for anyone's eyes.
+	poll := func(session string) Step {
+		return tool(session, "Bash", `{"command":"gh pr checks 7 --token hunter2"}`)
+	}
+	var script []Step
+	on := func(n int, steps ...Step) { script = append(script, OnRun(n, steps...)...) }
+
+	// Run 1, the Linear ticket: some work, then the same call for ever.
+	on(1, Step{Print: `{"type":"system","subtype":"init","session_id":"` + linearSession + `"}`}, Step{Spawn: &Spawn{Count: 1}},
+		tool(linearSession, "Read", `{"file_path":"src/login.go"}`), tool(linearSession, "Edit", `{"file_path":"src/login.go","old_string":"a","new_string":"b"}`))
+	for range 200 {
+		on(1, poll(linearSession), Step{Sleep: "50ms"})
+	}
+	on(1, Step{Sleep: "10m"})
+	// Run 2, the reply: varied calls, and repeats that stay below the limit
+	// of five: four times the same call, twice, and a circle of two calls
+	// that goes round four times.
+	for i := range 30 {
+		on(2, tool(linearSession, "Read", `{"file_path":"src/file-`+strconv.Itoa(i)+`.go"}`))
+	}
+	// The same program each time, with other arguments: that is work.
+	for i := range 30 {
+		on(2, tool(linearSession, "Bash", `{"command":"gh pr checks `+strconv.Itoa(i)+`"}`))
+	}
+	for range 2 {
+		on(2, poll(linearSession), poll(linearSession), poll(linearSession), poll(linearSession), tool(linearSession, "Read", `{"file_path":"src/login.go"}`))
+	}
+	for range 4 {
+		on(2, tool(linearSession, "Bash", `{"command":"sleep 30"}`), poll(linearSession))
+	}
+	on(2, Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"Fixed.","session_id":"` + linearSession + `"}`},
+		Report("done", "Fixed the login page."))
+	// Run 3, the Jira ticket: a circle of two calls.
+	on(3, Step{Print: `{"type":"system","subtype":"init","session_id":"` + jiraSession + `"}`})
+	for range 200 {
+		on(3, tool(jiraSession, "Read", `{"file_path":"src/a.go"}`), poll(jiraSession), Step{Sleep: "50ms"})
+	}
+	on(3, Step{Sleep: "10m"})
+	// Run 4, the comment on it.
+	on(4, Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"Fixed.","session_id":"` + jiraSession + `"}`},
+		Report("done", "Fixed it another way."))
+
+	o := Start(t, Options{
+		Script: script,
+		Configure: func(c *config.Config) {
+			withAPI(c)
+			c.Metrics = config.Metrics{Enabled: true, Token: metricsToken}
+			c.Agent.Adapter = "claude"
+			c.Agent.Watchdog.Repeats = 5
+			c.Agent.StopGrace = time.Second
+			// A run that ochell started again would show here.
+			c.Agent.MaxAttempts = 5
+			c.Agent.Retry.Backoff, c.Agent.Retry.MaxBackoff = 100*time.Millisecond, 100*time.Millisecond
+		},
+	})
+	o.Jira.Add(jiratest.Issue{Key: "DEV-190"})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// The run is flagged and stopped, long before the agent would end.
+	first := o.LinearCreated("ENG-190", "session-dog", "").TaskID(t)
+	run := o.WaitRun(first, 20*time.Second)
+	const seen = "the same tool call 5 times in a row (Bash gh)"
+	if !strings.Contains(run.Footer, "outcome=no_progress") || !strings.Contains(run.Footer, seen) {
+		t.Errorf("first run: %s", run.Footer)
+	}
+	stored := o.WaitStored(st, first, 10*time.Second)
+	if stored.Result.Outcome != "no_progress" || stored.Result.Escalation != "" || stored.Result.SessionID != linearSession ||
+		stored.Result.Err == nil || !strings.Contains(stored.Result.Err.Error(), seen) {
+		t.Errorf("stored run = %+v, want no_progress, no escalation, and its session", stored.Result)
+	}
+	tk, _ := st.Ticket("linear", "ENG-190")
+	if tk == nil || tk.State != "waiting" || tk.Reason != "no_progress" || tk.Attempts != 1 || tk.Tier != stored.Tier || tk.AgentSession != linearSession {
+		t.Errorf("ticket = %+v, want waiting (no_progress) after one attempt, in its tier, with its session", tk)
+	}
+	// With all its processes.
+	recs := o.WaitRecords(1, 5*time.Second)
+	expectAllGone(t, recs[0], 1)
+
+	// The ticket is told what was seen and what a person can do.
+	var told Activity
+	o.waitFor(10*time.Second, "the ticket to be told", func() bool {
+		acts := o.Linear.Activities("session-dog")
+		told = acts[len(acts)-1]
+		return told.Type == "elicitation"
+	})
+	for _, want := range []string{"The agent made no progress and was stopped: it made " + seen, "started nothing in its place",
+		"ENG-190 now waits for a human", "To let it go on: reply here", "The agent's session is kept", "To stop: send the stop signal"} {
+		if !strings.Contains(told.Body, want) {
+			t.Errorf("the ticket was not told %q:\n%s", want, told.Body)
+		}
+	}
+	if strings.Contains(told.Body, "escalation") {
+		t.Errorf("the ticket was told of an escalation:\n%s", told.Body)
+	}
+	// ochell says so in its log, and nowhere shows more of the call than
+	// its program.
+	if !strings.Contains(o.Output(), "watchdog: the run made no progress and was stopped") {
+		t.Error("ochell's log does not say that the watchdog stopped the run")
+	}
+	for name, text := range map[string]string{"ochell's log": o.Output(), "the ticket": told.Body, "the stored run": fmt.Sprint(stored.Result.Err), "the footer": run.Footer} {
+		if strings.Contains(text, "hunter2") || strings.Contains(text, "checks 7") {
+			t.Errorf("%s shows the arguments of the tool call", name)
+		}
+	}
+
+	// The inbox and the metrics say the same.
+	code, body := o.get("/api/v1/inbox", apiToken, false)
+	var inbox struct {
+		Items []struct{ Key, Reason, Why string }
+	}
+	if err := json.Unmarshal([]byte(body), &inbox); code != 200 || err != nil {
+		t.Fatalf("GET /api/v1/inbox: %d %v\n%s", code, err, body)
+	}
+	if len(inbox.Items) != 1 || inbox.Items[0].Key != "ENG-190" || inbox.Items[0].Reason != "no_progress" ||
+		!strings.Contains(inbox.Items[0].Why, "made the same tool calls over and over") {
+		t.Errorf("inbox = %+v", inbox.Items)
+	}
+	if code, body := o.get("/metrics", metricsToken, false); code != 200 ||
+		!strings.Contains(body, `ochell_runs_ended_total{outcome="no_progress"} 1`) || !strings.Contains(body, "ochell_run_failures_total 1\n") {
+		t.Errorf("GET /metrics: %d\n%s", code, body)
+	}
+
+	// Nothing is queued in its place.
+	time.Sleep(time.Second)
+	if n := len(o.Records()); n != 1 {
+		t.Fatalf("the agent was started %d times, want 1: ochell started the ticket again", n)
+	}
+	if queued, running, _ := st.Counts(); queued != 0 || running != 0 {
+		t.Errorf("%d queued and %d running runs after the watchdog stopped the run", queued, running)
+	}
+
+	// A reply continues the same agent session, and tells the agent why it
+	// was stopped. This run makes many calls and repeats some, below the
+	// limit: it is not touched.
+	second := o.LinearPrompted("ENG-190", "session-dog", "The checks are stuck; rerun them once and go on.").TaskID(t)
+	reply := o.WaitStored(st, second, 20*time.Second)
+	if reply.Result.Outcome != "finished" || !reply.Result.Resumed || reply.Attempt != 2 {
+		t.Errorf("the run of the reply = %+v, want a resumed second attempt that finished", reply)
+	}
+	recs = o.WaitRecords(2, 5*time.Second)
+	var resumed Record
+	for _, rec := range recs {
+		if slices.Contains(rec.Args, "--resume") {
+			resumed = rec
+		}
+	}
+	if !slices.Contains(resumed.Args, linearSession) {
+		t.Fatalf("no run resumed the session %s: %+v", linearSession, recs)
+	}
+	for _, want := range []string{"was stopped by the orchestrator because it made the same tool calls over and over",
+		"<comment>\nThe checks are stuck; rerun them once and go on.\n</comment>"} {
+		if !strings.Contains(resumed.Stdin, want) {
+			t.Errorf("the prompt of the reply lacks %q:\n%s", want, resumed.Stdin)
+		}
+	}
+	if tk, _ := st.Ticket("linear", "ENG-190"); tk == nil || tk.State != "in_review" || tk.Attempts != 2 {
+		t.Errorf("ticket = %+v, want in_review after two attempts", tk)
+	}
+
+	// A Jira ticket whose agent goes round a circle of two calls: the same,
+	// as a comment.
+	third := o.JiraAssigned("DEV-190", "Fix the login page").TaskID(t)
+	run = o.WaitRun(third, 20*time.Second)
+	const circle = "the same 2 tool calls, in the same order, 5 times in a row (Read src/a.go, Bash gh)"
+	if !strings.Contains(run.Footer, "outcome=no_progress") || !strings.Contains(run.Footer, circle) {
+		t.Errorf("third run: %s", run.Footer)
+	}
+	comments := o.WaitJiraComments("DEV-190", 2, 10*time.Second)
+	for _, want := range []string{circle, "DEV-190 now waits for a human", "To let it go on: comment on this ticket", "To stop: write /stop as the first line of a comment"} {
+		if !strings.Contains(comments[1], want) {
+			t.Errorf("the Jira ticket was not told %q:\n%s", want, comments[1])
+		}
+	}
+	o.waitFor(10*time.Second, "the Jira ticket to wait", func() bool {
+		tk, _ := st.Ticket("jira", "DEV-190")
+		return tk != nil && tk.State == "waiting" && tk.Reason == "no_progress"
+	})
+	time.Sleep(500 * time.Millisecond)
+	if n := len(o.Records()); n != 3 {
+		t.Fatalf("the agent was started %d times, want 3", n)
+	}
+	fourth := o.JiraCommented("DEV-190", "", "Use the API instead.").TaskID(t)
+	if again := o.WaitStored(st, fourth, 20*time.Second); again.Result.Outcome != "finished" || !again.Result.Resumed {
+		t.Errorf("the run of the comment = %+v, want a resumed run that finished", again)
+	}
+	if tk, _ := st.Ticket("jira", "DEV-190"); tk == nil || tk.State != "in_review" {
+		t.Errorf("ticket = %+v, want in_review", tk)
+	}
+}
+
+// The plain adapter reports no tool calls, so the watchdog sees nothing:
+// ochell says so at start, and the run goes to its end.
+func TestWatchdogSeesNothingWithThePlainAdapter(t *testing.T) {
+	var script []Step
+	for range 20 {
+		script = append(script, Step{Print: `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"gh pr checks 7"}}]}}`})
+	}
+	script = append(script, Report("done", "Done."))
+	o := Start(t, Options{Script: script, Configure: func(c *config.Config) { c.Agent.Watchdog.Repeats = 2 }})
+	id := o.LinearCreated("ENG-191", "session-plain", "").TaskID(t)
+	if run := o.WaitRun(id, 15*time.Second); !strings.Contains(run.Footer, "outcome=finished") {
+		t.Errorf("run: %s", run.Footer)
+	}
+	if !strings.Contains(o.Output(), "this agent adapter reports no tool calls: the watchdog sees nothing") {
+		t.Errorf("ochell did not say at start that the watchdog sees nothing:\n%s", o.Output())
+	}
+}

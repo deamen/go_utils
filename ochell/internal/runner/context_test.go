@@ -79,6 +79,20 @@ func TestRunContext(t *testing.T) {
 	}
 }
 
+// The run that a person starts after the watchdog stopped the one before
+// it is told why that one was stopped.
+func TestRunContextAfterTheWatchdog(t *testing.T) {
+	got := runContext(&task.Task{Attempt: 2, Cause: task.CauseFollowUp, LastOutcome: task.OutcomeNoProgress, Comment: "go on"}, true)
+	for _, want := range []string{"was stopped by the orchestrator because it made the same tool calls over and over", "Do not start the same calls again", `status "blocked"`, "<comment>\ngo on\n</comment>"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("context lacks %q:\n%s", want, got)
+		}
+	}
+	if got := runContext(&task.Task{Attempt: 2, Cause: task.CauseFollowUp, LastOutcome: task.OutcomeStalled, Comment: "go on"}, true); strings.Contains(got, "over and over") {
+		t.Errorf("a run after another outcome got the note:\n%s", got)
+	}
+}
+
 func TestRunContextOfThePlanGate(t *testing.T) {
 	plan := runContext(&task.Task{Attempt: 1, Phase: task.PhasePlan}, false)
 	if !strings.Contains(plan, "This run is for the plan only.") || !strings.Contains(plan, `status "plan"`) {

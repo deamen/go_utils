@@ -129,12 +129,12 @@ func (h *Handler) write(w io.Writer, m *store.Metrics, st runner.Status) {
 	for o, n := range m.Ended {
 		ended[string(o)] = float64(n)
 		switch o {
-		case "failed", "timed_out", "stalled", "not_started":
+		case "failed", "timed_out", "stalled", "no_progress", "not_started":
 			failures += n
 		}
 	}
 	labelled("ochell_runs_ended_total", "outcome", ended)
-	metric("ochell_run_failures_total", "counter", "Runs that failed, timed out, stalled or could not be started.")
+	metric("ochell_run_failures_total", "counter", "Runs that failed, timed out, stalled, made no progress or could not be started.")
 	fmt.Fprintf(w, "ochell_run_failures_total %d\n", failures)
 	metric("ochell_run_retries_total", "counter", "Runs that ochell started by itself after a run that failed for a temporary reason or stalled.")
 	fmt.Fprintf(w, "ochell_run_retries_total %d\n", m.Started["retry"]+m.Started["stalled"])

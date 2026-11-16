@@ -78,6 +78,9 @@ func jiraFinished(t *task.Task, res task.Result, canReply bool) string {
 	if res.Escalation != "" {
 		return escalationText(t, res)
 	}
+	if res.Outcome == task.OutcomeNoProgress {
+		return noProgressText(t, res)
+	}
 	if res.Err != nil {
 		return strings.TrimSpace(failureText(res) + "\n\n" + noFormat(lastN(res.Message, replyMax)))
 	}

@@ -941,6 +941,10 @@ func (r *Runner) Start() error {
 	if n, err := r.store.Active(); err == nil && n > 0 {
 		r.log.Info("tasks queued before the restart will be run", "tasks", n)
 	}
+	if r.cfg.Watchdog.Repeats > 0 && !agent.ReportsTools(r.adapter) {
+		// Better said than believed: nothing watches these runs.
+		r.log.Warn("agent.watchdog.repeats is set, but this agent adapter reports no tool calls: the watchdog sees nothing and stops no run (agent.stall_timeout still stops a silent one)", "adapter", r.cfg.Adapter)
+	}
 	if st, err := r.Status(); err == nil {
 		if st.Paused {
 			r.log.Warn("ochell is paused: no run starts until it is resumed (ochell resume)")
@@ -1199,7 +1203,8 @@ func (r *Runner) budget(t *task.Task, tier policy.Tier, log *slog.Logger) (spent
 //   - a run that stalled, or that failed for a temporary reason (a rate
 //     limit, an error of the model's API), is tried again after a wait.
 //
-// A failure of the task itself is not retried. Whether the ticket still has
+// A failure of the task itself is not retried, and neither is a run that
+// the watchdog stopped: it would go round in the same circle. Whether the ticket still has
 // an attempt left is decided by the store.
 func (r *Runner) next(t *task.Task, res task.Result) (store.Again, bool) {
 	switch {
@@ -1454,9 +1459,16 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	// The session is recorded as soon as the agent names it, not only at
 	// the end: if ochell does not live to see the end of this run, the run
 	// that takes its place continues in the same session.
+	// The watchdog sees the same tool calls, and stops a run that goes
+	// round in a circle.
+	dog := newWatchdog(r.cfg.Watchdog.Repeats)
 	out := r.adapter.Output(func(ev agent.Event) {
-		if ev.Tool != "" && r.progress != nil {
-			r.progress.ToolUsed(t, ev.Tool, rd.text(ev.Param))
+		if ev.Tool != "" {
+			param := rd.text(ev.Param)
+			if r.progress != nil {
+				r.progress.ToolUsed(t, ev.Tool, param)
+			}
+			dog.observe(toolCall{id: ev.Call, tool: ev.Tool, param: param})
 		}
 		if ev.SessionID == "" {
 			return
@@ -1478,7 +1490,7 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 		Output:    io.MultiWriter(lf, out),
 		Timeout:   r.cfg.Timeout,
 	}
-	w, outcome := r.execute(ctx, spec, r.cfg.StallTimeout)
+	w, outcome := r.execute(ctx, spec, r.cfg.StallTimeout, dog.stopped())
 	if outcome == task.OutcomeNotStarted {
 		res.Err = w.err
 		return res
@@ -1522,6 +1534,10 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 		res.Err = fmt.Errorf("agent timed out after %s", r.cfg.Timeout)
 	case res.Outcome == task.OutcomeStalled:
 		res.Err = fmt.Errorf("the agent wrote no output for %s and was stopped", r.cfg.StallTimeout)
+	case res.Outcome == task.OutcomeNoProgress:
+		res.Err = fmt.Errorf("the agent made no progress and was stopped: %s", dog.reason())
+		r.log.Warn("watchdog: the run made no progress and was stopped; the ticket now waits for a human", "task", t.ID, "source", t.Source, "key", t.Key,
+			"seen", dog.reason(), "session", res.SessionID)
 	case res.Outcome == task.OutcomeStopped:
 		res.Err = errors.New("the agent was stopped because ochell is shutting down")
 	case errors.Is(w.err, launcher.ErrNotStarted):
@@ -1577,15 +1593,16 @@ func (l *lastWrite) idle() time.Duration {
 }
 
 // execute starts what spec describes and waits for it to end. It stops it
-// at spec.Timeout, when ctx is done, and, with stall set, when it has
-// written no output for that long.
+// at spec.Timeout, when ctx is done, with stall set, when it has written
+// no output for that long, and when noProgress is closed (the watchdog of
+// the run; nil: there is none).
 //
 // Why it ended is decided here, from what ochell asked for. The exit code
 // cannot tell: a unit that systemd stopped exits with 0, and one that hit
 // its own time limit exits with 1 like a failed agent. The outcome is
 // finished (it ended by itself, with any exit code), timed_out, stalled,
-// stopped, or not_started with the reason in the error.
-func (r *Runner) execute(ctx context.Context, spec launcher.Spec, stall time.Duration) (waitResult, task.Outcome) {
+// no_progress, stopped, or not_started with the reason in the error.
+func (r *Runner) execute(ctx context.Context, spec launcher.Spec, stall time.Duration, noProgress <-chan struct{}) (waitResult, task.Outcome) {
 	var silent <-chan time.Time
 	var out *lastWrite
 	if stall > 0 {
@@ -1619,6 +1636,8 @@ func (r *Runner) execute(ctx context.Context, spec launcher.Spec, stall time.Dur
 			return r.stop(proc, waited), task.OutcomeTimedOut
 		case <-ctx.Done():
 			return r.stop(proc, waited), task.OutcomeStopped
+		case <-noProgress:
+			return r.stop(proc, waited), task.OutcomeNoProgress
 		case <-silent:
 			if out.idle() >= stall {
 				return r.stop(proc, waited), task.OutcomeStalled

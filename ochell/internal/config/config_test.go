@@ -431,6 +431,9 @@ func TestRetryValidation(t *testing.T) {
 		"no backoff":        {func(c *Config) { c.Agent.Retry.Backoff = 0 }, "backoff must be positive"},
 		"max below backoff": {func(c *Config) { c.Agent.Retry.MaxBackoff = time.Second }, "max_backoff not below"},
 		"negative stall":    {func(c *Config) { c.Agent.StallTimeout = -time.Second }, "stall_timeout"},
+		"negative repeats":  {func(c *Config) { c.Agent.Watchdog.Repeats = -1 }, "watchdog.repeats"},
+		"one repeat":        {func(c *Config) { c.Agent.Watchdog.Repeats = 1 }, "watchdog.repeats"},
+		"watchdog on":       {func(c *Config) { c.Agent.Watchdog.Repeats = 2 }, ""},
 		// Without patterns nothing is retried, and the backoff is not looked at.
 		"retry turned off": {func(c *Config) { c.Agent.Retry = Retry{} }, ""},
 	} {
