@@ -106,6 +106,10 @@ type Runner struct {
 	// the file; nil: no repository's file is looked at (workflow.go).
 	wfCfg config.Workflow
 	wfSrc WorkflowSource
+	// levelMu makes a change of a class's level of autonomy one step: the
+	// level is read, decided on and written under it (autonomy.go). It is
+	// never held while mu is asked for.
+	levelMu sync.Mutex
 	// grants holds what each run in progress was granted, by task id, for
 	// the workspace hooks of that run. Guarded by mu.
 	grants map[string]*granted
@@ -324,6 +328,9 @@ func (r *Runner) FollowUp(t *task.Task, addressed bool) (later bool, err error) 
 	if later, err = r.store.FollowUp(t, addressed, store.Limits{MaxQueued: max(r.cfg.QueueSize, 1)}); err != nil {
 		return false, err
 	}
+	// A person may have sent the ticket back: the rate of its class is
+	// looked at before the run starts, so that a demotion holds for it.
+	r.checkLevels()
 	r.wakeWorker()
 	return later, nil
 }
@@ -549,6 +556,9 @@ type Status struct {
 	Holds []string `json:"holds,omitempty"`
 	// Workflows are the repositories whose WORKFLOW.md ochell has read.
 	Workflows []WorkflowStatus `json:"workflows,omitempty"`
+	// Autonomy are the classes of work with their level of autonomy, for
+	// a policy that has levels.
+	Autonomy []Class `json:"autonomy,omitempty"`
 }
 
 func (r *Runner) Status() (Status, error) {
@@ -587,6 +597,9 @@ func (r *Runner) Status() (Status, error) {
 		return st, err
 	}
 	if st.Workflows, err = r.workflows(); err != nil {
+		return st, err
+	}
+	if st.Autonomy, err = r.classes(false); err != nil {
 		return st, err
 	}
 	st.Queued, st.Running, err = r.store.Counts()
@@ -927,6 +940,10 @@ func (r *Runner) Start() error {
 		r.wg.Add(1)
 		go r.runBackup()
 	}
+	if r.policy.Autonomy.Enabled() {
+		r.wg.Add(1)
+		go r.runAutonomy()
+	}
 	n := max(r.cfg.MaxConcurrent, 1)
 	for range n {
 		r.wg.Add(1)
@@ -1032,11 +1049,16 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	}
 	r.mu.Unlock()
 
-	// What holds for this run: the ticket's tier, narrowed by the
-	// WORKFLOW.md of its repository as the default branch has it now.
+	// What holds for this run: the ticket's tier, held back by the level of
+	// autonomy that its class has now, and narrowed by the WORKFLOW.md of
+	// its repository as the default branch has it now.
+	t.Autonomy, _ = r.levelOf(r.policy.Tier(t.Tier).Name)
+	if t.Autonomy != "" {
+		log = log.With("autonomy", t.Autonomy)
+	}
 	wf := r.flow(ctx, t, log)
 	// A ticket whose tier requires an approved plan, and has none, gets a
-	// run that only plans.
+	// run that only plans. At the level observe that is every ticket.
 	if wf.Tier.PlanGate == policy.PlanGateRequired && !t.PlanApproved {
 		t.Phase = task.PhasePlan
 	}
@@ -1054,7 +1076,7 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 		}
 		res = r.run(ctx, t, wf)
 	}
-	res.Workflow = wf.version
+	res.Workflow, res.Autonomy = wf.version, t.Autonomy
 	r.mu.Lock()
 	by, stopped := r.stops[k]
 	closed := r.closing[k]
@@ -1099,6 +1121,9 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 			time.AfterFunc(wait+10*time.Millisecond, r.wakeWorker)
 		}
 	}
+	// The run may have handed over a pull request, or delivered a message
+	// that sent the ticket back: the rate of its class has changed.
+	r.checkLevels()
 	if r.notify != nil {
 		if err := r.notify.Finished(notifyCtx, t, res); err != nil {
 			log.Warn("finish notification failed", "err", err)
@@ -1362,6 +1387,9 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	}
 	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s tier=%s phase=%s\n# command=%s (%d args) workdir=%s session=%s\n",
 		t.ID, t.Source, t.Key, t.URL, t.Tier, phaseName(t.Phase), r.cfg.Command, len(cmd.Args), dir, session)
+	if t.Autonomy != "" {
+		fmt.Fprintf(lf, "# autonomy=%s (the level of the tier %s)\n", t.Autonomy, t.Tier)
+	}
 	if wf.version != "" {
 		fmt.Fprintf(lf, "# workflow=%s (%s of %s, from its default branch)\n", wf.version, workflow.FileName, t.Repo)
 	}
@@ -1609,6 +1637,9 @@ func (r *Runner) taskEnv(t *task.Task) []string {
 	}
 	if t.Tier != "" {
 		env = append(env, "ORCH_TASK_TIER="+t.Tier)
+	}
+	if t.Autonomy != "" {
+		env = append(env, "ORCH_TASK_AUTONOMY="+t.Autonomy)
 	}
 	if branch := r.ws.view(t).Branch; branch != "" {
 		env = append(env, "ORCH_TASK_BRANCH="+branch)

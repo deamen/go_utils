@@ -196,6 +196,9 @@ type Audit struct {
 	// Workflow is the version of the repository's WORKFLOW.md that the
 	// run ran under.
 	Workflow string `json:"workflow,omitempty"`
+	// Autonomy is the level of autonomy that the class of the ticket had
+	// when the run started; left out for a policy without levels.
+	Autonomy string `json:"autonomy,omitempty"`
 	// PromptSHA256 is the hash of the prompt the agent was given.
 	PromptSHA256     string `json:"prompt_sha256,omitempty"`
 	InputTokens      int64  `json:"input_tokens"`
@@ -228,7 +231,7 @@ func runOf(r store.RunInfo) Run {
 	if !r.Started.IsZero() {
 		out.Started = &r.Started
 		u := r.Result.Usage
-		out.Audit = &Audit{PolicyVersion: r.PolicyVersion, Tier: r.Tier, Grants: r.Result.Grants, Workflow: r.Result.Workflow, PromptSHA256: r.Result.PromptHash,
+		out.Audit = &Audit{PolicyVersion: r.PolicyVersion, Tier: r.Tier, Grants: r.Result.Grants, Workflow: r.Result.Workflow, Autonomy: r.Result.Autonomy, PromptSHA256: r.Result.PromptHash,
 			InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CacheReadTokens: u.CacheReadTokens, CacheWriteTokens: u.CacheWriteTokens}
 	}
 	if !r.Ended.IsZero() {
@@ -253,6 +256,9 @@ type State struct {
 	// Workflows are the repositories whose WORKFLOW.md ochell has read:
 	// the version in force, and what of the file is not.
 	Workflows []runner.WorkflowStatus `json:"workflows,omitempty"`
+	// Autonomy are the tiers with their level of autonomy: the level, since
+	// when, and who decided it.
+	Autonomy []runner.Class `json:"autonomy,omitempty"`
 	// Counts are the number of tickets in each state.
 	Counts  map[string]int `json:"counts"`
 	Running []Ticket       `json:"running"`
@@ -280,7 +286,7 @@ func (a *API) state(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
-	out := State{Paused: st.Paused, Holds: st.Holds, Workflows: st.Workflows, Counts: map[string]int{}}
+	out := State{Paused: st.Paused, Holds: st.Holds, Workflows: st.Workflows, Autonomy: st.Autonomy, Counts: map[string]int{}}
 	all, err := a.store.Tickets(0)
 	if err != nil {
 		a.fail(w, err)
@@ -478,6 +484,10 @@ var statePage = template.Must(template.New("state").Funcs(funcs).Parse(`<!doctyp
 {{if .Workflows}}<h2>WORKFLOW.md of the repositories</h2><table><tr><th>Repository</th><th>In force</th><th>Looked at</th><th>Not in force</th></tr>
 {{range .Workflows}}<tr><td>{{.Repo}}</td><td>{{if .Version}}{{.Version}}<br><span class="dim">since {{when .Loaded}}</span>{{else}}<span class="dim">none</span>{{end}}</td><td>{{when .Checked}}</td>
 <td>{{if .Error}}<b>{{.Error}}</b><br>{{end}}{{range .Ignored}}{{.}}<br>{{end}}</td></tr>
+{{end}}</table>{{end}}
+{{if .Autonomy}}<h2>Levels of autonomy</h2><table><tr><th>Tier</th><th>Level</th><th>Since</th><th>Decided by</th></tr>
+{{range .Autonomy}}<tr><td>{{.Tier}}</td><td>{{.Level}}</td><td>{{if .Since}}{{when .Since}}{{else}}<span class="dim">the start</span>{{end}}</td>
+<td>{{if .By}}{{.By}}{{if .Reason}}<br><span class="dim">{{.Reason}}</span>{{end}}{{else}}<span class="dim">the policy file (start_level)</span>{{end}}</td></tr>
 {{end}}</table>{{end}}
 <h2>Waiting for a person</h2>{{template "tickets" .Waiting}}
 <h2>Running</h2>{{template "tickets" .Running}}

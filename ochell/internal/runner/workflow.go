@@ -72,7 +72,9 @@ func (r *Runner) host(tier policy.Tier) workflow.Host {
 // each setting that would widen the policy, goes to ochell's log, to the
 // log of the run and to the status API.
 func (r *Runner) flow(ctx context.Context, t *task.Task, log *slog.Logger) *flow {
-	f := &flow{Effective: workflow.Effective{Tier: r.policy.Tier(t.Tier)}, hooks: map[string][]*template.Template{}}
+	// The level of autonomy comes first, so the file is held against the
+	// tier as the level leaves it: both can only narrow.
+	f := &flow{Effective: workflow.Effective{Tier: policy.Narrow(r.policy.Tier(t.Tier), t.Autonomy)}, hooks: map[string][]*template.Template{}}
 	if r.wfSrc == nil || t.Repo == "" {
 		return f
 	}

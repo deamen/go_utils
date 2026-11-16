@@ -112,6 +112,13 @@ func TestInvalidPolicies(t *testing.T) {
 		"priority rank":        {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {priorities: {P0: 0}}", "a rank from 1 (the most urgent) to 5"},
 		"priority twice":       {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {priorities: {P0: 1, p0: 2}}", "listed twice"},
 		"misspelt scheduling":  {"tiers: [{name: a}]\ndefault_tier: a\nscheduling: {required_label: [x]}", "field required_label not found"},
+		"bad start level":      {"tiers: [{name: a}]\ndefault_tier: a\nautonomy: {start_level: free}", "start_level must be observe, assisted, autonomous"},
+		"start at auto-merge":  {"tiers: [{name: a, auto_merge: after_ci}]\ndefault_tier: a\nautonomy: {start_level: auto-merge}", "start_level must be observe, assisted, autonomous"},
+		"demote without start": {"tiers: [{name: a}]\ndefault_tier: a\nautonomy: {demote: {min_sample: 3}}", "without autonomy.start_level"},
+		"bad rate":             {"tiers: [{name: a}]\ndefault_tier: a\nautonomy: {start_level: observe, demote: {sent_back_rate: 30}}", "sent_back_rate must be above 0 and at most 1"},
+		"negative window":      {"tiers: [{name: a}]\ndefault_tier: a\nautonomy: {start_level: observe, demote: {window: -1h}}", "window must be more than 0"},
+		"negative sample":      {"tiers: [{name: a}]\ndefault_tier: a\nautonomy: {start_level: observe, demote: {min_sample: -1}}", "min_sample must be at least 1"},
+		"misspelt autonomy":    {"tiers: [{name: a}]\ndefault_tier: a\nautonomy: {start: observe}", "field start not found"},
 		"not yaml":             {"tiers: [", "yaml"},
 	} {
 		_, err := Parse([]byte(c.in))
@@ -396,6 +403,86 @@ scheduling:
 	} {
 		if got := strings.Join(s.Missing(c.have), ","); got != c.want {
 			t.Errorf("Missing(%q) = %q, want %q", c.have, got, c.want)
+		}
+	}
+}
+
+// The levels of autonomy: what the policy file sets, which level a class
+// can have, and what a level holds back of a tier.
+func TestAutonomy(t *testing.T) {
+	// A policy without the section has no levels, and a tier holds as it
+	// is written.
+	p, err := Parse([]byte("tiers: [{name: a, pr_review: sampled, auto_merge: after_ci}]\ndefault_tier: a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Autonomy.Enabled() || p.Level("a", LevelAutonomous) != "" || p.DescribeAutonomy() != "" || Builtin().Autonomy.Enabled() {
+		t.Errorf("a policy without autonomy has levels: %+v", p.Autonomy)
+	}
+	if got := Narrow(p.Tier("a"), p.Level("a", "")); got.PRReview != PRReviewSampled || got.AutoMerge != AutoMergeAfterCI || got.PlanGate != PlanGateSkip {
+		t.Errorf("without levels the tier is narrowed: %+v", got)
+	}
+
+	p, err = Parse([]byte(`
+tiers:
+  - {name: low, pr_review: sampled, auto_merge: after_ci}
+  - {name: high, plan_gate: required, pr_review: sampled, auto_merge: after_ci}
+default_tier: low
+autonomy:
+  start_level: assisted
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := p.Autonomy.Demote; d.SentBackRate != DefaultSentBackRate || d.Window != DefaultDemoteWindow || d.MinSample != DefaultMinSample {
+		t.Errorf("defaults of demote = %+v", d)
+	}
+	if got, want := p.DescribeAutonomy(), "start_level=assisted demote: sent_back_rate=0.3 window=336h0m0s min_sample=5"; got != want {
+		t.Errorf("DescribeAutonomy = %q, want %q", got, want)
+	}
+	// Only the lowest tier can reach auto-merge, and only with after_ci.
+	if p.MaxLevel("low") != LevelAutoMerge || p.MaxLevel("high") != LevelAutonomous {
+		t.Errorf("MaxLevel: low %s, high %s", p.MaxLevel("low"), p.MaxLevel("high"))
+	}
+	never, _ := Parse([]byte("tiers: [{name: low}]\ndefault_tier: low\nautonomy: {start_level: observe, demote: {sent_back_rate: 0.5, window: 24h, min_sample: 2}}"))
+	if never.MaxLevel("low") != LevelAutonomous || never.Autonomy.Demote != (Demote{SentBackRate: 0.5, Window: 24 * time.Hour, MinSample: 2}) {
+		t.Errorf("a lowest tier with auto_merge: never: max %s, %+v", never.MaxLevel("low"), never.Autonomy.Demote)
+	}
+	for _, c := range []struct{ tier, stored, want string }{
+		{"low", "", LevelAssisted},                 // nobody changed it: the start level
+		{"low", LevelObserve, LevelObserve},        //
+		{"low", LevelAutoMerge, LevelAutoMerge},    //
+		{"high", LevelAutoMerge, LevelAutonomous},  // the file changed since: the highest it can have
+		{"high", "something", LevelAssisted},       // not a level
+		{"gone", LevelAutonomous, LevelAutonomous}, // a tier that the policy no longer has
+	} {
+		if got := p.Level(c.tier, c.stored); got != c.want {
+			t.Errorf("Level(%s, %q) = %q, want %q", c.tier, c.stored, got, c.want)
+		}
+	}
+	if LevelAbove(LevelObserve) != LevelAssisted || LevelAbove(LevelAutoMerge) != LevelAutoMerge || LevelBelow(LevelAssisted) != LevelObserve || LevelBelow(LevelObserve) != LevelObserve {
+		t.Error("LevelAbove and LevelBelow do not move one step")
+	}
+
+	// What a level leaves of a tier: never more than the tier says.
+	for _, c := range []struct{ tier, level, plan, review, merge string }{
+		{"low", LevelObserve, PlanGateRequired, PRReviewRequired, AutoMergeNever},
+		{"low", LevelAssisted, PlanGateSkip, PRReviewRequired, AutoMergeNever},
+		{"low", LevelAutonomous, PlanGateSkip, PRReviewSampled, AutoMergeNever},
+		{"low", LevelAutoMerge, PlanGateSkip, PRReviewSampled, AutoMergeAfterCI},
+		{"high", LevelAssisted, PlanGateRequired, PRReviewRequired, AutoMergeNever},
+		{"high", LevelAutonomous, PlanGateRequired, PRReviewSampled, AutoMergeNever},
+	} {
+		got := Narrow(p.Tier(c.tier), c.level)
+		if got.PlanGate != c.plan || got.PRReview != c.review || got.AutoMerge != c.merge {
+			t.Errorf("%s at %s: plan_gate=%s pr_review=%s auto_merge=%s", c.tier, c.level, got.PlanGate, got.PRReview, got.AutoMerge)
+		}
+	}
+	// A tier that is strict already stays strict at every level.
+	strict := Tier{Name: "s", PlanGate: PlanGateRequired, PRReview: PRReviewRequired, AutoMerge: AutoMergeNever}
+	for _, l := range Levels {
+		if got := Narrow(strict, l); got.PlanGate != strict.PlanGate || got.PRReview != strict.PRReview || got.AutoMerge != strict.AutoMerge {
+			t.Errorf("a strict tier at %s was widened: %+v", l, got)
 		}
 	}
 }

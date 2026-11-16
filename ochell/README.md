@@ -155,7 +155,7 @@ ochell serve --config config.yaml                 # default command
 ochell ngrok-sync --config config.yaml [--dry-run] [--loop]
 ochell linear-install --config config.yaml        # prints the agent install URL
 ochell jira-check --config config.yaml [--comment-on KEY]   # check the Jira API access
-ochell policy-check --config config.yaml          # check the policy file and print its tiers and scheduling
+ochell policy-check --config config.yaml          # check the policy file and print its tiers, scheduling and autonomy settings
 ochell workflow-check --file WORKFLOW.md --config config.yaml   # check a repository's WORKFLOW.md against the policy
 ochell version
 
@@ -167,6 +167,10 @@ ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts and
 ochell cost [<jira|linear> <KEY>] --config config.yaml  # what the tickets have cost, or one ticket with its runs
 ochell outcomes [--since D] [--until D] --config config.yaml   # outcome metrics per tier for a period
 ochell backup [--to FILE] --config config.yaml          # back the store up, while ochell runs
+ochell autonomy --config config.yaml                    # the level of autonomy of each tier, its numbers and the last changes
+ochell promote <TIER> [--reason TEXT] --config config.yaml   # raise the level of a tier by one step
+ochell demote  <TIER> [--reason TEXT] --config config.yaml   # lower it by one step
+ochell flag <jira|linear> <KEY> --reason TEXT --config config.yaml   # for a guardrail: flag a ticket's run, which lowers the level of its tier
 
 # while ochell is stopped
 ochell restore --from FILE --config config.yaml         # put a backup in the place of the store
@@ -213,7 +217,8 @@ ochell keeps its durable state in one SQLite file, `store.path` (default `ochell
 - the **tickets** ochell has worked on: state (see [Ticket states](#ticket-states)), risk tier, priority, number of attempts, working directory, and the agent's session id for a resume;
 - the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, the risk tier and the policy version it ran under, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to, and what the agent adapter read from it (final message, session id, cost, token counts);
 - the **webhook deliveries** handled in the last 24 hours;
-- the last valid **`WORKFLOW.md`** of each repository (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)).
+- the last valid **`WORKFLOW.md`** of each repository (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository));
+- every change of a tier's **level of autonomy**: who decided it, why, and the numbers it was decided on (see [Graduated autonomy](#graduated-autonomy)).
 
 So a restart loses no queued task, and a retried or replayed delivery from before the restart is still recognised. SQLite keeps two more files next to it while ochell runs (`-wal` and `-shm`). Do not copy the file of a running ochell by hand; use the [backup](#backup-and-restore).
 
@@ -396,6 +401,7 @@ retention:
 |---|---|
 | policy version, tier | the version of the [policy](#policy-and-risk-tiers) in force when the run started, and the tier it ran under |
 | workflow | the version of the repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) that the run ran under, if any |
+| autonomy | the [level of autonomy](#graduated-autonomy) that the ticket's tier had when the run started, for a policy with levels |
 | grants | what the tier granted the run, by name: the tools file, and the names of the variables from `env`, the credentials file and `mint`. Never a value |
 | prompt hash | the SHA-256 of the prompt the agent was given. The prompt itself is in the run log, not in the store |
 | tokens, cost | input, output, cache read and cache write tokens, and the cost in USD (see [Cost and budgets](#cost-and-budgets)) |
@@ -429,6 +435,7 @@ low     14       17    9.8000    0.7000           13             9m30s          
 - **"Merged untouched" is the nearest ochell can get to "merged without human changes"**: it knows whether a person asked for changes through the ticket or the pull request, not whether someone pushed commits to the branch themselves.
 - There is no escalation rate here.
 - These numbers are for the regular look at how each class of work goes. If people send back a large share of one tier's pull requests, change the policy or the prompt for that tier rather than correcting pull requests one by one.
+- They are also what a tier's [level of autonomy](#graduated-autonomy) is decided on: "sent back" is the override rate that takes a level away.
 
 ### The status API
 Read-only pages about what ochell is doing, on the same listener as the webhooks.
@@ -442,7 +449,7 @@ api:
 
 | Endpoint | Shows |
 |---|---|
-| `GET /api/v1/state` | whether runs start and what holds them back; how many tickets are in each state; the tickets that are running, queued, and waiting for a person, each with its state, reason, tier, priority and attempts, and a queued one with why [scheduling](#scheduling) holds it (`hold`); and for each repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) the version in force and what of the file is not |
+| `GET /api/v1/state` | whether runs start and what holds them back; how many tickets are in each state; the tickets that are running, queued, and waiting for a person, each with its state, reason, tier, priority and attempts, and a queued one with why [scheduling](#scheduling) holds it (`hold`); for each repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) the version in force and what of the file is not; and for each tier its [level of autonomy](#graduated-autonomy), since when and who decided it (`autonomy`) |
 | `GET /api/v1/inbox` | **the attention inbox**: exactly the tickets that wait for a person, each with its reason |
 | `GET /api/v1/tasks/<key>` | one ticket with every run: when it started and ended, why it was queued, its outcome, its cost, and what the agent said. Add `?source=jira` or `?source=linear` when both trackers have the key |
 
@@ -515,7 +522,7 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
   | `approvers` | who may approve a plan of this tier (see [The plan gate](#the-plan-gate)) | everyone who may send follow-ups on the ticket |
   | `max_concurrent` | how many tickets of this tier may have an agent running at the same time (see [Scheduling](#scheduling)) | `0`: no limit |
 
-  `budget_usd` and `max_turns` are enforced (see [Cost and budgets](#cost-and-budgets) and [Escalation](#escalation)), and so is `plan_gate` (see [The plan gate](#the-plan-gate)). `pr_review` and `auto_merge` are checked and recorded; what acts on them comes with the handoff and with graduated autonomy.
+  `budget_usd` and `max_turns` are enforced (see [Cost and budgets](#cost-and-budgets) and [Escalation](#escalation)), and so is `plan_gate` (see [The plan gate](#the-plan-gate)). `pr_review` and `auto_merge` are checked and recorded: ochell itself reviews and merges nothing (see [Handoff](#handoff-review-merge-done)). With [graduated autonomy](#graduated-autonomy), `sampled` and `after_ci` count only from the level that carries them.
 - **Who may assign work of a tier:** `allowed_assigners` of a tier lists Jira accountIds, and Linear user ids or email addresses.
   - It **narrows** the `allowed_assigners` of the source (see [Guards and the admin channel](#guards-and-the-admin-channel)), which is checked first. A tier without a list takes everyone whom the source allows.
   - It holds for the tier the ticket ends up in, so also for a ticket that a label raised into the tier.
@@ -551,7 +558,7 @@ A tier with `plan_gate: required` splits the work on a ticket in two: first a pl
 - **A new assignment is new work** and needs a new plan. So does a ticket that an [escalation](#escalation) moved into a tier with a plan gate before its plan was approved.
 - **A run for a plan that reports `done`** is taken as a plan all the same: whatever the agent calls it, nobody approved.
 - **What keeps the agent from doing the work in the plan run is its prompt.** ochell does not start the work run without the approval, and that is what it enforces. To also take the tools away in the plan run, give the agent its own restrictions (for Claude Code: its permission settings); ochell does not switch them per phase.
-- **`plan_gate: skip`** (the default): there is no plan run.
+- **`plan_gate: skip`** (the default): there is no plan run, unless the tier is at the level `observe` (see [Graduated autonomy](#graduated-autonomy)).
 - On a Jira ticket the approval needs the system webhook with the *Comment created* event; Jira Automation carries no comments.
 
 ### Tools and credentials per tier
@@ -635,6 +642,7 @@ The file is YAML front matter between two lines of `---`, and after it the promp
   | the prompt (the text after the front matter) | it takes the place of `agent.prompt_template`. A prompt is text for the agent and grants nothing | |
 
   - The tier is the ticket's own (see [Policy and risk tiers](#policy-and-risk-tiers)): the same file can narrow one tier and be ignored in part for another.
+  - With [graduated autonomy](#graduated-autonomy), the tier is held back by its level first, and the file is compared with what is left. `pr_review: sampled` in the file is ignored while the tier's level does not carry `sampled` yet.
   - **A setting that would widen the policy is ignored and reported; the rest of the file holds.** Where it is reported: a warning in ochell's log, a `# workflow:` line in the log of the run, `ochell status`, and `GET /api/v1/state` of [the status API](#the-status-api) (`workflows`, with the reason for each setting). The ticket is not told: it would be told at every run.
   - **Nothing else can be set.** The budget, the grants, the labels, who may assign or approve, the pauses, the throttles and the [scheduling](#scheduling) are the policy file's alone. A file that names one of them, or any setting that ochell does not know, is invalid as a whole.
   - A run that reaches the `max_turns` of the file ends like one that reaches the tier's (see [Escalation](#escalation)).
@@ -769,6 +777,88 @@ tiers:
 - A held ticket counts in `agent.queue_size`. It is stopped like any queued ticket: from the ticket, by closing it, or with `ochell stop`.
 - A change of the policy file takes effect at the next start. A ticket that was held under the old settings is looked at again then.
 
+### Graduated autonomy
+A class of work earns its autonomy step by step. Each tier has a **level**, which holds back what the tier allows until an operator has promoted it. An operator promotes a tier on the strength of its [outcome metrics](#audit-trail-and-outcome-metrics); ochell demotes it by itself when people send back too many of its pull requests, or when a guardrail outside ochell flags a run.
+
+```yaml
+# policy.yaml
+autonomy:
+  start_level: observe        # observe, assisted or autonomous
+  demote:
+    sent_back_rate: 0.3       # above 30% of the pull requests sent back, the tier loses a level
+    window: 336h              # over the last 14 days
+    min_sample: 5             # and at least 5 tickets with a pull request
+```
+
+| Level | Plan gate | `pr_review` | `auto_merge` |
+|---|---|---|---|
+| `observe` | **every ticket** gets a run that only plans, and waits for `/approve`, whatever the tier's `plan_gate` says | `required` | `never` |
+| `assisted` | the tier's | `required` | `never` |
+| `autonomous` | the tier's | the tier's: `sampled` counts | `never` |
+| `auto-merge` | the tier's | the tier's | the tier's: `after_ci` counts |
+
+- **A level never gives a tier more than the policy file says.** It only holds back: a tier with `plan_gate: required` plans at every level, and a tier with `auto_merge: never` never merges without a person. A repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) narrows what the level leaves; neither gives back what the other took.
+- **What ochell enforces of this is the plan gate** (see [The plan gate](#the-plan-gate)). `pr_review` and `auto_merge` are settings that ochell checks and records, at every level: **ochell merges nothing**, its GitHub token only reads (see [Handoff](#handoff-review-merge-done)). The level says whether a tier's `sampled` and `after_ci` are in force; acting on them is for the branch protection and the merge rules of the code host.
+- **A class of work is a tier.** The levels are per tier, not per repository or per rule: the outcome metrics are per tier, and a rule only chooses a tier. To give one repository its own level, give it its own tier with a rule.
+- **`auto-merge` is for the lowest tier alone** (the first of `tiers`), and only when that tier sets `auto_merge: after_ci`. No other tier can be promoted above `autonomous`, and `start_level` cannot be `auto-merge`.
+- **Without the `autonomy` section there are no levels:** every tier holds as it is written.
+
+**Promotion is an operator's decision**, one step at a time:
+
+```
+$ ochell promote low --reason "four weeks, one pull request of twelve sent back" --config config.yaml
+the tier low is now at the level autonomous (it was at assisted); this holds for the runs that start from now on
+recorded: by the operator deamen, with 12 ticket(s) with a pull request since 2026-11-02 09:00, sent back: 1 of 12 (8%), merged untouched: 10 of 11 (91%)
+```
+
+- **It is recorded** in [the store](#the-store): who decided (the OS user that ran the command, as the command says it), when, from which level to which, the reason, and the numbers of the tier at that moment.
+- **Only the admin socket promotes** (see [Guards and the admin channel](#guards-and-the-admin-channel)). Nothing on a ticket, in a repository or in a message does, and the bot account cannot.
+- ochell does not refuse a promotion for its numbers: it shows them and records them, and the decision is the operator's.
+- `ochell demote <TIER>` is the same step down, by hand.
+
+**Demotion is automatic**, in two cases. Each takes one level away and is recorded in the same way, with the reason and the numbers.
+
+| What happens | Who is recorded | When ochell looks |
+|---|---|---|
+| more than `sent_back_rate` of the tier's tickets with a pull request were sent back by a person, and there are at least `min_sample` of them | `ochell itself` | when a follow-up arrives, when a run ends, and every 15 minutes. No restart is needed |
+| a guardrail outside ochell flags a run: `ochell flag <jira|linear> <KEY> --reason TEXT` | the OS user that ran the command | at once |
+
+- **The override rate is "sent back" of [`ochell outcomes`](#audit-trail-and-outcome-metrics)**: of the tickets that handed over a pull request, the ones that a person sent back with a follow-up (a comment on the ticket, a reply in the session, a review comment on the pull request).
+- **The numbers are those of the tier under its present level:** the tickets that handed over a pull request since the level last changed, and not longer ago than `window`. So a tier earns a new record at every level, and one bad stretch takes one level away, not all of them.
+- **`ochell flag` is the way in for a guardrail**: a CI watcher, a hook that denied something, a reviewer's tooling. It runs on the host as ochell's OS user, over the admin socket, which the agent cannot open with the `systemd` launcher. The flag is recorded with the ticket and its last run. A tier at `observe` stays there, and the flag is recorded all the same.
+- **A change of level holds for the runs that start afterwards.** It stops no run, moves no ticket to another tier and changes no budget: it is not an [escalation](#escalation). A ticket that is under way when its tier goes down to `observe` gets a plan run as its next run (a follow-up, a retry, a run for failed checks), unless its plan was approved before.
+- A level that a tier can no longer have, because the policy file changed after the promotion, counts as the highest it can have.
+
+**Where to see it:**
+
+```
+$ ochell autonomy --config config.yaml
+levels of autonomy per tier (times in UTC); the numbers are of the tickets under the present level
+TIER  LEVEL     SINCE             BY                             PULL REQUESTS  SENT BACK     MERGED  MERGED UNTOUCHED
+low   assisted  2026-11-16 09:12  ochell itself                  0              -             0       -
+high  observe   -                 the policy file (start_level)  3              1 of 3 (33%)  2       1 of 2 (50%)
+last changes, the newest first:
+2026-11-16 09:12  low: autonomous -> assisted, by ochell itself; people sent back 4 of the 9 tickets with a pull request since 2026-11-02 09:00 UTC (44%); the policy allows 30% (autonomy.demote.sent_back_rate, with at least 5 tickets) [9 ticket(s) with a pull request since 2026-11-02 09:00, sent back: 4 of 9 (44%), merged untouched: 5 of 5 (100%)]
+2026-11-02 09:00  low: assisted -> autonomous, by the operator deamen; four weeks, one pull request of twelve sent back [12 ticket(s) with a pull request since 2026-10-19 09:00, sent back: 1 of 12 (8%), merged untouched: 10 of 11 (91%)]
+2026-10-19 09:00  low: observe -> assisted, by the operator deamen; the plans were right [6 ticket(s) with a pull request since 2026-10-05 09:00, sent back: 0 of 6 (0%), merged untouched: 6 of 6 (100%)]
+```
+
+- `ochell status` has one line per tier, and `GET /api/v1/state` of [the status API](#the-status-api) has `autonomy`.
+- **Each run records the level it ran under**, in its [audit record](#audit-trail-and-outcome-metrics) and in its log. The agent gets it as `ORCH_TASK_AUTONOMY`.
+- `ochell policy-check` prints the settings, and for each tier where it starts and how far it can be promoted.
+- ochell's log has a warning for every change.
+
+| Setting | Meaning | Default |
+|---|---|---|
+| `autonomy.start_level` | the level of a tier whose level nobody has changed: `observe`, `assisted` or `autonomous` | none: no levels |
+| `autonomy.demote.sent_back_rate` | the share of sent-back tickets above which a tier loses a level, from above 0 to 1. `1`: never | `0.3` |
+| `autonomy.demote.window` | how far back the tickets count | `336h` (14 days) |
+| `autonomy.demote.min_sample` | how many tickets with a pull request a tier must have before its rate counts | `5` |
+
+- **Turning it on changes what runs:** with `start_level: observe`, every tier starts with a plan run for each ticket. To keep what the tiers do today and only add the demotion, start at `autonomous`.
+- The thresholds are in the policy file, so they change in the review of that file and with a restart. The levels are in the store and change at once.
+- Promoting a real class of work needs weeks of run history. The mechanism was tested with recorded runs, not with such a history.
+
 ### Gate integrity
 The agent can write to its tickets with its own tool (`twg`), as the bot account. So it could try to pass ochell's gates itself: approve its own plan, take a label off to get into a lower tier, assign itself a ticket again, or close the ticket as if the work had been accepted. None of that works: **what the bot account does on a ticket is never taken as a person's word.**
 
@@ -788,6 +878,7 @@ And for everyone:
 - **A plan is approved only with `/approve` from someone who may** (see [The plan gate](#the-plan-gate)). No status and no label approves anything.
 - **A budget is renewed only by an operator**, and a tier's limits are in the policy file, which the agent cannot write.
 - **A repository's `WORKFLOW.md` can make a gate stricter, never looser** (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)). The agent can change that file on its own branch; ochell reads the default branch.
+- **A tier's level of autonomy goes up only by an operator's `ochell promote`** (see [Graduated autonomy](#graduated-autonomy)). Nothing on a ticket or in a repository raises it.
 
 Who the bot account is:
 - **Jira:** `bot_account_id` of `jira_webhook` and of `jira_automation`. Let the agent's `twg` use that same account.
@@ -892,7 +983,7 @@ Limits on what starts a run, and one way to talk to the running ochell.
   - A ticket whose assigner ochell does not know (a Jira Automation rule that sends no initiator) has no `assigner`.
   - Message text is never a way in: what a comment says does not change who may send one, or what the agent may do.
 
-**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `cost`, `outcomes`, `backup`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
+**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `cost`, `outcomes`, `backup`, `autonomy`, `promote`, `demote`, `flag`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
 - Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port: the agent runs on the same host and can reach any local port. With the `systemd` launcher the agent is another user and cannot open the socket; with the `direct` launcher it is the same user and can.
 - Keep the socket in a directory that the agent user cannot write to.
 
@@ -1097,7 +1188,7 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 ### Agent environment
 The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:
 - the variables named in `agent.env_pass`, copied from ochell's environment when they are set. The default list is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), `SSL_CERT_FILE` and `SSL_CERT_DIR`;
-- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL`, `ORCH_TASK_BRANCH`, `ORCH_TASK_TIER` (the ticket's [risk tier](#policy-and-risk-tiers)) and `ORCH_RESULT_FILE`, and `ORCH_TASK_REPO` when a repository is mapped to the ticket;
+- `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL`, `ORCH_TASK_BRANCH`, `ORCH_TASK_TIER` (the ticket's [risk tier](#policy-and-risk-tiers)) and `ORCH_RESULT_FILE`, `ORCH_TASK_REPO` when a repository is mapped to the ticket, and `ORCH_TASK_AUTONOMY` (the tier's [level of autonomy](#graduated-autonomy)) when the policy has levels;
 - the variables set in `agent.env`;
 - what the ticket's tier grants: `ORCH_MCP_CONFIG`, the tier's `env`, and its credentials (see [Tools and credentials per tier](#tools-and-credentials-per-tier)).
 
@@ -1213,6 +1304,7 @@ Notes:
 - **Metrics:** the endpoint needs its own token on every scrape (see [Metrics](#metrics)).
 - **Status API:** it needs its token on every request, also from the same host (see [The status API](#the-status-api)).
 - **Policy:** the tiers and limits are in a file of ochell's own, which the agent must not be able to write (see [Policy and risk tiers](#policy-and-risk-tiers)). Nothing in a ticket or a repository widens them.
+- **Graduated autonomy:** a level only holds back what a tier allows, and only an operator on the admin socket raises one (see [Graduated autonomy](#graduated-autonomy)). ochell merges nothing at any level.
 - **Scheduling:** a label of `required_labels` counts only when someone other than the bot account put it on the ticket; the priority and `blocked_by` order the work and are not approvals (see [Scheduling](#scheduling)).
 - **A repository's `WORKFLOW.md`** is untrusted: it is read from the default branch only, it can only narrow the policy, and its templates are placeholders, not programs (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)). That the agent cannot push to the default branch is GitHub's branch protection to enforce.
 - **Agent OS user:** with the `direct` launcher the agent runs as the same OS user as ochell and can read ochell's files. Deploy with the `systemd` launcher (see [Launchers](#launchers)).

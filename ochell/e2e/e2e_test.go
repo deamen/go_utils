@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -2385,6 +2387,18 @@ func TestBuiltInPolicy(t *testing.T) {
 	}
 	if out, code := o.Admin("policy-check"); code != 0 || !strings.Contains(out, "the built-in policy holds") {
 		t.Errorf("ochell policy-check: exit %d, %q", code, out)
+	}
+	// It has no levels of autonomy: nothing to show, to promote or to flag.
+	if run := o.WaitStored(st, id, 10*time.Second); run.Result.Autonomy != "" {
+		t.Errorf("a run without levels has the level %q", run.Result.Autonomy)
+	}
+	for _, cmd := range [][]string{{"autonomy"}, {"promote", "normal"}, {"flag", "jira", "DEV-72", "--reason", "x"}} {
+		if out, code := o.Admin(cmd...); code == 0 || !strings.Contains(out, "no autonomy section") {
+			t.Errorf("ochell %s without levels: exit %d, %q", cmd[0], code, out)
+		}
+	}
+	if out, _ := o.Admin("status"); strings.Contains(out, "autonomy") {
+		t.Errorf("ochell status without levels: %q", out)
 	}
 }
 
@@ -4854,4 +4868,283 @@ func TestScheduling(t *testing.T) {
 		release(t, o, "DEV-240")
 		waitState(t, o, st, "jira", "DEV-240", "in_review")
 	})
+}
+
+const autonomyPolicy = `
+version: autonomy-1
+tiers:
+  - {name: low}
+  - {name: high, plan_gate: required, labels: [risk-high]}
+default_tier: low
+autonomy:
+  start_level: observe
+  demote: {sent_back_rate: 0.5, window: 1h, min_sample: 3}
+`
+
+// Graduated autonomy (H5): a class of work with a good record is promoted
+// by an operator, which is recorded with who decided and the numbers of
+// the class; when people then send back more of its pull requests than the
+// policy allows, ochell demotes the class by itself, without a restart;
+// and the level in force decides what the next run does.
+func TestGraduatedAutonomy(t *testing.T) {
+	pr := func(n int) string { return fmt.Sprintf("https://github.com/example/web/pull/%d", n) }
+	script := OnRun(1, Report("plan", "1. Rename the function."))
+	script = append(script, OnRun(2, Report("done", "Done as planned.", "pr_url", pr(300)))...)
+	for i, n := range []int{301, 302, 303} {
+		script = append(script, OnRun(3+i, Report("done", "Opened a pull request.", "pr_url", pr(n)))...)
+	}
+	script = append(script, OnRun(6, Report("done", "Renamed it."))...)
+	script = append(script, OnRun(7, Report("done", "Changed it."))...)
+	script = append(script, OnRun(8, Report("plan", "1. Look at the code first."))...)
+	o := Start(t, Options{Script: script, Policy: autonomyPolicy, Configure: withAPI})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	state := func(key string) string {
+		t.Helper()
+		tk, err := st.Ticket("linear", key)
+		if err != nil || tk == nil {
+			t.Fatalf("ticket %s: %+v, %v", key, tk, err)
+		}
+		if tk.Reason != "" {
+			return string(tk.State) + " (" + string(tk.Reason) + ")"
+		}
+		return string(tk.State)
+	}
+	level := func(tier string) *store.LevelChange {
+		t.Helper()
+		last, err := st.Level(tier)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return last
+	}
+	autonomyOf := func(rec Record) string { v, _ := rec.Getenv("ORCH_TASK_AUTONOMY"); return v }
+	me, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if out, code := o.Admin("policy-check"); code != 0 || !strings.Contains(out, "autonomy: start_level=observe demote: sent_back_rate=0.5 window=1h0m0s min_sample=3") ||
+		!strings.Contains(out, "low: starts at observe, can be promoted up to autonomous") {
+		t.Errorf("ochell policy-check: exit %d, %q", code, out)
+	}
+
+	// At the level observe a ticket of a tier without a plan gate gets a
+	// run that only plans, and waits for /approve.
+	first := o.LinearCreated("ENG-300", "session-300", "").TaskID(t)
+	run := o.WaitStored(st, first, 15*time.Second)
+	if run.Result.Phase != "plan" || run.Result.Autonomy != "observe" || run.Tier != "low" {
+		t.Fatalf("the first run at observe: tier %q, %+v", run.Tier, run.Result)
+	}
+	recs := o.WaitRecords(1, 5*time.Second)
+	if autonomyOf(recs[0]) != "observe" || !strings.Contains(recs[0].Stdin, "This run is for the plan only.") {
+		t.Errorf("the agent of the first run: ORCH_TASK_AUTONOMY=%q, prompt:\n%s", autonomyOf(recs[0]), recs[0].Stdin)
+	}
+	if got := state("ENG-300"); got != "waiting (plan_approval)" {
+		t.Fatalf("ENG-300 = %s, want waiting (plan_approval)", got)
+	}
+	r := o.LinearPrompted("ENG-300", "session-300", "/approve")
+	if r.Status != 200 || !strings.HasPrefix(r.Body, "approved; queued ") {
+		t.Fatalf("the approval: %d %q", r.Status, r.Body)
+	}
+	if run := o.WaitStored(st, strings.TrimPrefix(r.Body, "approved; queued "), 15*time.Second); run.Result.Phase != "" || run.Result.PRURL != pr(300) {
+		t.Fatalf("the run after the approval: %+v", run.Result)
+	}
+	o.waitFor(10*time.Second, "ENG-300 to be in review", func() bool { return state("ENG-300") == "in_review" })
+	if out, _ := o.Admin("status"); !strings.Contains(out, "\nautonomy: the tier low is at the level observe\nautonomy: the tier high is at the level observe") {
+		t.Errorf("ochell status at the start level: %q", out)
+	}
+
+	// The record is good: an operator promotes the class. Nothing was
+	// changed before, and the decision is recorded with who and the numbers.
+	if level("low") != nil {
+		t.Fatalf("the level of low was changed before anyone decided: %+v", level("low"))
+	}
+	if out, code := o.Admin("autonomy"); code != 0 || !regexp.MustCompile(`(?m)^low\s+observe\s+-\s+the policy file \(start_level\)\s+1\s+0 of 1 \(0%\)`).MatchString(out) || !strings.Contains(out, "no level was changed yet") {
+		t.Errorf("ochell autonomy before the promotion: exit %d\n%s", code, out)
+	}
+	out, code := o.Admin("promote", "low", "--reason", "the plans were right every time")
+	if code != 0 || !strings.Contains(out, "the tier low is now at the level assisted (it was at observe)") ||
+		!strings.Contains(out, "recorded: by the operator "+me.Username+", with 1 ticket(s) with a pull request") || !strings.Contains(out, "sent back: 0 of 1 (0%)") {
+		t.Fatalf("ochell promote: exit %d, %q", code, out)
+	}
+	up := level("low")
+	if up == nil || up.From != "observe" || up.To != "assisted" || up.By != "the operator "+me.Username || up.Reason != "the plans were right every time" ||
+		up.Record.PullRequests != 1 || up.Record.SentBack != 0 || up.Record.Tickets != 1 || up.Record.Runs != 2 || time.Since(up.At) > time.Minute {
+		t.Errorf("the promotion as recorded = %+v", up)
+	}
+	// One step at a time, and only for a tier that is there.
+	if out, code := o.Admin("promote", "nope"); code == 0 || !strings.Contains(out, "nothing was changed") {
+		t.Errorf("ochell promote of an unknown tier: exit %d, %q", code, out)
+	}
+	if out, code := o.Admin("promote"); code == 0 || !strings.Contains(out, "usage: ochell promote <TIER>") {
+		t.Errorf("ochell promote without a tier: exit %d, %q", code, out)
+	}
+
+	// At assisted the tier's own plan gate holds, which is none: three
+	// tickets are worked at once, and each hands over a pull request.
+	sessions := map[string]string{}
+	for i, key := range []string{"ENG-301", "ENG-302", "ENG-303"} {
+		sessions[key] = "session-" + key
+		id := o.LinearCreated(key, sessions[key], "").TaskID(t)
+		if run := o.WaitStored(st, id, 15*time.Second); run.Result.Phase != "" || run.Result.Autonomy != "assisted" || run.Result.PRURL == "" {
+			t.Fatalf("the run of %s at assisted: %+v", key, run.Result)
+		}
+		if rec := o.WaitRecords(3+i, 5*time.Second)[2+i]; autonomyOf(rec) != "assisted" || strings.Contains(rec.Stdin, "for the plan only") {
+			t.Errorf("the agent of %s: ORCH_TASK_AUTONOMY=%q", key, autonomyOf(rec))
+		}
+		o.waitFor(10*time.Second, key+" to be in review", func() bool { return state(key) == "in_review" })
+	}
+
+	// A reviewer sends one of the three back: one of three is within what
+	// the policy allows.
+	back := o.LinearPrompted("ENG-301", sessions["ENG-301"], "Please rename the function.").TaskID(t)
+	o.WaitStored(st, back, 15*time.Second)
+	o.waitFor(10*time.Second, "ENG-301 to be in review again", func() bool { return state("ENG-301") == "in_review" })
+	if got := level("low"); got.To != "assisted" {
+		t.Fatalf("one ticket of three sent back changed the level: %+v", got)
+	}
+	// The second one takes the rate to two of three, above the threshold:
+	// ochell demotes the class itself, when the follow-up arrives.
+	back = o.LinearPrompted("ENG-302", sessions["ENG-302"], "This is not what the ticket asks for.").TaskID(t)
+	down := level("low")
+	if down.From != "assisted" || down.To != "observe" || down.By != "ochell itself" || down.Record.PullRequests != 3 || down.Record.SentBack != 2 ||
+		!strings.Contains(down.Reason, "people sent back 2 of the 3 tickets with a pull request") || !strings.Contains(down.Reason, "the policy allows 50%") {
+		t.Fatalf("the demotion as recorded = %+v", down)
+	}
+	if !strings.Contains(o.Output(), "autonomy: a class was demoted") {
+		t.Error("ochell's log does not say that the class was demoted")
+	}
+	o.WaitStored(st, back, 15*time.Second)
+	o.WaitRecords(7, 5*time.Second)
+
+	// The level in force decides what the next run does: a new ticket of
+	// the class gets a run that only plans again.
+	next := o.LinearCreated("ENG-304", "session-304", "").TaskID(t)
+	if run := o.WaitStored(st, next, 15*time.Second); run.Result.Phase != "plan" || run.Result.Autonomy != "observe" {
+		t.Fatalf("the run of a new ticket after the demotion: %+v", run.Result)
+	}
+	if rec := o.WaitRecords(8, 5*time.Second)[7]; autonomyOf(rec) != "observe" || !strings.Contains(rec.Stdin, "This run is for the plan only.") {
+		t.Errorf("the agent after the demotion: ORCH_TASK_AUTONOMY=%q, prompt:\n%s", autonomyOf(rec), rec.Stdin)
+	}
+	if got := state("ENG-304"); got != "waiting (plan_approval)" {
+		t.Errorf("ENG-304 = %s, want waiting (plan_approval)", got)
+	}
+	// Nothing else was touched: the tickets keep their tier.
+	if tk, _ := st.Ticket("linear", "ENG-303"); tk.Tier != "low" || tk.State != "in_review" {
+		t.Errorf("ENG-303 = %+v", tk)
+	}
+
+	// What an operator sees: the level, since when and by whom, and both
+	// decisions.
+	out, code = o.Admin("autonomy")
+	for _, want := range []*regexp.Regexp{
+		regexp.MustCompile(`(?m)^low\s+observe\s+\d{4}-\d\d-\d\d \d\d:\d\d\s+ochell itself\s+0\s+-`),
+		regexp.MustCompile(`(?m)^high\s+observe\s+-\s+the policy file \(start_level\)`),
+		regexp.MustCompile(`low: assisted -> observe, by ochell itself; people sent back 2 of the 3 tickets`),
+		regexp.MustCompile(`low: observe -> assisted, by the operator ` + regexp.QuoteMeta(me.Username) + `; the plans were right every time \[1 ticket\(s\) with a pull request`),
+	} {
+		if code != 0 || !want.MatchString(out) {
+			t.Errorf("ochell autonomy lacks %s (exit %d):\n%s", want, code, out)
+		}
+	}
+	if out, _ := o.Admin("status"); !strings.Contains(out, "autonomy: the tier low is at the level observe since ") || !strings.Contains(out, ", by ochell itself") {
+		t.Errorf("ochell status after the demotion: %q", out)
+	}
+	// The status API has the level of each tier, and each run's record the
+	// level it ran under.
+	var page struct {
+		Autonomy []struct{ Tier, Level, By, Reason string }
+	}
+	if code, body := o.get("/api/v1/state", apiToken, false); code != 200 || json.Unmarshal([]byte(body), &page) != nil || len(page.Autonomy) != 2 ||
+		page.Autonomy[0].Tier != "low" || page.Autonomy[0].Level != "observe" || page.Autonomy[0].By != "ochell itself" || page.Autonomy[1].Level != "observe" {
+		t.Errorf("GET /api/v1/state: %d, autonomy %+v\n%s", code, page.Autonomy, body)
+	}
+	var entry struct {
+		Tickets []struct {
+			Runs []struct{ Audit struct{ Autonomy string } }
+		}
+	}
+	if code, body := o.get("/api/v1/tasks/ENG-303", apiToken, false); code != 200 || json.Unmarshal([]byte(body), &entry) != nil || len(entry.Tickets) != 1 ||
+		len(entry.Tickets[0].Runs) != 1 || entry.Tickets[0].Runs[0].Audit.Autonomy != "assisted" {
+		t.Errorf("GET /api/v1/tasks/ENG-303: %d\n%s", code, body)
+	}
+
+	// The level is in the store: it holds after a restart, and an operator
+	// can promote the class again when its record is good again.
+	o.Kill()
+	o.Restart()
+	if out, _ := o.Admin("status"); !strings.Contains(out, "autonomy: the tier low is at the level observe since ") {
+		t.Errorf("ochell status after a restart: %q", out)
+	}
+	if out, code := o.Admin("demote", "low"); code == 0 || !strings.Contains(out, "at the lowest level") {
+		t.Errorf("ochell demote at the lowest level: exit %d, %q", code, out)
+	}
+}
+
+// A guardrail outside ochell flags a run with a command on the admin
+// channel: the flag is recorded with the run, and the class of the ticket
+// goes down one level for the runs that start afterwards.
+func TestGuardrailFlag(t *testing.T) {
+	script := append(OnRun(1, Report("done", "Opened a pull request.", "pr_url", "https://github.com/example/web/pull/310")),
+		OnRun(2, Report("plan", "1. Look at the code first."))...)
+	o := Start(t, Options{Script: script, Policy: strings.Replace(autonomyPolicy, "start_level: observe", "start_level: assisted", 1)})
+	st, err := store.Open(o.Config.Store.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	me, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := o.LinearCreated("ENG-310", "session-310", "").TaskID(t)
+	if run := o.WaitStored(st, first, 15*time.Second); run.Result.Phase != "" || run.Result.Autonomy != "assisted" {
+		t.Fatalf("the run at assisted: %+v", run.Result)
+	}
+	o.waitFor(10*time.Second, "ENG-310 to be in review", func() bool { tk, _ := st.Ticket("linear", "ENG-310"); return tk.State == "in_review" })
+
+	// A flag needs a reason and a ticket that ochell knows.
+	if out, code := o.Admin("flag", "linear", "ENG-310"); code == 0 || !strings.Contains(out, "usage: ochell flag <jira|linear> <KEY> --reason TEXT") {
+		t.Errorf("ochell flag without a reason: exit %d, %q", code, out)
+	}
+	if out, code := o.Admin("flag", "linear", "NOPE-1", "--reason", "x"); code == 0 || !strings.Contains(out, "ochell knows no linear ticket NOPE-1") {
+		t.Errorf("ochell flag of an unknown ticket: exit %d, %q", code, out)
+	}
+	if last, _ := st.Level("low"); last != nil {
+		t.Fatalf("a refused flag changed the level: %+v", last)
+	}
+
+	out, code := o.Admin("flag", "linear", "ENG-310", "--reason", "the pull request failed CI three times")
+	if code != 0 || !strings.Contains(out, "the flag on linear ENG-310 is recorded; its tier low is now at the level observe (it was at assisted)") {
+		t.Fatalf("ochell flag: exit %d, %q", code, out)
+	}
+	last, err := st.Level("low")
+	if err != nil || last == nil || last.From != "assisted" || last.To != "observe" || last.By != "the operator "+me.Username ||
+		last.Source != "linear" || last.Key != "ENG-310" || last.Run != first || last.Reason != "a guardrail flagged the run: the pull request failed CI three times" {
+		t.Fatalf("the flag as recorded = %+v, %v", last, err)
+	}
+	// The flagged ticket is not touched; the next run of the class is held
+	// to a plan.
+	if tk, _ := st.Ticket("linear", "ENG-310"); tk.State != "in_review" || tk.Tier != "low" {
+		t.Errorf("the flagged ticket = %+v", tk)
+	}
+	next := o.LinearCreated("ENG-311", "session-311", "").TaskID(t)
+	if run := o.WaitStored(st, next, 15*time.Second); run.Result.Phase != "plan" || run.Result.Autonomy != "observe" {
+		t.Errorf("the run after the flag: %+v", run.Result)
+	}
+	if out, _ := o.Admin("autonomy"); !strings.Contains(out, "low: assisted -> observe, by the operator "+me.Username+"; flagged: linear ENG-310, run "+first+"; a guardrail flagged the run: the pull request failed CI three times") {
+		t.Errorf("ochell autonomy after the flag:\n%s", out)
+	}
+	// At the lowest level a flag is recorded, and the level stays.
+	if out, code := o.Admin("flag", "linear", "ENG-310", "--reason", "again"); code != 0 || !strings.Contains(out, "is at the lowest level already (observe)") {
+		t.Errorf("ochell flag at the lowest level: exit %d, %q", code, out)
+	}
+	if list, _ := st.LevelChanges(0); len(list) != 2 || list[0].From != "observe" || list[0].To != "observe" {
+		t.Errorf("the recorded changes = %+v", list)
+	}
 }

@@ -286,6 +286,9 @@ type Policy struct {
 	Throttles Throttles `yaml:"throttles"`
 	// Scheduling says which queued ticket starts next, and which waits.
 	Scheduling Scheduling `yaml:"scheduling"`
+	// Autonomy gives the classes of work a level of autonomy, which holds
+	// back what a tier allows until an operator has promoted the class.
+	Autonomy Autonomy `yaml:"autonomy"`
 
 	// File is where the policy was read from; empty for the built-in one.
 	File string `yaml:"-"`
@@ -477,6 +480,7 @@ func Parse(raw []byte) (*Policy, error) {
 	if p.Scheduling.CheckInterval == 0 {
 		p.Scheduling.CheckInterval = DefaultCheckInterval
 	}
+	p.Autonomy.setDefaults()
 	if p.Version == "" {
 		sum := sha256.Sum256(raw)
 		p.Version = "sha256:" + hex.EncodeToString(sum[:6])
@@ -504,6 +508,7 @@ func (p *Policy) Validate() error {
 		errs = append(errs, errors.New("throttles: a limit must not be negative; 0 means no limit"))
 	}
 	errs = append(errs, p.Scheduling.validate()...)
+	errs = append(errs, p.Autonomy.validate()...)
 	seen := map[string]bool{}
 	labels := map[string]string{}
 	for i, t := range p.Tiers {

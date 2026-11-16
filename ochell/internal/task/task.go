@@ -121,6 +121,10 @@ type Task struct {
 	// the ticket requires an approved plan, and there is none yet. The
 	// runner sets it.
 	Phase Phase
+	// Autonomy is the level of autonomy that the class of the ticket (its
+	// tier) has when the run starts; empty: the policy has no levels. The
+	// runner sets it.
+	Autonomy string
 }
 
 // Phase is the part of a ticket's work that a run is for.
@@ -232,6 +236,9 @@ type Result struct {
 	// Workflow is the version of the repository's WORKFLOW.md that the
 	// run ran under; empty: none.
 	Workflow string
+	// Autonomy is the level of autonomy that the run ran under; empty:
+	// the policy has no levels.
+	Autonomy string
 	// AwaitChecks says that the work was handed over with a pull request
 	// whose checks ochell follows: the ticket is not in review yet.
 	AwaitChecks bool

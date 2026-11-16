@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -50,6 +49,16 @@ type Control interface {
 	SetTier(source, key, tier string) error
 	// Stop ends the work on a ticket for the operator named in by.
 	Stop(source, key, by string) (runner.Stopped, error)
+	// Autonomy returns the classes of work with their level of autonomy
+	// and their numbers, and the last changes of levels.
+	Autonomy() ([]runner.Class, []store.LevelChange, error)
+	// Promote and Demote move the class of a tier one level up or down,
+	// for the operator named in by.
+	Promote(tier, by, reason string) (store.LevelChange, error)
+	Demote(tier, by, reason string) (store.LevelChange, error)
+	// Flag records that a guardrail outside ochell flagged the work on a
+	// ticket, and lowers the class of the ticket by one level.
+	Flag(source, key, by, reason string) (store.LevelChange, error)
 }
 
 // Server serves the admin commands on a unix socket.
@@ -263,7 +272,134 @@ func routes(c Control, log *slog.Logger) http.Handler {
 			answer(w, http.StatusInternalServerError, err.Error())
 		}
 	})
+	// operator names who ran a command, as the client says: everyone who
+	// can open the socket is ochell's own OS user, so this is a note for
+	// the record, not a credential.
+	operator := func(r *http.Request) string {
+		if user := strings.TrimSpace(r.URL.Query().Get("user")); user != "" {
+			return "the operator " + user
+		}
+		return "an operator"
+	}
+	// levelError answers a change of a level that was refused.
+	levelError := func(w http.ResponseWriter, what string, err error) {
+		switch {
+		case errors.Is(err, runner.ErrNoLevels):
+			answer(w, http.StatusBadRequest, "the policy file has no autonomy section (autonomy.start_level): there are no levels")
+		case errors.Is(err, runner.ErrNoTier), errors.Is(err, runner.ErrTopLevel), errors.Is(err, runner.ErrLowestLevel):
+			answer(w, http.StatusBadRequest, "nothing was changed: "+err.Error())
+		default:
+			log.Error("admin: "+what+" failed", "err", err)
+			answer(w, http.StatusInternalServerError, err.Error())
+		}
+	}
+	mux.HandleFunc("GET /autonomy", func(w http.ResponseWriter, r *http.Request) {
+		classes, changes, err := c.Autonomy()
+		if err != nil {
+			levelError(w, "autonomy", err)
+			return
+		}
+		answer(w, http.StatusOK, strings.TrimRight(AutonomyText(classes, changes), "\n"))
+	})
+	for _, cmd := range []string{"promote", "demote"} {
+		mux.HandleFunc("POST /"+cmd, func(w http.ResponseWriter, r *http.Request) {
+			q := r.URL.Query()
+			step := c.Promote
+			if cmd == "demote" {
+				step = c.Demote
+			}
+			ch, err := step(q.Get("tier"), operator(r), reason(q.Get("reason")))
+			if err != nil {
+				levelError(w, cmd, err)
+				return
+			}
+			answer(w, http.StatusOK, fmt.Sprintf("the tier %s is now at the level %s (it was at %s); this holds for the runs that start from now on\nrecorded: by %s, with %s",
+				ch.Class, ch.To, ch.From, ch.By, recordText(ch.Record)))
+		})
+	}
+	mux.HandleFunc("POST /flag", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		source, key, why := q.Get("source"), q.Get("key"), reason(q.Get("reason"))
+		if why == "" {
+			answer(w, http.StatusBadRequest, "a flag needs a reason: what the guardrail found")
+			return
+		}
+		switch ch, err := c.Flag(source, key, operator(r), why); {
+		case err == nil && ch.From == ch.To:
+			answer(w, http.StatusOK, fmt.Sprintf("the flag on %s %s is recorded; its tier %s is at the lowest level already (%s)", source, key, ch.Class, ch.To))
+		case err == nil:
+			answer(w, http.StatusOK, fmt.Sprintf("the flag on %s %s is recorded; its tier %s is now at the level %s (it was at %s), for the runs that start from now on", source, key, ch.Class, ch.To, ch.From))
+		case errors.Is(err, store.ErrUnknown):
+			answer(w, http.StatusNotFound, fmt.Sprintf("ochell knows no %s ticket %s", source, key))
+		default:
+			levelError(w, "flag", err)
+		}
+	})
 	return mux
+}
+
+// maxReason is how much of the reason of a change of a level is kept.
+const maxReason = 500
+
+// reason is the reason of a change of a level as it is recorded: one line
+// of a bounded length.
+func reason(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > maxReason {
+		s = strings.ToValidUTF8(s[:maxReason], "") + " […]"
+	}
+	return s
+}
+
+// recordText writes the numbers of a class for the operator.
+func recordText(r store.Record) string {
+	return fmt.Sprintf("%d ticket(s) with a pull request since %s, sent back: %s, merged untouched: %s",
+		r.PullRequests, r.Since.UTC().Format("2006-01-02 15:04"), share(r.SentBack, r.PullRequests), share(r.MergedUntouched, r.Merged))
+}
+
+// AutonomyText writes the classes of work with their levels, and the last
+// changes of levels, for the operator.
+func AutonomyText(classes []runner.Class, changes []store.LevelChange) string {
+	var b strings.Builder
+	when := func(t time.Time) string { return t.UTC().Format("2006-01-02 15:04") }
+	b.WriteString("levels of autonomy per tier (times in UTC); the numbers are of the tickets under the present level\n")
+	tw := tabwriter.NewWriter(&b, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(tw, "TIER\tLEVEL\tSINCE\tBY\tPULL REQUESTS\tSENT BACK\tMERGED\tMERGED UNTOUCHED")
+	for _, c := range classes {
+		since, by := "-", "the policy file (start_level)"
+		if c.Since != nil {
+			since, by = when(*c.Since), c.By
+		}
+		var r store.Record
+		if c.Record != nil {
+			r = *c.Record
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%d\t%s\n", c.Tier, c.Level, since, by, r.PullRequests, share(r.SentBack, r.PullRequests), r.Merged, share(r.MergedUntouched, r.Merged))
+	}
+	tw.Flush()
+	if len(changes) == 0 {
+		b.WriteString("no level was changed yet\n")
+		return b.String()
+	}
+	b.WriteString("last changes, the newest first:\n")
+	for _, ch := range changes {
+		what := ch.From + " -> " + ch.To
+		if ch.From == ch.To {
+			what = "stays at " + ch.To
+		}
+		fmt.Fprintf(&b, "%s  %s: %s, by %s", when(ch.At), ch.Class, what, ch.By)
+		if ch.Key != "" {
+			fmt.Fprintf(&b, "; flagged: %s %s", ch.Source, ch.Key)
+			if ch.Run != "" {
+				fmt.Fprintf(&b, ", run %s", ch.Run)
+			}
+		}
+		if ch.Reason != "" {
+			fmt.Fprintf(&b, "; %s", ch.Reason)
+		}
+		fmt.Fprintf(&b, " [%s]\n", recordText(ch.Record))
+	}
+	return b.String()
 }
 
 // costText writes a cost report for the operator: one ticket with its
@@ -312,19 +448,6 @@ func costText(rep *runner.CostReport, one bool) string {
 	return b.String()
 }
 
-// Median returns the middle of some durations, 0 for none.
-func Median(d []time.Duration) time.Duration {
-	if len(d) == 0 {
-		return 0
-	}
-	sorted := slices.Clone(d)
-	slices.Sort(sorted)
-	if n := len(sorted); n%2 == 0 {
-		return (sorted[n/2-1] + sorted[n/2]) / 2
-	}
-	return sorted[len(sorted)/2]
-}
-
 // share writes a part of a whole as "3 of 4 (75%)", and "-" for no whole.
 func share(part, whole int) string {
 	if whole == 0 {
@@ -352,7 +475,7 @@ func OutcomesText(list []store.Outcomes, since, until time.Time) string {
 			per = fmt.Sprintf("%.4f", o.CostUSD/float64(o.Tickets))
 		}
 		if len(o.TimeToPR) > 0 {
-			ttp = Median(o.TimeToPR).Round(time.Second).String()
+			ttp = store.Median(o.TimeToPR).Round(time.Second).String()
 		}
 		fmt.Fprintf(tw, "%s\t%d\t%d\t%.4f\t%s\t%d\t%s\t%s\t%d\t%s\t%d\n", tier, o.Tickets, o.Runs, o.CostUSD, per, o.PullRequests, ttp,
 			share(o.Reworked, o.PullRequests), o.Merged, share(o.MergedUntouched, o.Merged), o.Reopened)
@@ -363,8 +486,9 @@ func OutcomesText(list []store.Outcomes, since, until time.Time) string {
 
 // describe is what pause, resume and status answer with: one line
 // that says whether runs start and how many are queued and running, a
-// line for everything that holds runs back, and a line for everything in
-// a repository's WORKFLOW.md that is not in force.
+// line for everything that holds runs back, a line for the level of
+// autonomy of each tier, and a line for everything in a repository's
+// WORKFLOW.md that is not in force.
 func describe(st runner.Status) string {
 	state := "running"
 	if st.Paused {
@@ -373,6 +497,13 @@ func describe(st runner.Status) string {
 	out := fmt.Sprintf("%s; %d queued, %d running", state, st.Queued, st.Running)
 	for _, h := range st.Holds {
 		out += "\nheld: " + h
+	}
+	for _, c := range st.Autonomy {
+		line := fmt.Sprintf("\nautonomy: the tier %s is at the level %s", c.Tier, c.Level)
+		if c.Since != nil {
+			line += fmt.Sprintf(" since %s, by %s", c.Since.UTC().Format("2006-01-02 15:04 UTC"), c.By)
+		}
+		out += line
 	}
 	// What of a repository's WORKFLOW.md is not in force.
 	for _, w := range st.Workflows {
