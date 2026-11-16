@@ -50,8 +50,9 @@ type Client struct {
 }
 
 var (
-	_ tracker.Client = (*Client)(nil)
-	_ tracker.Source = (*Client)(nil)
+	_ tracker.Client  = (*Client)(nil)
+	_ tracker.Source  = (*Client)(nil)
+	_ tracker.Tickets = (*Client)(nil)
 )
 
 // New returns the client for sources.jira_api.
@@ -218,6 +219,10 @@ func (c *Client) myself(ctx context.Context) (string, error) {
 	c.me = who.AccountID
 	return c.me, nil
 }
+
+// Account returns the accountId of the account that owns the token: the
+// account that everything ochell writes to Jira comes from.
+func (c *Client) Account(ctx context.Context) (string, error) { return c.myself(ctx) }
 
 type account struct {
 	AccountID string `json:"accountId"`
@@ -425,6 +430,90 @@ func (c *Client) Scheduling(ctx context.Context, key string) (tracker.Scheduling
 			out.BlockedBy = append(out.BlockedBy, l.InwardIssue.Key)
 		}
 	}
+	return out, nil
+}
+
+// jiraTime is how Jira writes a point in time.
+const jiraTime = "2006-01-02T15:04:05.000-0700"
+
+// Ticket returns one ticket as a person sees it: its summary, description,
+// status, labels and components, and its newest comments. Version 2 of the
+// API gives the description and the comments as text, where version 3
+// gives a document tree.
+func (c *Client) Ticket(ctx context.Context, key string) (tracker.Ticket, error) {
+	var out tracker.Ticket
+	me, err := c.myself(ctx)
+	if err != nil {
+		return out, err
+	}
+	path, err := issuePath(key, "?fields=summary,description,status,labels,components")
+	if err != nil {
+		return out, err
+	}
+	var is struct {
+		Key    string `json:"key"`
+		Fields struct {
+			Summary     string   `json:"summary"`
+			Description string   `json:"description"`
+			Labels      []string `json:"labels"`
+			Components  []struct {
+				Name string `json:"name"`
+			} `json:"components"`
+			Status struct {
+				Name string `json:"name"`
+			} `json:"status"`
+		} `json:"fields"`
+	}
+	notFound := func(err error) error {
+		var apiErr *Error
+		if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+			return tracker.ErrNotFound
+		}
+		return err
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, &is); err != nil {
+		return out, notFound(err)
+	}
+	out = tracker.Ticket{Key: key, Title: is.Fields.Summary, URL: c.BaseURL + "/browse/" + key,
+		Description: is.Fields.Description, Status: is.Fields.Status.Name, Labels: append([]string{}, is.Fields.Labels...)}
+	for _, comp := range is.Fields.Components {
+		if comp.Name != "" {
+			out.Labels = append(out.Labels, comp.Name)
+		}
+	}
+	// The comments are a request of their own: the newest first, so that a
+	// ticket with many comments costs one page.
+	path, err = issuePath(key, fmt.Sprintf("/comment?orderBy=-created&maxResults=%d", tracker.MaxComments))
+	if err != nil {
+		return out, err
+	}
+	var page struct {
+		Total    int `json:"total"`
+		Comments []struct {
+			Author *struct {
+				AccountID   string `json:"accountId"`
+				DisplayName string `json:"displayName"`
+			} `json:"author"`
+			Body    string `json:"body"`
+			Created string `json:"created"`
+		} `json:"comments"`
+	}
+	if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
+		return out, notFound(err)
+	}
+	for _, cm := range page.Comments {
+		one := tracker.Comment{Body: cm.Body}
+		if cm.Author != nil {
+			one.Author, one.Bot = cm.Author.DisplayName, cm.Author.AccountID == me
+		}
+		one.At, _ = time.Parse(jiraTime, cm.Created)
+		out.Comments = append(out.Comments, one)
+	}
+	if len(out.Comments) > tracker.MaxComments {
+		out.Comments = out.Comments[:tracker.MaxComments]
+	}
+	slices.Reverse(out.Comments)
+	out.MoreComments = max(page.Total-len(out.Comments), 0)
 	return out, nil
 }
 

@@ -41,6 +41,9 @@ type granted struct {
 	// mcpConfig is the file with the MCP servers of the run, or "".
 	mcpConfig string
 	revoke    []string
+	// toolsToken is the token of the run for ochell's ticket tools, or "".
+	// It is among the secrets too.
+	toolsToken string
 }
 
 // grant collects what the tier of t grants its runs. It reads the
@@ -76,6 +79,13 @@ func (r *Runner) grant(ctx context.Context, t *task.Task) (*granted, error) {
 		out.minted = minted
 		out.secrets = append(out.secrets, minted...)
 	}
+	if g.TicketTools {
+		if err := r.grantTools(t, out); err != nil {
+			// What was made for the run is of no use without it.
+			r.takeBack(t, out)
+			return nil, fmt.Errorf("the ticket tools of the tier %s: %w", t.Tier, err)
+		}
+	}
 	return out, nil
 }
 
@@ -90,7 +100,8 @@ func (g *granted) describe() string {
 		var out []string
 		for _, e := range list {
 			name, _, _ := strings.Cut(e, "=")
-			if name != "ORCH_MCP_CONFIG" {
+			// ochell's own variables are not grants of the policy.
+			if !strings.HasPrefix(name, "ORCH_") {
 				out = append(out, name)
 			}
 		}
@@ -105,6 +116,9 @@ func (g *granted) describe() string {
 	}
 	if n := names(g.minted); n != "" {
 		parts = append(parts, "minted="+n)
+	}
+	if g.toolsToken != "" {
+		parts = append(parts, "ticket_tools")
 	}
 	return strings.Join(parts, " ")
 }

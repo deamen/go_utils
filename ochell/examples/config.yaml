@@ -46,6 +46,18 @@ metrics:
   enabled: false
   token: ${OCHELL_METRICS_TOKEN}
 
+# The ticket tools: ochell's own MCP server, at /mcp on the same listener
+# as the webhooks. A run whose tier has "grants.ticket_tools" in the policy
+# file reads and comments on its ticket through it, with a token of its own
+# that opens that ticket only, and needs no tracker token. It needs
+# sources.jira_api for Jira tickets and the installed app for Linear.
+# "url" is the address for an agent on this host; empty: the http listener
+# on the loopback address. See examples/mcp-ticket-tools.json for the MCP
+# configuration of such a tier.
+ticket_tools:
+  enabled: false
+  url: ""                   # e.g. https://ochell.example.com/mcp
+
 # The scheduled backup of the store: a consistent copy at every interval,
 # the newest "keep" of them kept. Put "dir" where the agent cannot read,
 # and copy the backups off the host. Leave "dir" empty for none; "ochell
@@ -157,7 +169,7 @@ agent:
   prompt_via: stdin
   prompt_template: |
     You are the digital employee assigned {{.Source}} ticket {{.Key}} ({{.URL}}).
-    Use twg to retrieve the full ticket details, complete the task, and open a pull request.
+    {{if .TicketTools}}Read the full ticket with the tool get_ticket of the MCP server "ochell"{{else}}Use twg to retrieve the full ticket details{{end}}, complete the task, and open a pull request.
     {{- if .Repo}}
     The repository for this ticket is {{.Repo}}.
     {{- end}}

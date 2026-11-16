@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -291,12 +292,33 @@ func TestGrants(t *testing.T) {
 		t.Error("no grants are not empty")
 	}
 
+	// The ticket tools: with an MCP configuration, ochell's server has to
+	// be in it, with the address and the token as references.
+	withTools := write("mcp-tools.json", `{"mcpServers":{"ochell":{"type":"http","url":"${ORCH_TOOLS_URL}","headers":{"Authorization":"Bearer ${ORCH_TOOLS_TOKEN}"}}}}`, 0o644)
+	p, err = Load(policyFile("      ticket_tools: true\n      mcp_config: " + withTools + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := p.Tier("low").Grants; !g.TicketTools || g.Empty() || !strings.Contains(p.Describe()[0], "grants=mcp_config+ticket_tools") {
+		t.Errorf("grants = %+v, Describe = %q", g, p.Describe()[0])
+	}
+	if p, err := Load(policyFile("      ticket_tools: true\n")); err != nil || (Grants{TicketTools: true}).Empty() || !p.Tier("low").Grants.TicketTools {
+		t.Errorf("the ticket tools alone: %v", err)
+	}
+	// The example is such a file.
+	if raw, err := os.ReadFile("../../examples/mcp-ticket-tools.json"); err != nil || !json.Valid(raw) || !strings.Contains(string(raw), TicketToolsRefs[0]) || !strings.Contains(string(raw), TicketToolsRefs[1]) {
+		t.Errorf("examples/mcp-ticket-tools.json: %v, %s", err, raw)
+	}
+	noToken := write("mcp-no-token.json", `{"mcpServers":{"ochell":{"type":"http","url":"${ORCH_TOOLS_URL}"}}}`, 0o644)
+
 	// What Load refuses because of the files.
 	open := write("open.env", "TOKEN=abcdef\n", 0o640)
 	bad := write("bad.env", "TOKEN=abcdef\nthis is not a variable\n", 0o600)
 	noexec := write("noexec", "#!/bin/sh\n", 0o644)
 	for name, c := range map[string]struct{ grants, want string }{
 		"missing mcp":        {"      mcp_config: " + dir + "/none.json\n", "grants.mcp_config"},
+		"tools not in mcp":   {"      ticket_tools: true\n      mcp_config: " + mcp + "\n", "does not name ochell's server: it needs an entry with ${ORCH_TOOLS_URL}"},
+		"tools, no token":    {"      ticket_tools: true\n      mcp_config: " + noToken + "\n", "it needs an entry with ${ORCH_TOOLS_TOKEN}"},
 		"readable creds":     {"      credentials_file: " + open + "\n", "can be read or written by its group or by others"},
 		"missing creds":      {"      credentials_file: " + dir + "/none.env\n", "grants.credentials_file"},
 		"malformed creds":    {"      credentials_file: " + bad + "\n", "line 2 is not NAME=VALUE"},
@@ -319,6 +341,7 @@ func TestGrants(t *testing.T) {
 		"relative mint":   {"mint: [mint-token]", "grants.mint: the command must be an absolute path"},
 		"revoke only":     {"revoke: [/bin/true]", "grants.revoke without grants.mint"},
 		"unknown setting": {"tokens: [x]", "field tokens not found"},
+		"tools not a yes": {"ticket_tools: [get_ticket]", "cannot unmarshal"},
 	} {
 		_, err := Parse([]byte("tiers: [{name: a, grants: {" + c.grants + "}}]\ndefault_tier: a"))
 		if err == nil || !strings.Contains(err.Error(), c.want) {
