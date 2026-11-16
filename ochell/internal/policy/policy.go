@@ -272,14 +272,17 @@ func (t Tier) MayAssign(ids ...string) bool {
 // Rule gives a tier to the tickets it matches. Every field that is set
 // must match; at least one must be set.
 type Rule struct {
-	// Source is "jira" or "linear".
+	// Source is "jira", "linear" or "github".
 	Source string `yaml:"source"`
-	// Project is the Jira project key or the Linear team key: the part of
-	// the ticket key before the number.
+	// Project is the Jira project key, the Linear team key or the project
+	// of a repository of the GitHub source: the part of the ticket key
+	// before the number.
 	Project string `yaml:"project"`
 	// Repo is the repository mapped to the ticket (the repos setting).
 	Repo string `yaml:"repo"`
 	// IssueType is the Jira issue type, such as "Bug". Linear has none.
+	// For GitHub it is "Pull Request" for a pull request, and for an
+	// issue its issue type, or "Issue" where the organization has none.
 	IssueType string `yaml:"issue_type"`
 	// Tier is the name of the tier the matching tickets get.
 	Tier string `yaml:"tier"`
@@ -593,8 +596,8 @@ func (p *Policy) Validate() error {
 	}
 	for i, r := range p.Rules {
 		at := fmt.Sprintf("rules[%d]", i)
-		if r.Source != "" && r.Source != "jira" && r.Source != "linear" {
-			errs = append(errs, fmt.Errorf("%s.source must be jira, linear or empty", at))
+		if r.Source != "" && r.Source != "jira" && r.Source != "linear" && r.Source != "github" {
+			errs = append(errs, fmt.Errorf("%s.source must be jira, linear, github or empty", at))
 		}
 		if r.Source == "" && r.Project == "" && r.Repo == "" && r.IssueType == "" {
 			errs = append(errs, fmt.Errorf("%s matches every ticket: set source, project, repo or issue_type, or use default_tier", at))

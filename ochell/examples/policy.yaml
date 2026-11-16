@@ -87,7 +87,9 @@ scheduling:
   max_concurrent_per_repo: 2
   # wait: a ticket that the tracker calls blocked by another, open ticket
   # (Jira: the link "is blocked by"; Linear: the relation "blocks") waits
-  # until that one is done. ignore (the default): it starts.
+  # until that one is done. ignore (the default): it starts. Not with
+  # sources.github: ochell reads no dependencies between GitHub issues, and
+  # does not start with this gate while that source is on.
   blocked_by: wait
   # Labels that a ticket must carry before its work starts: every one of
   # them, each put there by a person. A label that the bot account added
@@ -128,9 +130,12 @@ autonomy:
 default_tier: normal
 
 # The first rule that matches a ticket gives its tier. A rule matches when
-# every field it sets matches: source (jira | linear), project (the part of
-# the ticket key before the number), repo (as in "repos" of config.yaml) and
-# issue_type (Jira only).
+# every field it sets matches: source (jira | linear | github), project (the
+# part of the ticket key before the number), repo (as in "repos" of
+# config.yaml; for a GitHub ticket without an entry there, the address
+# https://github.com/<owner>/<name>.git) and issue_type (Jira's issue type;
+# for GitHub "Pull Request", or the issue's type, or "Issue"; Linear has
+# none).
 rules:
   - {source: jira, project: OPS, issue_type: Bug, tier: low}
   - {repo: "git@github.com:example/docs.git", tier: low}

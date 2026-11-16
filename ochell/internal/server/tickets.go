@@ -24,6 +24,14 @@ func (s *Server) Tickets(source string) tracker.Tickets {
 		if s.linear != nil {
 			return s.linear
 		}
+	default:
+		// A source behind the interface writes as its own bot account,
+		// and refuses when its token is another account's.
+		if b := s.sources[source]; b != nil {
+			if t := b.src.Tickets(); t != nil {
+				return t
+			}
+		}
 	}
 	return nil
 }

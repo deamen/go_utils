@@ -1,13 +1,14 @@
 # ochell
-Webhook receiver for the "digital employee" POC. When a Jira or Linear ticket is assigned to the digital employee, it authenticates the webhook and launches one agent CLI process (e.g. Claude Code) with a prompt describing the ticket. The agent then reads the ticket (with `twg`, or with [ochell's own ticket tools](#ticket-tools)), does the work and opens a PR.
+Webhook receiver for the "digital employee" POC. When a Jira or Linear ticket, or a GitHub issue, is assigned to the digital employee, it authenticates the webhook and launches one agent CLI process (e.g. Claude Code) with a prompt describing the ticket. The agent then reads the ticket (with `twg`, or with [ochell's own ticket tools](#ticket-tools)), does the work and opens a PR.
 
 ```
 Jira (webhook / Automation) ─┐                ┌──────────────────────┐   exec (no shell)   ┌───────────┐
                              ├─► ngrok ──────►│ ochell               ├────────────────────►│ claude -p │
-Linear (agent app)  ─────────┘  IP policy +   │ verify → parse →     │  one per ticket     └───────────┘
-                                verify-webhook │ dedup → queue → run  │
+Linear (agent app)  ─────────┤  IP policy +   │ verify → parse →     │  one per ticket     └───────────┘
+GitHub (issues, PRs) ────────┘  verify-webhook │ dedup → queue → run  │
                                                └──────────┬───────────┘
-                                                          └─► Linear agent activities (ack / result)
+                                                          └─► Linear agent activities, comments on Jira tickets
+                                                              and GitHub issues (ack / result)
 ```
 
 ## Supported sources
@@ -16,14 +17,17 @@ Linear (agent app)  ─────────┘  IP policy +   │ verify →
 | Jira system webhook | `POST /webhooks/jira` | `X-Hub-Signature: sha256=<HMAC>` with the webhook secret, and `timestamp` within `max_skew` (2h) | `jira:issue_updated` whose changelog changes `assignee` to the bot, or `jira:issue_created` already assigned to the bot. `comment_created` by a person on a ticket ochell holds (a follow-up) |
 | Jira Automation "Send web request" | `POST /webhooks/jira-automation` | Shared token in a header (`Authorization: Bearer …` by default). Automation cannot sign payloads. | An authenticated request that names the bot as assignee. Without `bot_account_id`, any authenticated request (the rule decides when to fire) |
 | Linear agent app (`actor=app`) | `POST /webhooks/linear` | `Linear-Signature` HMAC and `webhookTimestamp` within 60s | `AgentSessionEvent` `created` (issue delegated to, or agent mentioned) |
+| GitHub webhook | `POST /webhooks/github` | `X-Hub-Signature-256: sha256=<HMAC>` with the webhook secret | `issues` or `pull_request` with the action `assigned`, whose assignee is the bot's login, in a configured repository. `issue_comment` `created` by a person on a ticket ochell holds (a follow-up). See [GitHub issues and pull requests](#github-issues-and-pull-requests) |
+
+The Jira and Linear handlers are older than the `Source` interface ([internal/source](internal/source/source.go)) and are in the server as they were. GitHub is behind it: a source authenticates a delivery and reads it into an event (assigned, unassigned, commented, closed, updated), says who its bot account is and writes on a ticket; what an event may do is decided in one place for every such source ([internal/server/source.go](internal/server/source.go)).
 
 Behaviour common to all sources:
 - **Responses:**
   - 200 when a task is queued, ignored or a duplicate, and when a ticket is not started because no repository is mapped to it;
   - 401 when authentication fails;
   - 400 when the payload is unusable, for example a Jira Automation request that names no assignee;
-- **Duplicate deliveries:** a signed request is dropped when its body, or its `X-Atlassian-Webhook-Identifier` / `Linear-Delivery` id, was seen before. The body counts because the signature covers it; the id is a header that a replayed request can change. Both are kept in the store for 24 hours, also across a restart.
-- **Replay:** a signed request is rejected with 401 when its timestamp (`timestamp` for Jira, `webhookTimestamp` for Linear) is further than `max_skew` from now. The default is 60s for Linear and 2h for Jira: Jira retries a failed delivery up to five times, 5 to 15 minutes apart, and a retry may carry the timestamp of the event. Jira Automation requests carry no timestamp.
+- **Duplicate deliveries:** a signed request is dropped when its body, or its `X-Atlassian-Webhook-Identifier` / `Linear-Delivery` / `X-GitHub-Delivery` id, was seen before. The body counts because the signature covers it; the id is a header that a replayed request can change. Both are kept in the store for 24 hours, also across a restart.
+- **Replay:** a signed request is rejected with 401 when its timestamp (`timestamp` for Jira, `webhookTimestamp` for Linear) is further than `max_skew` from now. The default is 60s for Linear and 2h for Jira: Jira retries a failed delivery up to five times, 5 to 15 minutes apart, and a retry may carry the timestamp of the event. Jira Automation requests and GitHub's deliveries carry no timestamp. For GitHub the body is signed, so what keeps a captured delivery from being used again is that its body is remembered for 24 hours; after that it would be taken once more, and start a run only if ochell does not hold the ticket by then.
 - **One run per ticket:** a ticket that is already queued or running is not started again. A second assignment is answered with 200 `already in progress`. A new Linear session on such a ticket that brings no message gets a `response` activity that says so, which closes that session; the result is posted in the first session. A message to a busy ticket is kept for its next run (see *Messages during a run* below).
 - **Linear session updates:** the orchestrator posts a `thought` activity right away, because Linear expects one within 10s. When the run ends it posts what the agent reported in its result file (see [The result file](#the-result-file)): a `response` for finished work, an `elicitation` for anything that needs a human. A run that failed, timed out or was stopped gets an `error`.
 - **Jira ticket updates:** with the Jira API configured (see [Jira API access](#jira-api-access)), ochell comments on a Jira ticket when a run starts, and again when it ends, with the same text a Linear session gets: the agent's message and its pull request, its question, or why the run failed. A ticket that was accepted but not started (no repository, attempts used up) gets a comment that says so. With `review_status` the ticket is also moved to that status when the agent reports its work as done. Without the API a Jira ticket gets no answer.
@@ -44,11 +48,13 @@ Behaviour common to all sources:
   | Jira: a comment whose **first line is `/stop`**, and nothing else on that line. More lines may follow | the people of `allowed_follow_ups` |
   | Jira: the ticket is **taken away from the bot** (assigned to someone else, or to nobody) | whoever Jira lets do that |
   | Linear: the issue is taken away from the agent (an `Issue` update that changes the delegate) | whoever Linear lets do that |
+  | GitHub: a comment on the issue whose **first line is `/stop`** | the people of `allowed_follow_ups` |
+  | GitHub: the issue is **unassigned** from the bot | whoever GitHub lets do that |
   | The ticket is **closed** in the tracker while it is queued or running | whoever the tracker lets do that |
 
   - **What is stopped:** a running agent with all its processes (as at the time limit); a run that is still queued, which then never starts; and a ticket that only waited, which is released.
   - **The ticket becomes `cancelled`.** It is not started again, and comments on a Jira ticket start nothing, until it is assigned again. Messages that waited for its next run are dropped. The run has the outcome `cancelled`.
-  - **The ticket shows it:** a `response` in the Linear session, a comment on the Jira ticket, that says who stopped it and how, and that it has to be assigned again to go on.
+  - **The ticket shows it:** a `response` in the Linear session, a comment on the Jira ticket or the GitHub issue, that says who stopped it and how, and that it has to be assigned again to go on.
   - A closed ticket becomes `done` once its run has ended, and its working directory is removed as for any closed ticket.
   - **Jira may not send the unassign event** when the webhook's filter is `assignee = <bot>`: the ticket no longer matches after the change. ochell handles the event when it arrives, and [the poller](#the-poller) finds the ticket otherwise. That was not tested against a real Jira (MMZ-94).
   - The Linear events were not checked against Linear: where the payload carries the stop signal, and what an issue update looks like when the delegate changes. The second also needs the app's webhook to subscribe to **Issues**, and is only acted on when the payload names this app's user as the earlier delegate.
@@ -67,6 +73,44 @@ Behaviour common to all sources:
   - Who wrote the reply is checked against `allowed_follow_ups` (see [Guards and the admin channel](#guards-and-the-admin-channel)). Whether the payload names the author of a prompt was not checked against Linear; without one, the creator of the session counts.
   - The `stop` signal stops the ticket (see *Stopping from the ticket* above).
 
+### GitHub issues and pull requests
+A GitHub issue that is assigned to the digital employee's GitHub account starts a run in the same way as a Jira or Linear ticket: the same queue, tiers, workspace, prompt, gates and record. A pull request that is assigned to it does as well; in GitHub's API a pull request is an issue.
+
+```yaml
+github:
+  bot_login: digital-employee        # the GitHub login of the digital employee
+sources:
+  github:
+    enabled: true
+    secret: ${GITHUB_WEBHOOK_SECRET}
+    token: ${GITHUB_ISSUES_TOKEN}    # optional: issues read and write; see below
+    repos:
+      - repo: acme/shop              # issue 12 is the ticket shop-12
+      - {repo: acme/web.site, project: WEB}
+    allowed_assigners: [alice, bob]  # GitHub logins; empty: everyone
+    allowed_follow_ups: [assigner, reporter]
+```
+
+- **Only the repositories of `sources.github.repos`.** A delivery about any other repository starts nothing, also when it is signed (the secret may be that of a webhook of a whole organization); it is answered with 200 `ignored: …` and a warning in the log.
+- **The ticket key** is the project of the repository, `-` and the number of the issue: `shop-12`. The project is the name of the repository, with `_` for each `.`, unless `project` says otherwise. It is what `repos` and the rules of the policy call `project`, with `source: github`. Two repositories with one project (the same name under two owners) are refused at start, as is a name that cannot be part of a key (it starts with `_` or `-`, or has more than 50 characters): set `project` then. A project must not be changed while its tickets are open; ochell would take them for other tickets.
+- **The repository of a ticket** is the one its issue is in, as `https://<host>/<owner>/<name>.git`. An entry of [`repos`](#repositories) that matches the ticket comes first, for another address (SSH) or another repository; a GitHub ticket that no entry matches is not held for it.
+- **What starts a run:** the action `assigned` of an `issues` or `pull_request` event, when the assignee is `github.bot_login`. Who assigned it is the `sender` of the event, a GitHub login, which `allowed_assigners` and the tier's own list are checked against.
+- **What does not:**
+  - an assignment by the bot account itself (403), or by someone who is not allowed (403);
+  - **a pull request that the bot opened**, whatever is done with it: that is the work of a ticket, which the [handoff](#handoff-review-merge-done) follows, and never a ticket of its own. The same holds for a pull request under any account that a ticket named as its work;
+  - a request for a review (`review_requested`). A review asks for an opinion; the prompt, the result and the handoff are built for work that ends in a pull request. Assign the pull request to have it worked on;
+  - a reopened issue. As for Jira, a ticket that ochell knows starts again when it is assigned again.
+- **Follow-ups:** a comment of a person on an issue that is assigned to the bot and that ochell holds starts a run with that comment, in the same agent session, as for Jira. `/stop` and `/approve` as the first line are the commands. Comments by the bot's login are ignored. Who may is `allowed_follow_ups`: GitHub logins, `assigner` and `reporter` (who opened the issue).
+- **One comment reaches the agent once.** Comments on the pull request that a ticket opened come in through the handoff, which reads the pull request; the webhook's `issue_comment` about such a pull request is ignored. For a ticket that is itself a pull request, the conversation comes in through the webhook, and the handoff, should it follow that same pull request, passes on only the comments on the diff and the reviews.
+- **Unassigning** the issue from the bot stops the work, **closing** it makes the ticket done (also by the merge of a pull request that says `Fixes #12`), and a change of its labels or title can raise its tier. A close and a change by the bot's login count for nothing.
+- **The issue type** that a rule of the policy sees (`issue_type`) is `Pull Request` for a pull request, and for an issue its issue type where the organization has issue types, else `Issue`.
+- **No priority.** GitHub issues have none, so a GitHub ticket is queued without one.
+- **Telling the issue:** `github.token`, the token of the handoff, only reads, and stays that way. To comment on an issue ochell needs **`sources.github.token`**: a token of the digital employee's own account with read and write access to **issues** (and to **pull requests**, when pull requests are assigned to it), and nothing else. Never give it access to contents, or the right to merge. With it, the issue gets a comment when a run starts and when it ends, and when the ticket is not started, as a Jira ticket does; ochell also asks GitHub about issues with it, for [the poller](#the-poller), the [gates of scheduling](#scheduling) and the [ticket tools](#ticket-tools). Without it the issue gets no answer from ochell, as a Jira ticket without `sources.jira_api`, and GitHub is not asked.
+  - **The token must belong to `github.bot_login`.** ochell asks GitHub once whose it is, and writes nothing with a token of another account: a comment by any other account would come back as a person's and start a run. A token of a GitHub App installation cannot be asked that way, and is not supported.
+  - It is not the agent's token. The agent reaches GitHub with its own (see [Tools and credentials per tier](#tools-and-credentials-per-tier)).
+- **What GitHub cannot do here** is refused at start, not left to do nothing: `scheduling.blocked_by: wait` (ochell reads no dependencies between issues), `scheduling.required_labels` and `ticket_tools` without `sources.github.token`. There is no status to move an issue to at the hand-over (`review_status` is Jira's).
+- **The prompt:** the default prompt tells the agent to read the ticket with `twg`, or with the ticket tools. For a GitHub ticket the context of the prompt names the issue (`The ticket is the issue #12 of the GitHub repository acme/shop.`), so an agent with `gh` or the ticket tools finds it; adapt `agent.prompt_template` where neither is there.
+
 ### The poller
 A webhook is fast, but it can be lost: ochell was down, the network failed, or the tracker does not send the event at all (Jira and the unassign event). So ochell also asks each tracker for the bot's open tickets, **at start and then every `poller.interval`** (default 5m; `0s` turns it off). The webhook stays for speed; the poll is for correctness.
 
@@ -77,11 +121,11 @@ A webhook is fast, but it can be lost: ochell was down, the network failed, or t
 | a ticket with a queued or running task that is **no longer the bot's** | stops it; the ticket becomes `cancelled`, and is told why |
 | any other ticket that ochell knows | nothing |
 
-- **Which trackers:** Jira needs the API access (`sources.jira_api`); Linear needs the installed app and its token. A tracker that cannot be asked is not polled; the log says so at start.
+- **Which trackers:** Jira needs the API access (`sources.jira_api`); Linear needs the installed app and its token; GitHub needs `sources.github.token`, and is asked for the open issues and pull requests of each configured repository that are assigned to the bot (a pull request that the bot opened is not among them). A tracker that cannot be asked is not polled; the log says so at start.
 - **A ticket that ochell knows is never started by the poller.** One that waits for a human or is in review has had its run. One that a person stopped or released (`cancelled`) stays stopped until it is assigned again, and only a webhook says that. So a new assignment of a ticket that ochell already knows is not recovered when its webhook is lost: assign it once more.
 - **On the first start with the poller, every open ticket of the bot is new to ochell and is started.** Look at what `ochell jira-check` lists before you turn it on, or pause first (`ochell pause`) and look at `ochell status`. `agent.queue_size` bounds how many wait.
 - **Linear sessions:** a ticket that came through a webhook has an agent session to report to. One that the poller finds has none, so ochell opens a session on the issue itself and reports there.
-- **Who assigned it** is read from the ticket's history (Jira: the last change of the assignee to the bot, else the creator; Linear: the last change of the delegate to the agent, else the creator). `allowed_assigners` holds for the poller as for a webhook: a ticket whose assigner is not on the list, or cannot be found, is not started, and the log says so once.
+- **Who assigned it** is read from the ticket's history (Jira: the last change of the assignee to the bot, else the creator; Linear: the last change of the delegate to the agent, else the creator; GitHub: the last `assigned` event of the issue that names the bot). `allowed_assigners` holds for the poller as for a webhook: a ticket whose assigner is not on the list, or cannot be found, is not started, and the log says so once.
 - **Before it stops anything, the poller asks the tracker about that one ticket.** A ticket that is missing from the list but open and still the bot's is left alone: the search may be behind, or `jira_api.jql` narrower than the bot's tickets. A list that cannot be read changes nothing at all.
 - **Linear and mentions:** an issue on which the agent was only mentioned was never delegated to it, so it is not on the list. Its run is stopped by the poller only when the issue is closed.
 - **Jira Automation without `bot_account_id`** can start tickets that are not assigned to the bot. With that configuration the poller starts missed tickets but stops none.
@@ -199,18 +243,18 @@ ochell version
 ochell status --config config.yaml                # paused or running; what is queued and running, and what is held
 ochell pause  --config config.yaml [--tier NAME]  # hold the queue: no new run starts
 ochell resume --config config.yaml [--tier NAME]
-ochell reset <jira|linear> <KEY> --config config.yaml   # reset the attempts and the budget of a ticket; --tier NAME also sets its risk tier
-ochell cost [<jira|linear> <KEY>] --config config.yaml  # what the tickets have cost, or one ticket with its runs
+ochell reset <jira|linear|github> <KEY> --config config.yaml   # reset the attempts and the budget of a ticket; --tier NAME also sets its risk tier
+ochell cost [<jira|linear|github> <KEY>] --config config.yaml  # what the tickets have cost, or one ticket with its runs
 ochell outcomes [--since D] [--until D] --config config.yaml   # outcome metrics per tier for a period
 ochell backup [--to FILE] --config config.yaml          # back the store up, while ochell runs
 ochell autonomy --config config.yaml                    # the level of autonomy of each tier, its numbers and the last changes
 ochell promote <TIER> [--reason TEXT] --config config.yaml   # raise the level of a tier by one step
 ochell demote  <TIER> [--reason TEXT] --config config.yaml   # lower it by one step
-ochell flag <jira|linear> <KEY> --reason TEXT --config config.yaml   # for a guardrail: flag a ticket's run, which lowers the level of its tier
+ochell flag <jira|linear|github> <KEY> --reason TEXT --config config.yaml   # for a guardrail: flag a ticket's run, which lowers the level of its tier
 
 # while ochell is stopped
 ochell restore --from FILE --config config.yaml         # put a backup in the place of the store
-ochell stop  <jira|linear> <KEY> --config config.yaml   # stop the run of a ticket and release it
+ochell stop  <jira|linear|github> <KEY> --config config.yaml   # stop the run of a ticket and release it
 ```
 
 ## Configuration
@@ -239,6 +283,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--jira-webhook`, `--jira-webhook-secret`, `--jira-bot-account-id` | Jira system webhook source |
 | `--jira-automation`, `--jira-automation-header`, `--jira-automation-token` | Jira Automation source |
 | `--linear`, `--linear-secret`, `--linear-client-id`, `--linear-client-secret`, `--linear-redirect-url` | Linear agent source |
+| `--github-webhook`, `--github-webhook-path`, `--github-webhook-secret` | GitHub source; its repositories are set in YAML (`sources.github.repos`) |
 
 Example without a YAML file:
 ```
@@ -291,11 +336,12 @@ repos:
   - {source: linear, project: ENG, repo: git@github.com:example/engine.git}
 ```
 
-- **`project`** is the Jira project key or the Linear team key: the part of the ticket key before the number (`DEV` in `DEV-42`). `"*"` matches every project.
-- **`source`** is `jira` or `linear`; leave it out to match both.
+- **`project`** is the Jira project key, the Linear team key or the project of a repository of the GitHub source: the part of the ticket key before the number (`DEV` in `DEV-42`). `"*"` matches every project.
+- **`source`** is `jira`, `linear` or `github`; leave it out to match all.
 - **`label`** is optional and narrows an entry to tickets with that label, or in Jira that component. Labels come from the webhook payload: the Jira system webhook has them; for Jira Automation add `"labels": "{{issue.labels}}"` to the request body. Whether the Linear agent session payload carries labels has not been checked against Linear.
 - **The first entry that matches wins**, so put the narrower entries first.
 - **A ticket that no entry matches is not started.** It is recorded as `waiting` with the reason `no_repo_mapping`, the request is answered with 200 `not started: …`, ochell logs a warning, and a Linear session is told why. After the mapping is added, assign the ticket again.
+- **A GitHub ticket has a repository of its own:** the one its issue is in. An entry that matches it comes first; without one it runs in its own repository, and is not held.
 - With no `repos` at all, every ticket runs, without a repository.
 
 ### Handoff: review, merge, done
@@ -312,9 +358,9 @@ The agent opens a pull request and hands the ticket over; a person reviews and m
      # api_url: https://ghe.example.com/api/v3   # GitHub Enterprise Server
    ```
 
-3. **When a person has merged or closed it, the ticket is `done`**, as when the ticket is closed in the tracker: its working directory can go (`workspace.cleanup`), and the ticket is told who merged, in a comment on the Jira ticket or in its Linear session. A ticket with several pull requests is done when none of them is open any more.
+3. **When a person has merged or closed it, the ticket is `done`**, as when the ticket is closed in the tracker: its working directory can go (`workspace.cleanup`), and the ticket is told who merged, in a comment on the Jira ticket or the GitHub issue, or in its Linear session. A ticket with several pull requests is done when none of them is open any more.
 
-- **The digital employee never merges or deploys.** ochell cannot enforce that; GitHub does. Give the digital employee's GitHub account no right to merge: protect the branches that it opens pull requests against (a required review by someone else, and no bypass for the account), and give it no deploy rights. ochell's own token only reads.
+- **The digital employee never merges or deploys.** ochell cannot enforce that; GitHub does. Give the digital employee's GitHub account no right to merge: protect the branches that it opens pull requests against (a required review by someone else, and no bypass for the account), and give it no deploy rights. ochell's own token for the handoff (`github.token`) only reads. The token of the [GitHub source](#github-issues-and-pull-requests) (`sources.github.token`) is another one, and writes one thing: comments on issues.
 - **A merge by the digital employee's own account is not an acceptance.** With `bot_login` set, ochell records such a merge, logs an error that names the repository's branch protection, and leaves the ticket in review.
 - **Only the ticket's own pull request counts.** The address comes from the agent, so ochell follows it only when it is a pull request on the configured GitHub, from the branch that the ticket is worked on (`workspace.branch`, `bot/<KEY>` by default). Anything else is recorded as `rejected`, with the reason, and is not asked about again. Otherwise an agent could name someone else's merged pull request and have its ticket done.
 - **A question that GitHub does not answer changes nothing**; ochell asks again at the next interval.
@@ -338,7 +384,7 @@ The agent opens a pull request and hands the ticket over; a person reviews and m
 - **A review comment wakes the ticket as a follow-up.** What a reviewer writes on the pull request (in the conversation, on a line of the diff, or as the text of a review) reaches the agent like a comment on the ticket, with the author, the place and the pull request. Each comment is passed on once.
   - **Whose comments count:** `github.allowed_reviewers` (GitHub logins); without that list, the people whom GitHub calls owner, member or collaborator of the repository. Never the digital employee's own account (`bot_login`).
   - ochell looks at the first hundred comments of each kind on a pull request.
-- All of this is by polling, every `github.poll_interval`; ochell needs no webhook from GitHub.
+- All of this is by polling, every `github.poll_interval`; the handoff needs no webhook from GitHub. The webhook of the [GitHub source](#github-issues-and-pull-requests) is for issues that are tickets, and brings nothing about the pull requests that tickets open.
 
 ### Metrics
 Counters and gauges about the runs, in the Prometheus text format, at `GET /metrics` on the listeners of the webhooks.
@@ -488,7 +534,7 @@ api:
 |---|---|
 | `GET /api/v1/state` | whether runs start and what holds them back; how many tickets are in each state; the tickets that are running, queued, and waiting for a person, each with its state, reason, tier, priority and attempts, and a queued one with why [scheduling](#scheduling) holds it (`hold`); for each repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) the version in force and what of the file is not; and for each tier its [level of autonomy](#graduated-autonomy), since when and who decided it (`autonomy`) |
 | `GET /api/v1/inbox` | **the attention inbox**: exactly the tickets that wait for a person, each with its reason |
-| `GET /api/v1/tasks/<key>` | one ticket with every run: when it started and ended, why it was queued, its outcome, its cost, and what the agent said. Add `?source=jira` or `?source=linear` when both trackers have the key |
+| `GET /api/v1/tasks/<key>` | one ticket with every run: when it started and ended, why it was queued, its outcome, its cost, and what the agent said. Add `?source=jira`, `?source=linear` or `?source=github` when more than one source has the key |
 
 - **The answer is JSON.** A browser (a request that accepts `text/html`) gets a plain page with the same content.
 - **Every request needs the token**: `Authorization: Bearer <api.token>`, at least 16 characters. The pages show ticket titles and what agents said, and the agent runs on the same host and can reach any local port, so a loopback address is not enough. Do not put the token in the agent's environment.
@@ -534,14 +580,14 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
 
      | Field | Matches |
      |---|---|
-     | `source` | `jira` or `linear` |
+     | `source` | `jira`, `linear` or `github` |
      | `project` | the Jira project key or the Linear team key: the part of the ticket key before the number |
      | `repo` | the repository mapped to the ticket by [`repos`](#repositories) |
      | `issue_type` | the Jira issue type, such as `Bug`. The system webhook has it; for Jira Automation add `"issueType": "{{issue.issueType.name}}"` to the request body. Linear has none |
 
   2. `default_tier`, when no rule matches.
   3. **A label can only raise it.** A ticket that carries one of a tier's `labels` (in Jira also: a component) gets at least that tier. No label lowers a tier.
-- **A tier only goes up while ochell knows the ticket.** When a ticket is assigned again and the policy now gives it a lower tier, for example because a label was taken off, it keeps the tier it had. The agent can edit labels too, so a label that is gone must not lower anything. The one way down is an operator's `ochell reset <jira|linear> <KEY> --tier <name>`.
+- **A tier only goes up while ochell knows the ticket.** When a ticket is assigned again and the policy now gives it a lower tier, for example because a label was taken off, it keeps the tier it had. The agent can edit labels too, so a label that is gone must not lower anything. The one way down is an operator's `ochell reset <jira|linear|github> <KEY> --tier <name>`.
 - **The order of `tiers` matters**: it is from the lowest to the highest, which is what "raise" and "higher" mean.
 - **Each run records its tier** and the version of the policy in force when it started (`version`, or a hash of the file when that is left out). The agent is told its tier in `ORCH_TASK_TIER`; the log line `task queued` names the tier and the rule it came from.
 - **What a tier sets:**
@@ -635,7 +681,7 @@ tiers:
 - **A tier without `grants`** gets what every run has: the launcher's `ENV_FILE` (with `podman`: `agent.podman.env_file`), `agent.env`, and the agent user's own MCP configuration (with `podman`: what the image and the ticket's home directory hold).
 
 ### Ticket tools
-ochell can give the agent its own tools for the ticket, so that the agent needs no tracker token at all. The tools are an MCP server that ochell itself serves. The agent asks ochell; ochell asks Jira or Linear with its own access, and returns the answer. The tracker tokens stay on the host.
+ochell can give the agent its own tools for the ticket, so that the agent needs no tracker token at all. The tools are an MCP server that ochell itself serves. The agent asks ochell; ochell asks Jira, Linear or GitHub with its own access, and returns the answer. The tracker tokens stay on the host.
 
 ```yaml
 # config.yaml
@@ -677,13 +723,14 @@ The last file is [examples/mcp-ticket-tools.json](examples/mcp-ticket-tools.json
   - A comment whose first line begins with `/approve` or `/stop` is refused as well.
   - **Jira:** the account of `sources.jira_api` must be the bot account (`bot_account_id`). ochell asks Jira which account its token belongs to, and writes no comment for the agent when it is another one: such a comment would come back as a person's.
   - **Linear:** the comment is the app's own.
+  - **GitHub:** the account of `sources.github.token` must be `github.bot_login`, in the same way.
   - A comment may have 16,000 characters, and one run may add 20.
   - The ticket moves to `review_status` as before: ochell does that itself when the run reports `done`.
 - **What the tools return is ticket text**, which anyone who can write on the ticket controls. It is marked as such in the answer, the description is cut at 12,000 characters, each comment at 4,000, and the whole at 64 KB; the newest comments are the ones that stay.
 - **The prompt tells the agent** to use the tools and not `twg`: a line at the top of the run context, for every template, also a repository's (see [The prompt](#the-prompt)).
-- **A run with the tools must not hold a tracker secret of ochell's.** If the value of a variable that the run would get (`agent.env`, `env_pass`, the tier's `env`, `credentials_file` or `mint`) holds the Jira API token, a webhook secret, the Automation token or the Linear client secret, the run is not started (`not_started`). ochell cannot see the launcher's `ENV_FILE` or the agent user's own files: take the agent's `twg` credentials out of those yourself.
+- **A run with the tools must not hold a tracker secret of ochell's.** If the value of a variable that the run would get (`agent.env`, `env_pass`, the tier's `env`, `credentials_file` or `mint`) holds the Jira API token, a webhook secret, the Automation token, the Linear client secret or the token of the GitHub source, the run is not started (`not_started`). ochell cannot see the launcher's `ENV_FILE` or the agent user's own files: take the agent's `twg` credentials out of those yourself.
 - **The record:** a run that had the tools has `ticket_tools` among its grants in its [audit record](#audit-trail-and-outcome-metrics). ochell's log has a line `ticket tool called` for every call, with the run, the ticket, the tool and whether it was refused; never what was read or written.
-- **It needs ochell's own access to the tracker:** `sources.jira_api` for Jira tickets, the installed app for Linear. `ticket_tools` is refused at start without them.
+- **It needs ochell's own access to the tracker:** `sources.jira_api` for Jira tickets, the installed app for Linear, `sources.github.token` for GitHub issues. `ticket_tools` is refused at start without them.
 - **The protocol** is MCP, revision 2025-06-18, over HTTP: each request is a POST with one JSON-RPC message, answered with one JSON object. There is no event stream (a GET gets 405) and no session. The methods are `initialize`, `ping`, `tools/list` and `tools/call`.
 - Limits of this:
   - **All agents run as the same OS user.** One agent can read the environment of another agent's process, and with it that run's token, as it can read that run's minted credentials. The token then opens the other run's ticket, for reading and commenting, until that run ends. Not with the `podman` launcher: a container does not see the processes of another.
@@ -761,7 +808,7 @@ The hard controls: an operator can hold what ochell starts, and the policy bound
 | `ochell pause --tier NAME`, `ochell resume --tier NAME` | the same for the tickets of one tier. The other tiers are not touched |
 | `ochell status` | says whether runs start, how many are queued and running, and what holds runs back: a pause, a throttle, and what [scheduling](#scheduling) holds |
 
-- **A pause stops nothing that runs.** To stop the agent of one ticket, use `ochell stop <jira|linear> <KEY>` (see [Guards and the admin channel](#guards-and-the-admin-channel)). ochell has no command that stops every running agent: that is not an orchestrator's work.
+- **A pause stops nothing that runs.** To stop the agent of one ticket, use `ochell stop <jira|linear|github> <KEY>` (see [Guards and the admin channel](#guards-and-the-admin-channel)). ochell has no command that stops every running agent: that is not an orchestrator's work.
 - **Webhooks are still accepted** while ochell is paused; their tickets are queued.
 - **A pause is kept across a restart**, of everything and of a tier.
 - **A pause can also be a setting in the policy file:** `paused: true` at the top holds everything, and `paused: true` in a tier holds that tier. A command does not end such a pause; change the file and restart.
@@ -839,14 +886,14 @@ tiers:
 - **`required_labels`:** the ticket must carry every label of the list (in Jira also: a component). Upper and lower case are not told apart.
   - **A label that the bot account put on the ticket does not count** (see [Gate integrity](#gate-integrity)): the agent can label tickets with its own tool. ochell reads from the ticket's history who added each label: the author of the last change that added it, or the creator for a label that the ticket was created with.
   - So the labels in a webhook's payload open nothing here; they still choose the repository and the tier.
-- **`blocked_by: wait`:** the ticket waits while the tracker says that an open ticket blocks it. In Jira that is a link whose description on the ticket's side is "is blocked by"; in Linear a relation of the type `blocks` that points at the issue. A blocker is done when its status category is *Done* in Jira, or its state is completed or cancelled in Linear. The blocker need not be a ticket of the digital employee.
+- **`blocked_by: wait`:** the ticket waits while the tracker says that an open ticket blocks it. In Jira that is a link whose description on the ticket's side is "is blocked by"; in Linear a relation of the type `blocks` that points at the issue. A blocker is done when its status category is *Done* in Jira, or its state is completed or cancelled in Linear. The blocker need not be a ticket of the digital employee. **GitHub has no such gate:** ochell reads no dependencies between issues, and refuses to start with `blocked_by: wait` while the GitHub source is on.
   - **It is an order of work, not an approval.** ochell takes the tracker's word for what blocks what: whoever can edit the links, or close the blocker, in the tracker can let the ticket go, the bot account included. Where a person must say yes, use `required_labels` or [the plan gate](#the-plan-gate).
-- **Both are read from the tracker's API**, at the time it matters, not from a payload. ochell refuses to start with a gate in the policy when a source that is turned on cannot be asked: the Jira sources need [`sources.jira_api`](#jira-api-access), Linear needs the installed app.
+- **Both are read from the tracker's API**, at the time it matters, not from a payload. ochell refuses to start with a gate in the policy when a source that is turned on cannot be asked: the Jira sources need [`sources.jira_api`](#jira-api-access), Linear needs the installed app, GitHub needs `sources.github.token`.
 - **A gate that cannot be checked stays shut.** While the tracker does not answer, a ticket that a gate could hold waits, and ochell asks again at the next interval. A Linear session outside an issue has no labels and no blockers.
 - **What continues the work is not held:** a retry, a follow-up, an approved plan, a run for failed checks. To stop work that has started, use the stop from the ticket.
 
 **A held ticket stays `queued`.**
-- **It is told once** why it waits, when ochell first finds it held: a comment on the Jira ticket, a `thought` in the Linear session. Not at every look, and not when the reason changes.
+- **It is told once** why it waits, when ochell first finds it held: a comment on the Jira ticket or the GitHub issue, a `thought` in the Linear session. Not at every look, and not when the reason changes.
 - **`ochell status` says what waits and why**, and so does `GET /api/v1/state` of [the status API](#the-status-api) (`holds`, and `hold` of each queued ticket):
 
   ```
@@ -915,7 +962,7 @@ recorded: by the operator deamen, with 12 ticket(s) with a pull request since 20
 | What happens | Who is recorded | When ochell looks |
 |---|---|---|
 | more than `sent_back_rate` of the tier's tickets with a pull request were sent back by a person, and there are at least `min_sample` of them | `ochell itself` | when a follow-up arrives, when a run ends, and every 15 minutes. No restart is needed |
-| a guardrail outside ochell flags a run: `ochell flag <jira|linear> <KEY> --reason TEXT` | the OS user that ran the command | at once |
+| a guardrail outside ochell flags a run: `ochell flag <jira|linear|github> <KEY> --reason TEXT` | the OS user that ran the command | at once |
 
 - **The override rate is "sent back" of [`ochell outcomes`](#audit-trail-and-outcome-metrics)**: of the tickets that handed over a pull request, the ones that a person sent back with a follow-up (a comment on the ticket, a reply in the session, a review comment on the pull request).
 - **The numbers are those of the tier under its present level:** the tickets that handed over a pull request since the level last changed, and not longer ago than `window`. So a tier earns a new record at every level, and one bad stretch takes one level away, not all of them.
@@ -958,8 +1005,8 @@ The agent can write to its tickets, as the bot account: with its own tool (`twg`
 
 | What the bot account does | What ochell does with it |
 |---|---|
-| a comment on a Jira ticket, a message in a Linear session: a reply, `/approve`, `/stop` | ignored. It starts no run and approves nothing. (This is also the loop guard) |
-| assigns a Jira ticket to itself, or triggers the Automation rule | rejected with 403. [The poller](#the-poller) does not start such a ticket either |
+| a comment on a Jira ticket or a GitHub issue, a message in a Linear session: a reply, `/approve`, `/stop` | ignored. It starts no run and approves nothing. (This is also the loop guard) |
+| assigns a Jira ticket or a GitHub issue to itself, or triggers the Automation rule | rejected with 403. [The poller](#the-poller) does not start such a ticket either |
 | delegates a Linear issue to itself, or opens a session | ignored, like the sessions ochell opens itself |
 | changes labels or the issue type | ignored: no tier moves |
 | puts a label of `required_labels` on a ticket | does not count: the ticket still waits for the label from a person (see [Scheduling](#scheduling)) |
@@ -968,7 +1015,7 @@ The agent can write to its tickets, as the bot account: with its own tool (`twg`
 | takes the ticket away from itself | allowed: it stops the work, which passes no gate |
 
 And for everyone:
-- **A label that would lower the tier is ignored.** A tier only goes up while ochell knows the ticket, so removing a label, or a label that the policy gives a lower tier, changes nothing. Lowering is the operator's `ochell reset <jira|linear> <KEY> --tier <name>` (see [Policy and risk tiers](#policy-and-risk-tiers)).
+- **A label that would lower the tier is ignored.** A tier only goes up while ochell knows the ticket, so removing a label, or a label that the policy gives a lower tier, changes nothing. Lowering is the operator's `ochell reset <jira|linear|github> <KEY> --tier <name>` (see [Policy and risk tiers](#policy-and-risk-tiers)).
 - **A plan is approved only with `/approve` from someone who may** (see [The plan gate](#the-plan-gate)). No status and no label approves anything.
 - **A budget is renewed only by an operator**, and a tier's limits are in the policy file, which the agent cannot write.
 - **A repository's `WORKFLOW.md` can make a gate stricter, never looser** (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)). The agent can change that file on its own branch; ochell reads the default branch.
@@ -977,12 +1024,13 @@ And for everyone:
 Who the bot account is:
 - **Jira:** `bot_account_id` of `jira_webhook` and of `jira_automation`. Let the agent's `twg` use that same account. What the [ticket tools](#ticket-tools) write comes from the account of `sources.jira_api`, and ochell writes it only when that is this account.
 - **Linear:** the app's own user, which every signed webhook names (`appUserId`), and the user ids in `sources.linear.bot_user_ids`. Set those when the agent's tool writes to Linear as another account than the app.
+- **GitHub:** `github.bot_login`, compared without regard to case: the account that issues are assigned to, that the agent writes as, and that `sources.github.token` must belong to. The GitHub source does not start without it.
 
 Limits of this:
-- **The actor comes from the webhook payload**: `user.accountId` in Jira, `actor.id` (issue events) and `agentActivity.user` (messages) in Linear. A Jira event without a user is taken as a person's.
+- **The actor comes from the webhook payload**: `user.accountId` in Jira, `actor.id` (issue events) and `agentActivity.user` (messages) in Linear, `sender.login` (and `comment.user.login` for a comment) in GitHub. A Jira event without a user is taken as a person's.
 - **The poller does not know who closed a ticket.** When it finds a ticket closed whose agent is still running, it stops the agent, whoever closed it.
 - **A label that the bot adds counts at the next assignment** for the tier, like any label on the ticket then. It can only raise the tier. For `required_labels` it never counts: there ochell asks the tracker who added the label.
-- **Who added a label is the tracker's history.** ochell reads the last hundred changes of a Linear issue, and what Jira returns with the ticket. A label whose change is not among them counts as the creator's.
+- **Who added a label is the tracker's history.** ochell reads the last hundred changes of a Linear issue, what Jira returns with the ticket, and the events of a GitHub issue (up to a thousand; with more, the gate stays shut). A label whose change is not among them counts as the creator's.
 - **`blocked_by` and the priority are not gates.** The bot account can remove a link, close a blocker or set a priority in the tracker, and ochell takes the tracker's word for those (see [Scheduling](#scheduling)). They order the work that people assigned; they do not approve any.
 
 ### Escalation
@@ -1010,7 +1058,7 @@ What a human can do then:
 - **Cancel:** the stop signal in Linear, `/stop` in a Jira comment, or take the ticket away from the digital employee (see *Stopping from the ticket*).
 
 Notes:
-- **`budget` at the highest tier, or when the next tier has nothing left either, needs an operator:** a reply starts a run that is refused again. `ochell reset <jira|linear> <KEY>` gives the ticket a new budget.
+- **`budget` at the highest tier, or when the next tier has nothing left either, needs an operator:** a reply starts a run that is refused again. `ochell reset <jira|linear|github> <KEY>` gives the ticket a new budget.
 - **Only a move to a higher tier is a trigger.** An update that would lower the tier changes nothing. A ticket whose agent is not running only gets the new tier: there is nothing to stop.
 - **The tier's update events** are `jira:issue_updated` of the Jira system webhook, and `Issue` updates of Linear (the app's webhook must subscribe to issue events). Jira Automation sends none.
 - `needs_input` and `blocked` from the agent are not escalations: the ticket waits with its own reason and stays in its tier.
@@ -1044,14 +1092,14 @@ ochell records what each run cost, as far as the agent says, and stops a ticket 
   - **A ticket with nothing left is not started**, whatever asks for the run: a new assignment, a reply, a retry, the poller.
   - **In both cases this is an [escalation](#escalation):** the ticket waits for a human, moves up one tier, and is told why and what to do. The run's outcome is `over_budget`. The agent session is kept.
   - **After the escalation the ticket is one tier up, and that tier's budget counts.** If that leaves it something, a reply on the ticket lets it go on. If not, or if it was in the highest tier already:
-  - **Only an operator gives a ticket a new budget:** `ochell reset <jira|linear> <KEY>`. The count starts at zero again, the record of what was spent stays, and a reply on the ticket (or a new assignment) then continues in the same session. A message on the ticket cannot raise a budget.
+  - **Only an operator gives a ticket a new budget:** `ochell reset <jira|linear|github> <KEY>`. The count starts at zero again, the record of what was spent stays, and a reply on the ticket (or a new assignment) then continues in the same session. A message on the ticket cannot raise a budget.
   - **A budget needs the `claude` adapter.** With `plain`, ochell would know no cost and could stop nothing, so it refuses to start when the policy sets `budget_usd`.
   - The budget is what the agent CLI reports as its cost. It is not the bill.
 
 ### Guards and the admin channel
 Limits on what starts a run, and one way to talk to the running ochell.
 
-- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). **A message from a person (a reply in the ticket's Linear session, a comment on the Jira ticket) starts the count again**: the cap is there to stop what runs without anyone looking, and here someone looked. The attempt number in the prompt still counts every run. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear> <KEY>` sets the count back to zero (and starts the ticket's [budget](#cost-and-budgets) anew); then assign the ticket again.
+- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). **A message from a person (a reply in the ticket's Linear session, a comment on the Jira ticket or the GitHub issue) starts the count again**: the cap is there to stop what runs without anyone looking, and here someone looked. The attempt number in the prompt still counts every run. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear|github> <KEY>` sets the count back to zero (and starts the ticket's [budget](#cost-and-budgets) anew); then assign the ticket again.
 - **Pause:** see also [Pauses and throttles](#pauses-and-throttles), for the pause of one tier. `ochell pause` holds the queue. No new run starts; running agents go on; webhooks are still accepted and queued. `ochell resume` ends it, and the queued tasks run. Both take effect at once, without a restart, and a pause is kept across a restart. `ochell status` says which it is, and how many tasks are queued and running.
 - **Assigner allowlist:** `allowed_assigners` of a source, when it is not empty, lists who may assign work. Anyone else is rejected, and the rejection is logged with the ticket and the assigner. Nothing is stored for a rejected assignment.
 
@@ -1060,18 +1108,19 @@ Limits on what starts a run, and one way to talk to the running ochell.
   | Jira system webhook | `user.accountId` of the event: the user who made the change | 403 |
   | Jira Automation | `initiatorAccountId` in the request body: add `"initiatorAccountId": "{{initiator.accountId}}"` to the rule's body. A request without it is rejected with 400 | 403 |
   | Linear | the id or the email address of `agentSession.creator` (or `creatorId`). If the payload has neither, the assignment is rejected. Those fields were not checked against Linear | 200, and an `error` activity in the session |
+  | GitHub | `sender.login` of the event: the GitHub login of the user who assigned the issue. Upper and lower case are not told apart | 403 |
 
-- **Manual stop:** `ochell stop <jira|linear> <KEY>` stops and releases a ticket from the host, for when the tracker's event never arrived: a network error, or Jira not sending the unassign event.
+- **Manual stop:** `ochell stop <jira|linear|github> <KEY>` stops and releases a ticket from the host, for when the tracker's event never arrived: a network error, or Jira not sending the unassign event.
   - It does what a stop from the ticket does (see *Stopping from the ticket*): the running agent is stopped with all its processes, a queued run is taken out of the queue, and a ticket that only waited is released. The ticket becomes `cancelled` and is not started again, by a comment or by anything ochell does itself, until it is assigned again.
-  - **The ticket is told** that it was stopped with `ochell stop`, and by which OS user: a comment on a Jira ticket, a `response` in the Linear session of its last run. ochell's log has the same.
+  - **The ticket is told** that it was stopped with `ochell stop`, and by which OS user: a comment on a Jira ticket or a GitHub issue, a `response` in the Linear session of its last run. ochell's log has the same.
   - The command exits with an error when ochell knows no such ticket, or when the ticket is already done or released.
-- **Follow-up allowlist:** `allowed_follow_ups` of `jira_webhook` and of `linear` says who may send the agent a follow-up (a comment on the Jira ticket, a reply in the Linear session).
+- **Follow-up allowlist:** `allowed_follow_ups` of `jira_webhook`, of `linear` and of `github` says who may send the agent a follow-up (a comment on the Jira ticket or the GitHub issue, a reply in the Linear session).
 
   | Entry | Who it allows |
   |---|---|
-  | a Jira accountId; a Linear user id or email address | that person, on every ticket |
+  | a Jira accountId; a Linear user id or email address; a GitHub login | that person, on every ticket |
   | `assigner` | who assigned this ticket to the bot. ochell records that with each assignment: the same person `allowed_assigners` checks |
-  | `reporter` | the reporter of the Jira issue, when the comment's payload names one. Linear has no such field in its payload |
+  | `reporter` | the reporter of the Jira issue, when the comment's payload names one; who opened the GitHub issue. Linear has no such field in its payload |
 
   - **Empty (the default): the people of `allowed_assigners`** may follow up, and everyone when that is empty too.
   - **A message from anyone else is not passed on.** It starts no run and is not kept for a later one. Its author is told why: an `error` activity in the Linear session, a comment on the Jira ticket. That happens once per author and ticket in 24 hours, not after every message.
@@ -1374,8 +1423,21 @@ Requires a Jira admin.
    - The install link is signed with the client secret, and you can set `organization_id` to pin the workspace.
 4. Delegate an issue to the agent, or @mention it. Linear sets the agent as the issue's **delegate**; the human assignee stays.
 
+### GitHub webhook
+1. Create a GitHub account for the digital employee, and give it access to the repositories: it must be assignable there (triage or write access). Put its login in `github.bot_login`. Give it no right to merge (see [Handoff](#handoff-review-merge-done)).
+2. Create the webhook, in each repository under *Settings → Webhooks → Add webhook* (needs admin access to the repository), or once for the organization under its *Settings → Webhooks*.
+   - Payload URL: `https://<ngrok-domain>/webhooks/github`
+   - Content type: **`application/json`**. ochell does not read the form encoding.
+   - Set a **Secret**, and put it in `sources.github.secret`.
+   - Events: *Let me select individual events*, then **Issues**, **Issue comments**, and **Pull requests** when pull requests are assigned to the digital employee. Anything else that arrives is ignored.
+3. List the repositories in `sources.github.repos`, as `owner/name`. A webhook of an organization sends events of all its repositories; only the listed ones start work.
+4. For comments on the issues, the poller, the gates of scheduling and the ticket tools: create a fine-grained personal access token **of the digital employee's account**, for those repositories, with *Issues: Read and write* (and *Pull requests: Read and write* when pull requests are tickets) and nothing else, and put it in `sources.github.token`. It is not `github.token`, and not the agent's token.
+5. Assign an issue to the digital employee. GitHub answers its first delivery, a `ping`, with 200 `ignored`.
+
+For GitHub Enterprise Server set `github.api_url` (`https://<host>/api/v3`); it holds for the source as for the handoff.
+
 ### ngrok
-1. In the ngrok dashboard, create two IP Policies (Atlassian and Linear) and an API key.
+1. In the ngrok dashboard, create an IP Policy for each tracker you use (Atlassian, Linear, GitHub) and an API key.
 2. Run `ochell ngrok-sync --dry-run` to see the planned changes, then run it without `--dry-run`. You can also set `ngrok_sync.enabled: true` to resync every `interval` while serving.
    - The command manages only rules tagged `managed-by:ochell`. Rules you add by hand are left alone.
 3. Start ngrok with the policy from [examples/ngrok-policy.yaml](examples/ngrok-policy.yaml):
@@ -1383,8 +1445,9 @@ Requires a Jira admin.
    ngrok http 8080 --url https://<domain>.ngrok-free.app --traffic-policy-file ngrok-policy.yaml
    ```
    The policy does three things: it IP-restricts each path, verifies Jira and Linear signatures with `verify-webhook`, and requires the bearer token on the Automation path. The orchestrator **checks all of these again**, so it stays safe if the policy is missing or misconfigured.
+   - **GitHub:** the example has the two rules for `/webhooks/github` as comments (the IP policy `ngrok_sync.github_policy_id`, and `verify-webhook` with the provider `github`). With them the policy has seven rules, which is more than the Free plan's five. Without them the path is open at ngrok, and ochell's own check of the signature is what holds.
 
-If the orchestrator is exposed directly instead, set `ip_allowlist.enabled: true`. Only set `trust_proxy_header` when a trusted proxy sets `X-Forwarded-For`.
+If the orchestrator is exposed directly instead, set `ip_allowlist.enabled: true`. Only set `trust_proxy_header` when a trusted proxy sets `X-Forwarded-For`. The GitHub path then takes the addresses that github.com publishes for its webhooks (`ip_allowlist.github_feed`); a GitHub Enterprise Server has no such list, so name its address in `extra_cidrs`.
 
 ## Testing with curl
 You can send the sample payloads in [testdata/](testdata/) by hand to check the endpoints and the agent command without Jira or Linear. Start a local instance with test secrets and `cat` as the agent, so that no real agent runs:
@@ -1434,13 +1497,41 @@ curl -i -X POST "$URL/webhooks/linear" \
 ```
 Without `client_id` the orchestrator logs that the session will not receive activities. With a real Linear app configured, it will try to post activities to the sample's fake session ID and log an error.
 
+### GitHub issue assigned
+The GitHub source needs its repositories, which have no flag, so start the instance with a small YAML file as well (`--config github-test.yaml`):
+```yaml
+github:
+  bot_login: digital-employee
+sources:
+  github:
+    enabled: true
+    secret: github-secret
+    repos: [{repo: acme/shop}]
+```
+```
+BODY=$(cat testdata/github-issue-assigned.json)
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac github-secret | sed 's/^.* //')
+curl -i -X POST "$URL/webhooks/github" \
+  -H 'Content-Type: application/json' \
+  -H 'X-GitHub-Event: issues' \
+  -H "X-GitHub-Delivery: test-$(date +%s)" \
+  -H "X-Hub-Signature-256: sha256=$SIG" \
+  --data-binary "$BODY"
+```
+It returns `200 queued <task id>` for the ticket `shop-12`. The sample has no time in it, so a second send within 24 hours returns `duplicate delivery` whatever its delivery id; change the body (the title) to send it again. Without `sources.github.token` nothing is written on the issue.
+
 Notes:
-- A repeated body, or a repeated `X-Atlassian-Webhook-Identifier` or `Linear-Delivery` value, returns `duplicate delivery`. The examples set a new timestamp in the body and add `$(date +%s)` to the id, so wait a second before sending one again.
+- A repeated body, or a repeated `X-Atlassian-Webhook-Identifier`, `Linear-Delivery` or `X-GitHub-Delivery` value, returns `duplicate delivery`. The examples set a new timestamp in the body and add `$(date +%s)` to the id, so wait a second before sending one again.
 - A wrong signature or token, or a timestamp outside `max_skew`, returns `401`.
 - To test through ngrok, set `URL` to `https://<ngrok-domain>`. The policy's `restrict-ips` rules will block requests from your own IP unless you add it.
 
 ## Security notes
-- **IP allowlists only reduce noise.** Atlassian's egress ranges also carry customer-controlled traffic (e.g. Forge apps). The signature or token is the real authentication.
+- **IP allowlists only reduce noise.** Atlassian's egress ranges also carry customer-controlled traffic (e.g. Forge apps), and GitHub's webhook ranges carry the webhooks of every GitHub user. The signature or token is the real authentication.
+- **GitHub source:**
+  - Anyone who can write on an issue controls its text, and on a public repository that is everyone. Who may *assign* an issue is GitHub's to say (people with triage access); set `allowed_assigners`, and `allowed_follow_ups`, on a repository where more people can than should direct the agent.
+  - Only the repositories of `sources.github.repos` start work, whatever a signed delivery says.
+  - GitHub's deliveries carry no timestamp. A captured delivery is refused for the 24 hours that ochell remembers its body. After that it would be accepted again, and it starts a run only when ochell does not hold the ticket by then (a ticket that is done, or one it never recorded); keep the secret of the webhook secret, and change it when it may have leaked.
+  - ochell has two GitHub tokens, and neither can merge or push: `github.token` reads; `sources.github.token` reads issues and writes comments on them, as the digital employee's account. ochell writes nothing with a token of another account.
 - **Ticket content is untrusted.** It reaches the agent's prompt, so it can attempt prompt injection. Give the agent only the access and permissions it needs, and keep a human review of the PR (QC) before anything is deployed.
 - **Limits:**
   - Request bodies are limited to 1 MiB.
@@ -1461,6 +1552,9 @@ Notes:
 
 ## Licensing notes (checked October 2026)
 - **Jira:** the digital employee is a normal Atlassian user, so it needs one seat. Creating a system webhook needs a Jira admin.
+- **GitHub** (not checked again for this source; verify before you rely on it):
+  - The digital employee is a normal GitHub user. In an organization on a paid plan it takes one seat; that is the account the handoff already assumes.
+  - Repository and organization webhooks are part of every plan. Creating one needs admin access to the repository, or an owner of the organization.
 - **Linear:**
   - An agent app installed with `actor=app` is **not a billable seat**, and the agent platform is available on every plan, including Free.
   - Free allows 2 teams and 250 issues. Basic is $10 per user per month and Business $16 (billed yearly).

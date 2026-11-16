@@ -172,3 +172,39 @@ func TestComments(t *testing.T) {
 		t.Errorf("comments from the second on = %+v", later)
 	}
 }
+
+// The one thing that ochell writes is a comment on an issue, and only the
+// token of the GitHub source can: the token of the handoff reads.
+func TestCommentOnIssue(t *testing.T) {
+	gh := githubtest.New(t)
+	gh.AddIssue(githubtest.Issue{Owner: "example", Repo: "web", Number: 3, Title: "A bug", Author: "alice", Assignees: []string{"digital-employee"}})
+	ctx := context.Background()
+	ref := github.Ref{Owner: "example", Repo: "web", Number: 3}
+
+	read := github.New(gh.URL, githubtest.Token)
+	if err := read.CommentOnIssue(ctx, ref, "Hello."); err == nil {
+		t.Error("the read token wrote a comment")
+	}
+	if gh.Refused() != 1 || len(gh.IssueComments("example", "web", 3)) != 0 {
+		t.Errorf("refused = %d, comments = %v", gh.Refused(), gh.IssueComments("example", "web", 3))
+	}
+
+	issues := github.New(gh.URL, githubtest.IssuesToken)
+	if login, err := issues.Login(ctx); err != nil || login != githubtest.Bot {
+		t.Errorf("Login = %q, %v", login, err)
+	}
+	if err := issues.CommentOnIssue(ctx, ref, strings.Repeat("é", 40000)); err != nil {
+		t.Fatal(err)
+	}
+	got := gh.IssueComments("example", "web", 3)
+	if len(got) != 1 || got[0].Author != githubtest.Bot || len(got[0].Body) > 60010 || !strings.HasSuffix(got[0].Body, " […]") {
+		t.Errorf("comments = %d, the first of %d bytes", len(got), len(got[0].Body))
+	}
+	is, err := issues.Issue(ctx, ref)
+	if err != nil || is.Title != "A bug" || is.Author != "alice" || is.Comments != 1 || is.State != "open" || is.PullRequest || len(is.Assignees) != 1 {
+		t.Errorf("Issue = %+v, %v", is, err)
+	}
+	if _, err := issues.Issue(ctx, github.Ref{Owner: "example", Repo: "web", Number: 4}); !github.NotFound(err) {
+		t.Errorf("an issue that is not there: %v", err)
+	}
+}

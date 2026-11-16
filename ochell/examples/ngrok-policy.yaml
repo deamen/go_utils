@@ -49,3 +49,24 @@ on_http_request:
         config:
           status_code: 401
           body: unauthorized
+
+  # GitHub (sources.github). These two rules make seven, which is more than
+  # the five of the ngrok Free plan; ochell checks the signature itself
+  # whether they are here or not.
+  # - name: GitHub path only from GitHub's webhook ranges
+  #   expressions:
+  #     - "req.url.path == '/webhooks/github'"
+  #   actions:
+  #     - type: restrict-ips
+  #       config:
+  #         enforce: true
+  #         ip_policies: ["ipp_GITHUB_POLICY_ID"]
+  #
+  # - name: Verify GitHub webhook signature (X-Hub-Signature-256)
+  #   expressions:
+  #     - "req.url.path == '/webhooks/github'"
+  #   actions:
+  #     - type: verify-webhook
+  #       config:
+  #         provider: github
+  #         secret: "GITHUB_WEBHOOK_SECRET"

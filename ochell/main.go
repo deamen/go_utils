@@ -1,8 +1,8 @@
 /*
 AI tasks orchestrator for the "digital employee" POC.
 
-Receives Jira (native webhook or Automation "Send web request") and Linear
-(agent app) webhooks, authenticates them, and launches the configured agent
+Receives Jira (native webhook or Automation "Send web request"), Linear
+(agent app) and GitHub (issues and pull requests) webhooks, authenticates them, and launches the configured agent
 CLI (e.g. Claude Code) with a prompt describing the assigned ticket.
 */
 package main
@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -55,16 +56,16 @@ var availCmds = [][2]string{
 	{"pause", "hold the queue of the running ochell: no new run starts; --tier NAME holds one tier"},
 	{"resume", "end a pause; --tier NAME ends the pause of one tier"},
 	{"status", "say whether the running ochell is paused, and what is queued and running"},
-	{"reset", "reset the attempts of a ticket, and with --tier set its risk tier: ochell reset <jira|linear> <KEY> [--tier NAME]"},
+	{"reset", "reset the attempts of a ticket, and with --tier set its risk tier: ochell reset <jira|linear|github> <KEY> [--tier NAME]"},
 	{"backup", "back the store of the running ochell up: to backup.dir, or to a file with --to"},
 	{"restore", "put a backup in the place of the store, while ochell is stopped: ochell restore --from FILE"},
 	{"outcomes", "show the outcome metrics per tier for a period: ochell outcomes [--since 2026-11-01] [--until 2026-11-15]"},
-	{"cost", "show what the tickets have cost, or one ticket with its runs: ochell cost [<jira|linear> <KEY>]"},
-	{"stop", "stop the run of a ticket and release the ticket: ochell stop <jira|linear> <KEY>"},
+	{"cost", "show what the tickets have cost, or one ticket with its runs: ochell cost [<jira|linear|github> <KEY>]"},
+	{"stop", "stop the run of a ticket and release the ticket: ochell stop <jira|linear|github> <KEY>"},
 	{"autonomy", "show the level of autonomy of each tier, with its numbers and the last changes"},
 	{"promote", "raise the level of autonomy of a tier by one step: ochell promote <TIER> [--reason TEXT]"},
 	{"demote", "lower the level of autonomy of a tier by one step: ochell demote <TIER> [--reason TEXT]"},
-	{"flag", "for a guardrail outside ochell: record a flag on a ticket's run and lower the level of its tier: ochell flag <jira|linear> <KEY> --reason TEXT"},
+	{"flag", "for a guardrail outside ochell: record a flag on a ticket's run and lower the level of its tier: ochell flag <jira|linear|github> <KEY> --reason TEXT"},
 	{"version", "print the version"},
 }
 
@@ -182,6 +183,12 @@ func serve(args []string) error {
 		return err
 	}
 	srv.UsePolicy(pol)
+	if gs := cfg.Sources.GitHub; gs.Enabled {
+		log.Info("GitHub source: issues and pull requests assigned to the digital employee are tickets", "path", gs.Path, "repositories", len(gs.Repos), "bot_login", cfg.GitHub.BotLogin)
+		if gs.Token == "" {
+			log.Warn("sources.github has no token: ochell writes nothing on the issues, the poller does not ask GitHub for missed assignments, and the gates of scheduling and the ticket tools cannot be used for GitHub tickets")
+		}
+	}
 	if err := srv.CheckScheduling(); err != nil {
 		return fmt.Errorf("invalid policy:\n%w", err)
 	}
@@ -201,13 +208,13 @@ func serve(args []string) error {
 		// agent is another OS user and cannot open a socket of ochell's;
 		// what keeps others out is the token of each run.
 		tools := mcp.New(version, log)
-		for _, source := range []string{"jira", "linear"} {
+		for _, source := range config.SourceNames {
 			if t := srv.Tickets(source); t != nil {
 				tools.Use(source, t)
 			}
 		}
 		lc, jc := cfg.Sources.Linear, cfg.Sources
-		r.UseTicketTools(tools, cfg.TicketToolsURL(), []string{jc.JiraAPI.Token, jc.JiraWebhook.Secret, jc.JiraAutomation.Token, lc.Secret, lc.ClientSecret})
+		r.UseTicketTools(tools, cfg.TicketToolsURL(), []string{jc.JiraAPI.Token, jc.JiraWebhook.Secret, jc.JiraAutomation.Token, lc.Secret, lc.ClientSecret, jc.GitHub.Token, jc.GitHub.Secret})
 		srv.Mount(mcp.Path, tools)
 		log.Info("ticket tools", "path", mcp.Path, "url", cfg.TicketToolsURL())
 	}
@@ -555,8 +562,8 @@ func adminCommand(cmd string, args []string) error {
 		rest = nil
 		me()
 	case "flag":
-		if len(rest) != 2 || (rest[0] != "jira" && rest[0] != "linear") || strings.TrimSpace(why) == "" {
-			return errors.New("usage: ochell flag <jira|linear> <KEY> --reason TEXT [flags]")
+		if len(rest) != 2 || !slices.Contains(config.SourceNames, rest[0]) || strings.TrimSpace(why) == "" {
+			return errors.New("usage: ochell flag <jira|linear|github> <KEY> --reason TEXT [flags]")
 		}
 		query.Set("source", rest[0])
 		query.Set("key", rest[1])
@@ -591,8 +598,8 @@ func adminCommand(cmd string, args []string) error {
 		query.Set("until", to.UTC().Format(time.RFC3339Nano))
 	case "cost":
 		method = "GET"
-		if len(rest) != 0 && (len(rest) != 2 || (rest[0] != "jira" && rest[0] != "linear")) {
-			return errors.New("usage: ochell cost [<jira|linear> <KEY>] [flags]")
+		if len(rest) != 0 && (len(rest) != 2 || !slices.Contains(config.SourceNames, rest[0])) {
+			return errors.New("usage: ochell cost [<jira|linear|github> <KEY>] [flags]")
 		}
 		if len(rest) == 2 {
 			query.Set("source", rest[0])
@@ -600,8 +607,8 @@ func adminCommand(cmd string, args []string) error {
 		}
 		rest = nil
 	case "reset", "stop":
-		if len(rest) != 2 || (rest[0] != "jira" && rest[0] != "linear") {
-			return fmt.Errorf("usage: ochell %s <jira|linear> <KEY> [flags]", cmd)
+		if len(rest) != 2 || !slices.Contains(config.SourceNames, rest[0]) {
+			return fmt.Errorf("usage: ochell %s <jira|linear|github> <KEY> [flags]", cmd)
 		}
 		query.Set("source", rest[0])
 		query.Set("key", rest[1])

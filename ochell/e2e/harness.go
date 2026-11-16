@@ -1,8 +1,8 @@
 //go:build unix
 
 // Package e2e is the end-to-end test harness. It starts a real ochell
-// process with a scripted fake agent (see fakeagent), a fake Linear API and
-// a fake Jira site,
+// process with a scripted fake agent (see fakeagent), a fake Linear API, a
+// fake Jira site and a fake GitHub API,
 // and sends it signed webhooks, so the full loop can be tested without a
 // real agent or tracker.
 //
@@ -36,6 +36,7 @@ import (
 
 	"ochell/internal/auth"
 	"ochell/internal/config"
+	"ochell/internal/github/githubtest"
 	"ochell/internal/source/linear/lineartest"
 	"ochell/internal/store"
 	"ochell/internal/tracker/jiraapi/jiratest"
@@ -53,6 +54,14 @@ const (
 	AgentToken = "e2e-agent-token"
 	// LinearAppUserID is the Linear user of the agent app itself.
 	LinearAppUserID = "app-user-0000"
+	// GitHubSecret is the secret of the GitHub webhook, GitHubRepo the one
+	// repository of the GitHub source, GitHubBot the login of the digital
+	// employee there and GitHubHuman who assigns the issues, unless
+	// Ochell.Actor says otherwise.
+	GitHubSecret = "e2e-github-secret"
+	GitHubRepo   = "acme/shop"
+	GitHubBot    = githubtest.Bot
+	GitHubHuman  = "alice"
 	// HumanAccountID is who assigns the tickets, unless Ochell.Actor says
 	// otherwise: the Jira accountId and the Linear user id of the payloads.
 	HumanAccountID = "557058:human"
@@ -369,6 +378,9 @@ type Options struct {
 	Policy string
 	// Env is added to the environment of the ochell process.
 	Env []string
+	// GitHub turns the GitHub source on, for the issues of GitHubRepo, with
+	// the fake GitHub API as its tracker. It is off otherwise.
+	GitHub bool
 	// OtherAgentUser prepares for an agent that runs as another OS user (the
 	// systemd launcher on the VM): it must be able to read its script and
 	// write its record, but not ochell's configuration.
@@ -383,6 +395,9 @@ type Ochell struct {
 	Linear *FakeLinear
 	// Jira is the fake Jira site that the Jira API client talks to.
 	Jira *jiratest.Server
+	// GitHub is the fake GitHub API: the issues that the GitHub source
+	// asks about and comments on.
+	GitHub *githubtest.Server
 	// Actor is the user who assigns the tickets in the payloads that are
 	// sent from now on. Empty: HumanAccountID.
 	Actor string
@@ -480,6 +495,7 @@ func Start(t *testing.T, opts Options) *Ochell {
 	}
 	o.Linear = lineartest.New(t, LinearToken)
 	o.Jira = jiratest.New(t)
+	o.GitHub = githubtest.New(t)
 
 	port := freePort(t)
 	cfg := config.Default()
@@ -526,6 +542,14 @@ func Start(t *testing.T, opts Options) *Ochell {
 	// Off, so that a test counts only the activities it is about. The
 	// test of the tool activities turns them on.
 	cfg.Sources.Linear.ToolActivityInterval = 0
+	if opts.GitHub {
+		cfg.GitHub.APIURL = o.GitHub.URL
+		cfg.GitHub.BotLogin = GitHubBot
+		cfg.Sources.GitHub.Enabled = true
+		cfg.Sources.GitHub.Secret = GitHubSecret
+		cfg.Sources.GitHub.Token = githubtest.IssuesToken
+		cfg.Sources.GitHub.Repos = []config.GitHubRepo{{Repo: GitHubRepo}}
+	}
 	if opts.Policy != "" {
 		cfg.Policy.File = filepath.Join(dir, "policy.yaml")
 		if err := os.WriteFile(cfg.Policy.File, []byte(opts.Policy), 0o600); err != nil {
@@ -901,6 +925,125 @@ func (o *Ochell) JiraCommented(key, author, text string) Response {
 		"X-Hub-Signature":                "sha256=" + auth.SignHex(JiraSecret, body),
 		"X-Atlassian-Webhook-Identifier": nextDelivery(),
 	})
+}
+
+// GitHubEvent sends a signed GitHub webhook of the kind event ("issues",
+// "issue_comment", "pull_request") about the issue number of repo, as
+// owner/name. The sender is Ochell.Actor, or GitHubHuman; the issue is
+// assigned to the digital employee, was opened by GitHubHuman and has
+// Ochell.Labels. more is added to the payload, and to the issue under
+// "issue".
+func (o *Ochell) GitHubEvent(event, action, repo string, number int, more map[string]any) Response {
+	o.t.Helper()
+	sender := o.Actor
+	if sender == "" {
+		sender = GitHubHuman
+	}
+	labels := []map[string]string{}
+	for _, l := range o.Labels {
+		labels = append(labels, map[string]string{"name": l})
+	}
+	kind := "issues"
+	if event == "pull_request" {
+		kind = "pull"
+	}
+	issue := map[string]any{
+		"number": number, "title": fmt.Sprintf("Issue %d", number), "state": "open",
+		"html_url":  fmt.Sprintf("https://github.com/%s/%s/%d", repo, kind, number),
+		"user":      map[string]string{"login": GitHubHuman},
+		"labels":    labels,
+		"assignees": []map[string]string{{"login": GitHubBot}},
+		// As on GitHub, where every change of an issue moves this time: two
+		// deliveries about one issue are not the same bytes.
+		"updated_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	payload := map[string]any{
+		"action":     action,
+		"repository": map[string]string{"full_name": repo},
+		"sender":     map[string]string{"login": sender},
+	}
+	for k, v := range more {
+		if k == "issue" {
+			for ik, iv := range v.(map[string]any) {
+				issue[ik] = iv
+			}
+			continue
+		}
+		payload[k] = v
+	}
+	if event == "pull_request" {
+		payload["pull_request"] = issue
+	} else {
+		payload["issue"] = issue
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		o.t.Fatal(err)
+	}
+	return o.Post(o.Config.Sources.GitHub.Path, body, map[string]string{
+		"X-GitHub-Event":      event,
+		"X-GitHub-Delivery":   nextDelivery(),
+		"X-Hub-Signature-256": "sha256=" + auth.SignHex(GitHubSecret, body),
+	})
+}
+
+// GitHubAssigned sends a signed GitHub webhook: the issue number of
+// GitHubRepo was assigned to the digital employee.
+func (o *Ochell) GitHubAssigned(number int, title string) Response {
+	o.t.Helper()
+	return o.GitHubEvent("issues", "assigned", GitHubRepo, number, map[string]any{
+		"assignee": map[string]string{"login": GitHubBot},
+		"issue":    map[string]any{"title": title},
+	})
+}
+
+// GitHubUnassigned sends a signed GitHub webhook: someone took the issue
+// away from the digital employee.
+func (o *Ochell) GitHubUnassigned(number int) Response {
+	o.t.Helper()
+	return o.GitHubEvent("issues", "unassigned", GitHubRepo, number, map[string]any{
+		"assignee": map[string]string{"login": GitHubBot},
+		"issue":    map[string]any{"assignees": []map[string]string{}},
+	})
+}
+
+// GitHubClosed sends a signed GitHub webhook: the issue was closed.
+func (o *Ochell) GitHubClosed(number int) Response {
+	o.t.Helper()
+	return o.GitHubEvent("issues", "closed", GitHubRepo, number, map[string]any{"issue": map[string]any{"state": "closed"}})
+}
+
+// GitHubCommented sends a signed GitHub webhook: someone added a comment
+// to an issue that is assigned to the digital employee. An empty author is
+// the person who assigns the issues; GitHubBot is the bot itself.
+func (o *Ochell) GitHubCommented(number int, author, text string) Response {
+	o.t.Helper()
+	if author == "" {
+		author = o.Actor
+	}
+	if author == "" {
+		author = GitHubHuman
+	}
+	return o.GitHubEvent("issue_comment", "created", GitHubRepo, number, map[string]any{
+		"sender":  map[string]string{"login": author},
+		"comment": map[string]any{"id": 20001, "body": text, "user": map[string]string{"login": author}},
+	})
+}
+
+// WaitIssueComments waits until the issue number of GitHubRepo on the fake
+// GitHub has n comments, and returns their texts.
+func (o *Ochell) WaitIssueComments(number, n int, timeout time.Duration) []string {
+	o.t.Helper()
+	owner, repo, _ := strings.Cut(GitHubRepo, "/")
+	var got []string
+	o.waitFor(timeout, fmt.Sprintf("%d comments on the GitHub issue %d", n, number), func() bool {
+		got = got[:0]
+		for _, c := range o.GitHub.IssueComments(owner, repo, number) {
+			got = append(got, c.Body)
+		}
+		return len(got) >= n
+	})
+	return got
 }
 
 // JiraAutomation sends a Jira Automation "Send web request" call.

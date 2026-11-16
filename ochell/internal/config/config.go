@@ -284,19 +284,143 @@ type Linear struct {
 	TokenURL string `yaml:"token_url"`
 }
 
+// GitHubSource makes GitHub issues and pull requests tickets: one that is
+// assigned to the digital employee's GitHub account (github.bot_login)
+// starts work, as a Jira or Linear ticket does. GitHub tells ochell by a
+// webhook of the repository or the organization.
+type GitHubSource struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`
+	// Secret is the secret of the webhook, which GitHub signs each
+	// delivery with.
+	Secret string `yaml:"secret"`
+	// Token is a token of the digital employee's GitHub account with read
+	// and write access to issues (and to pull requests, when pull requests
+	// are assigned to it), and nothing else. ochell comments on the issue
+	// with it, and asks GitHub about issues for the poller, the gates of
+	// scheduling and the ticket tools. It is not github.token, which only
+	// reads, and it is not the agent's. Empty: an issue gets no answer
+	// from ochell, and GitHub is not asked.
+	Token string `yaml:"token"`
+	// Repos are the repositories whose issues may become tickets. A
+	// delivery about any other repository starts nothing.
+	Repos []GitHubRepo `yaml:"repos"`
+	// AllowedAssigners, when not empty, are the GitHub logins of the
+	// people who may assign work.
+	AllowedAssigners []string `yaml:"allowed_assigners"`
+	// AllowedFollowUps, when not empty, says who may send follow-ups and
+	// stops in comments: GitHub logins, and the words "assigner" (who
+	// assigned the issue to the bot) and "reporter" (who opened it).
+	// Empty: the same people as AllowedAssigners.
+	AllowedFollowUps []string `yaml:"allowed_follow_ups"`
+}
+
+// GitHubRepo is one repository of the GitHub source.
+type GitHubRepo struct {
+	// Repo is the repository as owner/name.
+	Repo string `yaml:"repo"`
+	// Project is the part of the ticket keys before the number: the issue
+	// 12 of a repository with the project shop is the ticket shop-12. The
+	// repos setting and the rules of the policy name it as project. Empty:
+	// the name of the repository, with "_" for each ".".
+	Project string `yaml:"project"`
+}
+
+var (
+	gitHubRepo = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+)$`)
+	// A key is the project, "-" and the number of the issue, and a key has
+	// at most 64 characters.
+	gitHubProject = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$`)
+)
+
+// Split returns the owner and the name of the repository.
+func (r GitHubRepo) Split() (owner, name string, ok bool) {
+	m := gitHubRepo.FindStringSubmatch(r.Repo)
+	if m == nil || m[2] == "." || m[2] == ".." {
+		return "", "", false
+	}
+	return m[1], m[2], true
+}
+
+// ProjectKey returns the project of the repository's tickets: Project, or
+// what the name of the repository gives.
+func (r GitHubRepo) ProjectKey() string {
+	if r.Project != "" {
+		return r.Project
+	}
+	_, name, _ := r.Split()
+	return strings.ReplaceAll(name, ".", "_")
+}
+
+// Validate checks the settings of the GitHub source, when it is enabled.
+// gh is the github section, which names the bot's login and the API.
+func (g GitHubSource) Validate(gh GitHub) error {
+	if !g.Enabled {
+		return nil
+	}
+	var errs []error
+	if g.Secret == "" {
+		errs = append(errs, errors.New("sources.github.secret is required: the secret of the webhook"))
+	}
+	// Without it ochell cannot tell an assignment to the bot from any
+	// other, or the bot's own comments from a person's.
+	if gh.BotLogin == "" {
+		errs = append(errs, errors.New("sources.github requires github.bot_login: the GitHub login of the digital employee, whose issues are the tickets"))
+	}
+	if g.Token != "" && g.Token == gh.Token {
+		errs = append(errs, errors.New("sources.github.token must not be github.token: that one only reads, and this one writes comments on issues"))
+	}
+	if len(g.Repos) == 0 {
+		errs = append(errs, errors.New("sources.github.repos is required: the repositories whose issues may become tickets, as owner/name"))
+	}
+	seen := map[string]int{}
+	projects := map[string]int{}
+	for i, r := range g.Repos {
+		at := fmt.Sprintf("sources.github.repos[%d]", i)
+		if _, _, ok := r.Split(); !ok {
+			errs = append(errs, fmt.Errorf("%s.repo must be a repository as owner/name, not %q", at, r.Repo))
+			continue
+		}
+		if j, dup := seen[strings.ToLower(r.Repo)]; dup {
+			errs = append(errs, fmt.Errorf("%s: %s is repos[%d] as well", at, r.Repo, j))
+		}
+		seen[strings.ToLower(r.Repo)] = i
+		p := r.ProjectKey()
+		if !gitHubProject.MatchString(p) {
+			errs = append(errs, fmt.Errorf("%s: %q cannot be the project of ticket keys (letters, digits, _ and -, at most 50 characters, not starting with _ or -); set project", at, p))
+			continue
+		}
+		// Two repositories with one project would share their ticket keys.
+		if j, dup := projects[strings.ToLower(p)]; dup {
+			errs = append(errs, fmt.Errorf("%s has the project %s, as repos[%d] has: set project for one of them, so that their tickets have keys of their own", at, p, j))
+		}
+		projects[strings.ToLower(p)] = i
+	}
+	return errors.Join(errs...)
+}
+
 type Sources struct {
 	JiraWebhook    JiraWebhook    `yaml:"jira_webhook"`
 	JiraAutomation JiraAutomation `yaml:"jira_automation"`
 	JiraAPI        JiraAPI        `yaml:"jira_api"`
 	Linear         Linear         `yaml:"linear"`
+	GitHub         GitHubSource   `yaml:"github"`
 }
 
+// Names of the sources, as they are in ticket ids, in the repos setting,
+// in the rules of the policy and in the admin commands.
+var SourceNames = []string{"jira", "linear", "github"}
+
 type IPAllowlist struct {
-	Enabled       bool          `yaml:"enabled"`
-	AtlassianFeed bool          `yaml:"atlassian_feed"`
-	LinearFeed    bool          `yaml:"linear_feed"`
-	ExtraCIDRs    []string      `yaml:"extra_cidrs"`
-	Refresh       time.Duration `yaml:"refresh"`
+	Enabled       bool `yaml:"enabled"`
+	AtlassianFeed bool `yaml:"atlassian_feed"`
+	LinearFeed    bool `yaml:"linear_feed"`
+	// GitHubFeed takes the addresses that github.com sends webhooks from.
+	// GitHub Enterprise Server has no such list: name its address in
+	// extra_cidrs.
+	GitHubFeed bool          `yaml:"github_feed"`
+	ExtraCIDRs []string      `yaml:"extra_cidrs"`
+	Refresh    time.Duration `yaml:"refresh"`
 	// TrustProxyHeader uses the right-most X-Forwarded-For entry as the
 	// client IP. Only enable when a trusted proxy (e.g. ngrok) is in front.
 	TrustProxyHeader bool `yaml:"trust_proxy_header"`
@@ -308,6 +432,7 @@ type NgrokSync struct {
 	APIURL            string        `yaml:"api_url"`
 	AtlassianPolicyID string        `yaml:"atlassian_policy_id"`
 	LinearPolicyID    string        `yaml:"linear_policy_id"`
+	GitHubPolicyID    string        `yaml:"github_policy_id"`
 	Interval          time.Duration `yaml:"interval"`
 }
 
@@ -320,11 +445,12 @@ type Store struct {
 
 // Repo maps tickets to the repository they are worked on in.
 type Repo struct {
-	// Source is "jira" or "linear"; empty matches both.
+	// Source is "jira", "linear" or "github"; empty matches all.
 	Source string `yaml:"source"`
-	// Project is the Jira project key or the Linear team key, which is the
-	// part of the ticket key before the number (DEV in DEV-42). "*"
-	// matches every project.
+	// Project is the Jira project key, the Linear team key or the project
+	// of a repository of the GitHub source, which is the part of the
+	// ticket key before the number (DEV in DEV-42). "*" matches every
+	// project.
 	Project string `yaml:"project"`
 	// Label, when set, narrows the entry to tickets that carry this label
 	// (in Jira also: this component).
@@ -417,6 +543,9 @@ type API struct {
 // of the pull requests that its tickets opened. It is used when Token is
 // set. The token needs read access to pull requests and nothing else; it
 // is not the agent's.
+//
+// APIURL and BotLogin also hold for the GitHub source (sources.github),
+// which has a token of its own.
 type GitHub struct {
 	Token string `yaml:"token"`
 	// APIURL is the address of the API. Empty: github.com. For GitHub
@@ -425,7 +554,8 @@ type GitHub struct {
 	// PollInterval is how often ochell asks about the open pull requests.
 	PollInterval time.Duration `yaml:"poll_interval"`
 	// BotLogin is the GitHub login of the digital employee. A pull request
-	// that this account merged itself is not taken as accepted work.
+	// that this account merged itself is not taken as accepted work. For
+	// the GitHub source it is the account whose issues are the tickets.
 	BotLogin string `yaml:"bot_login"`
 	// ChecksGrace is how long ochell waits for a check to appear on a
 	// pull request before it takes the pull request to have none.
@@ -672,6 +802,7 @@ func Default() *Config {
 		Sources: Sources{
 			JiraWebhook:    JiraWebhook{Path: "/webhooks/jira", MaxSkew: 2 * time.Hour},
 			JiraAutomation: JiraAutomation{Path: "/webhooks/jira-automation", Header: "Authorization"},
+			GitHub:         GitHubSource{Path: "/webhooks/github"},
 			Linear: Linear{
 				Path:                 "/webhooks/linear",
 				MaxSkew:              60 * time.Second,
@@ -680,7 +811,7 @@ func Default() *Config {
 				TokenFile:            "linear-token.json",
 			},
 		},
-		IPAllowlist: IPAllowlist{AtlassianFeed: true, LinearFeed: true, Refresh: time.Hour},
+		IPAllowlist: IPAllowlist{AtlassianFeed: true, LinearFeed: true, GitHubFeed: true, Refresh: time.Hour},
 		NgrokSync:   NgrokSync{APIURL: "https://api.ngrok.com", Interval: 6 * time.Hour},
 	}
 }
@@ -831,6 +962,10 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.Sources.Linear.RedirectURL, "linear-redirect-url", c.Sources.Linear.RedirectURL, "public URL of the Linear OAuth callback")
 	fs.StringVar(&c.Sources.Linear.TokenFile, "linear-token-file", c.Sources.Linear.TokenFile, "file storing the Linear OAuth token")
 
+	fs.BoolVar(&c.Sources.GitHub.Enabled, "github-webhook", c.Sources.GitHub.Enabled, "enable the GitHub source: issues and pull requests assigned to the digital employee")
+	fs.StringVar(&c.Sources.GitHub.Path, "github-webhook-path", c.Sources.GitHub.Path, "GitHub webhook path")
+	fs.StringVar(&c.Sources.GitHub.Secret, "github-webhook-secret", c.Sources.GitHub.Secret, "GitHub webhook secret")
+
 	fs.BoolVar(&c.IPAllowlist.Enabled, "ip-allowlist", c.IPAllowlist.Enabled, "enforce source IP allowlists in the orchestrator")
 	fs.BoolVar(&c.IPAllowlist.TrustProxyHeader, "trust-proxy-header", c.IPAllowlist.TrustProxyHeader, "use X-Forwarded-For for the client IP")
 
@@ -838,6 +973,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.NgrokSync.APIKey, "ngrok-api-key", c.NgrokSync.APIKey, "ngrok API key")
 	fs.StringVar(&c.NgrokSync.AtlassianPolicyID, "ngrok-atlassian-policy", c.NgrokSync.AtlassianPolicyID, "ngrok IP policy id for Atlassian ranges")
 	fs.StringVar(&c.NgrokSync.LinearPolicyID, "ngrok-linear-policy", c.NgrokSync.LinearPolicyID, "ngrok IP policy id for Linear ranges")
+	fs.StringVar(&c.NgrokSync.GitHubPolicyID, "ngrok-github-policy", c.NgrokSync.GitHubPolicyID, "ngrok IP policy id for the ranges of GitHub's webhooks")
 }
 
 // Validate checks the settings of the Jira API, when it is configured.
@@ -886,8 +1022,8 @@ func (c *Config) Validate() error {
 		}
 	}
 	for i, r := range c.Repos {
-		if r.Source != "" && r.Source != "jira" && r.Source != "linear" {
-			errs = append(errs, fmt.Errorf("repos[%d].source must be jira, linear or empty", i))
+		if r.Source != "" && !slices.Contains(SourceNames, r.Source) {
+			errs = append(errs, fmt.Errorf("repos[%d].source must be jira, linear, github or empty", i))
 		}
 		if r.Project == "" {
 			errs = append(errs, fmt.Errorf(`repos[%d].project is required; "*" matches every project`, i))
@@ -929,6 +1065,11 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("workspace.hooks.%s: agent.launcher systemd requires the command to be an absolute path", h.Name))
 		}
 	}
+	if g := c.GitHub; g.APIURL != "" {
+		if u, err := url.Parse(g.APIURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			errs = append(errs, errors.New("github.api_url must be the address of the API, such as https://ghe.example.com/api/v3"))
+		}
+	}
 	if g := c.GitHub; g.Enabled() {
 		if g.PollInterval <= 0 {
 			errs = append(errs, errors.New("github.poll_interval must be positive"))
@@ -936,12 +1077,8 @@ func (c *Config) Validate() error {
 		if g.ChecksGrace < 0 {
 			errs = append(errs, errors.New("github.checks_grace must not be negative"))
 		}
-		if g.APIURL != "" {
-			if u, err := url.Parse(g.APIURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-				errs = append(errs, errors.New("github.api_url must be the address of the API, such as https://ghe.example.com/api/v3"))
-			}
-		}
-	} else if g.APIURL != "" || g.BotLogin != "" {
+	} else if (g.APIURL != "" || g.BotLogin != "") && !c.Sources.GitHub.Enabled {
+		// The GitHub source uses both, with a token of its own.
 		errs = append(errs, errors.New("github: api_url or bot_login is set but token is not"))
 	}
 	if wf := c.Workflow; wf.Enabled {
@@ -991,6 +1128,9 @@ func (c *Config) Validate() error {
 		}
 		if c.Sources.Linear.Enabled && c.Sources.Linear.ClientID == "" {
 			errs = append(errs, errors.New("ticket_tools needs the Linear app (sources.linear.client_id) for the Linear tickets: the tools read and comment with the app's token"))
+		}
+		if c.Sources.GitHub.Enabled && c.Sources.GitHub.Token == "" {
+			errs = append(errs, errors.New("ticket_tools needs sources.github.token for the GitHub tickets: the tools read and comment with ochell's own access to the issues"))
 		}
 		// A comment that the agent makes through the tools is written by
 		// the account of sources.jira_api. It must be known as the bot's,
@@ -1143,7 +1283,7 @@ func (c *Config) Validate() error {
 	}
 
 	s := c.Sources
-	if !s.JiraWebhook.Enabled && !s.JiraAutomation.Enabled && !s.Linear.Enabled {
+	if !s.JiraWebhook.Enabled && !s.JiraAutomation.Enabled && !s.Linear.Enabled && !s.GitHub.Enabled {
 		errs = append(errs, errors.New("no source enabled"))
 	}
 	if s.JiraWebhook.Enabled {
@@ -1169,6 +1309,9 @@ func (c *Config) Validate() error {
 	if s.Linear.Enabled && s.Linear.Secret == "" {
 		errs = append(errs, errors.New("sources.linear.secret is required"))
 	}
+	if err := s.GitHub.Validate(c.GitHub); err != nil {
+		errs = append(errs, err)
+	}
 	paths := map[string]string{}
 	for name, p := range map[string]struct {
 		on   bool
@@ -1177,6 +1320,7 @@ func (c *Config) Validate() error {
 		"jira_webhook":    {s.JiraWebhook.Enabled, s.JiraWebhook.Path},
 		"jira_automation": {s.JiraAutomation.Enabled, s.JiraAutomation.Path},
 		"linear":          {s.Linear.Enabled, s.Linear.Path},
+		"github":          {s.GitHub.Enabled, s.GitHub.Path},
 	} {
 		if !p.on {
 			continue

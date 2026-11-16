@@ -61,7 +61,8 @@ func jiraStarted(t *task.Task) string {
 	return "The digital employee started work on this ticket."
 }
 
-// replyHint tells the people on a Jira ticket how to answer the agent.
+// replyHint tells the people on a ticket with comments how to answer the
+// agent.
 const replyHint = "Reply in a comment on this ticket, and the digital employee goes on from there."
 
 // jiraFinished is the comment for the end of a run. It says the same as
@@ -69,44 +70,8 @@ const replyHint = "Reply in a comment on this ticket, and the digital employee g
 // ticket reaches ochell, so a run that waits for a person says how to
 // answer.
 func jiraFinished(t *task.Task, res task.Result, canReply bool) string {
-	if res.Next != "" {
-		return queuedAgainText(res)
-	}
-	if res.Outcome == task.OutcomeCancelled {
-		return cancelledText(t, res)
-	}
-	if res.Escalation != "" {
-		return escalationText(t, res)
-	}
-	if res.Outcome == task.OutcomeNoProgress {
-		return noProgressText(t, res)
-	}
-	if res.Err != nil {
-		return strings.TrimSpace(failureText(res) + "\n\n" + noFormat(lastN(res.Message, replyMax)))
-	}
-	if res.Signal == result.Plan {
-		msg := planText(res, "comment")
-		if !canReply {
-			msg += "\n\nComments reach the digital employee only through the Jira system webhook, which is not enabled here; until it is, a plan cannot be approved."
-		}
-		return msg
-	}
-	_, msg := signalActivity(res)
-	if res.Signal == result.Done && res.AwaitChecks {
-		msg = "The digital employee finished its work on this ticket.\n\n" + msg
-		if res.PRURL != "" {
-			msg += "\n\nPull request: " + res.PRURL
-		}
-		msg += "\n\n" + awaitChecksNote
-	} else if res.Signal == result.Done {
-		msg = "The digital employee finished its work on this ticket, which is now ready for review.\n\n" + msg
-		if res.PRURL != "" {
-			msg += "\n\nPull request: " + res.PRURL
-		}
-	} else if canReply {
-		msg += "\n\n" + replyHint
-	}
-	return msg
+	return finishedText(t, res, canReply, noFormat,
+		"Comments reach the digital employee only through the Jira system webhook, which is not enabled here; until it is, a plan cannot be approved.")
 }
 
 // noFormat shows agent output as it is: Jira would read it as wiki markup.

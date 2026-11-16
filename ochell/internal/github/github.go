@@ -1,11 +1,15 @@
-// Package github is ochell's read-only access to GitHub: what became of
-// the pull requests that its tickets opened. ochell only reads. It never
-// merges, approves or pushes, and its token needs no permission to.
+// Package github is ochell's access to GitHub. With the token of the
+// handoff (github.token) it only reads: what became of the pull requests
+// that its tickets opened, and a repository's WORKFLOW.md. With the token
+// of the GitHub source (sources.github.token) it reads issues and writes
+// comments on them (issues.go). It never merges, approves or pushes, and
+// neither token needs a permission to.
 //
 // It is not how the agent reaches GitHub; the agent has its own account.
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -201,12 +205,29 @@ func NotFound(err error) bool {
 }
 
 func (c *Client) get(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.APIURL+path, nil)
+	return c.do(ctx, http.MethodGet, path, nil, http.StatusOK, out)
+}
+
+// do sends one request and reads the answer into out. in, when not nil, is
+// sent as JSON. An answer with another status than want is an *Error.
+func (c *Client) do(ctx context.Context, method, path string, in any, want int, out any) error {
+	var send io.Reader
+	if in != nil {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		send = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.APIURL+path, send)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
@@ -219,12 +240,15 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	if err != nil {
 		return fmt.Errorf("github api: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != want {
 		msg := strings.TrimSpace(string(body))
 		if len(msg) > 300 {
 			msg = msg[:300] + "…"
 		}
 		return &Error{Status: resp.StatusCode, Body: msg}
+	}
+	if out == nil {
+		return nil
 	}
 	if err := json.Unmarshal(body, out); err != nil {
 		return fmt.Errorf("github api: %s: %w", path, err)
