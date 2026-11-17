@@ -205,36 +205,10 @@ agent:
   #            run_dir; args and workdir may only use .ID .Source .Key;
   #            env_pass is not used. ochell must be in the agent user's group
   #            to read the result files.
-  #   podman   a container of its own for each run and each workspace hook,
-  #            started by ochell's own OS user (rootless podman). The
-  #            container holds the working directory of its ticket, the
-  #            directory of its run, the ticket's home directory and nothing
-  #            else of the host. Requires podman.image and an absolute
-  #            workdir with {{.Key}}; env_pass is not used.
   launcher: direct
   systemd:
     launch_command: [sudo, -n, /usr/local/libexec/ochell/ochell-launch]
     stop_command: [sudo, -n, /usr/local/libexec/ochell/ochell-stop]
-  podman:
-    # The podman program: a name on ochell's PATH, or a path.
-    command: podman
-    # The image of every container. It must hold the agent CLI and what the
-    # workspace hooks call (git). Required with launcher: podman.
-    # image: registry.example.com/ochell-agent:7
-    # never (default): only an image that is already on the host. missing,
-    # newer, always: podman pulls it.
-    pull: never
-    # The agent's own credential, as NAME=VALUE lines (CLAUDE_CODE_OAUTH_TOKEN
-    # or ANTHROPIC_API_KEY). Owned by ochell's user, mode 0600. podman reads
-    # it; it is not mounted in a container.
-    # env_file: /etc/ochell/agent.env
-    # One directory per ticket: the agent's home directory (/home/agent) in
-    # that ticket's containers, where the agent CLI keeps its sessions.
-    # Removed with the ticket's working directory.
-    state_dir: /var/lib/ochell/state
-    # Added to every "podman run" after ochell's own options. The host's
-    # alone; ochell does not check them.
-    # args: [--memory=8g, --cpus=4]
   # Time between SIGTERM and SIGKILL when a run is stopped, at the time limit
   # or on shutdown. The whole agent is stopped, with its children.
   stop_grace: 10s

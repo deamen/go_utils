@@ -82,17 +82,6 @@ func (r *Runner) UseWorkspace(cfg config.Workspace) error {
 	return nil
 }
 
-// home returns the state directory of a ticket: the home directory of the
-// agent in the ticket's containers. It is empty without the podman
-// launcher. The name is made of the source and the key alone, so it can
-// only be that of one ticket.
-func (r *Runner) home(source, key string) string {
-	if r.stateDir == "" {
-		return ""
-	}
-	return filepath.Join(r.stateDir, unsafeName.ReplaceAllString(source+"-"+key, "_"))
-}
-
 // within reports whether dir is root or inside it. Both are cleaned paths.
 func within(root, dir string) bool {
 	return dir == root || strings.HasPrefix(dir, root+string(filepath.Separator))
@@ -160,11 +149,8 @@ func (r *Runner) runHook(ctx context.Context, name string, repo bool, tmpl []*te
 		Dir:       dir,
 		Env:       append(r.taskEnv(t), "ORCH_HOOK="+name),
 		Inherited: r.inheritedEnv(),
-		// With the podman launcher a hook is in a container like the
-		// agent's, with the same directories.
-		Home:    r.home(t.Source, t.Key),
-		Output:  out,
-		Timeout: r.ws.cfg.HookTimeout,
+		Output:    out,
+		Timeout:   r.ws.cfg.HookTimeout,
 	}
 	w, outcome := r.execute(ctx, spec, 0, nil)
 	var err error
@@ -317,13 +303,6 @@ func (r *Runner) removeWorkspace(source, key string) {
 		log.Error("cannot remove the working directory", "dir", clean, "err", err)
 		return
 	}
-	// What the agent kept for the ticket in its home directory goes with
-	// the working directory: the session in it is forgotten too.
-	if home := r.home(source, key); home != "" {
-		if err := os.RemoveAll(home); err != nil {
-			log.Error("cannot remove the state directory of the ticket", "dir", home, "err", err)
-		}
-	}
 	if err := r.store.ClearWorkspace(source, key); err != nil {
 		log.Error("cannot record the removal of the working directory", "err", err)
 	}
@@ -332,9 +311,8 @@ func (r *Runner) removeWorkspace(source, key string) {
 }
 
 // remove deletes dir. With the direct launcher the files belong to ochell's
-// own user, and with the podman launcher too: the agent has ochell's uid in
-// its container. With the systemd launcher they belong to the agent user,
-// so rm runs as that user, through the launcher, from the root.
+// own user. With the systemd launcher they belong to the agent user, so rm
+// runs as that user, through the launcher, from the root.
 func (r *Runner) remove(ctx context.Context, dir, unit string, out io.Writer) error {
 	if r.cfg.Launcher != "systemd" {
 		return os.RemoveAll(dir)

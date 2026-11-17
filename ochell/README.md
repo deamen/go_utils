@@ -177,7 +177,6 @@ agent:
 ### Stopping agents and shutting down
 - **A stop ends the whole agent**, not only its top process: sub-agents, MCP servers and git children too. ochell sends SIGTERM, and SIGKILL after `agent.stop_grace` (10s). This happens at `agent.timeout`, at `agent.stall_timeout`, when the [watchdog](#the-watchdog) fires and on shutdown.
   - With the `systemd` launcher ochell stops the unit, and systemd signals every process in it.
-  - With the `podman` launcher ochell stops the container (`podman stop`): podman sends SIGTERM to the agent, and SIGKILL to every process of the container after `stop_grace`. Nothing of a run is outside its container.
   - With the `direct` launcher the agent runs in its own process group and ochell signals the group. A child that leaves the group (`setsid`) is not reached; use the `systemd` launcher where that matters. When the agent exits by itself, what it left running in its group is killed as well.
 - **Shutdown** (SIGTERM or Ctrl-C): ochell stops accepting webhooks and waits up to `agent.drain_timeout` (30s) for running agents to finish. Then it stops the ones still running. A second signal ends the wait at once. Tasks that were queued but not started stay in the store and run after the next start.
   - If ochell runs as a systemd service, set the service's `TimeoutStopSec` above `drain_timeout` plus `stop_grace`, or systemd kills ochell first.
@@ -187,7 +186,7 @@ agent:
   - Its prompt has the **recovery note** in the run context: the agent may have done part of the work, and must check git, the pull request and the ticket's comments before it repeats anything with an effect outside the working directory.
   - The ticket is told that the run was cut off and is queued again: a `thought` in a Linear session, a comment on a Jira ticket.
   - It counts as an attempt. A ticket that has used up `agent.max_attempts` is not started again: it waits for a human with the reason `interrupted`, and gets an error that says so.
-  - **What the crash left running:** with the `systemd` launcher the unit of the interrupted run may still be there, so ochell stops it by its task id before the new attempt starts. With the `podman` launcher the container may still be there; it is named after the task id, and ochell removes it (`podman rm --force`) in the same way. With the `direct` launcher ochell cannot find the old agent; it runs on until it ends by itself, next to the new attempt. That is one more reason to deploy with `systemd` or `podman`.
+  - **What the crash left running:** with the `systemd` launcher the unit of the interrupted run may still be there, so ochell stops it by its task id before the new attempt starts. With the `direct` launcher ochell cannot find the old agent; it runs on until it ends by itself, next to the new attempt. That is one more reason to deploy with `systemd`.
 
 ## Build
 ```
@@ -207,13 +206,7 @@ run := o.WaitRun(id, 15*time.Second)          // exit code and log of the run
 rec := o.WaitRecords(1, 5*time.Second)[0]     // what the agent was started with
 acts := o.WaitActivities("session-1", 2, 10*time.Second)
 ```
-The harness uses the direct launcher by default. `e2e.UseFakeSystemd` selects the systemd launcher with the real launch and stop scripts and stand-ins for `systemd-run` and `systemctl`, which covers the path through the scripts in CI. `e2e.UseFakePodman` selects the podman launcher with a stand-in for `podman` that records how it was called and runs the agent as a plain process.
-
-**With a real podman.** `make test` does not need podman. The tests that call `e2e.UseRealPodman` (`TestPodmanSandbox…`) are skipped unless `OCHELL_E2E_PODMAN=1`:
-```
-OCHELL_E2E_PODMAN=1 go test ./e2e/ -run TestPodmanSandbox -count=1
-```
-They need rootless podman and no registry: the image is made on the spot from the fake agent, which is one static program (`podman import`), and removed afterwards. `OCHELL_E2E_PODMAN_ARGS` adds options to every `podman run`. CI runs them after `make test`.
+The harness uses the direct launcher by default. `e2e.UseFakeSystemd` selects the systemd launcher with the real launch and stop scripts and stand-ins for `systemd-run` and `systemctl`, which covers the path through the scripts in CI.
 
 ### Tests on the VM
 CI has no systemd, so what only real systemd can show runs on the VM. Set up the systemd launcher first (see [Launchers](#launchers)).
@@ -274,7 +267,7 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-arg` | Agent argument; repeatable; replaces the YAML `args` (default `-p`). Go template: `{{.Key}}`, `{{.Source}}`, `{{.ID}}`. Keep ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`, `{{.Prompt}}`) out of arguments; see [The prompt](#the-prompt) |
 | `--agent-prompt-via` | `stdin` (default) or `arg` |
 | `--agent-adapter` | Kind of agent CLI: `plain` (default) or `claude`; see [Agent adapters](#agent-adapters) |
-| `--agent-launcher` | `direct` (default), `systemd` or `podman`; see [Launchers](#launchers) |
+| `--agent-launcher` | `direct` (default) or `systemd`; see [Launchers](#launchers) |
 | `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
 | `--agent-stall-timeout` | Stop an agent that wrote no output for this long, and start the ticket again (default `0`: never); see [Retry and stall detection](#retry-and-stall-detection) |
 | `--agent-watchdog-repeats` | Stop an agent that made the same tool call, or the same few calls in a row, this many times, and leave the ticket to a human (default `0`: never); see [The watchdog](#the-watchdog) |
@@ -304,7 +297,7 @@ ochell keeps its durable state in one SQLite file, `store.path` (default `ochell
 
 So a restart loses no queued task, and a retried or replayed delivery from before the restart is still recognised. SQLite keeps two more files next to it while ochell runs (`-wal` and `-shm`). Do not copy the file of a running ochell by hand; use the [backup](#backup-and-restore).
 
-Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user; with the `podman` launcher, any directory that is not inside a working directory.
+Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user.
 
 ### Jira API access
 The webhooks only bring events in. For what ochell does on its own in Jira (commenting on a ticket when a run starts and ends, changing a status, finding the bot's tickets for [the poller](#the-poller), and reading a ticket's labels, blockers and priority for [scheduling](#scheduling)) it needs the Jira REST API, with the API token of the digital employee's account:
@@ -422,7 +415,7 @@ agent:
       static_configs: [{targets: ["127.0.0.1:8080"]}]
   ```
 - **The numbers are counted from the store at each scrape.** They are the same after a restart, and a counter never goes back.
-- **The agent's token.** ochell does not read the agent's own credential (it is in the launcher's root-only environment file, or in `agent.podman.env_file`), so the operator notes its last day in `agent.token_expires`. A token from `claude setup-token` lasts one year, and every run fails once it has expired.
+- **The agent's token.** ochell does not read the agent's own credential (it is in the launcher's root-only environment file), so the operator notes its last day in `agent.token_expires`. A token from `claude setup-token` lasts one year, and every run fails once it has expired.
   - From `agent.token_warn_days` (30) before that day, ochell logs a warning at start and then once a day; after it, an error.
   - Alert on `ochell_agent_token_days_left`.
   - Set the new date when you renew the token.
@@ -474,7 +467,7 @@ retention:
 - **Logs hold prompts and ticket text.** That is the reason for a limit, and the default is 30 days.
 - ochell looks at start and then every `retention.interval`.
 - **The store keeps the record of every run** (see [Audit trail and outcome metrics](#audit-trail-and-outcome-metrics)); only the files go. The `log_file` of an old run then names a file that is gone.
-- With the `systemd` launcher the run directories belong to the agent user, so they are removed as that user, like a working directory. With the `podman` launcher they belong to ochell's user.
+- With the `systemd` launcher the run directories belong to the agent user, so they are removed as that user, like a working directory.
 - Only `*.log` files in `log_dir` are touched; nothing else there, and nothing outside `log_dir` and `run_dir`.
 
 ### Audit trail and outcome metrics
@@ -614,7 +607,7 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
 - **The file is checked at start**, and ochell does not start with one it cannot trust:
   - it must be valid: a tier or a setting that ochell does not know is an error, so a misspelt limit never silently means no limit;
   - it must belong to root or to the user ochell runs as, and must not be writable by its group or by others; its directory must not be writable by others.
-- **The agent must not be able to write it.** With the `systemd` launcher the agent is another OS user, and the checks above keep it out. With the `podman` launcher the file is not in the agent's container. With the `direct` launcher the agent runs as ochell's own user and can write whatever ochell can; ochell logs a warning at start.
+- **The agent must not be able to write it.** With the `systemd` launcher the agent is another OS user, and the checks above keep it out. With the `direct` launcher the agent runs as ochell's own user and can write whatever ochell can; ochell logs a warning at start.
 - **`ochell policy-check --config config.yaml`** reads the file as `serve` does and prints the tiers and the scheduling settings. Use it in the review of a change, or with `--policy-file` on a file that is not installed yet.
 - **A change takes effect at the next start** of ochell. Tickets keep the tier they have until they are assigned again.
 - **Without `policy.file`** there is one built-in tier, `normal`, with the defaults above, and every ticket runs under it.
@@ -1033,7 +1026,7 @@ Limits on what starts a run, and one way to talk to the running ochell.
   - Message text is never a way in: what a comment says does not change who may send one, or what the agent may do.
 
 **The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `cost`, `outcomes`, `backup`, `autonomy`, `promote`, `demote`, `flag`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
-- Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port: the agent runs on the same host and can reach any local port. With the `systemd` launcher the agent is another user and cannot open the socket; with the `podman` launcher the socket is not in its container; with the `direct` launcher it is the same user and can.
+- Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port: the agent runs on the same host and can reach any local port. With the `systemd` launcher the agent is another user and cannot open the socket; with the `direct` launcher it is the same user and can.
 - Keep the socket in a directory that the agent user cannot write to.
 
 ### Workspaces
@@ -1050,7 +1043,7 @@ workspace:
 ```
 
 - **`root`**: every working directory must be inside it. A run whose `workdir` is outside is refused (`not_started`) before anything is created. Without a root nothing is checked and nothing is ever removed.
-- **Hooks** are ochell's own; they are not the hooks inside the agent's runtime. Each is a command with arguments, run without a shell, in the working directory, through the same launcher and as the same OS user as the agent. So with the `systemd` launcher the agent user owns the clone. With the `podman` launcher each hook is a container of its own, of the same image and with the same directories as the agent's, so what a hook calls (`git`) must be in the image.
+- **Hooks** are ochell's own; they are not the hooks inside the agent's runtime. Each is a command with arguments, run without a shell, in the working directory, through the same launcher and as the same OS user as the agent. So with the `systemd` launcher the agent user owns the clone.
 
   | Hook | When | If it fails |
   |---|---|---|
@@ -1070,7 +1063,6 @@ workspace:
   - **Linear:** an `Issue` event whose issue is completed, cancelled or removed. Linear sends these only when the app's webhook also subscribes to **Issues**. The shape of that payload was not checked against Linear.
   - The closed ticket becomes `done`. A ticket whose run is queued or running is stopped first (see *Stopping from the ticket*), and its directory goes when the run has ended.
   - With the `systemd` launcher the directory is removed as the agent user (`/bin/rm -rf`, through the launch script). What was done is in `<log_dir>/<time>-<source>-<key>.remove.log`.
-  - With the `podman` launcher ochell removes the directory itself, and with it the ticket's home directory in `agent.podman.state_dir` (see [Launchers](#launchers)).
   - The agent session is forgotten with the directory. A ticket that is assigned again gets a new directory and a new session.
 
 ### Ticket states
@@ -1127,7 +1119,7 @@ An adapter holds what differs between agent CLIs: how a run is started, how an e
 - **What is stored** with each run: the message, the session id, the cost in USD and the token counts. See [Cost and budgets](#cost-and-budgets) for how the cost of a resumed run is worked out.
 - **Budget:** for a ticket whose tier has a budget, the adapter adds `--max-budget-usd` with what the ticket has left. `--max-budget-usd` must not be in `agent.args`.
 - **Resume:** when a ticket runs again, in the same working directory as before, ochell continues the session of its last run instead of starting from zero. The run log says `session=new` or `session=resumed <id>`.
-  - Claude Code keeps its sessions under the agent user's configuration directory, so that directory must be the same for both runs. With the `podman` launcher that is the ticket's home directory, which ochell mounts in every container of the ticket.
+  - Claude Code keeps its sessions under the agent user's configuration directory, so that directory must be the same for both runs.
   - If a resumed run fails without opening a session (the session is gone), ochell forgets the session, and the ticket's next run starts a new one.
 - **Tool use in the Linear session:** while the agent runs, ochell shows the tools it uses as `action` activities in the ticket's Linear session, so the session shows progress between "picked up" and the result.
   - **Not every use is shown:** at most one activity per `sources.linear.tool_activity_interval` (30s). The next one says how many tool calls were left out. Each is ephemeral: Linear replaces it with the next activity, so the session shows what the agent does now, not a list.
@@ -1139,15 +1131,15 @@ An adapter holds what differs between agent CLIs: how a run is started, how an e
 ### Launchers
 A launcher starts and stops the agent process. `agent.launcher` selects it.
 
-| | `direct` (default) | `systemd` | `podman` |
-|---|---|---|---|
-| The agent runs as | ochell's own OS user | a separate OS user, in a transient unit `ochell-run-<task id>.service` | ochell's own OS user, in a container `ochell-run-<task id>` of its own (rootless podman) |
-| The agent can read ochell's config, Linear token file and logs | yes | no | no: they are not in its container |
-| The agent can read the working directories of other tickets | yes | yes: all runs are the same OS user | no: only its own is in its container |
-| A stop reaches | the agent's process group | every process of the unit, including children that left the process group | every process of the container |
-| After a crash of ochell, the agent that was left is | not found | stopped by its unit name | removed by its container name |
-| Needs | nothing | root to install two scripts, a sudo rule and an agent user | podman, and an image with the agent CLI |
-| Use for | development and tests | deployment | deployment |
+| | `direct` (default) | `systemd` |
+|---|---|---|
+| The agent runs as | ochell's own OS user | a separate OS user, in a transient unit `ochell-run-<task id>.service` |
+| The agent can read ochell's config, Linear token file and logs | yes | no |
+| The agent can read the working directories of other tickets | yes | yes: all runs are the same OS user |
+| A stop reaches | the agent's process group | every process of the unit, including children that left the process group |
+| After a crash of ochell, the agent that was left is | not found | stopped by its unit name |
+| Needs | nothing | root to install two scripts, a sudo rule and an agent user |
+| Use for | development and tests | deployment |
 
 **Why two root-owned scripts.** ochell must not have permission to create systemd units, because that would let it run anything as root. It calls [scripts/ochell-launch](scripts/ochell-launch) and [scripts/ochell-stop](scripts/ochell-stop) through `sudo` instead. The launch script takes the agent user, the workspace root and the environment file from `/etc/ochell/launcher.conf`, never from the caller, and refuses (exit 250) anything but a valid task id, a working directory inside the workspace root, allowed environment variable names and an absolute command path. It creates the working directory as the agent user.
 
@@ -1171,45 +1163,6 @@ Then set `agent.launcher: systemd` and check the result with `scripts/check-laun
 - **Run directory:** `run_dir` must be an absolute path inside `WORKSPACE_ROOT` too, for example `/work/runs`. The launch script creates each run's directory as the agent user, and the unit runs with umask 027. **Add the ochell user to the agent user's group**, so that ochell can read the result files; without that every run ends as `no_result`.
 - **Time limit:** ochell keeps the timer and stops the unit. The unit also gets its own limit, one minute longer, in case ochell is gone.
 
-**The `podman` launcher** runs each agent, and each [workspace hook](#workspaces), in a container of its own. ochell's own OS user starts it with `podman run`; there is no root, no `sudo` and no script in between.
-
-```yaml
-agent:
-  launcher: podman
-  command: claude                        # found in the image
-  workdir: /work/{{.Source}}/{{.Key}}
-  podman:
-    image: registry.example.com/ochell-agent:7
-    env_file: /etc/ochell/agent.env      # the agent's own credential
-    args: [--memory=8g, --cpus=4]
-```
-
-**What changes with `podman`:**
-- **What a container holds.** Its image, and these directories of the host, each under the same path as on the host:
-
-  | Mounted | How | What it is |
-  |---|---|---|
-  | the working directory of the ticket | read and write | `agent.workdir`, rendered for the ticket |
-  | the directory of the run | read and write | `<agent.run_dir>/<task id>`, where the agent leaves its [result file](#the-result-file); `ORCH_RESULT_FILE` holds in the container as it is |
-  | the home directory of the ticket | read and write, as `/home/agent` | `<agent.podman.state_dir>/<source>-<key>`; `HOME` is `/home/agent` |
-
-  Nothing else: not ochell's configuration, store, policy file, token file, logs or admin socket, and not the working directory, run directory or home directory of another ticket. ochell refuses to start a run (`not_started`) whose working directory holds `log_dir`, `run_dir` or `state_dir`; keep the working directories away from ochell's other files yourself.
-- **Working directory:** `workdir` must be an absolute path with `{{.Key}}` in it, so that a container holds the directory of one ticket only. The default `.` is refused at start.
-- **The home directory** is what the agent CLI keeps between the runs of one ticket: for Claude Code its sessions, so that a later run [resumes](#agent-adapters) the earlier one. Every ticket has its own, so an agent cannot read the sessions of another ticket. It is removed with the ticket's working directory (`workspace.cleanup`). What the agent CLI needs in its home directory on every run (settings, a `.gitconfig`) is not there in a new one: put it in the image outside `/home/agent`, or write it in an `after_create` hook.
-- **The image** is `agent.podman.image`. It must hold the agent CLI (`agent.command`; a name is enough, the image has its own `PATH`) and what the hooks call, such as `git`. ochell does not build it.
-  - **`pull: never`** is the default: a run uses an image that is already on the host (`podman pull`, or `podman build`), and fails as `not_started` when there is none. So what an agent runs does not change because a registry changed, and a run does not wait for a download or fail with the registry. `missing`, `newer` and `always` are podman's other policies; with them, name the image by its digest.
-- **Who the agent is:** the same uid in the container as ochell has on the host (`--userns=keep-id`), and not root there. So every file that a run leaves in the mounted directories belongs to ochell's user: ochell reads the result file and removes working directories itself, with no group to set up. The agent has no capabilities (`--cap-drop=all`) and cannot gain any (`--security-opt=no-new-privileges`).
-- **Credentials:** the agent authenticates with a token from `agent.podman.env_file` (`NAME=VALUE` lines: `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`). podman reads the file; it is not mounted. It must not be accessible to its group or to others (mode 0600), which ochell checks at start. No secret is on podman's command line.
-- **Environment:** the container has the environment of its image, so `env_pass` is not used, and nothing of ochell's own environment is passed on (`--env-host=false`, `--http-proxy=false`). ochell passes `ORCH_TASK_*` and `agent.env` as arguments of `podman run`, where other local users can read them, so **no secret goes in `agent.env`**. A proxy for the agent goes there too.
-- **Arguments:** podman changes nothing in them, so the rules of `systemd` about `prompt_via` and the templates do not apply. What [The prompt](#the-prompt) says about ticket text in arguments still does.
-- **Output:** the container's stdout and stderr go to ochell alone (`--log-driver=none`), which writes the run log.
-- **Time limit:** ochell keeps the timer and stops the container. The container also gets its own limit (`--timeout`), one minute longer, in case ochell is gone. The container of a hook that ochell did not see the end of ends at that limit.
-- **Stop:** the agent is the first process of its container. A program in that place gets SIGTERM only if it handles the signal; otherwise it runs on until `stop_grace` is over and podman kills the container. Add `--init` to `args` when the agent should be signalled like any other process.
-- **`args`** are added to every `podman run` after ochell's own options: limits (`--memory`, `--cpus`, `--pids-limit`), `--read-only`, a network. They are the host's; nothing in a ticket or in a repository's `WORKFLOW.md` adds an option. ochell does not check them: an option there can undo what the launcher sets, and a `--volume` there mounts more.
-- **SELinux:** the three directories are mounted with `:Z`, so podman labels them for the one container.
-- **The network is not restricted.** The agent needs the model's API and the git remote. A container reaches whatever the host reaches, also other services on the host that listen on more than the loopback address. What the sandbox isolates is the file system and the processes. Restrict the network with an option in `args` if you need to.
-- **Not a boundary against podman itself:** the containers are rootless and belong to ochell's user. A flaw in podman, the runtime or the kernel that lets a process leave its container gives it what ochell's user has.
-
 **Why a run ended** is in the last line of the run log and in ochell's log, as `outcome`:
 
 | Outcome | Meaning |
@@ -1221,7 +1174,7 @@ agent:
 | `no_progress` | ochell stopped it because it made the same tool calls over and over (see [The watchdog](#the-watchdog)) |
 | `stopped` | ochell stopped it because it is shutting down. The ticket is queued again |
 | `cancelled` | a person stopped the run, from the ticket or by closing or unassigning it |
-| `not_started` | the agent never ran: the command could not be executed, or the launch was refused. With the systemd launcher these are exit codes from 200 (250: refused by the launch script; 203: systemd could not execute the command). With the podman launcher they are 125 (podman could not create the container: no such image, for example), 126 and 127 (the command could not be run in the image) |
+| `not_started` | the agent never ran: the command could not be executed, or the launch was refused. With the systemd launcher these are exit codes from 200 (250: refused by the launch script; 203: systemd could not execute the command). |
 | `interrupted` | ochell itself was killed during the run, and found it unfinished at the next start. The ticket is queued again. This one is only in the store and in ochell's log, not in the run log |
 
 ochell sets the outcome from what it asked for, never from the exit code alone: a unit that systemd stopped exits with 0.
@@ -1274,7 +1227,7 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 | `plan` | the agent was asked for a plan first, and this is it; nothing is changed yet | waits, reason `plan_approval` (see [The plan gate](#the-plan-gate)) |
 
 - **`message`** is a short text for the people on the ticket; it is required for every status but `done`. **`pr_url`** and **`branch`** are optional. ochell keeps the last ones a ticket's runs named. Other fields are ignored.
-- **Where:** the path is in the agent's environment as `ORCH_RESULT_FILE`: `<agent.run_dir>/<task id>/result.json`. Every run has a directory of its own, so a file of an earlier run is never read. Keep `run_dir` outside the working directories, so the file cannot be committed. With the `podman` launcher the run's directory is mounted in its container under the same path.
+- **Where:** the path is in the agent's environment as `ORCH_RESULT_FILE`: `<agent.run_dir>/<task id>/result.json`. Every run has a directory of its own, so a file of an earlier run is never read. Keep `run_dir` outside the working directories, so the file cannot be committed.
 - **How the agent knows:** `{{.ResultInstructions}}` in the prompt template is the text that tells it. It names the variable, the format and the statuses.
 - **No file, or an invalid one:** the run has no result, and the ticket waits for a human with the reason `no_result`. The last line of the run log says `result=none` or `result=invalid`, and ochell's log says what was wrong with the file.
 - **Only a run that ended by itself with status 0 is believed.** For a run that failed, timed out or was stopped, the file is stored but does not change what happens to the ticket.
@@ -1289,7 +1242,7 @@ The agent does **not** inherit ochell's environment, because that holds the webh
 
 A run of any tier gets the same: a tier grants no tools or credentials of its own. What the agent needs (its tools, its MCP servers, its credentials) is set up in the environment that ochell runs in.
 
-With the `systemd` and `podman` launchers `env_pass` is not used: a unit has the environment of the agent user, and a container that of its image.
+With the `systemd` launcher `env_pass` is not used: a unit has the environment of the agent user.
 
 Setting `env_pass` (or `--agent-env-pass`) replaces the default list. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, add that name to `env_pass`. Never add a variable that holds one of ochell's own secrets.
 
@@ -1449,8 +1402,7 @@ Notes:
 - **Graduated autonomy:** a level only holds back what a tier allows, and only an operator on the admin socket raises one (see [Graduated autonomy](#graduated-autonomy)). ochell merges nothing at any level.
 - **Scheduling:** a label of `required_labels` counts only when someone other than the bot account put it on the ticket; the priority and `blocked_by` order the work and are not approvals (see [Scheduling](#scheduling)).
 - **A repository's `WORKFLOW.md`** is untrusted: it is read from the default branch only, it can only narrow the policy, and its templates are placeholders, not programs (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)). That the agent cannot push to the default branch is GitHub's branch protection to enforce.
-- **Agent OS user:** with the `direct` launcher the agent runs as the same OS user as ochell and can read ochell's files. Deploy with the `systemd` or the `podman` launcher (see [Launchers](#launchers)).
-- **Containers:** with the `podman` launcher a run sees the files of its own ticket and run and nothing else of the host. The network is not restricted, and what ochell's own OS user may do with podman is what stands between an agent and the host: rootless podman, a user namespace and no capabilities (see [Launchers](#launchers)).
+- **Agent OS user:** with the `direct` launcher the agent runs as the same OS user as ochell and can read ochell's files. Deploy with the `systemd` launcher (see [Launchers](#launchers)).
 - **Secrets:** never commit secrets or TLS keys. The repository's pre-commit hooks reject private keys.
 
 ## Licensing notes (checked October 2026)

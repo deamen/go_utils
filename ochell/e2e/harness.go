@@ -8,12 +8,10 @@
 //
 // The harness uses the direct launcher. Tests that need the systemd launcher
 // call RequireVM, which skips them unless OCHELL_E2E_VM=1: CI has no systemd,
-// so they run on the VM. Tests that need a real podman call UseRealPodman,
-// which skips them unless OCHELL_E2E_PODMAN=1.
+// so they run on the VM.
 package e2e
 
 import (
-	"archive/tar"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -49,8 +47,7 @@ const (
 	LinearSecret    = "e2e-linear-secret"
 	LinearToken     = "e2e-linear-access-token"
 	BotAccountID    = "712020:digital-employee"
-	// AgentToken is in the environment file of UseFakeSystemd and of the
-	// podman launchers.
+	// AgentToken is in the environment file of UseFakeSystemd.
 	AgentToken = "e2e-agent-token"
 	// LinearAppUserID is the Linear user of the agent app itself.
 	LinearAppUserID = "app-user-0000"
@@ -128,147 +125,6 @@ func UseFakeSystemd(t *testing.T, c *config.Config) string {
 	c.Agent.Workdir = filepath.Join(root, "{{.Source}}-{{.Key}}")
 	c.Agent.RunDir = filepath.Join(root, "runs")
 	return root
-}
-
-// UseFakePodman selects the podman launcher with a stand-in for podman, so
-// the launcher is covered where the tests must not depend on podman. There
-// is no container: the agent runs as a plain process. It returns the
-// directory in which the stand-in records how it was called.
-func UseFakePodman(t *testing.T, c *config.Config) string {
-	t.Helper()
-	fake, err := filepath.Abs("../internal/launcher/testdata/fake-podman")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := podmanDirs(t, c)
-	calls := filepath.Join(dir, "podman")
-	if err := os.Mkdir(calls, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// The launcher takes one program, so the stand-in's setting is in a
-	// script around it.
-	wrapper := filepath.Join(dir, "podman.sh")
-	script := "#!/bin/sh\nFAKE_PODMAN_DIR='" + calls + "' exec '" + fake + "' \"$@\"\n"
-	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	c.Agent.Podman.Command = wrapper
-	c.Agent.Podman.Image = "localhost/ochell-e2e:fake"
-	return calls
-}
-
-// podmanDirs selects the podman launcher with directories of ochell's own
-// in a new temporary directory, which it returns, and a file with the
-// agent's credential.
-func podmanDirs(t *testing.T, c *config.Config) string {
-	t.Helper()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	envFile := filepath.Join(dir, "agent.env")
-	if err := os.WriteFile(envFile, []byte("AGENT_TOKEN="+AgentToken+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c.Agent.Launcher = "podman"
-	c.Agent.Podman.EnvFile = envFile
-	c.Agent.Podman.StateDir = filepath.Join(dir, "state")
-	return dir
-}
-
-var (
-	imageOnce sync.Once
-	imageName string
-	imageErr  error
-)
-
-// podmanImage makes an image that holds the fake agent and nothing else,
-// once per test binary, without a registry: the agent is one static
-// program, imported as the image's only file.
-func podmanImage(podman string) (string, error) {
-	imageOnce.Do(func() {
-		if _, _, imageErr = build(); imageErr != nil {
-			return
-		}
-		agent := filepath.Join(buildDir, "fakeagent")
-		if !prebuilt {
-			// Not the one of the other tests: with the race detector it
-			// needs the C library, which the image does not have.
-			agent = filepath.Join(buildDir, "fakeagent-static")
-			cmd := exec.Command("go", "build", "-o", agent, "ochell/e2e/fakeagent")
-			cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-			if out, err := cmd.CombinedOutput(); err != nil {
-				imageErr = fmt.Errorf("go build the fake agent for the image: %v\n%s", err, out)
-				return
-			}
-		}
-		raw, err := os.ReadFile(agent)
-		if err != nil {
-			imageErr = err
-			return
-		}
-		var layer bytes.Buffer
-		tw := tar.NewWriter(&layer)
-		tw.WriteHeader(&tar.Header{Name: "fakeagent", Mode: 0o755, Size: int64(len(raw))})
-		tw.Write(raw)
-		if imageErr = tw.Close(); imageErr != nil {
-			return
-		}
-		name := fmt.Sprintf("localhost/ochell-e2e-fakeagent:%d", os.Getpid())
-		cmd := exec.Command(podman, "import", "-", name)
-		cmd.Stdin = &layer
-		if out, err := cmd.CombinedOutput(); err != nil {
-			imageErr = fmt.Errorf("podman import: %v\n%s", err, out)
-			return
-		}
-		imageName = name
-	})
-	return imageName, imageErr
-}
-
-// UseRealPodman selects the podman launcher with the real podman and an
-// image that holds the fake agent. It skips the test unless
-// OCHELL_E2E_PODMAN=1: "make test" must not depend on podman.
-// OCHELL_E2E_PODMAN_ARGS adds options to every "podman run", separated by
-// spaces, for a host whose podman needs them.
-//
-// The fake agent is told what to do and leaves its record through two
-// extra mounts, which a real agent does not have: the script, read-only,
-// and the directory of the records.
-func UseRealPodman(t *testing.T, c *config.Config) {
-	t.Helper()
-	if os.Getenv("OCHELL_E2E_PODMAN") != "1" {
-		t.Skip("needs a real podman; set OCHELL_E2E_PODMAN=1")
-	}
-	podman, err := exec.LookPath("podman")
-	if err != nil {
-		t.Fatalf("OCHELL_E2E_PODMAN=1, but there is no podman: %v", err)
-	}
-	image, err := podmanImage(podman)
-	if err != nil {
-		t.Fatal(err)
-	}
-	podmanDirs(t, c)
-	c.Agent.Podman.Command = podman
-	c.Agent.Podman.Image = image
-	c.Agent.Command = "/fakeagent"
-	records := c.Agent.Env["FAKEAGENT_RECORD_DIR"]
-	c.Agent.Podman.Args = []string{"--volume=" + records + ":" + records + ":z"}
-	if script := c.Agent.Env["FAKEAGENT_SCRIPT"]; script != "" {
-		c.Agent.Podman.Args = append(c.Agent.Podman.Args, "--volume="+script+":"+script+":ro,z")
-	}
-	c.Agent.Podman.Args = append(c.Agent.Podman.Args, strings.Fields(os.Getenv("OCHELL_E2E_PODMAN_ARGS"))...)
-}
-
-// Containers returns the names of the containers of ochell's runs that
-// the real podman still has, running or not.
-func Containers(t *testing.T) []string {
-	t.Helper()
-	out, err := exec.Command("podman", "ps", "--all", "--filter", "name=ochell-run-", "--format", "{{.Names}}").Output()
-	if err != nil {
-		t.Fatalf("podman ps: %v", err)
-	}
-	return strings.Fields(string(out))
 }
 
 // Step and Spawn mirror the fake agent's script format (fakeagent/main.go).
@@ -436,9 +292,6 @@ func build() (ochell, agent string, err error) {
 
 // RemoveBinaries deletes the compiled binaries; call it from TestMain.
 func RemoveBinaries() {
-	if imageName != "" {
-		exec.Command("podman", "rmi", "--force", imageName).Run()
-	}
 	if buildDir != "" && !prebuilt {
 		os.RemoveAll(buildDir)
 	}
