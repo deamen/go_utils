@@ -2,8 +2,8 @@
 //
 // Exactly one agent process is started per task; any multi-agent work is
 // managed by that agent. The command is executed without a shell, so ticket
-// content can never be interpreted as shell syntax. A launcher (package
-// launcher) starts and stops the process.
+// content can never be interpreted as shell syntax. Package launcher
+// starts and stops the process.
 //
 // The queue is in the store (package store), so queued tasks survive a
 // restart of ochell.
@@ -69,7 +69,6 @@ type Runner struct {
 	// progress is notify when it is a ProgressNotifier.
 	progress ProgressNotifier
 	adapter  agent.Adapter
-	launcher launcher.Launcher
 	// policy holds the risk tiers; the built-in one without a policy file.
 	policy  *policy.Policy
 	prompt  *template.Template
@@ -157,9 +156,6 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 		return nil, err
 	}
 	if r.adapter, err = agent.New(cfg); err != nil {
-		return nil, err
-	}
-	if r.launcher, err = launcher.New(cfg); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -1254,7 +1250,7 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 
 	// The workspace hooks come first. If one fails, the agent is not
 	// started in a directory that is not ready.
-	if err := r.prepare(ctx, t, dir, runName, file, wf); err != nil {
+	if err := r.prepare(ctx, t, dir, file, wf); err != nil {
 		res.Err = err
 		if ctx.Err() != nil {
 			res.Outcome = task.OutcomeStopped
@@ -1284,7 +1280,6 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 		}
 	})
 	spec := launcher.Spec{
-		TaskID:  runName,
 		Command: r.cfg.Command,
 		Args:    cmd.Args,
 		Stdin:   cmd.Stdin,
@@ -1356,7 +1351,7 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	// after_run follows every run in which the agent was started, but not
 	// one that a shutdown cut short. It does not change how the run ended.
 	if res.Outcome != task.OutcomeNotStarted && ctx.Err() == nil {
-		if err := r.hooks(ctx, "after_run", t, dir, runName, file, wf); err != nil {
+		if err := r.hooks(ctx, "after_run", t, dir, file, wf); err != nil {
 			r.log.Warn("after_run hook failed", "task", t.ID, "err", err)
 		}
 	}
@@ -1398,7 +1393,8 @@ func (r *Runner) execute(ctx context.Context, spec launcher.Spec, stall time.Dur
 		defer tick.Stop()
 		silent = tick.C
 	}
-	proc, err := r.launcher.Start(spec)
+	spec.StopGrace = r.cfg.StopGrace
+	proc, err := launcher.Start(spec)
 	if err != nil {
 		return waitResult{-1, err}, task.OutcomeNotStarted
 	}
@@ -1432,7 +1428,7 @@ func (r *Runner) execute(ctx context.Context, spec launcher.Spec, stall time.Dur
 }
 
 // stop asks the launcher to end the run and waits for the agent to exit.
-func (r *Runner) stop(proc launcher.Process, waited <-chan waitResult) waitResult {
+func (r *Runner) stop(proc *launcher.Process, waited <-chan waitResult) waitResult {
 	var stopErr error
 	if err := proc.Stop(); err != nil {
 		stopErr = fmt.Errorf("stop agent: %w", err)

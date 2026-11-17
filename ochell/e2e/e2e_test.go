@@ -921,7 +921,8 @@ func TestKilledRunIsResumedWithTheRecoveryNote(t *testing.T) {
 	})
 
 	o.Kill()
-	// With the direct launcher a killed ochell leaves its agent behind.
+	// A killed ochell leaves its agent behind: the agent is in its own
+	// process group.
 	syscall.Kill(-rec.PID, syscall.SIGKILL)
 	o.Restart()
 
@@ -2848,7 +2849,7 @@ rules:
   - {project: HIGH, tier: high}
 `
 
-// A tier grants nothing: a run of any tier gets the same tools and
+// A tier has no access of its own: a run of any tier gets the same tools and
 // credentials, those of the environment that ochell runs in. ochell runs
 // no command for a run's credentials and writes no file with them.
 func TestEveryTierGetsTheSameAccess(t *testing.T) {
@@ -3575,9 +3576,6 @@ func TestAuditTrail(t *testing.T) {
 	if r := entry.Tickets[0].Runs[0]; r.ID != first || r.Outcome != "finished" || r.Audit.PolicyVersion != "audit-1" || r.Audit.Tier != "low" ||
 		r.Audit.PromptSHA256 != hex.EncodeToString(sum[:]) {
 		t.Errorf("the first run in the API = %+v", r)
-	}
-	if strings.Contains(body, `"grants"`) {
-		t.Errorf("the API shows grants of a run:\n%s", body)
 	}
 
 	// The outcome metrics per tier, for a period that covers the test.

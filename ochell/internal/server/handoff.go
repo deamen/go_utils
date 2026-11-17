@@ -195,7 +195,7 @@ func (s *Server) followOpen(ctx context.Context, pr store.PullRequest, ref githu
 		return
 	}
 	switch checks.State {
-	case github.ChecksPending:
+	case github.ChecksRunning:
 	case github.ChecksNone:
 		// Checks appear a moment after a push. A pull request that has
 		// none after the grace period has none.

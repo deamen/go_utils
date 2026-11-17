@@ -33,10 +33,10 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-func TestDirectLauncher(t *testing.T) {
+func TestStart(t *testing.T) {
 	out := &syncBuffer{}
 	dir := filepath.Join(t.TempDir(), "new", "dir")
-	p, err := Direct{}.Start(Spec{
+	p, err := Start(Spec{
 		Command: "/bin/sh", Args: []string{"-c", `pwd; cat; echo " a=$A b=$B"; exit 5`}, Dir: dir,
 		Env: []string{"A=1", "B=2"}, Stdin: strings.NewReader("in"), Output: out,
 	})
@@ -49,7 +49,7 @@ func TestDirectLauncher(t *testing.T) {
 	if got, want := out.String(), dir+"\nin a=1 b=2\n"; got != want {
 		t.Errorf("output %q, want %q", got, want)
 	}
-	if _, err := (Direct{}).Start(Spec{Command: "/nonexistent/agent", Dir: dir, Output: out}); !errors.Is(err, ErrNotStarted) {
+	if _, err := Start(Spec{Command: "/nonexistent/agent", Dir: dir, Output: out}); !errors.Is(err, ErrNotStarted) {
 		t.Errorf("missing command: %v, want ErrNotStarted", err)
 	}
 }
@@ -73,12 +73,12 @@ func alive(pid int) bool {
 
 // A stop ends the whole process group of the agent: a child that ignores
 // SIGTERM is killed after the grace period, and nothing is left behind.
-func TestDirectLauncherStopLeavesNoChildBehind(t *testing.T) {
+func TestStopLeavesNoChildBehind(t *testing.T) {
 	out := &syncBuffer{}
-	p, err := Direct{StopGrace: 500 * time.Millisecond}.Start(Spec{
+	p, err := Start(Spec{
 		Command: "/bin/sh",
 		Args:    []string{"-c", `sh -c 'trap "" TERM; while :; do sleep 1; done' & echo "child $!"; wait`},
-		Dir:     t.TempDir(), Output: out,
+		Dir:     t.TempDir(), Output: out, StopGrace: 500 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)

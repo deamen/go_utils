@@ -88,7 +88,7 @@ func TestRead(t *testing.T) {
 	}
 
 	// The agent owns these directories. A link must not make ochell read a
-	// file of its own, which the agent cannot read itself.
+	// file outside them.
 	secret := filepath.Join(t.TempDir(), "secret.json")
 	if err := os.WriteFile(secret, []byte(`{"status":"done","message":"ochell's secret"}`), 0o600); err != nil {
 		t.Fatal(err)

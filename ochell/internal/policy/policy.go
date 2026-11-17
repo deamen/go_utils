@@ -460,7 +460,7 @@ func CheckFile(path string) error {
 		return err
 	}
 	if info.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("policy %s: the file is writable by its group or by others (mode %04o); the agent must not be able to change the policy: chmod go-w", path, info.Mode().Perm())
+		return fmt.Errorf("policy %s: the file is writable by its group or by others (mode %04o); other users must not be able to change the policy: chmod go-w", path, info.Mode().Perm())
 	}
 	dir := filepath.Dir(path)
 	dinfo, err := os.Stat(dir)
