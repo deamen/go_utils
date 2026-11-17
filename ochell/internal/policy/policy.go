@@ -52,8 +52,6 @@ type Tier struct {
 	// AutoMerge is "never", or "after_ci" for work that may be merged
 	// without a person once CI is green.
 	AutoMerge string `yaml:"auto_merge"`
-	// BudgetUSD is what a ticket of this tier may cost; 0: no limit.
-	BudgetUSD float64 `yaml:"budget_usd"`
 	// MaxTurns is how many turns one run of this tier may take; 0: no
 	// limit.
 	MaxTurns int `yaml:"max_turns"`
@@ -166,8 +164,6 @@ type Throttles struct {
 	// MaxOpenPRsPerRepo is how many pull requests of the bot may be open
 	// in one repository. A ticket that would open another one is held.
 	MaxOpenPRsPerRepo int `yaml:"max_open_prs_per_repo"`
-	// DailySpendUSD is what the runs of one day (UTC) may cost in total.
-	DailySpendUSD float64 `yaml:"daily_spend_usd"`
 }
 
 // Values of scheduling.blocked_by.
@@ -365,7 +361,7 @@ func (p *Policy) Validate() error {
 	if strings.ContainsAny(p.Version, " \t\n\r") || len(p.Version) > 64 {
 		errs = append(errs, errors.New("version must be one word of at most 64 characters"))
 	}
-	if th := p.Throttles; th.MaxRunsPerHour < 0 || th.MaxOpenPRsPerRepo < 0 || th.DailySpendUSD < 0 {
+	if th := p.Throttles; th.MaxRunsPerHour < 0 || th.MaxOpenPRsPerRepo < 0 {
 		errs = append(errs, errors.New("throttles: a limit must not be negative; 0 means no limit"))
 	}
 	errs = append(errs, p.Scheduling.validate()...)
@@ -392,9 +388,6 @@ func (p *Policy) Validate() error {
 		}
 		if t.AutoMerge != AutoMergeNever && t.AutoMerge != AutoMergeAfterCI {
 			errs = append(errs, fmt.Errorf("%s: auto_merge must be never or after_ci", at))
-		}
-		if t.BudgetUSD < 0 {
-			errs = append(errs, fmt.Errorf("%s: budget_usd must not be negative; 0 means no limit", at))
 		}
 		if t.MaxTurns < 0 {
 			errs = append(errs, fmt.Errorf("%s: max_turns must not be negative; 0 means no limit", at))
@@ -568,9 +561,6 @@ func (p *Policy) Describe() []string {
 	var out []string
 	for _, t := range p.Tiers {
 		line := fmt.Sprintf("%s: plan_gate=%s pr_review=%s auto_merge=%s", t.Name, t.PlanGate, t.PRReview, t.AutoMerge)
-		if t.BudgetUSD > 0 {
-			line += fmt.Sprintf(" budget_usd=%g", t.BudgetUSD)
-		}
 		if t.MaxTurns > 0 {
 			line += fmt.Sprintf(" max_turns=%d", t.MaxTurns)
 		}

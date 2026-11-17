@@ -1952,19 +1952,21 @@ func TestTierChangeFromAnUpdate(t *testing.T) {
 }
 
 func TestEscalationText(t *testing.T) {
-	res := task.Result{Outcome: task.OutcomeOverBudget, Err: errors.New("the run was stopped: it used up its budget"), Escalation: task.EscalationBudget, TierBefore: "low", TierAfter: "normal"}
+	res := task.Result{Outcome: task.OutcomeOverTurns, Err: errors.New("the run was stopped: it reached the limit of 30 turns of the tier low"), Escalation: task.EscalationTurns, TierBefore: "low", TierAfter: "normal"}
 	got := escalationText(&task.Task{Source: "jira", Key: "DEV-1"}, res)
 	for _, want := range []string{
-		"The run was stopped: it used up its budget.\n\nThis is an escalation (budget): DEV-1 now waits for a human.",
+		"The run was stopped: it reached the limit of 30 turns of the tier low.\n\nThis is an escalation (turns): DEV-1 now waits for a human.",
 		`It moved up from the risk tier "low" to "normal"`,
 		"- To let it go on where it stopped: comment on this ticket.",
 		"- To change what it should do: change the ticket",
 		"- To cancel: write /stop as the first line of a comment",
-		`"ochell reset jira DEV-1" starts the budget anew`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("text lacks %q:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "budget") {
+		t.Errorf("text speaks of a budget:\n%s", got)
 	}
 	// The highest tier: nothing to move up to; the agent's own words.
 	res = task.Result{Outcome: task.OutcomeFinished, Signal: result.OutOfScope, SignalMessage: "It asks for a deploy.", Escalation: task.EscalationOutOfScope}

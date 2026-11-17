@@ -19,8 +19,6 @@ owners:
 #   plan_gate:  skip | required   (default skip)
 #   pr_review:  required | sampled   (default required)
 #   auto_merge: never | after_ci   (default never)
-#   budget_usd: what one ticket may cost; 0 or left out: no limit. It needs
-#               agent.adapter claude; "ochell reset" starts it anew
 #   max_turns:  how many turns one run may take; 0 or left out: no limit.
 #               It needs agent.adapter claude
 #   labels:     a ticket with one of these labels gets at least this tier
@@ -38,17 +36,14 @@ tiers:
     plan_gate: skip
     pr_review: required
     auto_merge: never
-    budget_usd: 5
   - name: normal
     plan_gate: skip
     pr_review: required
     auto_merge: never
-    budget_usd: 20
   - name: high
     plan_gate: required
     pr_review: required
     auto_merge: never
-    budget_usd: 50
     labels: [risk-high, security]
     allowed_assigners: ["557058:team-lead", team.lead@example.com]
     max_concurrent: 1
@@ -63,7 +58,6 @@ paused: false
 throttles:
   max_runs_per_hour: 20        # runs that may start within one hour
   max_open_prs_per_repo: 5     # open pull requests of the bot in one repository
-  daily_spend_usd: 100         # what the runs of one day (UTC) may cost; needs agent.adapter claude
 
 # Scheduling: which queued ticket starts next, and which waits. The queue is
 # always in the order of the tracker's priority (the most urgent first, a

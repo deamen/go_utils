@@ -57,7 +57,7 @@ func (r *Runner) host(tier policy.Tier) workflow.Host {
 		Tier:           tier,
 		AllowHooks:     r.wfCfg.AllowHooks,
 		ReviewStatuses: r.wfCfg.ReviewStatuses,
-		LimitsTurns:    agent.LimitsBudget(r.adapter),
+		LimitsTurns:    agent.LimitsTurns(r.adapter),
 	}
 }
 

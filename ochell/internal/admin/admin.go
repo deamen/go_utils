@@ -236,7 +236,7 @@ func routes(c Control, log *slog.Logger) http.Handler {
 		}
 		switch err := c.ResetAttempts(source, key); {
 		case err == nil:
-			answer(w, http.StatusOK, fmt.Sprintf("the attempts and the budget of %s %s are reset%s; assign the ticket again, or reply on it, to start it", source, key, note))
+			answer(w, http.StatusOK, fmt.Sprintf("the attempts of %s %s are reset%s; assign the ticket again, or reply on it, to start it", source, key, note))
 		case errors.Is(err, store.ErrUnknown):
 			answer(w, http.StatusNotFound, fmt.Sprintf("ochell knows no %s ticket %s", source, key))
 		default:
@@ -408,21 +408,10 @@ func costText(rep *runner.CostReport, one bool) string {
 	tokens := func(u agent.Usage) string {
 		return fmt.Sprintf("%d\t%d\t%d\t%d", u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
 	}
-	budget := func(t runner.TicketCost) string {
-		if t.BudgetUSD <= 0 {
-			return "-"
-		}
-		return fmt.Sprintf("%.4f of %.2f", t.SinceResetUSD, t.BudgetUSD)
-	}
 	tw := tabwriter.NewWriter(&b, 0, 8, 2, ' ', 0)
 	if one && len(rep.Tickets) == 1 {
 		t := rep.Tickets[0]
 		fmt.Fprintf(&b, "%s %s: tier %s, %s, %d run(s), %.4f USD\n", t.Source, t.Key, t.Tier, t.State, t.Runs, t.CostUSD)
-		if t.BudgetUSD > 0 {
-			fmt.Fprintf(&b, "budget: %.4f USD of %.2f USD used since the last reset\n", t.SinceResetUSD, t.BudgetUSD)
-		} else {
-			fmt.Fprintf(&b, "budget: none in the tier %s\n", t.Tier)
-		}
 		fmt.Fprintln(tw, "RUN\tATTEMPT\tTIER\tOUTCOME\tCOST USD\tINPUT\tOUTPUT\tCACHE READ\tCACHE WRITE")
 		for _, r := range rep.Runs {
 			outcome := string(r.Outcome)
@@ -439,9 +428,9 @@ func costText(rep *runner.CostReport, one bool) string {
 	if len(rep.Tickets) == 0 {
 		return b.String()
 	}
-	fmt.Fprintln(tw, "TICKET\tTIER\tSTATE\tRUNS\tCOST USD\tBUDGET USD\tINPUT\tOUTPUT\tCACHE READ\tCACHE WRITE")
+	fmt.Fprintln(tw, "TICKET\tTIER\tSTATE\tRUNS\tCOST USD\tINPUT\tOUTPUT\tCACHE READ\tCACHE WRITE")
 	for _, t := range rep.Tickets {
-		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%d\t%.4f\t%s\t%s\n", t.Source, t.Key, t.Tier, t.State, t.Runs, t.CostUSD, budget(t), tokens(t.Usage))
+		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%d\t%.4f\t%s\n", t.Source, t.Key, t.Tier, t.State, t.Runs, t.CostUSD, tokens(t.Usage))
 	}
 	tw.Flush()
 	return b.String()

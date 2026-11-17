@@ -1047,8 +1047,8 @@ func TestRunsRecordTheirTier(t *testing.T) {
 	}
 }
 
-// What a ticket has cost is the sum over its runs; the part since the last
-// reset is what counts against a budget.
+// What a ticket has cost is the sum over its runs. A reset of its attempts
+// changes nothing of it.
 func TestCosts(t *testing.T) {
 	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
 	t0 := time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
@@ -1080,7 +1080,7 @@ func TestCosts(t *testing.T) {
 	}
 
 	c, err := s.TicketCost("linear", "ENG-1")
-	if err != nil || c.Runs != 2 || c.CostUSD != 0.75 || c.SinceResetUSD != 0.75 || c.Tier != "low" ||
+	if err != nil || c.Runs != 2 || c.CostUSD != 0.75 || c.Tier != "low" ||
 		c.Usage != (agent.Usage{InputTokens: 11, OutputTokens: 22, CacheReadTokens: 3, CacheWriteTokens: 4}) {
 		t.Errorf("cost of ENG-1 = %+v, %v", c, err)
 	}
@@ -1098,13 +1098,25 @@ func TestCosts(t *testing.T) {
 		t.Errorf("SessionCost of a run without a stored total = %v, want 2", got)
 	}
 
-	// A reset starts the budget anew and keeps the record.
+	// A reset keeps the record.
 	if err := s.ResetAttempts("linear", "ENG-1"); err != nil {
 		t.Fatal(err)
 	}
 	run("r5", "ENG-1", task.Result{SessionID: "s1", CostUSD: 0.125, SessionCostUSD: 0.875})
-	if c, _ := s.TicketCost("linear", "ENG-1"); c.Runs != 3 || c.CostUSD != 0.875 || c.SinceResetUSD != 0.125 {
+	if c, _ := s.TicketCost("linear", "ENG-1"); c.Runs != 3 || c.CostUSD != 0.875 {
 		t.Errorf("cost of ENG-1 after a reset = %+v", c)
+	}
+
+	// A run recorded by an older ochell can hold the outcome over_budget
+	// and the escalation budget, which are no longer set: it reads as it is.
+	if _, err := s.db.Exec(`UPDATE runs SET outcome = 'over_budget', escalation = 'budget' WHERE id = 'r5'`); err != nil {
+		t.Fatal(err)
+	}
+	if old, err := s.Run("r5"); err != nil || old.Result.Outcome != "over_budget" || old.Result.Escalation != "budget" {
+		t.Errorf("an old run with the outcome over_budget = %+v, %v", old, err)
+	}
+	if runs, err := s.RunCosts("linear", "ENG-1"); err != nil || len(runs) != 3 || runs[2].Outcome != "over_budget" {
+		t.Errorf("RunCosts with an old outcome = %+v, %v", runs, err)
 	}
 
 	runs, err := s.RunCosts("linear", "ENG-1")
@@ -1178,7 +1190,7 @@ func TestEscalationHoldsTheTicket(t *testing.T) {
 	}
 
 	// A person's stop wins over an escalation.
-	res = task.Result{Outcome: task.OutcomeCancelled, ExitCode: -1, Err: errors.New("stopped by a person"), Escalation: task.EscalationBudget}
+	res = task.Result{Outcome: task.OutcomeCancelled, ExitCode: -1, Err: errors.New("stopped by a person"), Escalation: task.EscalationTurns}
 	if err := s.Finish("r3", res); err != nil {
 		t.Fatal(err)
 	}
@@ -1410,19 +1422,15 @@ func TestHolds(t *testing.T) {
 	}
 	finish(third, task.Result{CostUSD: 5})
 
-	// The daily spend: 5 USD today (the first two runs were an hour ago,
-	// but on the same day: 12 in all).
-	s.SetHolds(Holds{DailySpendUSD: 12})
-	queue("LOW-3", "low", "")
-	if got := claim(); got != "" {
-		t.Fatalf("claimed %q over the daily spend", got)
-	}
-	if h, _ := s.Holding(); len(h.Throttles) != 1 || !strings.Contains(h.Throttles[0], "daily_spend_usd: the runs of today (UTC) have cost 12.00 USD, the limit is 12.00") {
-		t.Errorf("Holding = %+v", h)
-	}
+	// What the runs have cost (12 USD so far) holds nothing back.
 	now = now.Add(24 * time.Hour)
+	s.SetHolds(Holds{})
+	queue("LOW-3", "low", "")
+	if h, _ := s.Holding(); h.All() || len(h.Throttles) != 0 {
+		t.Errorf("Holding without throttles = %+v", h)
+	}
 	if got := claim(); got != "LOW-3" {
-		t.Fatalf("claimed %q the next day, want LOW-3", got)
+		t.Fatalf("claimed %q, want LOW-3", got)
 	}
 	// It opens a pull request in its repository.
 	finish("r4", task.Result{PRURL: "https://example.test/pr/1"})

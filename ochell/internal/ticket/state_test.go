@@ -88,7 +88,6 @@ func TestAfterRun(t *testing.T) {
 		{task.OutcomeFinished, result.OutOfScope}:    {Waiting, ReasonEscalation},
 		{task.OutcomeFinished, result.Plan}:          {Waiting, ReasonPlanApproval},
 		{task.OutcomeFailed, result.Plan}:            {Failed, ""},
-		{task.OutcomeOverBudget, result.None}:        {Waiting, ReasonEscalation},
 		{task.OutcomeOverTurns, result.Done}:         {Waiting, ReasonEscalation},
 		{task.OutcomeFinished, result.None}:          {Waiting, ReasonNoResult},
 		// Any other run: the outcome decides, whatever the agent wrote.

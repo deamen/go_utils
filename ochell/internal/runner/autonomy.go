@@ -18,7 +18,7 @@ import (
 // numbers of the class at that moment.
 //
 // A change holds for the runs that start after it. Nothing here stops a
-// run, moves a ticket to another tier or changes a budget.
+// run or moves a ticket to another tier.
 
 // ByOchell is who decided a demotion that nobody decided.
 const ByOchell = "ochell itself"

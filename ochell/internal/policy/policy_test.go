@@ -12,9 +12,9 @@ const three = `
 version: "2026-11"
 owners: [alice@example.com]
 tiers:
-  - {name: low, budget_usd: 5}
-  - {name: normal, budget_usd: 20, labels: [needs-care]}
-  - {name: high, plan_gate: required, budget_usd: 50, labels: [risk-high, Security]}
+  - {name: low, max_turns: 30}
+  - {name: normal, labels: [needs-care]}
+  - {name: high, plan_gate: required, labels: [risk-high, Security]}
 default_tier: normal
 rules:
   - {source: jira, project: OPS, issue_type: Bug, tier: low}
@@ -31,7 +31,7 @@ func TestParse(t *testing.T) {
 		t.Fatalf("policy = %+v", p)
 	}
 	// What a tier leaves out is the careful setting.
-	if low := p.Tier("low"); low.PlanGate != PlanGateSkip || low.PRReview != PRReviewRequired || low.AutoMerge != AutoMergeNever || low.BudgetUSD != 5 {
+	if low := p.Tier("low"); low.PlanGate != PlanGateSkip || low.PRReview != PRReviewRequired || low.AutoMerge != AutoMergeNever || low.MaxTurns != 30 {
 		t.Errorf("low = %+v", low)
 	}
 	if high := p.Tier("high"); high.PlanGate != PlanGateRequired {
@@ -47,7 +47,7 @@ func TestParse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, _ := Parse([]byte("tiers: [{name: only, budget_usd: 1}]\ndefault_tier: only\n"))
+	b, _ := Parse([]byte("tiers: [{name: only, max_turns: 1}]\ndefault_tier: only\n"))
 	if !strings.HasPrefix(a.Version, "sha256:") || a.Version == b.Version {
 		t.Errorf("versions %q and %q", a.Version, b.Version)
 	}
@@ -94,8 +94,8 @@ func TestInvalidPolicies(t *testing.T) {
 		"bad plan gate":        {"tiers: [{name: a, plan_gate: maybe}]\ndefault_tier: a", "plan_gate must be skip or required"},
 		"bad review":           {"tiers: [{name: a, pr_review: never}]\ndefault_tier: a", "pr_review must be required or sampled"},
 		"bad merge":            {"tiers: [{name: a, auto_merge: always}]\ndefault_tier: a", "auto_merge must be never or after_ci"},
-		"negative budget":      {"tiers: [{name: a, budget_usd: -1}]\ndefault_tier: a", "budget_usd must not be negative"},
-		"misspelt setting":     {"tiers: [{name: a, budget: 5}]\ndefault_tier: a", "field budget not found"},
+		"negative turns":       {"tiers: [{name: a, max_turns: -1}]\ndefault_tier: a", "max_turns must not be negative"},
+		"misspelt setting":     {"tiers: [{name: a, max_turn: 5}]\ndefault_tier: a", "field max_turn not found"},
 		"unknown top level":    {"tiers: [{name: a}]\ndefault_tier: a\nteirs: []", "field teirs not found"},
 		"rule without tier":    {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{project: X}]", "rules[0].tier is required"},
 		"rule unknown tier":    {"tiers: [{name: a}]\ndefault_tier: a\nrules: [{project: X, tier: b}]", `there is no tier "b"`},
@@ -432,6 +432,21 @@ autonomy:
 	for _, l := range Levels {
 		if got := Narrow(strict, l); got.PlanGate != strict.PlanGate || got.PRReview != strict.PRReview || got.AutoMerge != strict.AutoMerge {
 			t.Errorf("a strict tier at %s was widened: %+v", l, got)
+		}
+	}
+}
+
+// What a ticket or a day may cost is not ochell's to manage: a policy that
+// still sets a budget or a daily spend is refused as an unknown setting.
+func TestBudgetIsRefused(t *testing.T) {
+	for name, c := range map[string]struct{ in, want string }{
+		"tier budget":    {"tiers: [{name: a, budget_usd: 5}]\ndefault_tier: a", "field budget_usd not found"},
+		"no tier budget": {"tiers: [{name: a, budget_usd: 0}]\ndefault_tier: a", "field budget_usd not found"},
+		"daily spend":    {"tiers: [{name: a}]\ndefault_tier: a\nthrottles: {daily_spend_usd: 100}", "field daily_spend_usd not found"},
+		"no daily spend": {"tiers: [{name: a}]\ndefault_tier: a\nthrottles: {daily_spend_usd: 0}", "field daily_spend_usd not found"},
+	} {
+		if _, err := Parse([]byte(c.in)); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
 		}
 	}
 }
