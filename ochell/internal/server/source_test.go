@@ -379,9 +379,6 @@ func TestGitHubIssueIsTold(t *testing.T) {
 	if err := quiet.Finished(ctx, tk, task.Result{Signal: result.Done}); err != nil {
 		t.Errorf("Finished without a token: %v", err)
 	}
-	if quiet.Tickets("github") != nil || s.Tickets("github") == nil {
-		t.Error("the ticket tools have the GitHub tickets with the token only")
-	}
 }
 
 // The poller starts an issue whose webhook was missed, and stops what is

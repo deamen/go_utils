@@ -103,22 +103,11 @@ type Grants struct {
 	// useless. Both are run by ochell itself, not as the agent.
 	Mint   []string `yaml:"mint"`
 	Revoke []string `yaml:"revoke"`
-	// TicketTools gives a run ochell's ticket tools: it reads and comments
-	// on its ticket through ochell's own MCP server, and needs no tracker
-	// token for that. The host must have them turned on (ticket_tools in
-	// the configuration).
-	TicketTools bool `yaml:"ticket_tools"`
 }
-
-// TicketToolsRefs are what the MCP configuration of a tier with the ticket
-// tools must refer to: the address of ochell's server and the token of the
-// run, which the agent CLI replaces from the run's environment. The token
-// is never in a file.
-var TicketToolsRefs = []string{"${ORCH_TOOLS_URL}", "${ORCH_TOOLS_TOKEN}"}
 
 // Empty reports whether the tier grants nothing.
 func (g Grants) Empty() bool {
-	return g.MCPConfig == "" && len(g.Env) == 0 && g.CredentialsFile == "" && len(g.Mint) == 0 && !g.TicketTools
+	return g.MCPConfig == "" && len(g.Env) == 0 && g.CredentialsFile == "" && len(g.Mint) == 0
 }
 
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -211,16 +200,6 @@ func (p *Policy) checkGrants() error {
 		if g.MCPConfig != "" {
 			if info, err := os.Stat(g.MCPConfig); err != nil || !info.Mode().IsRegular() {
 				errs = append(errs, fmt.Errorf("tier %s: grants.mcp_config %s is not a file that ochell can see (%v)", t.Name, g.MCPConfig, err))
-			} else if g.TicketTools {
-				// With mcp_config the agent gets the servers of that file
-				// and no others, so ochell's own has to be in it.
-				raw, err := os.ReadFile(g.MCPConfig)
-				for _, ref := range TicketToolsRefs {
-					if err != nil || !strings.Contains(string(raw), ref) {
-						errs = append(errs, fmt.Errorf("tier %s: grants.ticket_tools: grants.mcp_config %s does not name ochell's server: it needs an entry with %s (see examples/mcp-ticket-tools.json)", t.Name, g.MCPConfig, ref))
-						break
-					}
-				}
 			}
 		}
 		if g.CredentialsFile != "" {
@@ -762,9 +741,6 @@ func (p *Policy) Describe() []string {
 			}
 			if len(g.Mint) > 0 {
 				what = append(what, "mint")
-			}
-			if g.TicketTools {
-				what = append(what, "ticket_tools")
 			}
 			line += " grants=" + strings.Join(what, "+")
 		}

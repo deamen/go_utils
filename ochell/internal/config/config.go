@@ -10,12 +10,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"net/url"
 	"os"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -189,10 +187,6 @@ type Podman struct {
 // PodmanPulls are the values of agent.podman.pull.
 var PodmanPulls = []string{"never", "missing", "newer", "always"}
 
-// ContainerHost is the name under which a container reaches the host it
-// runs on. podman puts it in the hosts file of every container.
-const ContainerHost = "host.containers.internal"
-
 type JiraWebhook struct {
 	Enabled      bool   `yaml:"enabled"`
 	Path         string `yaml:"path"`
@@ -297,9 +291,9 @@ type GitHubSource struct {
 	// Token is a token of the digital employee's GitHub account with read
 	// and write access to issues (and to pull requests, when pull requests
 	// are assigned to it), and nothing else. ochell comments on the issue
-	// with it, and asks GitHub about issues for the poller, the gates of
-	// scheduling and the ticket tools. It is not github.token, which only
-	// reads, and it is not the agent's. Empty: an issue gets no answer
+	// with it, and asks GitHub about issues for the poller and the gates of
+	// scheduling. It is not github.token, which only reads, and it is not
+	// the agent's. Empty: an issue gets no answer
 	// from ochell, and GitHub is not asked.
 	Token string `yaml:"token"`
 	// Repos are the repositories whose issues may become tickets. A
@@ -623,51 +617,6 @@ type Metrics struct {
 	Token string `yaml:"token"`
 }
 
-// TicketTools configures ochell's own MCP server: tools with which an
-// agent reads and comments on the ticket of its run, through ochell and
-// with ochell's access to the tracker, so that the agent needs no tracker
-// token. Which runs get them is the policy's to say (grants.ticket_tools
-// of a tier).
-type TicketTools struct {
-	Enabled bool `yaml:"enabled"`
-	// URL is the address under which an agent on this host reaches the
-	// server. Empty: the HTTP listener on the loopback address, with the
-	// server's path; with the podman launcher, the HTTP listener under
-	// the name that a container has for its host.
-	URL string `yaml:"url"`
-}
-
-// ticketToolsPath is where the server is mounted (mcp.Path).
-const ticketToolsPath = "/mcp"
-
-// TicketToolsURL returns the address of the ticket tools for an agent: URL, or
-// the HTTP listener.
-func (c *Config) TicketToolsURL() string {
-	if c.TicketTools.URL != "" {
-		return c.TicketTools.URL
-	}
-	host := c.HTTP.Address
-	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
-		// The listener takes every address; the agent is on this host.
-		host = "127.0.0.1"
-		if c.Agent.Launcher == "podman" {
-			// The loopback address of a container is its own.
-			host = ContainerHost
-		}
-	}
-	return "http://" + net.JoinHostPort(host, strconv.Itoa(c.HTTP.Port)) + ticketToolsPath
-}
-
-// loopback reports whether a listener with this address takes connections
-// from the host itself only.
-func loopback(address string) bool {
-	if address == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(address)
-	return ip != nil && ip.IsLoopback()
-}
-
 // Poller configures the safety net behind the webhooks: ochell asks each
 // tracker for the bot's open tickets, at start and then at this interval.
 type Poller struct {
@@ -695,7 +644,6 @@ type Config struct {
 	Retention   Retention   `yaml:"retention"`
 	Backup      Backup      `yaml:"backup"`
 	Metrics     Metrics     `yaml:"metrics"`
-	TicketTools TicketTools `yaml:"ticket_tools"`
 	Agent       Agent       `yaml:"agent"`
 	Sources     Sources     `yaml:"sources"`
 	IPAllowlist IPAllowlist `yaml:"ip_allowlist"`
@@ -732,7 +680,7 @@ func (c *Config) RepoFor(source, key string, labels []string) (repo string, ok b
 }
 
 const DefaultPromptTemplate = `You are the digital employee assigned {{.Source}} ticket {{.Key}} ({{.URL}}).
-{{if .TicketTools}}Read the full ticket with the tool get_ticket of the MCP server "ochell"{{else}}Use twg to retrieve the full ticket details{{end}}, complete the task, and open a pull request.
+Use twg to retrieve the full ticket details, complete the task, and open a pull request.
 {{- if .Repo}}
 The repository for this ticket is {{.Repo}}.
 {{- end}}
@@ -1109,37 +1057,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Metrics.Enabled && len(c.Metrics.Token) < 16 {
 		errs = append(errs, errors.New("metrics.token is required when the metrics endpoint is enabled, with at least 16 characters"))
-	}
-	if tt := c.TicketTools; tt.Enabled {
-		if tt.URL == "" && !c.HTTP.Enabled {
-			errs = append(errs, errors.New("ticket_tools.url is required when the http listener is off: the address under which an agent on this host reaches ochell, such as https://ochell.example.com/mcp"))
-		}
-		if tt.URL == "" && c.HTTP.Enabled && c.Agent.Launcher == "podman" && loopback(c.HTTP.Address) {
-			errs = append(errs, errors.New("ticket_tools with agent.launcher podman: the http listener takes only the loopback address, which a container does not reach; let http.address take an address that a container reaches, or set ticket_tools.url"))
-		}
-		if tt.URL != "" {
-			if u, err := url.Parse(tt.URL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Path != ticketToolsPath {
-				errs = append(errs, errors.New("ticket_tools.url must be the address of one of ochell's listeners with the path "+ticketToolsPath+", such as http://127.0.0.1:8080/mcp"))
-			}
-		}
-		// The tools use ochell's own access to each tracker.
-		if (c.Sources.JiraWebhook.Enabled || c.Sources.JiraAutomation.Enabled) && !c.Sources.JiraAPI.Enabled() {
-			errs = append(errs, errors.New("ticket_tools needs sources.jira_api for the Jira tickets: the tools read and comment with ochell's own access to Jira"))
-		}
-		if c.Sources.Linear.Enabled && c.Sources.Linear.ClientID == "" {
-			errs = append(errs, errors.New("ticket_tools needs the Linear app (sources.linear.client_id) for the Linear tickets: the tools read and comment with the app's token"))
-		}
-		if c.Sources.GitHub.Enabled && c.Sources.GitHub.Token == "" {
-			errs = append(errs, errors.New("ticket_tools needs sources.github.token for the GitHub tickets: the tools read and comment with ochell's own access to the issues"))
-		}
-		// A comment that the agent makes through the tools is written by
-		// the account of sources.jira_api. It must be known as the bot's,
-		// or it would start a run like a person's comment.
-		if c.Sources.JiraWebhook.Enabled && c.Sources.JiraWebhook.BotAccountID == "" {
-			errs = append(errs, errors.New("ticket_tools needs sources.jira_webhook.bot_account_id: the account of sources.jira_api, whose comments are never taken as a person's"))
-		}
-	} else if c.TicketTools.URL != "" {
-		errs = append(errs, errors.New("ticket_tools.url is set but ticket_tools.enabled is not"))
 	}
 	if _, err := c.Agent.TokenExpiry(); err != nil {
 		errs = append(errs, err)

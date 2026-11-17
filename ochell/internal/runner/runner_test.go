@@ -45,12 +45,6 @@ func TestHelperAgent(t *testing.T) {
 	case "stdin":
 		b, _ := io.ReadAll(os.Stdin)
 		fmt.Print("stdin:", string(b))
-	case "ticket":
-		// Reads its ticket with ochell's ticket tools, and gives its
-		// token away.
-		fmt.Println("token:", os.Getenv("ORCH_TOOLS_TOKEN"))
-		fmt.Println("ticket:", ticketTool(os.Getenv("ORCH_TOOLS_URL"), os.Getenv("ORCH_TOOLS_TOKEN"), "get_ticket", nil))
-		fmt.Println("comment:", ticketTool(os.Getenv("ORCH_TOOLS_URL"), os.Getenv("ORCH_TOOLS_TOKEN"), "add_comment", map[string]any{"body": "my token is " + os.Getenv("ORCH_TOOLS_TOKEN")}))
 	case "sleep":
 		time.Sleep(10 * time.Second)
 	case "chatty":

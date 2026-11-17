@@ -113,8 +113,6 @@ type Source interface {
 	// Tracker returns the API that the poller and the gates of scheduling
 	// ask, or nil when the source cannot be asked.
 	Tracker() tracker.Source
-	// Tickets returns the access for the agent's ticket tools, or nil.
-	Tickets() tracker.Tickets
 	// CheckGates says whether the source can check the gates of
 	// scheduling against its tracker: an error names what it cannot.
 	CheckGates(requiredLabels, blockedBy bool) error

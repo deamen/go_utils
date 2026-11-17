@@ -4,14 +4,12 @@
 // way a tracker is reached (an API client today, perhaps twg later) can
 // change without touching them.
 //
-// The agent reads a ticket with a tool of its own, or, where the host grants
-// them, through ochell's ticket tools (package mcp), which use Tickets.
+// It is not how the agent reads a ticket; the agent has its own tool.
 package tracker
 
 import (
 	"context"
 	"errors"
-	"time"
 )
 
 // Issue is one ticket, as far as ochell needs it.
@@ -103,46 +101,4 @@ type Client interface {
 	Comment(ctx context.Context, key, body string) error
 	// SetStatus moves a ticket to the status with this name.
 	SetStatus(ctx context.Context, key, status string) error
-}
-
-// Ticket is one ticket as the agent's ticket tools show it: what a person
-// sees on its page. All of it is text that people wrote, and untrusted.
-type Ticket struct {
-	Key   string
-	Title string
-	// URL is the page of the ticket for a person.
-	URL         string
-	Description string
-	// Status is the name of the ticket's status, such as "In Progress".
-	Status string
-	// Labels holds the labels of the ticket; for Jira also its components.
-	Labels []string
-	// Comments are the newest comments of the ticket, oldest first, and
-	// MoreComments how many older ones were left out.
-	Comments     []Comment
-	MoreComments int
-}
-
-// Comment is one comment on a ticket.
-type Comment struct {
-	// Author is the name of who wrote it, as the tracker shows it.
-	Author string
-	// Bot: the account that ochell asks the tracker as wrote it.
-	Bot  bool
-	At   time.Time
-	Body string
-}
-
-// MaxComments is how many comments of a ticket Tickets.Ticket returns.
-const MaxComments = 30
-
-// Tickets is the access to one tracker that the agent's ticket tools
-// need, as the bot account: read one ticket, and comment on it. There is
-// nothing here that assigns, relabels, moves or closes a ticket.
-type Tickets interface {
-	// Ticket returns one ticket with its newest comments. It returns
-	// ErrNotFound for a ticket that the tracker does not have.
-	Ticket(ctx context.Context, key string) (Ticket, error)
-	// Comment adds a comment to a ticket.
-	Comment(ctx context.Context, key, body string) error
 }

@@ -282,27 +282,8 @@ type Step struct {
 	TryRead    string `json:"try_read,omitempty"`
 	WaitFile   string `json:"wait_file,omitempty"`
 	IgnoreTerm bool   `json:"ignore_term,omitempty"`
-	MCP        *MCP   `json:"mcp,omitempty"`
 	Exit       *int   `json:"exit,omitempty"`
 	OnRun      int    `json:"on_run,omitempty"`
-}
-
-// MCP is one request of the fake agent to ochell's MCP server: a method of
-// the protocol, or with Tool a call of that tool with Args. TokenFile
-// holds a token to send in the place of the run's own.
-type MCP struct {
-	Method    string         `json:"method,omitempty"`
-	Tool      string         `json:"tool,omitempty"`
-	Args      map[string]any `json:"args,omitempty"`
-	TokenFile string         `json:"token_file,omitempty"`
-}
-
-// Answer is what ochell's MCP server said to one mcp step.
-type Answer struct {
-	Request string `json:"request"`
-	Status  int    `json:"status"`
-	Body    string `json:"body"`
-	Err     string `json:"err,omitempty"`
 }
 
 type File struct {
@@ -351,8 +332,6 @@ type Record struct {
 	// write_file step, by path.
 	Reads  map[string]string `json:"reads,omitempty"`
 	Writes map[string]string `json:"writes,omitempty"`
-	// MCP holds the answer to each mcp step, in order.
-	MCP []Answer `json:"mcp,omitempty"`
 }
 
 // Getenv returns the value of name in the agent's environment.

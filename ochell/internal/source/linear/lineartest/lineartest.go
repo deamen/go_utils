@@ -34,11 +34,7 @@ type Activity struct {
 // Issue is one issue of the fake workspace.
 type Issue struct {
 	Key, Title string
-	// Description is the text of the issue, and State the name of its
-	// workflow state.
-	Description string
-	State       string
-	Labels      []string
+	Labels     []string
 	// DelegatedBy is the user id of who delegated the issue to the agent,
 	// with the email address <id>@example.com. Empty: the issue was never
 	// delegated; the agent was at most mentioned on it.
@@ -58,14 +54,6 @@ type Issue struct {
 	closed, undelegated bool
 }
 
-// Comment is one comment on an issue: one that the agent app posted
-// through the API, or one that a test put there for a person (Say).
-type Comment struct {
-	Key, Body string
-	// Author is the user id of who wrote it.
-	Author string
-}
-
 // Server is a fake Linear API. It accepts one access token.
 type Server struct {
 	URL string
@@ -77,7 +65,6 @@ type Server struct {
 
 	mu         sync.Mutex
 	activities []Activity
-	comments   []Comment
 	issues     []*Issue
 	sessions   map[string][]string // sessions created by the agent, by issue
 	links      map[string]string   // external URL of each session
@@ -125,26 +112,6 @@ func (s *Server) Undelegate(key string) {
 	if is := s.find(key); is != nil {
 		is.undelegated = true
 	}
-}
-
-// Say puts a comment of a person on an issue.
-func (s *Server) Say(key, author, body string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.comments = append(s.comments, Comment{Key: key, Body: body, Author: author})
-}
-
-// Comments returns the comments on an issue so far, oldest first.
-func (s *Server) Comments(key string) []Comment {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out []Comment
-	for _, c := range s.comments {
-		if c.Key == key {
-			out = append(out, c)
-		}
-	}
-	return out
 }
 
 // Fail makes every request from now on fail, until it is called with false.
@@ -205,13 +172,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Query     string `json:"query"`
 		Variables struct {
-			ID       string `json:"id"`
-			After    string `json:"after"`
-			Comments int    `json:"comments"`
-			Input    struct {
+			ID    string `json:"id"`
+			After string `json:"after"`
+			Input struct {
 				AgentSessionID string `json:"agentSessionId"`
 				IssueID        string `json:"issueId"`
-				Body           string `json:"body"`
 				Ephemeral      bool   `json:"ephemeral"`
 				ExternalURLs   []struct {
 					URL string `json:"url"`
@@ -241,17 +206,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		data = s.scheduling(req.Variables.ID)
 	case strings.Contains(req.Query, "OchellIssue"):
 		data = s.issue(req.Variables.ID)
-	case strings.Contains(req.Query, "OchellTicket"):
-		data = s.ticket(req.Variables.ID, req.Variables.Comments)
-	case strings.Contains(req.Query, "OchellComment"):
-		// The mutation takes the id of the issue, not its key.
-		key, ok := strings.CutPrefix(req.Variables.Input.IssueID, "issue-")
-		if !ok || s.find(key) == nil || req.Variables.Input.Body == "" {
-			io.WriteString(w, `{"errors":[{"message":"Entity not found: Issue"}]}`)
-			return
-		}
-		s.comments = append(s.comments, Comment{Key: key, Body: req.Variables.Input.Body, Author: AppUserID})
-		data = map[string]any{"commentCreate": map[string]bool{"success": true}}
 	case strings.Contains(req.Query, "OchellSessionCreate"):
 		key := req.Variables.Input.IssueID
 		if s.find(key) == nil {
@@ -332,44 +286,6 @@ func (s *Server) issue(key string) map[string]any {
 	}
 	issue["history"] = map[string]any{"nodes": history}
 	out["issue"] = issue
-	return out
-}
-
-// ticket answers the query for one issue as a person sees it, with one
-// page of its comments, the newest first.
-func (s *Server) ticket(key string, limit int) map[string]any {
-	out := map[string]any{"viewer": map[string]string{"id": AppUserID}, "issue": nil}
-	is := s.find(key)
-	if is == nil {
-		return out
-	}
-	labels := []map[string]string{}
-	for _, l := range is.Labels {
-		labels = append(labels, map[string]string{"name": l})
-	}
-	nodes := []map[string]any{}
-	more := false
-	for i := len(s.comments) - 1; i >= 0; i-- {
-		c := s.comments[i]
-		if c.Key != key {
-			continue
-		}
-		if len(nodes) == limit {
-			more = true
-			break
-		}
-		nodes = append(nodes, map[string]any{
-			"body": c.Body, "createdAt": time.Date(2026, 11, 16, 9, 0, i, 0, time.UTC).Format("2006-01-02T15:04:05.000Z"),
-			"user": map[string]string{"id": c.Author, "name": "Name of " + c.Author}, "botActor": nil,
-		})
-	}
-	out["issue"] = map[string]any{
-		"id": "issue-" + key, "identifier": key, "title": is.Title, "description": is.Description,
-		"url":      "https://linear.app/example/issue/" + key,
-		"state":    map[string]string{"name": is.State},
-		"labels":   map[string]any{"nodes": labels},
-		"comments": map[string]any{"nodes": nodes, "pageInfo": map[string]bool{"hasNextPage": more}},
-	}
 	return out
 }
 

@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
-	"time"
 
 	"ochell/internal/tracker"
 )
@@ -14,10 +12,7 @@ import (
 // What the poller needs from Linear, as the agent app user. The queries
 // have names, so that a log or a test can tell them apart.
 
-var (
-	_ tracker.Source  = (*Client)(nil)
-	_ tracker.Tickets = (*Client)(nil)
-)
+var _ tracker.Source = (*Client)(nil)
 
 const (
 	issuePage = 50
@@ -318,137 +313,4 @@ func (c *Client) CreateSessionOnIssue(ctx context.Context, key string) (string, 
 		return "", errors.New("linear api: the session was not created")
 	}
 	return out.Create.AgentSession.ID, nil
-}
-
-const ticketQuery = `query OchellTicket($id: String!, $comments: Int!) {
-  viewer { id }
-  issue(id: $id) {
-    id identifier title description url
-    state { name }
-    labels { nodes { name } }
-    comments(first: $comments, orderBy: createdAt) {
-      nodes { body createdAt user { id name } botActor { name } }
-      pageInfo { hasNextPage }
-    }
-  }
-}`
-
-// ticket is what Ticket and Comment read of one issue.
-type ticket struct {
-	Viewer struct {
-		ID string `json:"id"`
-	} `json:"viewer"`
-	Issue *struct {
-		ID          string `json:"id"`
-		Identifier  string `json:"identifier"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		URL         string `json:"url"`
-		State       *struct {
-			Name string `json:"name"`
-		} `json:"state"`
-		Labels struct {
-			Nodes []struct {
-				Name string `json:"name"`
-			} `json:"nodes"`
-		} `json:"labels"`
-		Comments struct {
-			Nodes []struct {
-				Body      string `json:"body"`
-				CreatedAt string `json:"createdAt"`
-				User      *struct {
-					ID   string `json:"id"`
-					Name string `json:"name"`
-				} `json:"user"`
-				BotActor *struct {
-					Name string `json:"name"`
-				} `json:"botActor"`
-			} `json:"nodes"`
-			PageInfo struct {
-				HasNextPage bool `json:"hasNextPage"`
-			} `json:"pageInfo"`
-		} `json:"comments"`
-	} `json:"issue"`
-}
-
-func (c *Client) ticket(ctx context.Context, key string, comments int) (*ticket, error) {
-	var out ticket
-	if err := c.Do(ctx, ticketQuery, map[string]any{"id": key, "comments": comments}, &out); err != nil {
-		if strings.Contains(err.Error(), "Entity not found") {
-			return nil, tracker.ErrNotFound
-		}
-		return nil, err
-	}
-	if out.Issue == nil {
-		return nil, tracker.ErrNotFound
-	}
-	return &out, nil
-}
-
-// Ticket returns one issue as a person sees it: its title, description,
-// state and labels, and its newest comments.
-//
-// The comments are the first page that Linear returns, which is taken to
-// hold the newest; that was not checked against Linear. They are sorted
-// here, so that their order does not depend on Linear's. Linear does not
-// say how many comments an issue has; MoreComments is 1 when there are
-// more.
-func (c *Client) Ticket(ctx context.Context, key string) (tracker.Ticket, error) {
-	t, err := c.ticket(ctx, key, tracker.MaxComments)
-	if err != nil {
-		return tracker.Ticket{}, err
-	}
-	is := t.Issue
-	out := tracker.Ticket{Key: key, Title: is.Title, URL: is.URL, Description: is.Description}
-	if is.State != nil {
-		out.Status = is.State.Name
-	}
-	for _, l := range is.Labels.Nodes {
-		if l.Name != "" {
-			out.Labels = append(out.Labels, l.Name)
-		}
-	}
-	for _, n := range is.Comments.Nodes {
-		one := tracker.Comment{Body: n.Body}
-		one.At, _ = time.Parse(time.RFC3339, n.CreatedAt)
-		switch {
-		case n.User != nil:
-			one.Author, one.Bot = n.User.Name, n.User.ID != "" && n.User.ID == t.Viewer.ID
-		case n.BotActor != nil:
-			// An integration wrote it; the app's own comments are among
-			// these when Linear does not name the app's user.
-			one.Author = n.BotActor.Name
-		}
-		out.Comments = append(out.Comments, one)
-	}
-	slices.SortStableFunc(out.Comments, func(a, b tracker.Comment) int { return a.At.Compare(b.At) })
-	if is.Comments.PageInfo.HasNextPage {
-		out.MoreComments = 1
-	}
-	return out, nil
-}
-
-const commentMutation = `mutation OchellComment($input: CommentCreateInput!) {
-  commentCreate(input: $input) { success }
-}`
-
-// Comment adds a comment to an issue, as the agent app. The mutation wants
-// the id of the issue, not its key, so that is asked for first.
-func (c *Client) Comment(ctx context.Context, key, body string) error {
-	t, err := c.ticket(ctx, key, 1)
-	if err != nil {
-		return err
-	}
-	var out struct {
-		Create struct {
-			Success bool `json:"success"`
-		} `json:"commentCreate"`
-	}
-	if err := c.Do(ctx, commentMutation, map[string]any{"input": map[string]any{"issueId": t.Issue.ID, "body": body}}, &out); err != nil {
-		return err
-	}
-	if !out.Create.Success {
-		return errors.New("linear api: the comment was not created")
-	}
-	return nil
 }

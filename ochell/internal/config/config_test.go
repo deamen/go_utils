@@ -72,6 +72,11 @@ func TestUnknownYAMLKeyRejected(t *testing.T) {
 	if _, err := Load("serve", []string{"--config", p}, nil); err == nil {
 		t.Fatal("expected error for unknown key")
 	}
+	// The ticket tools are gone: a file that still sets them is refused.
+	p = writeYAML(t, "ticket_tools:\n  enabled: true\n")
+	if _, err := Load("serve", []string{"--config", p}, nil); err == nil || !strings.Contains(err.Error(), "field ticket_tools not found") {
+		t.Errorf("ticket_tools: err = %v, want an unknown setting", err)
+	}
 }
 
 func TestValidate(t *testing.T) {
@@ -604,76 +609,6 @@ func TestAPISettings(t *testing.T) {
 	}
 }
 
-func TestTicketToolsSettings(t *testing.T) {
-	base := func() *Config {
-		cfg := Default()
-		cfg.Sources.JiraWebhook = JiraWebhook{Enabled: true, Path: "/webhooks/jira", Secret: "s", BotAccountID: "712020:bot", MaxSkew: time.Hour}
-		cfg.Sources.JiraAPI = JiraAPI{BaseURL: "https://example.atlassian.net", Email: "bot@example.com", Token: "t"}
-		cfg.TicketTools.Enabled = true
-		return cfg
-	}
-	cfg := base()
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("valid ticket tools: %v", err)
-	}
-	// The address for an agent: the HTTP listener, on the loopback address
-	// when it takes every address.
-	for name, c := range map[string]struct {
-		change func(*Config)
-		want   string
-	}{
-		"every address": {func(*Config) {}, "http://127.0.0.1:8080/mcp"},
-		"one address":   {func(c *Config) { c.HTTP.Address, c.HTTP.Port = "10.0.0.5", 9000 }, "http://10.0.0.5:9000/mcp"},
-		"IPv6":          {func(c *Config) { c.HTTP.Address = "::" }, "http://127.0.0.1:8080/mcp"},
-		"a name":        {func(c *Config) { c.HTTP.Address = "localhost" }, "http://localhost:8080/mcp"},
-		"set":           {func(c *Config) { c.TicketTools.URL = "https://ochell.example.com/mcp" }, "https://ochell.example.com/mcp"},
-		// In a container the loopback address is the container's own.
-		"podman, every address": {func(c *Config) { podmanLauncher(c) }, "http://host.containers.internal:8080/mcp"},
-		"podman, one address":   {func(c *Config) { podmanLauncher(c); c.HTTP.Address = "10.0.0.5" }, "http://10.0.0.5:8080/mcp"},
-		"podman, set": {func(c *Config) {
-			podmanLauncher(c)
-			c.HTTP.Address, c.TicketTools.URL = "127.0.0.1", "http://10.0.2.2:8080/mcp"
-		},
-			"http://10.0.2.2:8080/mcp"},
-	} {
-		cfg := base()
-		c.change(cfg)
-		if err := cfg.Validate(); err != nil || cfg.TicketToolsURL() != c.want {
-			t.Errorf("%s: %q, %v; want %q", name, cfg.TicketToolsURL(), err, c.want)
-		}
-	}
-	for name, c := range map[string]struct {
-		change func(*Config)
-		want   string
-	}{
-		"no http listener": {func(c *Config) {
-			c.HTTP.Enabled = false
-			c.HTTPS = Listener{Enabled: true, Address: "0.0.0.0", Port: 8443, CertFile: "c", KeyFile: "k"}
-		}, "ticket_tools.url is required when the http listener is off"},
-		"podman, a loopback listener": {func(c *Config) { podmanLauncher(c); c.HTTP.Address = "127.0.0.1" }, "which a container does not reach"},
-		"podman, localhost":           {func(c *Config) { podmanLauncher(c); c.HTTP.Address = "localhost" }, "which a container does not reach"},
-		"another path":                {func(c *Config) { c.TicketTools.URL = "http://127.0.0.1:8080/tools" }, "with the path /mcp"},
-		"not a URL":                   {func(c *Config) { c.TicketTools.URL = "127.0.0.1:8080/mcp" }, "ticket_tools.url must be"},
-		"a password":                  {func(c *Config) { c.TicketTools.URL = "http://u:p@127.0.0.1:8080/mcp" }, "ticket_tools.url must be"},
-		"no Jira API":                 {func(c *Config) { c.Sources.JiraAPI = JiraAPI{} }, "ticket_tools needs sources.jira_api"},
-		"no bot":                      {func(c *Config) { c.Sources.JiraWebhook.BotAccountID = "" }, "ticket_tools needs sources.jira_webhook.bot_account_id"},
-		"no Linear app":               {func(c *Config) { c.Sources.Linear.Enabled, c.Sources.Linear.Secret = true, "s" }, "ticket_tools needs the Linear app"},
-		"address, off": {func(c *Config) {
-			c.TicketTools = TicketTools{URL: "http://127.0.0.1:8080/mcp"}
-		}, "ticket_tools.enabled is not"},
-	} {
-		cfg := base()
-		c.change(cfg)
-		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
-		}
-	}
-	// The default prompt names the ticket tool that the run has.
-	if !strings.Contains(DefaultPromptTemplate, `{{if .TicketTools}}Read the full ticket with the tool get_ticket of the MCP server "ochell"{{else}}Use twg`) {
-		t.Error("the default prompt does not tell a run with the ticket tools to use them")
-	}
-}
-
 func TestGitHubSettings(t *testing.T) {
 	base := func() *Config {
 		cfg := Default()
@@ -863,7 +798,6 @@ func TestGitHubSource(t *testing.T) {
 			c.Sources.Linear.Enabled = true
 			c.Sources.Linear.Secret = "s"
 		}, "share path"},
-		"tools, no token":   {func(c *Config) { c.TicketTools.Enabled = true; c.Sources.GitHub.Token = "" }, "ticket_tools needs sources.github.token"},
 		"bad api address":   {func(c *Config) { c.GitHub.APIURL = "ghe.example.com" }, "github.api_url must be the address of the API"},
 		"repos, bad source": {func(c *Config) { c.Repos = []Repo{{Source: "gitlab", Project: "*", Repo: "x"}} }, "repos[0].source must be jira, linear, github or empty"},
 	} {

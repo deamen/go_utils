@@ -1,5 +1,5 @@
 # ochell
-Webhook receiver for the "digital employee" POC. When a Jira or Linear ticket, or a GitHub issue, is assigned to the digital employee, it authenticates the webhook and launches one agent CLI process (e.g. Claude Code) with a prompt describing the ticket. The agent then reads the ticket (with `twg`, or with [ochell's own ticket tools](#ticket-tools)), does the work and opens a PR.
+Webhook receiver for the "digital employee" POC. When a Jira or Linear ticket, or a GitHub issue, is assigned to the digital employee, it authenticates the webhook and launches one agent CLI process (e.g. Claude Code) with a prompt describing the ticket. The agent then uses `twg` to read the ticket, does the work and opens a PR.
 
 ```
 Jira (webhook / Automation) ─┐                ┌──────────────────────┐   exec (no shell)   ┌───────────┐
@@ -33,7 +33,7 @@ Behaviour common to all sources:
 - **Jira ticket updates:** with the Jira API configured (see [Jira API access](#jira-api-access)), ochell comments on a Jira ticket when a run starts, and again when it ends, with the same text a Linear session gets: the agent's message and its pull request, its question, or why the run failed. A ticket that was accepted but not started (no repository, attempts used up) gets a comment that says so. With `review_status` the ticket is also moved to that status when the agent reports its work as done. Without the API a Jira ticket gets no answer.
 - **Jira follow-ups:** a comment that a person writes on a Jira ticket starts a new run of the ticket with that comment, for example the answer to a question the agent asked, or a remark of the reviewer. It needs the *Comment created* event on the system webhook (see [Jira system webhook](#jira-system-webhook-recommended)).
   - The run continues the **same agent session** as the ticket's earlier run when the adapter has sessions (`claude`), in the same working directory. The comment is in the run context of the prompt, marked as a message from a person that does not change what the agent may do.
-  - **Comments by the bot account are ignored** (`bot_account_id`). That covers what ochell writes itself and what the agent writes with its ticket tool or through [ochell's ticket tools](#ticket-tools), so the agent cannot wake itself up. This is why ochell's API token and the agent's `twg` must use the same Jira account.
+  - **Comments by the bot account are ignored** (`bot_account_id`). That covers what ochell writes itself and what the agent writes with its ticket tool, so the agent cannot wake itself up. This is why ochell's API token and the agent's `twg` must use the same Jira account.
   - **Only tickets that ochell holds:** a ticket it has worked on that waits for a human, is in review, or failed. A comment on a ticket that ochell never worked on, that is done or that was released is ignored: people talk to each other there. A comment on a ticket whose issue is assigned to someone else is ignored as well.
   - **Every comment of a person on such a ticket starts a run,** also one that was meant for a colleague. Jira has no way to address the agent only.
   - A comment that arrives while the ticket has a run is kept (see below).
@@ -105,11 +105,11 @@ sources:
 - **Unassigning** the issue from the bot stops the work, **closing** it makes the ticket done (also by the merge of a pull request that says `Fixes #12`), and a change of its labels or title can raise its tier. A close and a change by the bot's login count for nothing.
 - **The issue type** that a rule of the policy sees (`issue_type`) is `Pull Request` for a pull request, and for an issue its issue type where the organization has issue types, else `Issue`.
 - **No priority.** GitHub issues have none, so a GitHub ticket is queued without one.
-- **Telling the issue:** `github.token`, the token of the handoff, only reads, and stays that way. To comment on an issue ochell needs **`sources.github.token`**: a token of the digital employee's own account with read and write access to **issues** (and to **pull requests**, when pull requests are assigned to it), and nothing else. Never give it access to contents, or the right to merge. With it, the issue gets a comment when a run starts and when it ends, and when the ticket is not started, as a Jira ticket does; ochell also asks GitHub about issues with it, for [the poller](#the-poller), the [gates of scheduling](#scheduling) and the [ticket tools](#ticket-tools). Without it the issue gets no answer from ochell, as a Jira ticket without `sources.jira_api`, and GitHub is not asked.
+- **Telling the issue:** `github.token`, the token of the handoff, only reads, and stays that way. To comment on an issue ochell needs **`sources.github.token`**: a token of the digital employee's own account with read and write access to **issues** (and to **pull requests**, when pull requests are assigned to it), and nothing else. Never give it access to contents, or the right to merge. With it, the issue gets a comment when a run starts and when it ends, and when the ticket is not started, as a Jira ticket does; ochell also asks GitHub about issues with it, for [the poller](#the-poller) and the [gates of scheduling](#scheduling). Without it the issue gets no answer from ochell, as a Jira ticket without `sources.jira_api`, and GitHub is not asked.
   - **The token must belong to `github.bot_login`.** ochell asks GitHub once whose it is, and writes nothing with a token of another account: a comment by any other account would come back as a person's and start a run. A token of a GitHub App installation cannot be asked that way, and is not supported.
   - It is not the agent's token. The agent reaches GitHub with its own (see [Tools and credentials per tier](#tools-and-credentials-per-tier)).
-- **What GitHub cannot do here** is refused at start, not left to do nothing: `scheduling.blocked_by: wait` (ochell reads no dependencies between issues), `scheduling.required_labels` and `ticket_tools` without `sources.github.token`. There is no status to move an issue to at the hand-over (`review_status` is Jira's).
-- **The prompt:** the default prompt tells the agent to read the ticket with `twg`, or with the ticket tools. For a GitHub ticket the context of the prompt names the issue (`The ticket is the issue #12 of the GitHub repository acme/shop.`), so an agent with `gh` or the ticket tools finds it; adapt `agent.prompt_template` where neither is there.
+- **What GitHub cannot do here** is refused at start, not left to do nothing: `scheduling.blocked_by: wait` (ochell reads no dependencies between issues), and `scheduling.required_labels` without `sources.github.token`. There is no status to move an issue to at the hand-over (`review_status` is Jira's).
+- **The prompt:** the default prompt tells the agent to read the ticket with `twg`. For a GitHub ticket the context of the prompt names the issue (`The ticket is the issue #12 of the GitHub repository acme/shop.`), so an agent with `gh` finds it; adapt `agent.prompt_template` where it has neither.
 
 ### The poller
 A webhook is fast, but it can be lost: ochell was down, the network failed, or the tracker does not send the event at all (Jira and the unassign event). So ochell also asks each tracker for the bot's open tickets, **at start and then every `poller.interval`** (default 5m; `0s` turns it off). The webhook stays for speed; the poll is for correctness.
@@ -197,7 +197,7 @@ go build -o ochell .
 ```
 
 ### End-to-end tests
-`go test ./e2e/` (part of `make test`) starts a real `ochell` process and sends it signed webhooks. The agent is [e2e/fakeagent](e2e/fakeagent/main.go), a scripted stand-in that records its arguments, environment, stdin and working directory, and can call [ochell's ticket tools](#ticket-tools) as an agent CLI does, Linear is a fake API that records the activities ochell posts, and Jira is a fake site ([jiratest](internal/tracker/jiraapi/jiratest/jiratest.go)) with tickets and comments. No real agent or tracker is involved.
+`go test ./e2e/` (part of `make test`) starts a real `ochell` process and sends it signed webhooks. The agent is [e2e/fakeagent](e2e/fakeagent/main.go), a scripted stand-in that records its arguments, environment, stdin and working directory, Linear is a fake API that records the activities ochell posts, and Jira is a fake site ([jiratest](internal/tracker/jiraapi/jiratest/jiratest.go)) with tickets and comments. No real agent or tracker is involved.
 
 A test uses the harness in [e2e/harness.go](e2e/harness.go):
 ```go
@@ -307,7 +307,7 @@ So a restart loses no queued task, and a retried or replayed delivery from befor
 Put the file where the agent cannot read or write it: it holds ticket text, and later the agent's session ids. With the `systemd` launcher that is any directory of the ochell user; with the `podman` launcher, any directory that is not inside a working directory.
 
 ### Jira API access
-The webhooks only bring events in. For what ochell does on its own in Jira (commenting on a ticket when a run starts and ends, changing a status, finding the bot's tickets for [the poller](#the-poller), reading a ticket's labels, blockers and priority for [scheduling](#scheduling), and reading and commenting for the agent's [ticket tools](#ticket-tools)) it needs the Jira REST API, with the API token of the digital employee's account:
+The webhooks only bring events in. For what ochell does on its own in Jira (commenting on a ticket when a run starts and ends, changing a status, finding the bot's tickets for [the poller](#the-poller), and reading a ticket's labels, blockers and priority for [scheduling](#scheduling)) it needs the Jira REST API, with the API token of the digital employee's account:
 
 ```yaml
 sources:
@@ -321,10 +321,10 @@ sources:
 - **`jql`** selects the bot's open tickets, which is what the poller starts from. The default is `assignee = currentUser() AND statusCategory != Done`: the account that owns the token, so no account id is needed.
 - **Check it** with `ochell jira-check --config config.yaml`. It lists the tickets that the JQL selects; with `--comment-on KEY` it also adds a test comment to that ticket.
 - **`review_status`** is optional: the status, for example `In Review`, that a ticket is moved to when the agent reports its work as done. The ticket's workflow must have a transition to it from where the ticket is. If the move fails, ochell logs a warning, and the comment is there all the same. A repository can choose another one from a list of the host's (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)).
-- The token is ochell's own. It is not passed to the agent. With the [ticket tools](#ticket-tools) the agent needs no Jira token of its own either.
+- The token is ochell's own. It is not passed to the agent.
 - Without `base_url` ochell runs as before, and nothing that needs the API happens.
 
-Only [internal/tracker/jiraapi](internal/tracker/jiraapi/jiraapi.go) calls the Jira API. The rest of ochell uses the small interfaces in [internal/tracker](internal/tracker/tracker.go) (`Assigned`, `Comment`, `SetStatus`; for the poller and scheduling `Assigner`, `Lookup`, `Scheduling`; for the ticket tools `Ticket`), so another way to reach Jira, such as `twg`, can be added behind it.
+Only [internal/tracker/jiraapi](internal/tracker/jiraapi/jiraapi.go) calls the Jira API. The rest of ochell uses the small interfaces in [internal/tracker](internal/tracker/tracker.go) (`Assigned`, `Comment`, `SetStatus`; for the poller and scheduling `Assigner`, `Lookup`, `Scheduling`), so another way to reach Jira, such as `twg`, can be added behind it.
 
 ### Repositories
 `repos` says which repository a ticket belongs to. ochell needs it to prepare a workspace; the agent is told the repository in its prompt and in `ORCH_TASK_REPO`.
@@ -485,7 +485,7 @@ retention:
 | policy version, tier | the version of the [policy](#policy-and-risk-tiers) in force when the run started, and the tier it ran under |
 | workflow | the version of the repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) that the run ran under, if any |
 | autonomy | the [level of autonomy](#graduated-autonomy) that the ticket's tier had when the run started, for a policy with levels |
-| grants | what the tier granted the run, by name: the tools file, the names of the variables from `env`, the credentials file and `mint`, and `ticket_tools` for a run that had [ochell's ticket tools](#ticket-tools). Never a value |
+| grants | what the tier granted the run, by name: the tools file, and the names of the variables from `env`, the credentials file and `mint`. Never a value |
 | prompt hash | the SHA-256 of the prompt the agent was given. The prompt itself is in the run log, not in the store |
 | tokens, cost | input, output, cache read and cache write tokens, and the cost in USD (see [Cost and budgets](#cost-and-budgets)) |
 | outcome | how the run ended, the agent's own result, its message, and the trigger if one stopped it |
@@ -666,7 +666,6 @@ tiers:
 | `credentials_file` | the secrets of this file (`NAME=VALUE` lines; `#` starts a comment) in its environment. The file is read anew for each run |
 | `mint` | credentials made for this one run: ochell runs the command before the run, and what it prints as `NAME=VALUE` lines goes into the run's environment |
 | `revoke` | nothing; ochell runs the command when the run has ended, in whatever way, with the minted variables in its environment, so that it can make them useless |
-| `ticket_tools` | `true`: ochell's own tools for the run's ticket, in the place of a tracker token (see [Ticket tools](#ticket-tools)) |
 
 - **Secrets do not pass through the unit's settings or the command line.** With the `systemd` launcher, ochell writes the run's secrets to a file of its own in `agent.secrets_dir` (mode 0600, in a directory with mode 0700), and the launch script hands that file to systemd as an `EnvironmentFile`, like the launcher's `ENV_FILE`. Other users cannot read the values back with `systemctl show`, and they are not in `ps`. ochell removes the file when the run has ended. With the `podman` launcher the same file is what podman reads as an `--env-file`; it is not mounted in the container, and the values are not in `ps`. With the `direct` launcher they are in the environment of the agent process.
 - **Secrets are taken out of what ochell writes down and passes on.** In the run log, in the message that goes to the ticket, in what is stored about the run and in the tool activities, each value is replaced by `[redacted NAME]`. That covers the values of `credentials_file` and of `mint`; values shorter than 6 characters are left alone. The prompt never holds a secret: ochell does not put one there.
@@ -679,63 +678,6 @@ tiers:
 - **Read-only by default** is a matter of what you put in the files: give each tier the narrowest tokens that its work needs, and the tiers with more autonomy the least.
 - **The files are checked at start** (see [Policy and risk tiers](#policy-and-risk-tiers)): `credentials_file` must belong to root or to ochell's user and must not be accessible to its group or to others; `mcp_config` must exist; `mint` and `revoke` must be programs.
 - **A tier without `grants`** gets what every run has: the launcher's `ENV_FILE` (with `podman`: `agent.podman.env_file`), `agent.env`, and the agent user's own MCP configuration (with `podman`: what the image and the ticket's home directory hold).
-
-### Ticket tools
-ochell can give the agent its own tools for the ticket, so that the agent needs no tracker token at all. The tools are an MCP server that ochell itself serves. The agent asks ochell; ochell asks Jira, Linear or GitHub with its own access, and returns the answer. The tracker tokens stay on the host.
-
-```yaml
-# config.yaml
-ticket_tools:
-  enabled: true
-```
-
-```yaml
-# policy.yaml
-tiers:
-  - name: low
-    grants:
-      ticket_tools: true
-      mcp_config: /etc/ochell/mcp/ticket-tools.json
-```
-
-```json
-{"mcpServers": {"ochell": {"type": "http", "url": "${ORCH_TOOLS_URL}",
-  "headers": {"Authorization": "Bearer ${ORCH_TOOLS_TOKEN}"}}}}
-```
-
-The last file is [examples/mcp-ticket-tools.json](examples/mcp-ticket-tools.json).
-
-| Tool | What it does |
-|---|---|
-| `get_ticket` | returns the run's ticket: title, description, status, labels (in Jira also components), and the newest 30 comments with their authors |
-| `add_comment` | adds a comment to the run's ticket, as the digital employee |
-
-- **Two settings turn them on:** `ticket_tools.enabled` for the host, and `grants.ticket_tools` for each tier whose runs get them. A policy that grants them on a host that has them off is refused at start. The grant is in the policy file, so a ticket or a repository's `WORKFLOW.md` cannot turn the tools on.
-- **Each run gets a token of its own**, 256 random bits, in `ORCH_TOOLS_TOKEN`, and the address of the server in `ORCH_TOOLS_URL`. Every request must carry the token.
-  - **The token is bound to the run's ticket.** The tools take the ticket from the token, not from the agent. They accept an argument `ticket`, and refuse any key but the run's own.
-  - **It lasts as long as the run.** ochell keeps it in memory only, and it opens nothing once the run has ended, or after a restart of ochell.
-  - **It is a secret of the run**, like a minted credential (see [Tools and credentials per tier](#tools-and-credentials-per-tier)): it reaches a unit in the file of the run's credentials, not in the unit's settings, and it is replaced by `[redacted ORCH_TOOLS_TOKEN]` in the run log and in what goes to the ticket. It is never written to a file that the agent user can read.
-  - It is not a tracker token: it is worth nothing at Jira or Linear.
-- **How the agent finds the server.** With the `claude` adapter, through the tier's `mcp_config`: the file names ochell's server with the two variables, and Claude Code replaces them from the run's environment. So the file holds no secret and is the same for every run. A tier with the tools needs such a file with the `claude` adapter, and ochell checks at start that it refers to both variables. A tier that has other MCP servers adds the `ochell` entry to its file; the run still gets the servers of that file and no others. Another agent CLI reads the two variables itself.
-  - Claude Code calls the tools `mcp__ochell__get_ticket` and `mcp__ochell__add_comment`. In a headless run a tool may need to be allowed: add `--allowedTools`, `mcp__ochell__get_ticket,mcp__ochell__add_comment` to `agent.args`.
-- **Where the server listens:** on the listeners of the webhooks, at `/mcp`, like the status API. `ORCH_TOOLS_URL` is the HTTP listener on the loopback address (`http://127.0.0.1:8080/mcp`); set `ticket_tools.url` when only HTTPS is on, or when the agent has to use another address. It cannot be a unix socket of ochell's own: with the `systemd` launcher the agent is another OS user. With the `podman` launcher the loopback address is the container's own, so the default is `http://host.containers.internal:8080/mcp`, the name that podman gives a container for its host; the HTTP listener must then take more than the loopback address (ochell refuses to start otherwise), or `ticket_tools.url` names an address that a container reaches. What keeps others out is the token: a request without the token of a run in progress gets 401 and nothing else. If ochell is behind ngrok, the path needs no rule there; without a token it answers nothing.
-- **What the tools cannot do.** There is no tool that assigns, relabels, moves, closes or edits a ticket, and none that reads another ticket. What `add_comment` writes is written with ochell's token, as the bot account, so [Gate integrity](#gate-integrity) holds for it as for everything the bot account does: the comment starts no run and approves nothing.
-  - A comment whose first line begins with `/approve` or `/stop` is refused as well.
-  - **Jira:** the account of `sources.jira_api` must be the bot account (`bot_account_id`). ochell asks Jira which account its token belongs to, and writes no comment for the agent when it is another one: such a comment would come back as a person's.
-  - **Linear:** the comment is the app's own.
-  - **GitHub:** the account of `sources.github.token` must be `github.bot_login`, in the same way.
-  - A comment may have 16,000 characters, and one run may add 20.
-  - The ticket moves to `review_status` as before: ochell does that itself when the run reports `done`.
-- **What the tools return is ticket text**, which anyone who can write on the ticket controls. It is marked as such in the answer, the description is cut at 12,000 characters, each comment at 4,000, and the whole at 64 KB; the newest comments are the ones that stay.
-- **The prompt tells the agent** to use the tools and not `twg`: a line at the top of the run context, for every template, also a repository's (see [The prompt](#the-prompt)).
-- **A run with the tools must not hold a tracker secret of ochell's.** If the value of a variable that the run would get (`agent.env`, `env_pass`, the tier's `env`, `credentials_file` or `mint`) holds the Jira API token, a webhook secret, the Automation token, the Linear client secret or the token of the GitHub source, the run is not started (`not_started`). ochell cannot see the launcher's `ENV_FILE` or the agent user's own files: take the agent's `twg` credentials out of those yourself.
-- **The record:** a run that had the tools has `ticket_tools` among its grants in its [audit record](#audit-trail-and-outcome-metrics). ochell's log has a line `ticket tool called` for every call, with the run, the ticket, the tool and whether it was refused; never what was read or written.
-- **It needs ochell's own access to the tracker:** `sources.jira_api` for Jira tickets, the installed app for Linear, `sources.github.token` for GitHub issues. `ticket_tools` is refused at start without them.
-- **The protocol** is MCP, revision 2025-06-18, over HTTP: each request is a POST with one JSON-RPC message, answered with one JSON object. There is no event stream (a GET gets 405) and no session. The methods are `initialize`, `ping`, `tools/list` and `tools/call`.
-- Limits of this:
-  - **All agents run as the same OS user.** One agent can read the environment of another agent's process, and with it that run's token, as it can read that run's minted credentials. The token then opens the other run's ticket, for reading and commenting, until that run ends. Not with the `podman` launcher: a container does not see the processes of another.
-  - Not checked against a real Claude Code: that it replaces `${…}` in a file given with `--mcp-config` (its documentation describes that for `.mcp.json`), which protocol revision it asks for, and whether the tools need `--allowedTools` in a headless run. Not checked against a real Jira or Linear: the calls that read a ticket's comments and that add a comment to a Linear issue.
-- Without `ticket_tools.enabled` there is no such endpoint, and the agent reads its ticket with its own tool as before.
 
 ### WORKFLOW.md in the repository
 A repository can say how its tickets are worked, in a file `WORKFLOW.md` at its top: the prompt, hooks, the status of the hand-over, and limits that are stricter than the tier's. The file is versioned with the code, and the people who own the repository change it in a pull request.
@@ -1001,7 +943,7 @@ last changes, the newest first:
 - Promoting a real class of work needs weeks of run history. The mechanism was tested with recorded runs, not with such a history.
 
 ### Gate integrity
-The agent can write to its tickets, as the bot account: with its own tool (`twg`), or with a comment through [ochell's ticket tools](#ticket-tools). So it could try to pass ochell's gates itself: approve its own plan, take a label off to get into a lower tier, assign itself a ticket again, or close the ticket as if the work had been accepted. None of that works: **what the bot account does on a ticket is never taken as a person's word.**
+The agent can write to its tickets with its own tool (`twg`), as the bot account. So it could try to pass ochell's gates itself: approve its own plan, take a label off to get into a lower tier, assign itself a ticket again, or close the ticket as if the work had been accepted. None of that works: **what the bot account does on a ticket is never taken as a person's word.**
 
 | What the bot account does | What ochell does with it |
 |---|---|
@@ -1022,7 +964,7 @@ And for everyone:
 - **A tier's level of autonomy goes up only by an operator's `ochell promote`** (see [Graduated autonomy](#graduated-autonomy)). Nothing on a ticket or in a repository raises it.
 
 Who the bot account is:
-- **Jira:** `bot_account_id` of `jira_webhook` and of `jira_automation`. Let the agent's `twg` use that same account. What the [ticket tools](#ticket-tools) write comes from the account of `sources.jira_api`, and ochell writes it only when that is this account.
+- **Jira:** `bot_account_id` of `jira_webhook` and of `jira_automation`. Let the agent's `twg` use that same account.
 - **Linear:** the app's own user, which every signed webhook names (`appUserId`), and the user ids in `sources.linear.bot_user_ids`. Set those when the agent's tool writes to Linear as another account than the app.
 - **GitHub:** `github.bot_login`, compared without regard to case: the account that issues are assigned to, that the agent writes as, and that `sources.github.token` must belong to. The GitHub source does not start without it.
 
@@ -1303,7 +1245,7 @@ agent:
 - **Stop:** the agent is the first process of its container. A program in that place gets SIGTERM only if it handles the signal; otherwise it runs on until `stop_grace` is over and podman kills the container. Add `--init` to `args` when the agent should be signalled like any other process.
 - **`args`** are added to every `podman run` after ochell's own options: limits (`--memory`, `--cpus`, `--pids-limit`), `--read-only`, a network. They are the host's; nothing in a ticket or in a repository's `WORKFLOW.md` adds an option. ochell does not check them: an option there can undo what the launcher sets, and a `--volume` there mounts more.
 - **SELinux:** the three directories are mounted with `:Z`, so podman labels them for the one container. The tier's `mcp_config` is shared by runs and is not relabelled; give it a label that containers may read (`chcon -t container_file_t`).
-- **The network is not restricted.** The agent needs the model's API, the git remote and, with the [ticket tools](#ticket-tools), ochell itself. A container reaches whatever the host reaches, also other services on the host that listen on more than the loopback address. What the sandbox isolates is the file system and the processes. Restrict the network with an option in `args` if you need to.
+- **The network is not restricted.** The agent needs the model's API and the git remote. A container reaches whatever the host reaches, also other services on the host that listen on more than the loopback address. What the sandbox isolates is the file system and the processes. Restrict the network with an option in `args` if you need to.
 - **Not a boundary against podman itself:** the containers are rootless and belong to ochell's user. A flaw in podman, the runtime or the kernel that lets a process leave its container gives it what ochell's user has.
 
 **Why a run ended** is in the last line of the run log and in ochell's log, as `outcome`:
@@ -1325,12 +1267,11 @@ ochell sets the outcome from what it asked for, never from the exit code alone: 
 ### The prompt
 The prompt is rendered from `agent.prompt_template` and written to the agent's **stdin** (`prompt_via: stdin`, the default), which is how `claude -p` reads it when no prompt argument is given.
 
-The template sees the task (`.Source`, `.Key`, `.Title`, `.URL`, `.Repo`, `.Context`, `.Comment`, `.ID`, `.Attempt`) and what ochell adds: `.RunContext`, `.ResultInstructions`, `.ResultFile`, and `.TicketTools`, which is true for a run that has [ochell's ticket tools](#ticket-tools) (the default template then leaves `twg` out). **A template must include `{{.RunContext}}` and `{{.ResultInstructions}}`**; ochell refuses to start without them. See [The result file](#the-result-file).
+The template sees the task (`.Source`, `.Key`, `.Title`, `.URL`, `.Repo`, `.Context`, `.Comment`, `.ID`, `.Attempt`) and what ochell adds: `.RunContext`, `.ResultInstructions` and `.ResultFile`. **A template must include `{{.RunContext}}` and `{{.ResultInstructions}}`**; ochell refuses to start without them. See [The result file](#the-result-file).
 
 A repository can bring its own prompt in its `WORKFLOW.md`, which then takes the place of `agent.prompt_template` for its tickets (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)).
 
 **The run context** is what only ochell knows about a run. The agent still reads the ticket itself. It is empty for a plain first attempt; otherwise it says:
-- that the run has [ochell's ticket tools](#ticket-tools), and must use them and not `twg`, when its tier grants them;
 - which attempt this is, and whether it continues the agent session of the earlier attempt or starts a new one. In a new session the agent is told to look at the branch, the pull request and the ticket's comments before it repeats work;
 - that the earlier attempt was cut off by a temporary error, or was stopped as stalled, when ochell retries by itself (see [Retry and stall detection](#retry-and-stall-detection));
 - that the earlier run was stopped because it made the same tool calls over and over, and that the agent must take another way, when a person lets a ticket go on that [the watchdog](#the-watchdog) stopped;
@@ -1383,7 +1324,7 @@ The agent does **not** inherit ochell's environment, because that holds the webh
 - the variables named in `agent.env_pass`, copied from ochell's environment when they are set. The default list is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), `SSL_CERT_FILE` and `SSL_CERT_DIR`;
 - `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL`, `ORCH_TASK_BRANCH`, `ORCH_TASK_TIER` (the ticket's [risk tier](#policy-and-risk-tiers)) and `ORCH_RESULT_FILE`, `ORCH_TASK_REPO` when a repository is mapped to the ticket, and `ORCH_TASK_AUTONOMY` (the tier's [level of autonomy](#graduated-autonomy)) when the policy has levels;
 - the variables set in `agent.env`;
-- what the ticket's tier grants: `ORCH_MCP_CONFIG`, the tier's `env`, and its credentials (see [Tools and credentials per tier](#tools-and-credentials-per-tier)); with the [ticket tools](#ticket-tools) also `ORCH_TOOLS_URL` and the run's `ORCH_TOOLS_TOKEN`.
+- what the ticket's tier grants: `ORCH_MCP_CONFIG`, the tier's `env`, and its credentials (see [Tools and credentials per tier](#tools-and-credentials-per-tier)).
 
 With the `systemd` and `podman` launchers `env_pass` is not used: a unit has the environment of the agent user, and a container that of its image.
 
@@ -1431,7 +1372,7 @@ Requires a Jira admin.
    - Set a **Secret**, and put it in `sources.github.secret`.
    - Events: *Let me select individual events*, then **Issues**, **Issue comments**, and **Pull requests** when pull requests are assigned to the digital employee. Anything else that arrives is ignored.
 3. List the repositories in `sources.github.repos`, as `owner/name`. A webhook of an organization sends events of all its repositories; only the listed ones start work.
-4. For comments on the issues, the poller, the gates of scheduling and the ticket tools: create a fine-grained personal access token **of the digital employee's account**, for those repositories, with *Issues: Read and write* (and *Pull requests: Read and write* when pull requests are tickets) and nothing else, and put it in `sources.github.token`. It is not `github.token`, and not the agent's token.
+4. For comments on the issues, the poller and the gates of scheduling: create a fine-grained personal access token **of the digital employee's account**, for those repositories, with *Issues: Read and write* (and *Pull requests: Read and write* when pull requests are tickets) and nothing else, and put it in `sources.github.token`. It is not `github.token`, and not the agent's token.
 5. Assign an issue to the digital employee. GitHub answers its first delivery, a `ping`, with 200 `ignored`.
 
 For GitHub Enterprise Server set `github.api_url` (`https://<host>/api/v3`); it holds for the source as for the handoff.
@@ -1541,7 +1482,6 @@ Notes:
 - **The watchdog** compares the agent's tool calls by a hash, and keeps nothing of their input (see [The watchdog](#the-watchdog)). It stops a run that repeats itself; it is not a guardrail against what the agent does.
 - **Metrics:** the endpoint needs its own token on every scrape (see [Metrics](#metrics)).
 - **Status API:** it needs its token on every request, also from the same host (see [The status API](#the-status-api)).
-- **Ticket tools:** with them the agent holds no tracker token. Each run has a token of its own that opens its own ticket, for reading and commenting only, while the run goes on (see [Ticket tools](#ticket-tools)). What the tools return is ticket text, and as untrusted as the ticket.
 - **Policy:** the tiers and limits are in a file of ochell's own, which the agent must not be able to write (see [Policy and risk tiers](#policy-and-risk-tiers)). Nothing in a ticket or a repository widens them.
 - **Graduated autonomy:** a level only holds back what a tier allows, and only an operator on the admin socket raises one (see [Graduated autonomy](#graduated-autonomy)). ochell merges nothing at any level.
 - **Scheduling:** a label of `required_labels` counts only when someone other than the bot account put it on the ticket; the priority and `blocked_by` order the work and are not approvals (see [Scheduling](#scheduling)).
