@@ -220,7 +220,6 @@ ochell status --config config.yaml                # paused or running; what is q
 ochell pause  --config config.yaml [--tier NAME]  # hold the queue: no new run starts
 ochell resume --config config.yaml [--tier NAME]
 ochell reset <jira|linear|github> <KEY> --config config.yaml   # reset the attempts of a ticket; --tier NAME also sets its risk tier
-ochell cost [<jira|linear|github> <KEY>] --config config.yaml  # what the tickets have cost, or one ticket with its runs
 ochell outcomes [--since D] [--until D] --config config.yaml   # outcome metrics per tier for a period
 ochell backup [--to FILE] --config config.yaml          # back the store up, while ochell runs
 ochell autonomy --config config.yaml                    # the level of autonomy of each tier, its numbers and the last changes
@@ -272,7 +271,7 @@ The agent runs without a shell, with its working directory set to `workdir` (ren
 ### The store
 ochell keeps its durable state in one SQLite file, `store.path` (default `ochell.db` in the working directory). It is created when missing, readable by its owner only, and updated in place when a newer ochell needs more tables. It holds:
 - the **tickets** ochell has worked on: state (see [Ticket states](#ticket-states)), risk tier, priority, number of attempts, working directory, and the agent's session id for a resume;
-- the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, the risk tier and the policy version it ran under, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to, and what the agent adapter read from it (final message, session id, cost, token counts);
+- the **runs** of each ticket, which are also the task queue: when a run was received, started and ended, the risk tier and the policy version it ran under, its outcome, exit code and log file, the context that came with the webhook and the Linear session to report to, and what the agent adapter read from it (final message, session id);
 - the **webhook deliveries** handled in the last 24 hours;
 - the last valid **`WORKFLOW.md`** of each repository (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository));
 - every change of a tier's **level of autonomy**: who decided it, why, and the numbers it was decided on (see [Graduated autonomy](#graduated-autonomy)).
@@ -380,7 +379,6 @@ agent:
 | `ochell_run_failures_total` | counter | runs that failed, timed out, stalled, made no progress (`no_progress`) or could not be started |
 | `ochell_run_retries_total` | counter | runs that ochell started by itself after a temporary failure or a stall |
 | `ochell_run_duration_seconds` | histogram | how long the runs took (buckets of 1, 5, 15, 30, 60 and 120 minutes) |
-| `ochell_cost_usd_total`, `ochell_tokens_total{kind}` | counter | what the runs cost, as the agent reports it |
 | `ochell_queue_length`, `ochell_runs_running` | gauge | runs that wait, and runs that are going on |
 | `ochell_tickets{state}` | gauge | tickets by state |
 | `ochell_paused` | gauge | 1 while ochell is paused |
@@ -460,7 +458,6 @@ retention:
 | workflow | the version of the repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) that the run ran under, if any |
 | autonomy | the [level of autonomy](#graduated-autonomy) that the ticket's tier had when the run started, for a policy with levels |
 | prompt hash | the SHA-256 of the prompt the agent was given. The prompt itself is in the run log, not in the store |
-| tokens, cost | input, output, cache read and cache write tokens, and the cost in USD (see [Cost](#cost)) |
 | outcome | how the run ended, the agent's own result, its message, and the trigger if one stopped it |
 | phase, cause, times | whether it was a plan run, why it was queued, and when it was received, started and ended |
 
@@ -472,14 +469,14 @@ retention:
 ```
 $ ochell outcomes --since 2026-11-08 --until 2026-11-15 --config config.yaml
 outcomes per tier, 2026-11-08 00:00 to 2026-11-15 00:00 (UTC)
-TIER    TICKETS  RUNS  COST USD  COST PER TICKET  PULL REQUESTS  TIME TO PR (MEDIAN)  SENT BACK      MERGED  MERGED UNTOUCHED  REOPENED
-high    3        9     41.2000   13.7333          2              1h12m0s              1 of 2 (50%)   1       0 of 1 (0%)       0
-low     14       17    9.8000    0.7000           13             9m30s                2 of 13 (15%)  12      10 of 12 (83%)    1
+TIER  TICKETS  RUNS  PULL REQUESTS  TIME TO PR (MEDIAN)  SENT BACK      MERGED  MERGED UNTOUCHED  REOPENED
+high  3        9     2              1h12m0s              1 of 2 (50%)   1       0 of 1 (0%)       0
+low   14       17    13             9m30s                2 of 13 (15%)  12      10 of 12 (83%)    1
 ```
 
 | Column | Meaning |
 |---|---|
-| tickets, runs, cost, cost per ticket | the runs that started in the period, the tickets they belong to, and what they cost |
+| tickets, runs | the runs that started in the period, and the tickets they belong to |
 | pull requests | tickets that first handed over a pull request in the period |
 | time to PR | for those tickets, from the start of the first run to that hand-over; the median |
 | sent back | the rework rate: of those tickets, the ones that a person sent back with a follow-up after the pull request |
@@ -507,7 +504,7 @@ api:
 |---|---|
 | `GET /api/v1/state` | whether runs start and what holds them back; how many tickets are in each state; the tickets that are running, queued, and waiting for a person, each with its state, reason, tier, priority and attempts, and a queued one with why [scheduling](#scheduling) holds it (`hold`); for each repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) the version in force and what of the file is not; and for each tier its [level of autonomy](#graduated-autonomy), since when and who decided it (`autonomy`) |
 | `GET /api/v1/inbox` | **the attention inbox**: exactly the tickets that wait for a person, each with its reason |
-| `GET /api/v1/tasks/<key>` | one ticket with every run: when it started and ended, why it was queued, its outcome, its cost, and what the agent said. Add `?source=jira`, `?source=linear` or `?source=github` when more than one source has the key |
+| `GET /api/v1/tasks/<key>` | one ticket with every run: when it started and ended, why it was queued, its outcome, and what the agent said. Add `?source=jira`, `?source=linear` or `?source=github` when more than one source has the key |
 
 - **The answer is JSON.** A browser (a request that accepts `text/html`) gets a plain page with the same content.
 - **Every request needs the token**: `Authorization: Bearer <api.token>`, at least 16 characters. The pages show ticket titles and what agents said, and the agent runs on the same host and can reach any local port, so a loopback address is not enough.
@@ -940,28 +937,6 @@ Notes:
 - A ticket that used up its attempts and is assigned again is refused as before (see [Guards and the admin channel](#guards-and-the-admin-channel)).
 - Two triggers of the findings come later, with the read-only GitHub access: CI that is still red after N fixes, and a review requested by CODEOWNERS.
 
-### Cost
-ochell records what each run cost, as far as the agent says. What the work costs is not ochell's to manage: it gives the agent no spending limit, and holds or stops no run for what it cost.
-
-- **What is recorded** with each run: the cost in USD and the tokens (input, output, cache read, cache write). The run log ends with the same numbers. The `plain` adapter reports neither.
-- **`ochell cost`** shows it:
-
-  ```
-  $ ochell cost linear ENG-90 --config config.yaml
-  linear ENG-90: tier low, in_review, 3 run(s), 1.2500 USD
-  RUN                                   ATTEMPT  TIER  OUTCOME   COST USD  INPUT  OUTPUT  CACHE READ  CACHE WRITE
-  20261115T093000.000Z-linear-ENG-90    1        low   finished  0.6000    10     20      100         10
-  20261115T094500.000Z-linear-ENG-90    2        low   finished  0.4500    0      0       100         10
-  20261115T095000.000Z-linear-ENG-90    3        low   finished  0.2000    30     40      100         10
-  total                                                          1.2500    40     60      300         30
-  ```
-
-  Without a ticket, `ochell cost` lists the 50 tickets that ochell touched last, and the total over all runs and over the runs that started today (UTC).
-- **The cost of a run is the run's own.** Claude Code reports, in a resumed run, what the whole session has cost so far. ochell takes off what the session had cost before the run. The tokens it reports are already those of the run alone. So the cost of a ticket is the sum over its runs.
-  - Checked against Claude Code 2.1.311 on 15 November 2026, with six runs in one session. It was not compared with the usage that the account shows.
-  - A run that ends without a result event (it was stopped, or timed out) reports no cost. What it spent shows up in the cost of the ticket's next run in the same session.
-- **Runs recorded by an older ochell** can have the outcome `over_budget` and the escalation `budget`, from when ochell had budgets. They are shown as they are.
-
 ### Guards and the admin channel
 Limits on what starts a run, and one way to talk to the running ochell.
 
@@ -993,7 +968,7 @@ Limits on what starts a run, and one way to talk to the running ochell.
   - A ticket whose assigner ochell does not know (a Jira Automation rule that sends no initiator) has no `assigner`.
   - Message text is never a way in: what a comment says does not change who may send one, or what the agent may do.
 
-**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `cost`, `outcomes`, `backup`, `autonomy`, `promote`, `demote`, `flag`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
+**The admin channel** is a unix socket, `admin.socket` (default `ochell.sock` in the working directory; empty for none). The admin commands above (`status`, `pause`, `resume`, `reset`, `stop`, `outcomes`, `backup`, `autonomy`, `promote`, `demote`, `flag`) find it in the same configuration file as the server, so give them the same `--config`, and use an absolute path for the socket if you run them from another directory.
 - Only ochell's own OS user can open the socket (mode 0600). That is the access control, and the reason it is not a loopback port, which every local user can reach. The agent runs as ochell's own user and can open it.
 - Keep the socket in a directory that other users cannot write to.
 
@@ -1072,19 +1047,19 @@ What a run leads to:
 Pausing is not a state: it holds the queue, and queued tickets stay queued. The same goes for a throttle and for [scheduling](#scheduling): a ticket that waits for a place, a label or a blocker is `queued`.
 
 ### Agent adapters
-An adapter holds what differs between agent CLIs: how a run is started, how an earlier session is resumed, and how the output is read (final message, session id, cost). It only builds commands and parses output. Running and stopping the process is the launcher's job, so every adapter works with every launcher. `agent.adapter` selects it.
+An adapter holds what differs between agent CLIs: how a run is started, how an earlier session is resumed, and how the output is read (final message, session id). It only builds commands and parses output. Running and stopping the process is the launcher's job, so every adapter works with every launcher. `agent.adapter` selects it.
 
 | Adapter | Command | Result |
 |---|---|---|
-| `plain` (default) | `agent.command` with `agent.args`; the prompt on stdin, or in the arguments with `prompt_via: arg` | the last 4 KB of the output is the message; no session, no cost, no resume |
-| `claude` | `agent.command` with `agent.args`, plus `--output-format stream-json --verbose` (and `-p` if it is missing); the prompt on stdin; `--resume <session>` to continue | the final message, the session id, the cost and the token counts, read from Claude Code's event stream |
+| `plain` (default) | `agent.command` with `agent.args`; the prompt on stdin, or in the arguments with `prompt_via: arg` | the last 4 KB of the output is the message; no session, no resume |
+| `claude` | `agent.command` with `agent.args`, plus `--output-format stream-json --verbose` (and `-p` if it is missing); the prompt on stdin; `--resume <session>` to continue | the final message and the session id, read from Claude Code's event stream |
 
 `plain` works with any CLI that takes a prompt and prints an answer.
 
 **The `claude` adapter** (checked against Claude Code 2.1.311):
 - **Settings:** `adapter: claude` needs `prompt_via: stdin`. Keep your own flags in `agent.args`, for example `--permission-mode` or `--model`. ochell refuses to start when `args` holds a flag the adapter sets itself (`--output-format`, `--resume`, `--continue`, `--max-turns`, `--mcp-config`, `--strict-mcp-config`), or `--bare`, which makes Claude Code ignore the OAuth token.
 - **What the ticket gets:** the agent's final message, not the raw stream. The run log still has every event.
-- **What is stored** with each run: the message, the session id, the cost in USD and the token counts. See [Cost](#cost) for how the cost of a resumed run is worked out.
+- **What is stored** with each run: the message and the session id. ochell reads no cost and no token count from the output: what the work costs is for whoever set ochell up.
 - **Resume:** when a ticket runs again, in the same working directory as before, ochell continues the session of its last run instead of starting from zero. The run log says `session=new` or `session=resumed <id>`.
   - Claude Code keeps its sessions under its configuration directory, so that directory must be the same for both runs.
   - If a resumed run fails without opening a session (the session is gone), ochell forgets the session, and the ticket's next run starts a new one.

@@ -1965,14 +1965,11 @@ func TestEscalationText(t *testing.T) {
 			t.Errorf("text lacks %q:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "budget") {
-		t.Errorf("text speaks of a budget:\n%s", got)
-	}
 	// The highest tier: nothing to move up to; the agent's own words.
 	res = task.Result{Outcome: task.OutcomeFinished, Signal: result.OutOfScope, SignalMessage: "It asks for a deploy.", Escalation: task.EscalationOutOfScope}
 	got = escalationText(&task.Task{Source: "linear", Key: "ENG-1"}, res)
 	if !strings.HasPrefix(got, "The agent did not do this, because it is out of its scope: It asks for a deploy.\n\nThis is an escalation (out_of_scope)") ||
-		strings.Contains(got, "moved up") || !strings.Contains(got, "reply here") || strings.Contains(got, "budget") {
+		strings.Contains(got, "moved up") || !strings.Contains(got, "reply here") {
 		t.Errorf("text of an agent's escalation:\n%s", got)
 	}
 }

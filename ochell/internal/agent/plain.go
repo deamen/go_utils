@@ -10,7 +10,7 @@ import (
 const tailSize = 4096
 
 // Plain works with any CLI: the prompt goes in, and the last part of the
-// output is the result. It knows no sessions and no cost.
+// output is the result. It knows no sessions.
 type Plain struct {
 	// PromptOnStdin writes the prompt to the agent's stdin. Otherwise the
 	// configured arguments carry it ({{.Prompt}}, prompt_via: arg).

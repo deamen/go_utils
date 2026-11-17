@@ -147,14 +147,6 @@ func (h *Handler) write(w io.Writer, m *store.Metrics, st runner.Status) {
 	fmt.Fprintf(w, "ochell_run_duration_seconds_sum %s\n", num(m.DurationSum))
 	fmt.Fprintf(w, "ochell_run_duration_seconds_count %d\n", m.DurationCount)
 
-	metric("ochell_cost_usd_total", "counter", "What all runs cost, in USD, as the agent reports it.")
-	fmt.Fprintf(w, "ochell_cost_usd_total %s\n", num(m.CostUSD))
-	metric("ochell_tokens_total", "counter", "Tokens of all runs, by kind.")
-	labelled("ochell_tokens_total", "kind", map[string]float64{
-		"input": float64(m.Usage.InputTokens), "output": float64(m.Usage.OutputTokens),
-		"cache_read": float64(m.Usage.CacheReadTokens), "cache_write": float64(m.Usage.CacheWriteTokens),
-	})
-
 	if !h.TokenExpiry.IsZero() {
 		now := time.Now
 		if h.Now != nil {

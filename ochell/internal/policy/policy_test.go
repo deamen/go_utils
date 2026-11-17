@@ -435,18 +435,3 @@ autonomy:
 		}
 	}
 }
-
-// What a ticket or a day may cost is not ochell's to manage: a policy that
-// still sets a budget or a daily spend is refused as an unknown setting.
-func TestBudgetIsRefused(t *testing.T) {
-	for name, c := range map[string]struct{ in, want string }{
-		"tier budget":    {"tiers: [{name: a, budget_usd: 5}]\ndefault_tier: a", "field budget_usd not found"},
-		"no tier budget": {"tiers: [{name: a, budget_usd: 0}]\ndefault_tier: a", "field budget_usd not found"},
-		"daily spend":    {"tiers: [{name: a}]\ndefault_tier: a\nthrottles: {daily_spend_usd: 100}", "field daily_spend_usd not found"},
-		"no daily spend": {"tiers: [{name: a}]\ndefault_tier: a\nthrottles: {daily_spend_usd: 0}", "field daily_spend_usd not found"},
-	} {
-		if _, err := Parse([]byte(c.in)); err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s: err = %v, want one with %q", name, err, c.want)
-		}
-	}
-}

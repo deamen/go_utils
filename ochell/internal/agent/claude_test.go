@@ -75,7 +75,8 @@ func TestClaudeAdapterSettings(t *testing.T) {
 }
 
 // The sample is the output of Claude Code 2.1.311, shortened: stderr and
-// stdout mixed, with event types and fields that ochell does not use.
+// stdout mixed, with event types and fields that ochell does not use (the
+// cost and the token counts of the result among them).
 func TestClaudeOutput(t *testing.T) {
 	raw, err := os.ReadFile("testdata/claude-stream.jsonl")
 	if err != nil {
@@ -84,10 +85,6 @@ func TestClaudeOutput(t *testing.T) {
 	want := Report{
 		Message:   "Opened PR #7 for ENG-123.",
 		SessionID: "3dc26999-bd50-487b-b445-cb41a233c6a2",
-		CostUSD:   0.09006600000000001,
-		// Claude Code reports the cost of the session so far.
-		CostIsSessionTotal: true,
-		Usage:              Usage{InputTokens: 2, OutputTokens: 4, CacheReadTokens: 11852, CacheWriteTokens: 8403},
 	}
 	// However the stream is cut into writes, the report is the same.
 	for _, chunk := range []int{len(raw), 1, 7, 4096} {
@@ -110,7 +107,7 @@ func TestClaudeOutputWithoutResult(t *testing.T) {
 	io.WriteString(out, `{"type":"system","subtype":"init","session_id":"sess-1"}`+"\n")
 	io.WriteString(out, `{"type":"assistant","message":{"content":[{"type":"text","text":"Working on it."}]},"session_id":"sess-1"}`+"\n")
 	io.WriteString(out, `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]},"session_id":"sess-1"}`)
-	if got := out.Report(); got.SessionID != "sess-1" || got.Message != "Working on it." || got.CostUSD != 0 {
+	if got := out.Report(); got.SessionID != "sess-1" || got.Message != "Working on it." {
 		t.Errorf("stopped run: %+v", got)
 	}
 
@@ -123,9 +120,9 @@ func TestClaudeOutputWithoutResult(t *testing.T) {
 
 	// An error result: its text is the message.
 	out = Claude{}.Output(nil)
-	io.WriteString(out, `{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","session_id":"sess-2","total_cost_usd":1.5}`+"\n")
+	io.WriteString(out, `{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","session_id":"sess-2"}`+"\n")
 	io.WriteString(out, "Error: reached the turn limit\n")
-	if got := out.Report(); got.SessionID != "sess-2" || got.CostUSD != 1.5 || got.Message != "Error: reached the turn limit" || !got.Failed {
+	if got := out.Report(); got.SessionID != "sess-2" || got.Message != "Error: reached the turn limit" || !got.Failed {
 		t.Errorf("error result: %+v", got)
 	}
 
@@ -248,8 +245,7 @@ func TestToolCall(t *testing.T) {
 	}
 }
 
-// ochell passes no spending limit: a run gets Claude Code's turn limit
-// and nothing else, and a run that reached it is told apart from a failed
+// A run gets Claude Code's turn limit and no other limit, and a run that reached it is told apart from a failed
 // one.
 func TestClaudeLimits(t *testing.T) {
 	c := Claude{}
@@ -270,9 +266,9 @@ func TestClaudeLimits(t *testing.T) {
 
 	out := c.Output(nil)
 	out.Write([]byte(`{"type":"system","subtype":"init","session_id":"sess-1"}
-{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":7,"session_id":"sess-1","total_cost_usd":0.0043304699999999995,"usage":{"input_tokens":0,"output_tokens":0}}
+{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":7,"session_id":"sess-1","usage":{"input_tokens":0,"output_tokens":0}}
 `))
-	if got := out.Report(); !got.OverTurns || !got.Failed || !got.CostIsSessionTotal || got.CostUSD != 0.0043304699999999995 || got.SessionID != "sess-1" {
+	if got := out.Report(); !got.OverTurns || !got.Failed || got.SessionID != "sess-1" {
 		t.Errorf("report = %+v", got)
 	}
 }

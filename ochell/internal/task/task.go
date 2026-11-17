@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"ochell/internal/agent"
 	"ochell/internal/result"
 )
 
@@ -142,8 +141,8 @@ const (
 // human. Each one fires before the work goes on: the run is stopped, or
 // not started, and nothing follows by itself.
 //
-// Runs recorded by an older ochell can hold the escalation "budget", which
-// is no longer set; it is read and shown as it is.
+// Runs recorded by an older ochell can hold an escalation that is no longer
+// set; it is read and shown as it is.
 type Escalation string
 
 const (
@@ -165,8 +164,8 @@ const (
 // it asked for; the exit code alone cannot tell a stopped run from a
 // finished one.
 //
-// Runs recorded by an older ochell can hold the outcome "over_budget",
-// which is no longer set; it is read and shown as it is.
+// Runs recorded by an older ochell can hold an outcome that is no longer
+// set; it is read and shown as it is.
 type Outcome string
 
 const (
@@ -212,15 +211,9 @@ type Result struct {
 	Duration time.Duration
 	// Resumed says that the run continued the session of an earlier run.
 	Resumed bool
-	// SessionID is the agent's session, for a later resume; CostUSD and
-	// Usage are what this run alone cost. All three are empty for an agent
-	// that does not report them.
+	// SessionID is the agent's session, for a later resume. It is empty
+	// for an agent that has no sessions.
 	SessionID string
-	CostUSD   float64
-	Usage     agent.Usage
-	// SessionCostUSD is what the agent's session has cost so far, earlier
-	// runs included, for an agent that reports that; 0 otherwise.
-	SessionCostUSD float64
 	// Signal is what the agent's result file says about the run, and
 	// SignalMessage its text for the people on the ticket. Signal is
 	// result.None when the run left no valid file. PRURL and Branch are

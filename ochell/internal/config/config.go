@@ -46,7 +46,7 @@ type Agent struct {
 	Workdir        string `yaml:"workdir"`
 	// Adapter names the kind of agent CLI: how it is called and how its
 	// output is read. "plain" works with any CLI; "claude" is Claude Code
-	// with its event stream, which gives the session id and the cost.
+	// with its event stream, which gives the session id and the tools used.
 	Adapter string `yaml:"adapter"`
 	// Launcher is "direct": the agent is a child process of ochell. It is
 	// the only one.

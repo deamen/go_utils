@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"ochell/internal/agent"
 	"ochell/internal/result"
 	"ochell/internal/task"
 	"ochell/internal/ticket"
@@ -242,9 +241,8 @@ func TestAgentSession(t *testing.T) {
 
 	first := task.Result{
 		Outcome: task.OutcomeFinished, ExitCode: 0, Workdir: "/work/ENG-1", LogFile: "logs/r1.log",
-		Message: "Opened PR #7", SessionID: "sess-1", CostUSD: 0.25,
+		Message: "Opened PR #7", SessionID: "sess-1",
 		Signal: result.Done, SignalMessage: "Ready for review.", PRURL: "https://github.com/x/y/pull/7", Branch: "bot/ENG-1",
-		Usage: agent.Usage{InputTokens: 2, OutputTokens: 4, CacheReadTokens: 11852, CacheWriteTokens: 8403},
 	}
 	if got := run("r1", first); got.AgentSession != "" || got.Workspace != "" {
 		t.Errorf("first run of a ticket: session %q in %q, want none", got.AgentSession, got.Workspace)
@@ -551,8 +549,8 @@ func TestMigrateDropsGrants(t *testing.T) {
 
 	s := open(t, path)
 	var version int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) || version != 24 {
-		t.Errorf("schema version %d (%v), want 24", version, err)
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) {
+		t.Errorf("schema version %d (%v), want %d", version, err, len(migrations))
 	}
 	var n int
 	if err := s.db.QueryRow(`SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'grants'`).Scan(&n); err != nil || n != 0 {
@@ -564,6 +562,74 @@ func TestMigrateDropsGrants(t *testing.T) {
 	}
 	if r.Tier != "low" || r.Result.PromptHash != "abc123" || r.Result.Autonomy != "assisted" || r.Result.Outcome != task.OutcomeFinished {
 		t.Errorf("the run of the old file = %+v", r)
+	}
+}
+
+// A file of schema version 24, whose runs recorded what they cost and the
+// tokens they used, still opens: those columns go, with the cost base of a
+// ticket, and the runs and their record stay.
+func TestMigrateDropsCost(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ochell.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for v, m := range migrations[:24] {
+		if _, err := db.Exec(m); err != nil {
+			t.Fatalf("schema version %d: %v", v+1, err)
+		}
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 24;
+		INSERT INTO tickets (source, key, state, created_at, updated_at, agent_session, cost_base) VALUES ('linear', 'ENG-1', 'in_review', 0, 0, 'sess-1', 1.5);
+		INSERT INTO runs (id, source, key, status, attempt, received_at, started_at, ended_at, outcome, tier, agent_session, message, pr_url,
+				cost_usd, session_cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, prompt_hash, autonomy) VALUES
+			('r1', 'linear', 'ENG-1', 'ended', 1, 0, 1, 2, 'finished', 'low', 'sess-1', 'Opened PR #7', 'https://github.com/x/y/pull/7',
+				0.25, 0.25, 2, 4, 11852, 8403, 'abc123', 'assisted'),
+			('r2', 'linear', 'ENG-1', 'ended', 2, 3, 4, 5, 'failed', 'low', 'sess-1', '', '', 1.25, 1.5, 10, 20, 30, 40, 'def456', 'assisted');`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s := open(t, path)
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) || version != 25 {
+		t.Errorf("schema version %d (%v), want 25", version, err)
+	}
+	for table, cols := range map[string][]string{
+		"runs":    {"cost_usd", "session_cost_usd", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"},
+		"tickets": {"cost_base"},
+	} {
+		for _, col := range cols {
+			var n int
+			if err := s.db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, table, col).Scan(&n); err != nil || n != 0 {
+				t.Errorf("%s.%s is still there (%d, %v)", table, col, n, err)
+			}
+		}
+	}
+	r, err := s.Run("r1")
+	if err != nil || r == nil {
+		t.Fatalf("the run of the old file: %v, %v", r, err)
+	}
+	if r.Tier != "low" || r.Attempt != 1 || r.Result.PromptHash != "abc123" || r.Result.Autonomy != "assisted" || r.Result.Outcome != task.OutcomeFinished ||
+		r.Result.SessionID != "sess-1" || r.Result.Message != "Opened PR #7" || r.Result.PRURL != "https://github.com/x/y/pull/7" {
+		t.Errorf("the run of the old file = %+v", r)
+	}
+	runs, err := s.Runs("linear", "ENG-1")
+	if err != nil || len(runs) != 2 || runs[0].ID != "r1" || runs[1].ID != "r2" || runs[1].Result.Outcome != task.OutcomeFailed || runs[1].Result.PromptHash != "def456" {
+		t.Errorf("the runs of the old file = %+v, %v", runs, err)
+	}
+	if tk, err := s.Ticket("linear", "ENG-1"); err != nil || tk == nil || tk.State != ticket.InReview {
+		t.Errorf("the ticket of the old file = %+v, %v", tk, err)
+	}
+	// The migrated store takes new runs.
+	if err := s.Enqueue(newTask("r3", "ENG-1", time.Now()), Limits{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish("r3", task.Result{Outcome: task.OutcomeFinished, SessionID: "sess-1"}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1047,95 +1113,27 @@ func TestRunsRecordTheirTier(t *testing.T) {
 	}
 }
 
-// What a ticket has cost is the sum over its runs. A reset of its attempts
-// changes nothing of it.
-func TestCosts(t *testing.T) {
+// A run recorded by an older ochell can hold an outcome and an escalation
+// that are no longer set: it reads as it is.
+func TestOldOutcomesRead(t *testing.T) {
 	s := open(t, filepath.Join(t.TempDir(), "ochell.db"))
-	t0 := time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
-	s.now = func() time.Time { return t0 }
-	run := func(id, key string, res task.Result) {
-		t.Helper()
-		tk := newTask(id, key, t0)
-		tk.Tier = "low"
-		if err := s.Enqueue(tk, Limits{}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := s.Claim(); err != nil {
-			t.Fatal(err)
-		}
-		res.Outcome = task.OutcomeFinished
-		if err := s.Finish(id, res); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if c, err := s.TicketCost("linear", "ENG-1"); err != nil || c != nil {
-		t.Fatalf("cost of an unknown ticket = %+v, %v", c, err)
-	}
-	run("r1", "ENG-1", task.Result{SessionID: "s1", CostUSD: 0.5, SessionCostUSD: 0.5, Usage: agent.Usage{InputTokens: 1, OutputTokens: 2, CacheReadTokens: 3, CacheWriteTokens: 4}})
-	run("r2", "ENG-1", task.Result{SessionID: "s1", CostUSD: 0.25, SessionCostUSD: 0.75, Usage: agent.Usage{InputTokens: 10, OutputTokens: 20}})
-	run("r3", "ENG-2", task.Result{SessionID: "s2", CostUSD: 2})
-	// Queued and never started: no run that cost anything.
-	if err := s.Enqueue(newTask("r4", "ENG-3", t0.Add(time.Hour)), Limits{}); err != nil {
+	if err := s.Enqueue(newTask("r1", "ENG-1", time.Now()), Limits{}); err != nil {
 		t.Fatal(err)
 	}
-
-	c, err := s.TicketCost("linear", "ENG-1")
-	if err != nil || c.Runs != 2 || c.CostUSD != 0.75 || c.Tier != "low" ||
-		c.Usage != (agent.Usage{InputTokens: 11, OutputTokens: 22, CacheReadTokens: 3, CacheWriteTokens: 4}) {
-		t.Errorf("cost of ENG-1 = %+v, %v", c, err)
-	}
-	if c, _ := s.TicketCost("linear", "ENG-3"); c == nil || c.Runs != 0 || c.CostUSD != 0 {
-		t.Errorf("cost of a ticket that never ran = %+v", c)
-	}
-	// What a session had cost: the highest total a run in it reported.
-	for session, want := range map[string]float64{"s1": 0.75, "s2": 2, "other": 0, "": 0} {
-		if got, err := s.SessionCost("linear", "ENG-1", session); session != "s2" && (err != nil || got != want) {
-			t.Errorf("SessionCost(%q) = %v, %v; want %v", session, got, err, want)
-		}
-	}
-	// A run from before the session's total was stored has it in its cost.
-	if got, _ := s.SessionCost("linear", "ENG-2", "s2"); got != 2 {
-		t.Errorf("SessionCost of a run without a stored total = %v, want 2", got)
-	}
-
-	// A reset keeps the record.
-	if err := s.ResetAttempts("linear", "ENG-1"); err != nil {
+	if _, err := s.Claim(); err != nil {
 		t.Fatal(err)
 	}
-	run("r5", "ENG-1", task.Result{SessionID: "s1", CostUSD: 0.125, SessionCostUSD: 0.875})
-	if c, _ := s.TicketCost("linear", "ENG-1"); c.Runs != 3 || c.CostUSD != 0.875 {
-		t.Errorf("cost of ENG-1 after a reset = %+v", c)
-	}
-
-	// A run recorded by an older ochell can hold the outcome over_budget
-	// and the escalation budget, which are no longer set: it reads as it is.
-	if _, err := s.db.Exec(`UPDATE runs SET outcome = 'over_budget', escalation = 'budget' WHERE id = 'r5'`); err != nil {
+	if err := s.Finish("r1", task.Result{Outcome: task.OutcomeFinished}); err != nil {
 		t.Fatal(err)
 	}
-	if old, err := s.Run("r5"); err != nil || old.Result.Outcome != "over_budget" || old.Result.Escalation != "budget" {
-		t.Errorf("an old run with the outcome over_budget = %+v, %v", old, err)
+	if _, err := s.db.Exec(`UPDATE runs SET outcome = 'retired', escalation = 'retired' WHERE id = 'r1'`); err != nil {
+		t.Fatal(err)
 	}
-	if runs, err := s.RunCosts("linear", "ENG-1"); err != nil || len(runs) != 3 || runs[2].Outcome != "over_budget" {
-		t.Errorf("RunCosts with an old outcome = %+v, %v", runs, err)
+	if old, err := s.Run("r1"); err != nil || old.Result.Outcome != "retired" || old.Result.Escalation != "retired" {
+		t.Errorf("an old run with an outcome no longer set = %+v, %v", old, err)
 	}
-
-	runs, err := s.RunCosts("linear", "ENG-1")
-	if err != nil || len(runs) != 3 || runs[0].ID != "r1" || runs[2].ID != "r5" || runs[1].CostUSD != 0.25 || runs[1].Attempt != 2 || runs[1].Outcome != task.OutcomeFinished || runs[1].Tier != "low" {
-		t.Errorf("RunCosts = %+v, %v", runs, err)
-	}
-	all, err := s.TicketCosts(10)
-	if err != nil || len(all) != 3 {
-		t.Fatalf("TicketCosts = %+v, %v", all, err)
-	}
-	if two, _ := s.TicketCosts(2); len(two) != 2 {
-		t.Errorf("TicketCosts(2) returned %d tickets", len(two))
-	}
-	total, err := s.TotalCost(time.Time{})
-	if err != nil || total.Runs != 4 || total.CostUSD != 2.875 {
-		t.Errorf("TotalCost = %+v, %v", total, err)
-	}
-	if later, _ := s.TotalCost(t0.Add(time.Hour)); later.Runs != 0 || later.CostUSD != 0 {
-		t.Errorf("TotalCost since later = %+v", later)
+	if runs, err := s.Runs("linear", "ENG-1"); err != nil || len(runs) != 1 || runs[0].Result.Outcome != "retired" {
+		t.Errorf("Runs with an old outcome = %+v, %v", runs, err)
 	}
 }
 
@@ -1404,8 +1402,8 @@ func TestHolds(t *testing.T) {
 	if got := claim(); got != "HIGH-1" {
 		t.Fatalf("claimed %q after the pause ended, want HIGH-1", got)
 	}
-	finish(low1, task.Result{CostUSD: 3})
-	finish("r1", task.Result{CostUSD: 4})
+	finish(low1, task.Result{})
+	finish("r1", task.Result{})
 
 	// Runs per hour: two have started within the hour.
 	s.SetHolds(Holds{MaxRunsPerHour: 2})
@@ -1420,9 +1418,8 @@ func TestHolds(t *testing.T) {
 	if got := claim(); got != "LOW-2" {
 		t.Fatalf("claimed %q an hour later, want LOW-2", got)
 	}
-	finish(third, task.Result{CostUSD: 5})
+	finish(third, task.Result{})
 
-	// What the runs have cost (12 USD so far) holds nothing back.
 	now = now.Add(24 * time.Hour)
 	s.SetHolds(Holds{})
 	queue("LOW-3", "low", "")
@@ -1659,22 +1656,22 @@ func TestOutcomes(t *testing.T) {
 	pr := func(n string) string { return "https://example.test/pr/" + n }
 
 	// LOW-1: a pull request after 10 minutes, merged as it was.
-	run("LOW-1", "low", false, 10*time.Minute, task.Result{CostUSD: 1, PRURL: pr("1")})
+	run("LOW-1", "low", false, 10*time.Minute, task.Result{PRURL: pr("1")})
 	s.SetPullRequest("linear", "LOW-1", pr("1"), PRMerged, "reviewer", "")
 	// LOW-2: two runs to its pull request (30 minutes and a pause), sent
 	// back once by a person, then merged.
-	run("LOW-2", "low", false, 10*time.Minute, task.Result{CostUSD: 1, Outcome: task.OutcomeFinished, Signal: result.NeedsInput})
-	run("LOW-2", "low", true, 18*time.Minute, task.Result{CostUSD: 2, PRURL: pr("2")})
-	run("LOW-2", "low", true, 5*time.Minute, task.Result{CostUSD: 0.5})
+	run("LOW-2", "low", false, 10*time.Minute, task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput})
+	run("LOW-2", "low", true, 18*time.Minute, task.Result{PRURL: pr("2")})
+	run("LOW-2", "low", true, 5*time.Minute, task.Result{})
 	s.SetPullRequest("linear", "LOW-2", pr("2"), PRMerged, "reviewer", "")
 	// LOW-3: no pull request.
-	run("LOW-3", "low", false, time.Minute, task.Result{CostUSD: 0.5, Outcome: task.OutcomeFailed, ExitCode: 1, Err: errors.New("exit status 1")})
+	run("LOW-3", "low", false, time.Minute, task.Result{Outcome: task.OutcomeFailed, ExitCode: 1, Err: errors.New("exit status 1")})
 	// HIGH-1: done, then assigned again: reopened.
-	run("HIGH-1", "high", false, 20*time.Minute, task.Result{CostUSD: 4, PRURL: pr("3")})
+	run("HIGH-1", "high", false, 20*time.Minute, task.Result{PRURL: pr("3")})
 	if _, err := s.CloseTicket("linear", "HIGH-1"); err != nil {
 		t.Fatal(err)
 	}
-	run("HIGH-1", "high", false, 5*time.Minute, task.Result{CostUSD: 1})
+	run("HIGH-1", "high", false, 5*time.Minute, task.Result{})
 	end := now
 
 	got, err := s.Outcomes(t0, end)
@@ -1682,7 +1679,7 @@ func TestOutcomes(t *testing.T) {
 		t.Fatalf("Outcomes = %+v, %v", got, err)
 	}
 	high, low := got[0], got[1]
-	if low.Tier != "low" || low.Tickets != 3 || low.Runs != 5 || low.CostUSD != 5 || low.PullRequests != 2 || low.Reworked != 1 ||
+	if low.Tier != "low" || low.Tickets != 3 || low.Runs != 5 || low.PullRequests != 2 || low.Reworked != 1 ||
 		low.Merged != 2 || low.MergedUntouched != 1 || low.Reopened != 0 {
 		t.Errorf("low = %+v", low)
 	}
@@ -1691,7 +1688,7 @@ func TestOutcomes(t *testing.T) {
 	if len(low.TimeToPR) != 2 || low.TimeToPR[0]+low.TimeToPR[1] != 39*time.Minute {
 		t.Errorf("time to pull request of low = %v", low.TimeToPR)
 	}
-	if high.Tier != "high" || high.Tickets != 1 || high.Runs != 2 || high.CostUSD != 5 || high.PullRequests != 1 || high.Reworked != 0 || high.Merged != 0 || high.Reopened != 1 {
+	if high.Tier != "high" || high.Tickets != 1 || high.Runs != 2 || high.PullRequests != 1 || high.Reworked != 0 || high.Merged != 0 || high.Reopened != 1 {
 		t.Errorf("high = %+v", high)
 	}
 	// A period before all this, and one that covers only the last run.
@@ -1699,7 +1696,7 @@ func TestOutcomes(t *testing.T) {
 		t.Errorf("outcomes of an empty period = %+v", got)
 	}
 	last, _ := s.Outcomes(end.Add(-6*time.Minute-30*time.Second), end)
-	if len(last) != 1 || last[0].Tier != "high" || last[0].Runs != 1 || last[0].CostUSD != 1 || last[0].Reopened != 1 || last[0].PullRequests != 0 {
+	if len(last) != 1 || last[0].Tier != "high" || last[0].Runs != 1 || last[0].Reopened != 1 || last[0].PullRequests != 0 {
 		t.Errorf("outcomes of the last minutes = %+v", last)
 	}
 }
@@ -1804,9 +1801,9 @@ func TestMetrics(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	run("ENG-1", "", 30*time.Second, task.Result{Outcome: task.OutcomeFinished, Signal: result.Done, CostUSD: 1, Usage: agent.Usage{InputTokens: 10, OutputTokens: 20, CacheReadTokens: 30, CacheWriteTokens: 40}})
-	run("ENG-2", "", 10*time.Minute, task.Result{Outcome: task.OutcomeFailed, ExitCode: 1, Err: errors.New("exit status 1"), CostUSD: 0.5})
-	run("ENG-2", task.CauseRetry, 3*time.Hour, task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput, CostUSD: 2})
+	run("ENG-1", "", 30*time.Second, task.Result{Outcome: task.OutcomeFinished, Signal: result.Done})
+	run("ENG-2", "", 10*time.Minute, task.Result{Outcome: task.OutcomeFailed, ExitCode: 1, Err: errors.New("exit status 1")})
+	run("ENG-2", task.CauseRetry, 3*time.Hour, task.Result{Outcome: task.OutcomeFinished, Signal: result.NeedsInput})
 	if err := s.Enqueue(newTask("q1", "ENG-3", now), Limits{}); err != nil {
 		t.Fatal(err)
 	}
@@ -1829,9 +1826,6 @@ func TestMetrics(t *testing.T) {
 	// the long one in no bucket but the last, which is the count.
 	if m.DurationCount != 3 || m.DurationSum != 30+600+10800 || m.DurationBucket[0] != 1 || m.DurationBucket[1] != 1 || m.DurationBucket[2] != 2 || m.DurationBucket[5] != 2 {
 		t.Errorf("durations: count %d, sum %v, buckets %v", m.DurationCount, m.DurationSum, m.DurationBucket)
-	}
-	if m.CostUSD != 3.5 || m.Usage != (agent.Usage{InputTokens: 10, OutputTokens: 20, CacheReadTokens: 30, CacheWriteTokens: 40}) {
-		t.Errorf("cost %v, usage %+v", m.CostUSD, m.Usage)
 	}
 }
 
@@ -2069,7 +2063,7 @@ func TestLevels(t *testing.T) {
 	if list, err := s.LevelChanges(0); err != nil || len(list) != 0 {
 		t.Fatalf("LevelChanges of a new store = %+v, %v", list, err)
 	}
-	rec := Record{Since: now.Add(-24 * time.Hour), Until: now, Tickets: 5, Runs: 7, CostUSD: 2.5, PullRequests: 4, SentBack: 1, TimeToPR: 9 * time.Minute, Merged: 2, MergedUntouched: 1}
+	rec := Record{Since: now.Add(-24 * time.Hour), Until: now, Tickets: 5, Runs: 7, PullRequests: 4, SentBack: 1, TimeToPR: 9 * time.Minute, Merged: 2, MergedUntouched: 1}
 	up, err := s.ChangeLevel(LevelChange{Class: "low", From: "observe", To: "assisted", By: "the operator ada", Reason: "a good month", Record: rec})
 	if err != nil || up.ID == 0 || !up.At.Equal(now) {
 		t.Fatalf("ChangeLevel = %+v, %v", up, err)
