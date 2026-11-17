@@ -96,12 +96,6 @@ func main() {
 	runNo := len(earlier) + 1
 	stdin, _ := io.ReadAll(os.Stdin)
 	dir, _ := os.Getwd()
-	// One file per run. In a container every run has the same pid, so the
-	// number of the run is added when the name is taken.
-	recordName = fmt.Sprintf("run-%d.json", os.Getpid())
-	if _, err := os.Stat(filepath.Join(os.Getenv("FAKEAGENT_RECORD_DIR"), recordName)); err == nil {
-		recordName = fmt.Sprintf("run-%d-%d.json", os.Getpid(), runNo)
-	}
 	rec := Record{PID: os.Getpid(), UID: os.Getuid(), Reads: map[string]string{}, Writes: map[string]string{}, Args: os.Args[1:], Env: os.Environ(), Stdin: string(stdin), Dir: dir}
 	writeRecord(rec)
 
@@ -194,16 +188,13 @@ func child(ignoreTerm bool) {
 	time.Sleep(time.Hour)
 }
 
-// recordName is the name of the file with this run's record.
-var recordName string
-
 func writeRecord(rec Record) {
 	dir := os.Getenv("FAKEAGENT_RECORD_DIR")
 	if dir == "" {
 		return
 	}
 	raw, _ := json.MarshalIndent(rec, "", "  ")
-	name := filepath.Join(dir, recordName)
+	name := filepath.Join(dir, fmt.Sprintf("run-%d.json", rec.PID))
 	// Write then rename, so a reader never sees half a record.
 	if err := os.WriteFile(name+".tmp", raw, 0o644); err == nil {
 		err = os.Rename(name+".tmp", name)

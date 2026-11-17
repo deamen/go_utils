@@ -48,12 +48,10 @@ type Agent struct {
 	// output is read. "plain" works with any CLI; "claude" is Claude Code
 	// with its event stream, which gives the session id and the cost.
 	Adapter string `yaml:"adapter"`
-	// Launcher is "direct" (the agent is a child process of ochell),
-	// "systemd" (a transient unit under a separate OS user) or "podman" (a
-	// container of its own for each run).
+	// Launcher is "direct" (the agent is a child process of ochell) or
+	// "systemd" (a transient unit under a separate OS user).
 	Launcher string  `yaml:"launcher"`
 	Systemd  Systemd `yaml:"systemd"`
-	Podman   Podman  `yaml:"podman"`
 	// StopGrace is how long an agent that is being stopped has between
 	// SIGTERM and SIGKILL.
 	StopGrace time.Duration `yaml:"stop_grace"`
@@ -151,36 +149,6 @@ type Systemd struct {
 	LaunchCommand []string `yaml:"launch_command"`
 	StopCommand   []string `yaml:"stop_command"`
 }
-
-// Podman configures the podman launcher: each run, and each workspace hook,
-// is a container of its own, started by ochell's own OS user (rootless).
-// All of it is the host's to say; nothing here comes from a ticket or a
-// repository.
-type Podman struct {
-	// Command is the podman program: a name on ochell's PATH, or a path.
-	Command string `yaml:"command"`
-	// Image is the image of every container. It must hold the agent CLI
-	// and what the workspace hooks call (git).
-	Image string `yaml:"image"`
-	// Pull is podman's pull policy: never (the default), missing, newer or
-	// always. With never a run uses only an image that is already on the
-	// host, so what an agent runs does not change with a registry.
-	Pull string `yaml:"pull"`
-	// EnvFile holds the agent's own credential as NAME=VALUE lines, as
-	// podman's --env-file reads them. The file is ochell's and is not
-	// mounted in a container. Empty: none.
-	EnvFile string `yaml:"env_file"`
-	// StateDir holds one directory per ticket, which is the home directory
-	// of the agent in that ticket's containers: what the agent CLI keeps
-	// between the runs of a ticket (its sessions) is there.
-	StateDir string `yaml:"state_dir"`
-	// Args are added to every "podman run", after ochell's own options:
-	// limits of memory and CPU, a network, a read-only root.
-	Args []string `yaml:"args"`
-}
-
-// PodmanPulls are the values of agent.podman.pull.
-var PodmanPulls = []string{"never", "missing", "newer", "always"}
 
 type JiraWebhook struct {
 	Enabled      bool   `yaml:"enabled"`
@@ -724,7 +692,6 @@ func Default() *Config {
 				LaunchCommand: []string{"sudo", "-n", "/usr/local/libexec/ochell/ochell-launch"},
 				StopCommand:   []string{"sudo", "-n", "/usr/local/libexec/ochell/ochell-stop"},
 			},
-			Podman:       Podman{Command: "podman", Pull: "never", StateDir: "state"},
 			StopGrace:    10 * time.Second,
 			DrainTimeout: 30 * time.Second,
 			EnvPass:      append([]string(nil), DefaultEnvPass...),
@@ -873,7 +840,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.Var(&stringList{dst: &c.Agent.Args}, "agent-arg", "agent CLI argument, repeatable, Go template (replaces config args)")
 	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: stdin or arg")
 	fs.StringVar(&c.Agent.Adapter, "agent-adapter", c.Agent.Adapter, "kind of agent CLI: plain or claude")
-	fs.StringVar(&c.Agent.Launcher, "agent-launcher", c.Agent.Launcher, "how the agent is run: direct, systemd or podman")
+	fs.StringVar(&c.Agent.Launcher, "agent-launcher", c.Agent.Launcher, "how the agent is run: direct or systemd")
 	fs.Var(&stringList{dst: &c.Agent.EnvPass}, "agent-env-pass", "environment variable the agent inherits from ochell, repeatable (replaces config env_pass)")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
 	fs.DurationVar(&c.Agent.Timeout, "agent-timeout", c.Agent.Timeout, "maximum agent run time")
@@ -1123,38 +1090,8 @@ func (c *Config) Validate() error {
 		if len(c.Agent.Systemd.LaunchCommand) == 0 || len(c.Agent.Systemd.StopCommand) == 0 {
 			errs = append(errs, errors.New("agent.systemd requires launch_command and stop_command"))
 		}
-	case "podman":
-		// podman changes nothing in the arguments, and the image has a PATH
-		// of its own, so the rules of systemd about them are not needed.
-		p := c.Agent.Podman
-		if p.Command == "" {
-			errs = append(errs, errors.New("agent.launcher podman requires agent.podman.command"))
-		}
-		if p.Image == "" {
-			errs = append(errs, errors.New("agent.launcher podman requires agent.podman.image: the image with the agent CLI"))
-		}
-		if !slices.Contains(PodmanPulls, p.Pull) {
-			errs = append(errs, errors.New("agent.podman.pull must be never, missing, newer or always"))
-		}
-		if p.StateDir == "" {
-			errs = append(errs, errors.New("agent.launcher podman requires agent.podman.state_dir"))
-		}
-		// The working directory is mounted in the container under its own
-		// path, and it is all of the tickets' files that a run may see.
-		if !strings.HasPrefix(c.Agent.Workdir, "/") {
-			errs = append(errs, errors.New("agent.launcher podman requires agent.workdir to be an absolute path"))
-		}
-		if !strings.Contains(c.Agent.Workdir, ".Key") {
-			errs = append(errs, errors.New("agent.launcher podman requires agent.workdir to contain {{.Key}}, so that a container holds the directory of one ticket only"))
-		}
-		for _, a := range p.Args {
-			if a == "" {
-				errs = append(errs, errors.New("agent.podman.args must not hold an empty argument"))
-				break
-			}
-		}
 	default:
-		errs = append(errs, errors.New("agent.launcher must be direct, systemd or podman"))
+		errs = append(errs, errors.New("agent.launcher must be direct or systemd"))
 	}
 	if c.Agent.StopGrace < 0 {
 		errs = append(errs, errors.New("agent.stop_grace must not be negative"))

@@ -79,15 +79,12 @@ type Runner struct {
 	// failed for a temporary reason looks like.
 	transient []*regexp.Regexp
 	// runDir is the absolute path of agent.run_dir.
-	runDir string
-	// stateDir holds the home directories of the tickets, with the podman
-	// launcher; empty with the others.
-	stateDir string
-	ws       *workspace
-	locks    ticketLocks
-	mu       sync.Mutex
-	stopped  bool
-	wg       sync.WaitGroup
+	runDir  string
+	ws      *workspace
+	locks   ticketLocks
+	mu      sync.Mutex
+	stopped bool
+	wg      sync.WaitGroup
 	// What a stop from outside needs to know about the runs in progress,
 	// by source and key (ticketKey). All three are guarded by mu.
 	//
@@ -164,11 +161,6 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 	}
 	if r.launcher, err = launcher.New(cfg); err != nil {
 		return nil, err
-	}
-	if cfg.Launcher == "podman" {
-		if r.stateDir, err = filepath.Abs(cfg.Podman.StateDir); err != nil {
-			return nil, fmt.Errorf("agent podman.state_dir: %w", err)
-		}
 	}
 	if cfg.Launcher == "systemd" {
 		// Fail at start, not on the first ticket, when a template uses a
@@ -1439,7 +1431,6 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 		RunDir:    runDir,
 		Env:       append(r.taskEnv(t), result.EnvVar+"="+resultFile),
 		Inherited: r.inheritedEnv(),
-		Home:      r.home(t.Source, t.Key),
 		Output:    io.MultiWriter(file, out),
 		Timeout:   r.cfg.Timeout,
 	}

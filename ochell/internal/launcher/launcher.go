@@ -2,24 +2,19 @@
 //
 // The runner decides what to run and for how long; a launcher only starts
 // the process, reports how it exited and stops it on request. There are
-// three:
+// two:
 //
 //   - direct: the agent is a child process of ochell, under ochell's own OS
 //     user. For development and tests.
 //   - systemd: the agent is a systemd transient unit under a separate OS
 //     user, started and stopped through two root-owned scripts that ochell
 //     calls with sudo (scripts/ochell-launch and scripts/ochell-stop).
-//   - podman: the agent is in a container of its own, which ochell's own
-//     OS user starts, and sees only the directories of its ticket and run.
 package launcher
 
 import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
-	"runtime"
 	"time"
 
 	"ochell/internal/config"
@@ -32,7 +27,7 @@ var ErrNotStarted = errors.New("the agent could not be started")
 // Spec describes one agent run.
 type Spec struct {
 	// TaskID is unique per run. The systemd launcher uses it in the unit
-	// name, the podman launcher in the name of the container.
+	// name.
 	TaskID  string
 	Command string
 	Args    []string
@@ -42,19 +37,12 @@ type Spec struct {
 	// for ochell (the result file). The launcher creates it when missing,
 	// so that the agent can write in it. Empty: none.
 	RunDir string
-	// Home is a directory of the run's ticket alone, which is the home
-	// directory of the agent in its container: what the agent CLI keeps
-	// between the runs of a ticket. Only the podman launcher uses it, and
-	// creates it when missing. Empty: none.
-	Home string
 	// Env is set for the agent, as NAME=VALUE: ORCH_TASK_* and agent.env.
-	// With the systemd and podman launchers other local users can read
-	// these values.
+	// With the systemd launcher other local users can read these values.
 	Env []string
 	// Inherited is copied from ochell's own environment (agent.env_pass), as
 	// NAME=VALUE. Only the direct launcher uses it: a unit has the
-	// environment of the agent user instead, and a container that of its
-	// image.
+	// environment of the agent user instead.
 	Inherited []string
 	// Stdin is written to the agent's stdin; nil means no input.
 	Stdin io.Reader
@@ -101,60 +89,6 @@ func New(cfg config.Agent) (Launcher, error) {
 			StopCommand:   cfg.Systemd.StopCommand,
 			StopGrace:     cfg.StopGrace,
 		}, nil
-	case "podman":
-		p := &Podman{
-			Command:   cfg.Podman.Command,
-			Image:     cfg.Podman.Image,
-			Pull:      cfg.Podman.Pull,
-			Args:      cfg.Podman.Args,
-			StopGrace: cfg.StopGrace,
-		}
-		// podman takes the files by their full paths, and the directories
-		// of ochell's own are compared with what is mounted.
-		var err error
-		abs := func(name, path string) string {
-			if path == "" || err != nil {
-				return ""
-			}
-			var full string
-			if full, err = filepath.Abs(path); err != nil {
-				err = fmt.Errorf("agent.%s: %w", name, err)
-			}
-			return full
-		}
-		p.EnvFile = abs("podman.env_file", cfg.Podman.EnvFile)
-		for name, dir := range map[string]string{"log_dir": cfg.LogDir, "run_dir": cfg.RunDir, "podman.state_dir": cfg.Podman.StateDir} {
-			if full := abs(name, dir); full != "" {
-				p.Protected = append(p.Protected, full)
-			}
-		}
-		if err != nil {
-			return nil, err
-		}
-		if err := checkEnvFile(p.EnvFile); err != nil {
-			return nil, err
-		}
-		return p, nil
 	}
 	return nil, fmt.Errorf("agent.launcher: unknown launcher %q", cfg.Launcher)
-}
-
-// checkEnvFile refuses a file with the agent's credential that is missing,
-// or that users other than its owner can read.
-func checkEnvFile(path string) error {
-	if path == "" {
-		return nil
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("agent.podman.env_file: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("agent.podman.env_file %s: not a regular file", path)
-	}
-	// Windows has no such permission bits, and no podman launcher in use.
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("agent.podman.env_file %s: it holds a credential and must not be accessible to its group or to others (chmod 600)", path)
-	}
-	return nil
 }
