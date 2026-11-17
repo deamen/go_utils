@@ -48,10 +48,9 @@ type Agent struct {
 	// output is read. "plain" works with any CLI; "claude" is Claude Code
 	// with its event stream, which gives the session id and the cost.
 	Adapter string `yaml:"adapter"`
-	// Launcher is "direct" (the agent is a child process of ochell) or
-	// "systemd" (a transient unit under a separate OS user).
-	Launcher string  `yaml:"launcher"`
-	Systemd  Systemd `yaml:"systemd"`
+	// Launcher is "direct": the agent is a child process of ochell. It is
+	// the only one.
+	Launcher string `yaml:"launcher"`
 	// StopGrace is how long an agent that is being stopped has between
 	// SIGTERM and SIGKILL.
 	StopGrace time.Duration `yaml:"stop_grace"`
@@ -140,14 +139,6 @@ var DefaultRetryPatterns = []string{
 	`(?i)api error:? *\(?(429|5\d\d)`,
 	`(?i)service unavailable|bad gateway|gateway time-?out`,
 	`(?i)connection (reset|refused|timed out)`,
-}
-
-// Systemd configures the systemd launcher.
-type Systemd struct {
-	// LaunchCommand and StopCommand are the two root-owned scripts, with the
-	// sudo prefix ochell calls them through.
-	LaunchCommand []string `yaml:"launch_command"`
-	StopCommand   []string `yaml:"stop_command"`
 }
 
 type JiraWebhook struct {
@@ -688,14 +679,10 @@ func Default() *Config {
 			Workdir:        ".",
 			Adapter:        "plain",
 			Launcher:       "direct",
-			Systemd: Systemd{
-				LaunchCommand: []string{"sudo", "-n", "/usr/local/libexec/ochell/ochell-launch"},
-				StopCommand:   []string{"sudo", "-n", "/usr/local/libexec/ochell/ochell-stop"},
-			},
-			StopGrace:    10 * time.Second,
-			DrainTimeout: 30 * time.Second,
-			EnvPass:      append([]string(nil), DefaultEnvPass...),
-			Timeout:      2 * time.Hour,
+			StopGrace:      10 * time.Second,
+			DrainTimeout:   30 * time.Second,
+			EnvPass:        append([]string(nil), DefaultEnvPass...),
+			Timeout:        2 * time.Hour,
 			Retry: Retry{
 				Patterns:   append([]string(nil), DefaultRetryPatterns...),
 				Backoff:    time.Minute,
@@ -840,7 +827,7 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.Var(&stringList{dst: &c.Agent.Args}, "agent-arg", "agent CLI argument, repeatable, Go template (replaces config args)")
 	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: stdin or arg")
 	fs.StringVar(&c.Agent.Adapter, "agent-adapter", c.Agent.Adapter, "kind of agent CLI: plain or claude")
-	fs.StringVar(&c.Agent.Launcher, "agent-launcher", c.Agent.Launcher, "how the agent is run: direct or systemd")
+	fs.StringVar(&c.Agent.Launcher, "agent-launcher", c.Agent.Launcher, "how the agent is run: direct, the only launcher")
 	fs.Var(&stringList{dst: &c.Agent.EnvPass}, "agent-env-pass", "environment variable the agent inherits from ochell, repeatable (replaces config env_pass)")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
 	fs.DurationVar(&c.Agent.Timeout, "agent-timeout", c.Agent.Timeout, "maximum agent run time")
@@ -969,10 +956,6 @@ func (c *Config) Validate() error {
 		if h.Command[0] == "" {
 			errs = append(errs, fmt.Errorf("workspace.hooks.%s: the command is empty", h.Name))
 		}
-		// PATH in the unit is the system default.
-		if c.Agent.Launcher == "systemd" && !strings.HasPrefix(h.Command[0], "/") {
-			errs = append(errs, fmt.Errorf("workspace.hooks.%s: agent.launcher systemd requires the command to be an absolute path", h.Name))
-		}
 	}
 	if g := c.GitHub; g.APIURL != "" {
 		if u, err := url.Parse(g.APIURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
@@ -1064,34 +1047,8 @@ func (c *Config) Validate() error {
 	default:
 		errs = append(errs, errors.New("agent.adapter must be plain or claude"))
 	}
-	switch c.Agent.Launcher {
-	case "direct":
-	case "systemd":
-		// systemd replaces ${VAR} in the unit's arguments from its
-		// environment, which holds the agent's token, so ticket text must
-		// never be an argument.
-		if c.Agent.PromptVia != "stdin" {
-			errs = append(errs, errors.New("agent.launcher systemd requires prompt_via: stdin"))
-		}
-		// PATH in the unit is the system default.
-		if !strings.HasPrefix(c.Agent.Command, "/") {
-			errs = append(errs, errors.New("agent.launcher systemd requires agent.command to be an absolute path"))
-		}
-		// The launch script refuses any other working directory, which
-		// would make every run end as not started.
-		if !strings.HasPrefix(c.Agent.Workdir, "/") {
-			errs = append(errs, errors.New("agent.launcher systemd requires agent.workdir to be an absolute path, inside the launcher's WORKSPACE_ROOT"))
-		}
-		// The launch script creates the run directory as the agent user,
-		// and only inside the workspace root.
-		if !strings.HasPrefix(c.Agent.RunDir, "/") {
-			errs = append(errs, errors.New("agent.launcher systemd requires agent.run_dir to be an absolute path, inside the launcher's WORKSPACE_ROOT"))
-		}
-		if len(c.Agent.Systemd.LaunchCommand) == 0 || len(c.Agent.Systemd.StopCommand) == 0 {
-			errs = append(errs, errors.New("agent.systemd requires launch_command and stop_command"))
-		}
-	default:
-		errs = append(errs, errors.New("agent.launcher must be direct or systemd"))
+	if c.Agent.Launcher != "direct" {
+		errs = append(errs, errors.New("agent.launcher must be direct"))
 	}
 	if c.Agent.StopGrace < 0 {
 		errs = append(errs, errors.New("agent.stop_grace must not be negative"))

@@ -5,10 +5,6 @@
 // fake Jira site and a fake GitHub API,
 // and sends it signed webhooks, so the full loop can be tested without a
 // real agent or tracker.
-//
-// The harness uses the direct launcher. Tests that need the systemd launcher
-// call RequireVM, which skips them unless OCHELL_E2E_VM=1: CI has no systemd,
-// so they run on the VM.
 package e2e
 
 import (
@@ -20,7 +16,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -47,8 +42,6 @@ const (
 	LinearSecret    = "e2e-linear-secret"
 	LinearToken     = "e2e-linear-access-token"
 	BotAccountID    = "712020:digital-employee"
-	// AgentToken is in the environment file of UseFakeSystemd.
-	AgentToken = "e2e-agent-token"
 	// LinearAppUserID is the Linear user of the agent app itself.
 	LinearAppUserID = "app-user-0000"
 	// GitHubSecret is the secret of the GitHub webhook, GitHubRepo the one
@@ -63,69 +56,6 @@ const (
 	// otherwise: the Jira accountId and the Linear user id of the payloads.
 	HumanAccountID = "557058:human"
 )
-
-// RequireVM skips a test that needs the systemd launcher and its sudo
-// scripts. Set OCHELL_E2E_VM=1 on a VM that has them installed.
-func RequireVM(t *testing.T) {
-	t.Helper()
-	if os.Getenv("OCHELL_E2E_VM") != "1" {
-		t.Skip("VM-only test: needs the systemd launcher; set OCHELL_E2E_VM=1 on the VM")
-	}
-}
-
-// UseFakeSystemd selects the systemd launcher with the real launch and stop
-// scripts, and stand-ins for systemd-run and systemctl, so the path through
-// the scripts is covered where there is no systemd. The agent still runs as
-// the current user. It returns the workspace root.
-func UseFakeSystemd(t *testing.T, c *config.Config) string {
-	t.Helper()
-	if os.Geteuid() == 0 {
-		t.Skip("the scripts ignore the stand-ins when run as root")
-	}
-	abs := func(rel string) string {
-		p, err := filepath.Abs(rel)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return p
-	}
-	u, err := user.Current()
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, state := filepath.Join(dir, "work"), filepath.Join(dir, "systemd")
-	for _, d := range []string{root, state} {
-		if err := os.Mkdir(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	envFile := filepath.Join(dir, "agent.env")
-	if err := os.WriteFile(envFile, []byte("AGENT_TOKEN="+AgentToken+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	conf := filepath.Join(dir, "launcher.conf")
-	settings := "AGENT_USER=" + u.Username + "\nWORKSPACE_ROOT=" + root + "\nENV_FILE=" + envFile + "\nALLOWED_ENV='^FAKEAGENT_[A-Z_]+$'\n"
-	if err := os.WriteFile(conf, []byte(settings), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	overrides := []string{
-		"/usr/bin/env",
-		"OCHELL_LAUNCHER_CONF=" + conf,
-		"OCHELL_LAUNCHER_SYSTEMD_RUN=" + abs("../internal/launcher/testdata/fake-systemd-run"),
-		"OCHELL_LAUNCHER_SYSTEMCTL=" + abs("../internal/launcher/testdata/fake-systemctl"),
-		"FAKE_SYSTEMD_DIR=" + state,
-	}
-	c.Agent.Launcher = "systemd"
-	c.Agent.Systemd.LaunchCommand = append(append([]string{}, overrides...), abs("../scripts/ochell-launch"))
-	c.Agent.Systemd.StopCommand = append(append([]string{}, overrides...), abs("../scripts/ochell-stop"))
-	c.Agent.Workdir = filepath.Join(root, "{{.Source}}-{{.Key}}")
-	c.Agent.RunDir = filepath.Join(root, "runs")
-	return root
-}
 
 // Step and Spawn mirror the fake agent's script format (fakeagent/main.go).
 type Step struct {
@@ -215,10 +145,6 @@ type Options struct {
 	// GitHub turns the GitHub source on, for the issues of GitHubRepo, with
 	// the fake GitHub API as its tracker. It is off otherwise.
 	GitHub bool
-	// OtherAgentUser prepares for an agent that runs as another OS user (the
-	// systemd launcher on the VM): it must be able to read its script and
-	// write its record, but not ochell's configuration.
-	OtherAgentUser bool
 }
 
 // Ochell is a running ochell process and the fakes around it.
@@ -259,18 +185,11 @@ var (
 	buildOnce sync.Once
 	buildDir  string
 	buildErr  error
-	prebuilt  bool
 )
 
 // build compiles ochell and the fake agent once per test binary.
 func build() (ochell, agent string, err error) {
 	buildOnce.Do(func() {
-		// On the VM there may be no Go toolchain: use binaries built elsewhere.
-		if dir := os.Getenv("OCHELL_E2E_BIN_DIR"); dir != "" {
-			prebuilt = true
-			buildDir, buildErr = filepath.Abs(dir)
-			return
-		}
 		buildDir, buildErr = os.MkdirTemp("", "ochell-e2e-bin")
 		if buildErr != nil {
 			return
@@ -292,7 +211,7 @@ func build() (ochell, agent string, err error) {
 
 // RemoveBinaries deletes the compiled binaries; call it from TestMain.
 func RemoveBinaries() {
-	if buildDir != "" && !prebuilt {
+	if buildDir != "" {
 		os.RemoveAll(buildDir)
 	}
 }
@@ -310,17 +229,6 @@ func Start(t *testing.T, opts Options) *Ochell {
 	o := &Ochell{t: t, Dir: dir, bin: ochellBin, env: opts.Env, recordDir: filepath.Join(dir, "records"), out: &lockedBuffer{}}
 	for _, d := range []string{o.recordDir, filepath.Join(dir, "work")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if opts.OtherAgentUser {
-		// The test's temporary directories are private to the current user.
-		for _, d := range []string{filepath.Dir(dir), dir} {
-			if err := os.Chmod(d, 0o755); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := os.Chmod(o.recordDir, 0o777); err != nil {
 			t.Fatal(err)
 		}
 	}

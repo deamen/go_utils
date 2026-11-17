@@ -99,9 +99,6 @@ func TestApply(t *testing.T) {
 			File{Hooks: Hooks{BeforeRun: hook, AfterRun: hook}, PlanGate: "required"}, Host{Tier: loose},
 			policy.Tier{Name: "low", PlanGate: "required", PRReview: "sampled", AutoMerge: "after_ci"}, "", 0,
 			[]string{"hooks.before_run is ignored: the host does not run a repository's hooks", "hooks.after_run is ignored"}},
-		"a hook that systemd cannot find": {
-			File{Hooks: Hooks{BeforeRun: []string{"make"}, AfterRun: hook}}, Host{Tier: loose, AllowHooks: true, AbsoluteCommands: true}, loose, "", 1,
-			[]string{"hooks.before_run is ignored: with the systemd launcher the command must be an absolute path"}},
 	} {
 		c.file.Prompt = body
 		e := c.file.Apply(c.host)

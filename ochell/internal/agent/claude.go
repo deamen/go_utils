@@ -80,7 +80,7 @@ func (c Claude) Start(run Run) (Command, error) { return c.command(run), nil }
 
 // sessionID is what a Claude Code session id may look like. The id comes
 // out of the agent's output and goes back into an argument, so nothing else
-// is accepted: with the systemd launcher a '$' in an argument is expanded.
+// is accepted.
 var sessionID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 
 func (c Claude) Resume(run Run, session string) (Command, error) {

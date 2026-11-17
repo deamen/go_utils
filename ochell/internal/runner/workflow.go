@@ -54,11 +54,10 @@ type flow struct {
 // host is what this ochell allows a repository's file, for a tier.
 func (r *Runner) host(tier policy.Tier) workflow.Host {
 	return workflow.Host{
-		Tier:             tier,
-		AllowHooks:       r.wfCfg.AllowHooks,
-		ReviewStatuses:   r.wfCfg.ReviewStatuses,
-		LimitsTurns:      agent.LimitsBudget(r.adapter),
-		AbsoluteCommands: r.cfg.Launcher == "systemd",
+		Tier:           tier,
+		AllowHooks:     r.wfCfg.AllowHooks,
+		ReviewStatuses: r.wfCfg.ReviewStatuses,
+		LimitsTurns:    agent.LimitsBudget(r.adapter),
 	}
 }
 

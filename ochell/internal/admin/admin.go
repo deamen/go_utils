@@ -3,9 +3,8 @@
 // reset, stop).
 //
 // The socket is a file that only ochell's own OS user may open. That is the
-// whole access control, and the reason it is not a loopback port: the agent
-// runs on the same host and can reach any local port, but with the systemd
-// launcher it runs as another user and cannot open this file.
+// whole access control, and the reason it is not a loopback port, which
+// every local user can reach.
 package admin
 
 import (

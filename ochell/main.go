@@ -163,9 +163,6 @@ func serve(args []string) error {
 		return err
 	}
 	log.Info("policy", "file", pol.File, "version", pol.Version, "tiers", len(pol.Tiers), "default_tier", pol.DefaultTier, "rules", len(pol.Rules))
-	if pol.File != "" && cfg.Agent.Launcher == "direct" {
-		log.Warn("the agent runs as ochell's own OS user (agent.launcher direct) and can write whatever ochell can, the policy file included; use the systemd launcher where the policy has to hold against the agent")
-	}
 
 	st, err := store.Open(cfg.Store.Path)
 	if err != nil {
@@ -438,7 +435,7 @@ func workflowCheck(args []string) error {
 	}
 	for _, t := range pol.Tiers {
 		e := f.Apply(workflow.Host{Tier: t, AllowHooks: cfg.Workflow.AllowHooks, ReviewStatuses: cfg.Workflow.ReviewStatuses,
-			LimitsTurns: cfg.Agent.Adapter == "claude", AbsoluteCommands: cfg.Agent.Launcher == "systemd"})
+			LimitsTurns: cfg.Agent.Adapter == "claude"})
 		line := fmt.Sprintf("tier %s: plan_gate=%s pr_review=%s auto_merge=%s", t.Name, e.Tier.PlanGate, e.Tier.PRReview, e.Tier.AutoMerge)
 		if e.Tier.MaxTurns > 0 {
 			line += fmt.Sprintf(" max_turns=%d", e.Tier.MaxTurns)

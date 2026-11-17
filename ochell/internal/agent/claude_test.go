@@ -44,8 +44,8 @@ func TestClaudeCommand(t *testing.T) {
 	if stdin, _ := io.ReadAll(cmd.Stdin); string(stdin) != "Fix ENG-123" {
 		t.Errorf("stdin of a resumed run = %q, want the prompt", stdin)
 	}
-	// The session id goes into an argument: nothing that systemd or a
-	// command line could read as something else.
+	// The session id goes into an argument: nothing that a command line
+	// could read as something else.
 	for _, bad := range []string{"", "${CLAUDE_CODE_OAUTH_TOKEN}", "--bare", "a b", "x;y"} {
 		if _, err := (Claude{}).Resume(run, bad); !errors.Is(err, ErrNoResume) {
 			t.Errorf("Resume(%q) = %v, want ErrNoResume", bad, err)

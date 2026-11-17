@@ -219,9 +219,6 @@ type Host struct {
 	// LimitsTurns says that the agent adapter can stop a run at a number
 	// of turns.
 	LimitsTurns bool
-	// AbsoluteCommands says that a hook's command must be an absolute
-	// path (the systemd launcher).
-	AbsoluteCommands bool
 }
 
 // Effective is what holds for a run: the host's policy, narrowed by the
@@ -313,9 +310,6 @@ func (f *File) Apply(h Host) Effective {
 			continue
 		case !h.AllowHooks:
 			ignore("hooks.%s is ignored: the host does not run a repository's hooks (workflow.allow_hooks)", hk.Name)
-			continue
-		case h.AbsoluteCommands && !strings.HasPrefix(hk.Command[0], "/"):
-			ignore("hooks.%s is ignored: with the systemd launcher the command must be an absolute path", hk.Name)
 			continue
 		}
 		switch hk.Name {

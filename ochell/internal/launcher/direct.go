@@ -19,7 +19,7 @@ const outputWait = 5 * time.Second
 //
 // The agent gets its own process group, and a stop signals the whole group:
 // sub-agents, MCP servers and git children end with it. A child that leaves
-// the group (setsid) is not reached; the systemd launcher has no such gap.
+// the group (setsid) is not reached.
 type Direct struct {
 	// StopGrace is the time between SIGTERM and SIGKILL when stopping.
 	StopGrace time.Duration
@@ -65,12 +65,6 @@ func (d Direct) Start(spec Spec) (Process, error) {
 	}()
 	return p, nil
 }
-
-// Reap does nothing: a new ochell process does not know the process group
-// of a run that an earlier one started. An agent that outlived a killed
-// ochell runs on until it ends by itself. The systemd launcher has no such
-// gap.
-func (Direct) Reap(string) error { return nil }
 
 type directProcess struct {
 	cmd    *exec.Cmd

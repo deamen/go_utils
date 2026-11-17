@@ -2,10 +2,10 @@
 // the rules that say which tier a ticket runs under.
 //
 // The policy is a file of its own in ochell's configuration. Nothing in a
-// ticket, a repository or the agent's working directory can change it: the
-// file must not be writable by the agent's OS user, and a change to it goes
-// through the review of whoever owns ochell's configuration. That review is
-// how people decide, ahead of time, how much autonomy a class of work gets.
+// ticket or a repository can change it: the file must not be writable by
+// other users, and a change to it goes through the review of whoever owns
+// ochell's configuration. That review is how people decide, ahead of time,
+// how much autonomy a class of work gets.
 package policy
 
 import (
@@ -453,12 +453,8 @@ func (p *Policy) Validate() error {
 
 // CheckFile refuses a policy file that someone other than root or the user
 // ochell runs as could change: by writing to it, or by putting another
-// file in its place.
-//
-// It cannot check who the agent's OS user is. With the systemd launcher
-// that is another user, who is covered by this check. With the direct
-// launcher the agent runs as ochell's own user and can write whatever
-// ochell can.
+// file in its place. The agent runs as ochell's own user, so it is not
+// kept out by this check.
 func CheckFile(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {

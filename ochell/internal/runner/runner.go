@@ -162,16 +162,6 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 	if r.launcher, err = launcher.New(cfg); err != nil {
 		return nil, err
 	}
-	if cfg.Launcher == "systemd" {
-		// Fail at start, not on the first ticket, when a template uses a
-		// field that argView does not have.
-		probe := argView{ID: "id", Source: "source", Key: "KEY-1"}
-		for _, t := range append([]*template.Template{r.workdir}, r.args...) {
-			if _, err := render(t, probe); err != nil {
-				return nil, fmt.Errorf("agent %s: with the systemd launcher only .ID, .Source and .Key may be used here, because ticket text must not reach the command line: %w", t.Name(), err)
-			}
-		}
-	}
 	return r, nil
 }
 
@@ -894,11 +884,6 @@ func (r *Runner) Start() error {
 	for _, in := range interrupted {
 		t := in.Task
 		r.log.Warn("run was interrupted: ochell stopped while the agent was running", "task", t.ID, "source", t.Source, "key", t.Key, "queued_again", in.Next)
-		// An agent that outlived the ochell that started it must not go on
-		// working next to the run that takes its place.
-		if err := r.launcher.Reap(unsafeName.ReplaceAllString(t.ID, "_")); err != nil {
-			r.log.Warn("cannot make sure that the interrupted run has ended; its agent may still be running", "task", t.ID, "err", err)
-		}
 	}
 	if len(interrupted) > 0 && r.notify != nil {
 		r.wg.Add(1)
@@ -1228,25 +1213,6 @@ func (r *Runner) backoff(attempt int) time.Duration {
 
 var unsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
-// argView is what argument and working directory templates see with the
-// systemd launcher: only fields that cannot hold ticket text. systemd
-// replaces ${VAR} in a unit's arguments from its environment, which holds
-// the agent's token, so a ticket title of "${CLAUDE_CODE_OAUTH_TOKEN}" in an
-// argument would put the real token on the command line.
-type argView struct {
-	ID     string
-	Source string
-	Key    string
-}
-
-// argData returns the template data for arguments and the working directory.
-func (r *Runner) argData(t *task.Task) any {
-	if r.cfg.Launcher == "systemd" {
-		return argView{ID: t.ID, Source: t.Source, Key: t.Key}
-	}
-	return t
-}
-
 // promptView is what the prompt template sees: the task, and what ochell
 // adds for this run.
 type promptView struct {
@@ -1274,7 +1240,7 @@ func (r *Runner) command(t *task.Task, prompt *template.Template, view promptVie
 	}
 	args := make([]string, 0, len(r.args))
 	for _, a := range r.args {
-		s, err := render(a, r.argData(t))
+		s, err := render(a, t)
 		if err != nil {
 			return agent.Command{}, fmt.Errorf("render args: %w", err)
 		}
@@ -1316,7 +1282,7 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	runDir := filepath.Join(r.runDir, runName)
 	resultFile := filepath.Join(runDir, result.FileName)
 
-	dir, err := render(r.workdir, r.argData(t))
+	dir, err := render(r.workdir, t)
 	if err != nil {
 		res.Err = fmt.Errorf("render workdir: %w", err)
 		return res
@@ -1541,9 +1507,8 @@ func (l *lastWrite) idle() time.Duration {
 // no output for that long, and when noProgress is closed (the watchdog of
 // the run; nil: there is none).
 //
-// Why it ended is decided here, from what ochell asked for. The exit code
-// cannot tell: a unit that systemd stopped exits with 0, and one that hit
-// its own time limit exits with 1 like a failed agent. The outcome is
+// Why it ended is decided here, from what ochell asked for: the exit code
+// cannot tell. The outcome is
 // finished (it ended by itself, with any exit code), timed_out, stalled,
 // no_progress, stopped, or not_started with the reason in the error.
 func (r *Runner) execute(ctx context.Context, spec launcher.Spec, stall time.Duration, noProgress <-chan struct{}) (waitResult, task.Outcome) {
