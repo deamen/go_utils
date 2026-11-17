@@ -64,7 +64,6 @@ type Step struct {
 	Sleep      string `json:"sleep,omitempty"`
 	Spawn      *Spawn `json:"spawn,omitempty"`
 	WriteFile  *File  `json:"write_file,omitempty"`
-	TryRead    string `json:"try_read,omitempty"`
 	WaitFile   string `json:"wait_file,omitempty"`
 	IgnoreTerm bool   `json:"ignore_term,omitempty"`
 	Exit       *int   `json:"exit,omitempty"`
@@ -78,7 +77,6 @@ type File struct {
 
 type Spawn struct {
 	Count      int  `json:"count"`
-	Setsid     bool `json:"setsid,omitempty"`
 	IgnoreTerm bool `json:"ignore_term,omitempty"`
 }
 
@@ -107,15 +105,12 @@ func Report(status, message string, more ...string) Step {
 // Record is what the fake agent saw when it was started.
 type Record struct {
 	PID      int      `json:"pid"`
-	UID      int      `json:"uid"`
 	Args     []string `json:"args"`
 	Env      []string `json:"env"`
 	Stdin    string   `json:"stdin"`
 	Dir      string   `json:"dir"`
 	Children []int    `json:"children,omitempty"`
-	// Reads and Writes hold "ok" or the error of each try_read and
-	// write_file step, by path.
-	Reads  map[string]string `json:"reads,omitempty"`
+	// Writes holds "ok" or the error of each write_file step, by path.
 	Writes map[string]string `json:"writes,omitempty"`
 }
 

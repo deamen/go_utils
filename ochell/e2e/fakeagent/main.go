@@ -39,8 +39,6 @@ type Step struct {
 	// directory, and $NAME in the path is replaced from the environment
 	// (e.g. $ORCH_RESULT_FILE).
 	WriteFile *File `json:"write_file,omitempty"`
-	// TryRead reads a file and notes in the record whether that worked.
-	TryRead string `json:"try_read,omitempty"`
 	// WaitFile waits until a file exists, so that a test decides when the
 	// run goes on. $NAME in the path is replaced from the environment
 	// (e.g. $ORCH_TASK_KEY).
@@ -62,9 +60,6 @@ type File struct {
 
 type Spawn struct {
 	Count int `json:"count"`
-	// Setsid puts the children in a new session, so they leave the agent's
-	// process group.
-	Setsid bool `json:"setsid,omitempty"`
 	// IgnoreTerm makes the children survive SIGTERM.
 	IgnoreTerm bool `json:"ignore_term,omitempty"`
 }
@@ -72,7 +67,6 @@ type Spawn struct {
 // Record is written once per run, before the first step.
 type Record struct {
 	PID   int      `json:"pid"`
-	UID   int      `json:"uid"`
 	Args  []string `json:"args"`
 	Env   []string `json:"env"`
 	Stdin string   `json:"stdin"`
@@ -80,9 +74,8 @@ type Record struct {
 	// Children holds the pids started by spawn steps. The record file is
 	// rewritten after each spawn step.
 	Children []int `json:"children,omitempty"`
-	// Reads and Writes hold the result of each try_read and write_file
-	// step, by path: "ok" or the error.
-	Reads  map[string]string `json:"reads,omitempty"`
+	// Writes holds the result of each write_file step, by path: "ok" or
+	// the error.
 	Writes map[string]string `json:"writes,omitempty"`
 }
 
@@ -96,7 +89,7 @@ func main() {
 	runNo := len(earlier) + 1
 	stdin, _ := io.ReadAll(os.Stdin)
 	dir, _ := os.Getwd()
-	rec := Record{PID: os.Getpid(), UID: os.Getuid(), Reads: map[string]string{}, Writes: map[string]string{}, Args: os.Args[1:], Env: os.Environ(), Stdin: string(stdin), Dir: dir}
+	rec := Record{PID: os.Getpid(), Writes: map[string]string{}, Args: os.Args[1:], Env: os.Environ(), Stdin: string(stdin), Dir: dir}
 	writeRecord(rec)
 
 	var script Script
@@ -140,10 +133,6 @@ func main() {
 		case st.WriteFile != nil:
 			rec.Writes[st.WriteFile.Path] = result(os.WriteFile(os.ExpandEnv(st.WriteFile.Path), []byte(st.WriteFile.Content), 0o644))
 			writeRecord(rec)
-		case st.TryRead != "":
-			_, err := os.ReadFile(st.TryRead)
-			rec.Reads[st.TryRead] = result(err)
-			writeRecord(rec)
 		case st.WaitFile != "":
 			for path := os.ExpandEnv(st.WaitFile); ; time.Sleep(20 * time.Millisecond) {
 				if _, err := os.Stat(path); err == nil {
@@ -173,7 +162,6 @@ func spawn(s Spawn) int {
 	cmd := exec.Command(os.Args[0], args...)
 	// The children keep the agent's stdout open, as real children do.
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: s.Setsid}
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(os.Stderr, "fakeagent: spawn:", err)
 		os.Exit(64)

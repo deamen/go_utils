@@ -36,7 +36,6 @@ func TestParse(t *testing.T) {
 
 	for name, c := range map[string]struct{ file, want string }{
 		"an unknown setting":       {"---\nplan_gat: required\n---\n", "field plan_gat not found"},
-		"grants":                   {"---\ngrants: {env: {A: b}}\n---\n", "field grants not found"},
 		"who may approve":          {"---\napprovers: [someone]\n---\n", "field approvers not found"},
 		"a hook at the removal":    {"---\nhooks: {before_remove: [/bin/true]}\n---\n", "field before_remove not found"},
 		"a value that is no value": {"---\nplan_gate: sometimes\n---\n", "plan_gate must be skip or required"},

@@ -11,6 +11,15 @@ GitHub (issues, PRs) ────────┘  verify-webhook │ dedup → q
                                                               and GitHub issues (ack / result)
 ```
 
+## How ochell is meant to be run
+**ochell is an employee.** It works under its own account, with the access that the people who deploy it give it, and the agent it starts works the same way.
+
+- **The environment that ochell runs in is the security boundary**: the host, VM or container, its network, and the accounts it can reach. ochell draws no boundary of its own around the agent.
+- **The agent runs as ochell, with all of its access.** It is a child process of ochell, under ochell's own OS user, with ochell's whole environment. So it can read what ochell can read and do what ochell can do: the configuration and the policy file, [the store](#the-store) and its backups, the Linear token file, the tokens in ochell's environment, the logs and the working directories of other tickets, and it can open [the admin socket](#guards-and-the-admin-channel).
+- **Tools, credentials and the cost of the work are for the people who deploy it.** The agent's CLI, its MCP servers, its credentials and its permission settings are set up in ochell's environment (see [Agent environment](#agent-environment)); every run gets the same, whatever its tier. ochell records no cost and limits none: the tokens are used by the tool that does the work, and are paid for by whoever set it up.
+
+What ochell's own controls are for, then: the tiers, gates, limits and the record of every run steer the work and keep the decisions of people (see [Policy and risk tiers](#policy-and-risk-tiers), [Gate integrity](#gate-integrity)). The tokens of the status API and the metrics, and the mode of the admin socket, keep out other users and other processes on the host and the network. None of them is a fence against the agent: what the agent must not do is kept from it by the environment, the accounts it uses (for example a GitHub account without the right to merge) and the review of its work.
+
 ## Supported sources
 | Source | Endpoint (default) | Authentication | Trigger |
 |---|---|---|---|
@@ -107,7 +116,7 @@ sources:
 - **No priority.** GitHub issues have none, so a GitHub ticket is queued without one.
 - **Telling the issue:** `github.token`, the token of the handoff, only reads, and stays that way. To comment on an issue ochell needs **`sources.github.token`**: a token of the digital employee's own account with read and write access to **issues** (and to **pull requests**, when pull requests are assigned to it), and nothing else. Never give it access to contents, or the right to merge. With it, the issue gets a comment when a run starts and when it ends, and when the ticket is not started, as a Jira ticket does; ochell also asks GitHub about issues with it, for [the poller](#the-poller) and the [gates of scheduling](#scheduling). Without it the issue gets no answer from ochell, as a Jira ticket without `sources.jira_api`, and GitHub is not asked.
   - **The token must belong to `github.bot_login`.** ochell asks GitHub once whose it is, and writes nothing with a token of another account: a comment by any other account would come back as a person's and start a run. A token of a GitHub App installation cannot be asked that way, and is not supported.
-  - It is not the agent's token. The agent reaches GitHub with its own, from the environment that ochell runs in (see [Agent environment](#agent-environment)).
+  - It is for what ochell writes. The agent reaches GitHub with what the environment that ochell runs in gives it (see [Agent environment](#agent-environment)); as it runs with ochell's access, it can read this token too.
 - **What GitHub cannot do here** is refused at start, not left to do nothing: `scheduling.blocked_by: wait` (ochell reads no dependencies between issues), and `scheduling.required_labels` without `sources.github.token`. There is no status to move an issue to at the hand-over (`review_status` is Jira's).
 - **The prompt:** the default prompt tells the agent to read the ticket with `twg`. For a GitHub ticket the context of the prompt names the issue (`The ticket is the issue #12 of the GitHub repository acme/shop.`), so an agent with `gh` finds it; adapt `agent.prompt_template` where it has neither.
 
@@ -249,7 +258,6 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-arg` | Agent argument; repeatable; replaces the YAML `args` (default `-p`). Go template: `{{.Key}}`, `{{.Source}}`, `{{.ID}}`. Keep ticket text (`{{.Title}}`, `{{.URL}}`, `{{.Context}}`, `{{.Prompt}}`) out of arguments; see [The prompt](#the-prompt) |
 | `--agent-prompt-via` | `stdin` (default) or `arg` |
 | `--agent-adapter` | Kind of agent CLI: `plain` (default) or `claude`; see [Agent adapters](#agent-adapters) |
-| `--agent-launcher` | `direct`, the only launcher; see [Launchers](#launchers) |
 | `--agent-stall-timeout` | Stop an agent that wrote no output for this long, and start the ticket again (default `0`: never); see [Retry and stall detection](#retry-and-stall-detection) |
 | `--agent-watchdog-repeats` | Stop an agent that made the same tool call, or the same few calls in a row, this many times, and leave the ticket to a human (default `0`: never); see [The watchdog](#the-watchdog) |
 | `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-max-attempts`, `--agent-log-dir`, `--agent-run-dir` | Execution settings |
@@ -295,7 +303,7 @@ sources:
 - **`jql`** selects the bot's open tickets, which is what the poller starts from. The default is `assignee = currentUser() AND statusCategory != Done`: the account that owns the token, so no account id is needed.
 - **Check it** with `ochell jira-check --config config.yaml`. It lists the tickets that the JQL selects; with `--comment-on KEY` it also adds a test comment to that ticket.
 - **`review_status`** is optional: the status, for example `In Review`, that a ticket is moved to when the agent reports its work as done. The ticket's workflow must have a transition to it from where the ticket is. If the move fails, ochell logs a warning, and the comment is there all the same. A repository can choose another one from a list of the host's (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)).
-- The token is ochell's own. It is not passed to the agent.
+- The token is ochell's own, for what ochell does. The agent runs with ochell's access and can read it (see [How ochell is meant to be run](#how-ochell-is-meant-to-be-run)).
 - Without `base_url` ochell runs as before, and nothing that needs the API happens.
 
 Only [internal/tracker/jiraapi](internal/tracker/jiraapi/jiraapi.go) calls the Jira API. The rest of ochell uses the small interfaces in [internal/tracker](internal/tracker/tracker.go) (`Assigned`, `Comment`, `SetStatus`; for the poller and scheduling `Assigner`, `Lookup`, `Scheduling`), so another way to reach Jira, such as `twg`, can be added behind it.
@@ -326,7 +334,7 @@ The agent opens a pull request and hands the ticket over; a person reviews and m
 
    ```yaml
    github:
-     token: ${GITHUB_READ_TOKEN}     # read access to pull requests; not the agent's token
+     token: ${GITHUB_READ_TOKEN}     # read access to pull requests
      poll_interval: 2m
      bot_login: digital-employee     # the GitHub login of the digital employee
      # api_url: https://ghe.example.com/api/v3   # GitHub Enterprise Server
@@ -385,7 +393,7 @@ agent:
 | `ochell_agent_token_expiry_timestamp_seconds`, `ochell_agent_token_days_left` | gauge | the end of the agent's token, with `agent.token_expires` |
 | `ochell_build_info{version}` | gauge | always 1 |
 
-- **Every scrape needs the token** (`Authorization: Bearer <metrics.token>`, at least 16 characters), because the agent runs on the same host and can reach any local port. It is a token of its own: a scraper does not need [the status API](#the-status-api)'s, which opens ticket text.
+- **Every scrape needs the token** (`Authorization: Bearer <metrics.token>`, at least 16 characters), because every user and process on the host can reach a local port. It keeps out others, not the agent, which runs with ochell's access. It is a token of its own: a scraper does not need [the status API](#the-status-api)'s, which opens ticket text.
 
   ```yaml
   # prometheus.yml
@@ -406,7 +414,7 @@ The store holds what cannot be rebuilt from the trackers: the agents' session id
 
 ```yaml
 backup:
-  dir: /var/backups/ochell      # where the agent cannot read; best on another disk
+  dir: /var/backups/ochell      # best on another disk
   interval: 24h
   keep: 7
 ```
@@ -507,7 +515,7 @@ api:
 | `GET /api/v1/tasks/<key>` | one ticket with every run: when it started and ended, why it was queued, its outcome, and what the agent said. Add `?source=jira`, `?source=linear` or `?source=github` when more than one source has the key |
 
 - **The answer is JSON.** A browser (a request that accepts `text/html`) gets a plain page with the same content.
-- **Every request needs the token**: `Authorization: Bearer <api.token>`, at least 16 characters. The pages show ticket titles and what agents said, and the agent runs on the same host and can reach any local port, so a loopback address is not enough.
+- **Every request needs the token**: `Authorization: Bearer <api.token>`, at least 16 characters. The pages show ticket titles and what agents said, and every user and process on the host can reach a local port, so a loopback address is not enough. The token keeps out others, not the agent, which runs with ochell's access.
 
   ```
   curl -H "Authorization: Bearer $OCHELL_API_TOKEN" http://127.0.0.1:8080/api/v1/state
@@ -655,7 +663,7 @@ The file is YAML front matter between two lines of `---`, and after it the promp
   | `max_turns` | a number below the tier's limit, or any number for a tier without one. Needs the `claude` adapter | a number above the tier's limit: ignored |
   | `review_status` | one of `workflow.review_statuses`; it takes the place of `sources.jira_api.review_status` for the repository's tickets | any other status: ignored. A status moves the ticket in Jira, so the host says which ones a repository may choose |
   | `hooks` (`after_create`, `before_run`, `after_run`) | with `workflow.allow_hooks`: the hook runs **after** the host's hook of the same name, never in its place | without `allow_hooks`: ignored |
-  | the prompt (the text after the front matter) | it takes the place of `agent.prompt_template`. A prompt is text for the agent and grants nothing | |
+  | the prompt (the text after the front matter) | it takes the place of `agent.prompt_template`. A prompt is text for the agent and gives it no access | |
 
   - The tier is the ticket's own (see [Policy and risk tiers](#policy-and-risk-tiers)): the same file can narrow one tier and be ignored in part for another.
   - With [graduated autonomy](#graduated-autonomy), the tier is held back by its level first, and the file is compared with what is left. `pr_review: sampled` in the file is ignored while the tier's level does not carry `sampled` yet.
@@ -664,7 +672,7 @@ The file is YAML front matter between two lines of `---`, and after it the promp
   - A run that reaches the `max_turns` of the file ends like one that reaches the tier's (see [Escalation](#escalation)).
 - **An invalid file keeps the last good one.** ochell keeps the last version that was valid in [the store](#the-store), and it stays in force, also across a restart, while the default branch has a file that is invalid or that ochell cannot read (GitHub does not answer, or the token cannot see the repository). The reason is reported in the same places. Without an earlier good version the host's settings hold alone.
   - A file that was **removed** from the default branch is no longer in force: the host's settings hold alone.
-- **Why hooks need the host's yes.** A hook is a command that ochell runs for every ticket of the repository, as the agent's OS user and with the agent's environment, before anyone has looked at the run. The agent can already run commands there, so a hook reaches nothing new; but it runs without the agent deciding to, also in a run that is only for a plan. The host decides whether repositories may do that. `before_remove` cannot be set: a working directory is removed outside any run.
+- **Why hooks need the host's yes.** A hook is a command that ochell runs for every ticket of the repository, as ochell's own OS user and with the agent's environment, before anyone has looked at the run. The agent can already run commands there, so a hook reaches nothing new; but it runs without the agent deciding to, also in a run that is only for a plan. The host decides whether repositories may do that. `before_remove` cannot be set: a working directory is removed outside any run.
 - **The templates are not Go templates.** In the prompt and in a hook's arguments only `{{.Name}}` is replaced, so that text from a repository is never run as a template program. Anything else in `{{ }}` makes the file invalid.
   - The prompt: `.Source`, `.Key`, `.Title`, `.URL`, `.Repo`, `.Context`, `.ID`, `.Attempt`, `.ResultFile`, and `.RunContext` and `.ResultInstructions`, which **must** both be there (see [The prompt](#the-prompt)). The run context is where ochell tells the agent that a run is for a plan only.
   - A hook's arguments: `.ID`, `.Source`, `.Key`, `.Repo`, `.Branch`.
@@ -890,7 +898,7 @@ The agent can write to its tickets with its own tool (`twg`), as the bot account
 And for everyone:
 - **A label that would lower the tier is ignored.** A tier only goes up while ochell knows the ticket, so removing a label, or a label that the policy gives a lower tier, changes nothing. Lowering is the operator's `ochell reset <jira|linear|github> <KEY> --tier <name>` (see [Policy and risk tiers](#policy-and-risk-tiers)).
 - **A plan is approved only with `/approve` from someone who may** (see [The plan gate](#the-plan-gate)). No status and no label approves anything.
-- **A tier's limits are in the policy file**, which the agent cannot write.
+- **A tier's limits are in the policy file**, which ochell reads at start. Nothing on a ticket or in a repository changes them. The agent runs as ochell, so a policy file that belongs to ochell's user is one it could change; let the file belong to root when that matters (see [Policy and risk tiers](#policy-and-risk-tiers)).
 - **A repository's `WORKFLOW.md` can make a gate stricter, never looser** (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)). The agent can change that file on its own branch; ochell reads the default branch.
 - **A tier's level of autonomy goes up only by an operator's `ochell promote`** (see [Graduated autonomy](#graduated-autonomy)). Nothing on a ticket or in a repository raises it.
 
@@ -986,7 +994,7 @@ workspace:
 ```
 
 - **`root`**: every working directory must be inside it. A run whose `workdir` is outside is refused (`not_started`) before anything is created. Without a root nothing is checked and nothing is ever removed.
-- **Hooks** are ochell's own; they are not the hooks inside the agent's runtime. Each is a command with arguments, run without a shell, in the working directory, through the same launcher and as the same OS user as the agent.
+- **Hooks** are ochell's own; they are not the hooks inside the agent's runtime. Each is a command with arguments, run without a shell, in the working directory, in the same way as the agent: as ochell's own OS user, in a process group of its own (see [Running the agent](#running-the-agent)).
 
   | Hook | When | If it fails |
   |---|---|---|
@@ -1047,7 +1055,7 @@ What a run leads to:
 Pausing is not a state: it holds the queue, and queued tickets stay queued. The same goes for a throttle and for [scheduling](#scheduling): a ticket that waits for a place, a label or a blocker is `queued`.
 
 ### Agent adapters
-An adapter holds what differs between agent CLIs: how a run is started, how an earlier session is resumed, and how the output is read (final message, session id). It only builds commands and parses output. Running and stopping the process is the launcher's job, so every adapter works with every launcher. `agent.adapter` selects it.
+An adapter holds what differs between agent CLIs: how a run is started, how an earlier session is resumed, and how the output is read (final message, session id). It only builds commands and parses output. Running and stopping the process is ochell's own (see [Running the agent](#running-the-agent)). `agent.adapter` selects it.
 
 | Adapter | Command | Result |
 |---|---|---|
@@ -1070,8 +1078,8 @@ An adapter holds what differs between agent CLIs: how a run is started, how an e
   - `tool_activity_interval: 0s` posts none. A Jira ticket has no place for this, and gets none. The `plain` adapter does not know what the agent does.
   - Whether Linear shows an ephemeral `action` as described was not checked against Linear.
 
-### Launchers
-A launcher starts and stops the agent process. `agent.launcher` selects it, and `direct`, the default, is the only one: the agent is a child process of ochell and runs as ochell's own OS user, the way an employee works under their own account.
+### Running the agent
+The agent is a child process of ochell, started without a shell, and runs as ochell's own OS user, the way an employee works under their own account (see [How ochell is meant to be run](#how-ochell-is-meant-to-be-run)). There is no setting for this.
 
 - The agent can read ochell's config, Linear token file and logs, and the working directories of other tickets.
 - A stop reaches the agent's process group (see [Stopping agents and shutting down](#stopping-agents-and-shutting-down)).
@@ -1149,14 +1157,14 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 - Result files are removed with their run directory after `retention.logs` (see [Retention](#retention)).
 
 ### Agent environment
-ochell is treated like an employee: the agent gets all the access that ochell has, and that includes ochell's environment. The agent, and every [workspace hook](#workspaces), gets:
+ochell is treated like an employee (see [How ochell is meant to be run](#how-ochell-is-meant-to-be-run)): the agent gets all the access that ochell has, and that includes ochell's environment. The agent, and every [workspace hook](#workspaces), gets:
 - ochell's whole environment, as ochell was started with it;
 - `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL`, `ORCH_TASK_BRANCH`, `ORCH_TASK_TIER` (the ticket's [risk tier](#policy-and-risk-tiers)) and `ORCH_RESULT_FILE`, `ORCH_TASK_REPO` when a repository is mapped to the ticket, and `ORCH_TASK_AUTONOMY` (the tier's [level of autonomy](#graduated-autonomy)) when the policy has levels;
 - the variables set in `agent.env`.
 
 A later item overrides an earlier one: a name in `agent.env` wins over the same name in ochell's environment, and every name is set once. `ORCH_RESULT_FILE` (and `ORCH_HOOK` for a hook) is always ochell's.
 
-A run of any tier gets the same: a tier grants no tools or credentials of its own. What the agent needs (its tools, its MCP servers, its credentials) is set up in the environment that ochell runs in. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, set it in ochell's environment; no setting names it.
+A run of any tier gets the same: a tier gives no tools or credentials of its own. What the agent needs (its tools, its MCP servers, its credentials) is set up in the environment that ochell runs in. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, set it in ochell's environment; no setting names it.
 
 ## Setup
 ### Jira system webhook (recommended)
@@ -1301,20 +1309,19 @@ Notes:
   - Only the repositories of `sources.github.repos` start work, whatever a signed delivery says.
   - GitHub's deliveries carry no timestamp. A captured delivery is refused for the 24 hours that ochell remembers its body. After that it would be accepted again, as the assignment or the comment that it was: a replayed assignment starts a run unless the ticket is queued or running then, within `agent.max_attempts`. Keep the secret of the webhook secret, and change it when it may have leaked.
   - ochell has two GitHub tokens, and neither can merge or push: `github.token` reads; `sources.github.token` reads issues and writes comments on them, as the digital employee's account. ochell writes nothing with a token of another account.
-- **Ticket content is untrusted.** It reaches the agent's prompt, so it can attempt prompt injection. Give the agent only the access and permissions it needs, and keep a human review of the PR (QC) before anything is deployed.
+- **Ticket content is untrusted.** It reaches the agent's prompt, so it can attempt prompt injection. The agent has all the access that ochell's environment gives, so give that environment only the access and permissions the work needs, and keep a human review of the PR (QC) before anything is deployed.
 - **Limits:**
   - Request bodies are limited to 1 MiB.
   - Ticket keys must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` before they are used in file names or templates.
   - Signatures and tokens are compared in constant time.
-- **Agent environment:** the agent gets ochell's whole environment, including the secrets that ochell holds there (see [Agent environment](#agent-environment)). The boundary is the host or container that ochell runs in.
 - **The watchdog** compares the agent's tool calls by a hash, and keeps nothing of their input (see [The watchdog](#the-watchdog)). It stops a run that repeats itself; it is not a guardrail against what the agent does.
 - **Metrics:** the endpoint needs its own token on every scrape (see [Metrics](#metrics)).
 - **Status API:** it needs its token on every request, also from the same host (see [The status API](#the-status-api)).
-- **Policy:** the tiers and limits are in a file of ochell's own, (see [Policy and risk tiers](#policy-and-risk-tiers)). Nothing in a ticket or a repository widens them.
+- **Policy:** the tiers and limits are in a file of ochell's own (see [Policy and risk tiers](#policy-and-risk-tiers)). Nothing in a ticket or a repository widens them.
 - **Graduated autonomy:** a level only holds back what a tier allows, and only an operator on the admin socket raises one (see [Graduated autonomy](#graduated-autonomy)). ochell merges nothing at any level.
 - **Scheduling:** a label of `required_labels` counts only when someone other than the bot account put it on the ticket; the priority and `blocked_by` order the work and are not approvals (see [Scheduling](#scheduling)).
 - **A repository's `WORKFLOW.md`** is untrusted: it is read from the default branch only, it can only narrow the policy, and its templates are placeholders, not programs (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)). That the agent cannot push to the default branch is GitHub's branch protection to enforce.
-- **Agent OS user:** the agent runs as the same OS user as ochell and can read ochell's files (see [Launchers](#launchers)). The boundary is the host or container that ochell runs in.
+- **The agent has ochell's access:** it runs as ochell's own OS user with ochell's whole environment, including the secrets that ochell holds there, and can read ochell's files and open its admin socket. The boundary is the environment that ochell runs in (see [How ochell is meant to be run](#how-ochell-is-meant-to-be-run)).
 - **Secrets:** never commit secrets or TLS keys. The repository's pre-commit hooks reject private keys.
 
 ## Licensing notes (checked October 2026)

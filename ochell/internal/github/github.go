@@ -293,15 +293,15 @@ func (c *Client) PullRequest(ctx context.Context, ref Ref) (*PullRequest, error)
 const (
 	// ChecksNone: nothing checks this commit, as far as GitHub knows.
 	ChecksNone = "none"
-	// ChecksPending: at least one check has not finished.
-	ChecksPending = "pending"
+	// ChecksRunning: at least one check has not finished.
+	ChecksRunning = "pending"
 	ChecksPassed  = "passed"
 	ChecksFailed  = "failed"
 )
 
 // Checks is the state of the checks of one commit.
 type Checks struct {
-	// State is ChecksNone, ChecksPending, ChecksPassed or ChecksFailed. It
+	// State is ChecksNone, ChecksRunning, ChecksPassed or ChecksFailed. It
 	// is ChecksFailed only when every check has finished and at least one
 	// did not succeed, so that Failed is the whole list.
 	State  string
@@ -379,7 +379,7 @@ func (c *Client) Checks(ctx context.Context, ref Ref, sha string) (*Checks, erro
 	switch {
 	case total == 0:
 	case pending:
-		out.State, out.Failed = ChecksPending, nil
+		out.State, out.Failed = ChecksRunning, nil
 	case len(out.Failed) > 0:
 		out.State = ChecksFailed
 	default:

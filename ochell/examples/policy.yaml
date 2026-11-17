@@ -1,8 +1,9 @@
 # ochell example policy: the risk tiers, and which tier a ticket runs under.
 #
-# Point ochell at this file with policy.file in config.yaml. Keep it where
-# the agent cannot write: ochell refuses a file that its group or others can
-# write to, or that belongs to anyone but root or ochell's own user. Change
+# Point ochell at this file with policy.file in config.yaml. ochell refuses a
+# file that its group or others can write to, or that belongs to anyone but
+# root or ochell's own user. The agent runs as ochell's own user, so let the
+# file belong to root when the agent must not change it. Change
 # it through a reviewed pull request; that review is where people decide how
 # much autonomy a class of work gets. "ochell policy-check" reads it as
 # "ochell serve" does.

@@ -72,11 +72,6 @@ func TestUnknownYAMLKeyRejected(t *testing.T) {
 	if _, err := Load("serve", []string{"--config", p}, nil); err == nil {
 		t.Fatal("expected error for unknown key")
 	}
-	// The ticket tools are gone: a file that still sets them is refused.
-	p = writeYAML(t, "ticket_tools:\n  enabled: true\n")
-	if _, err := Load("serve", []string{"--config", p}, nil); err == nil || !strings.Contains(err.Error(), "field ticket_tools not found") {
-		t.Errorf("ticket_tools: err = %v, want an unknown setting", err)
-	}
 }
 
 func TestValidate(t *testing.T) {
@@ -271,24 +266,6 @@ sources:
 	}
 }
 
-// The agent inherits ochell's whole environment; no setting names what it
-// gets. A config that still sets env_pass is refused at start.
-func TestEnvPassIsRefused(t *testing.T) {
-	for name, yml := range map[string]string{
-		"list":  "agent:\n  env_pass: [PATH, HOME, ANTHROPIC_API_KEY]\n",
-		"empty": "agent:\n  env_pass: []\n",
-	} {
-		p := writeYAML(t, "sources:\n  jira_automation:\n    enabled: true\n    token: t\n"+yml)
-		_, err := Load("serve", []string{"--config", p}, nil)
-		if want := "field env_pass not found"; err == nil || !strings.Contains(err.Error(), want) {
-			t.Errorf("%s: got %v, want an error with %q", name, err, want)
-		}
-	}
-	if _, err := Load("serve", []string{"--agent-env-pass", "PATH"}, nil); err == nil {
-		t.Error("--agent-env-pass: accepted, want an unknown flag")
-	}
-}
-
 func TestPromptOnStdinByDefault(t *testing.T) {
 	cfg := Default()
 	if cfg.Agent.PromptVia != "stdin" {
@@ -317,57 +294,24 @@ func TestPromptOnStdinByDefault(t *testing.T) {
 	}
 }
 
-// The container launcher is gone (MMZ-111): a configuration that still
-// selects it, or still has its settings, is refused at start.
-func TestPodmanLauncherIsRefused(t *testing.T) {
-	cfg := Default()
-	cfg.Sources.JiraAutomation.Enabled = true
-	cfg.Sources.JiraAutomation.Token = "t"
-	cfg.Agent.Launcher = "podman"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.launcher must be direct") {
-		t.Errorf("agent.launcher podman: got %v", err)
-	}
-	// What ochell does at start: load, then validate.
-	for name, c := range map[string]struct{ yml, want string }{
-		"launcher": {"agent:\n  launcher: podman\n", "agent.launcher must be direct"},
-		"settings": {"agent:\n  podman:\n    image: localhost/agent:1\n", "field podman not found"},
-		"empty":    {"agent:\n  podman: {}\n", "field podman not found"},
+// There is one way to start an agent: as a child process of ochell. A
+// configuration that still chooses one is refused at start as an unknown
+// setting, and so is a setting that only a removed way of starting it had.
+func TestLauncherIsRefused(t *testing.T) {
+	for name, yml := range map[string]string{
+		"direct":  "agent:\n  launcher: direct\n",
+		"other":   "agent:\n  launcher: container\n",
+		"empty":   "agent:\n  launcher: \"\"\n",
+		"section": "agent:\n  container: {}\n",
 	} {
-		p := writeYAML(t, "sources:\n  jira_automation:\n    enabled: true\n    token: t\n"+c.yml)
-		cfg, err := Load("serve", []string{"--config", p}, nil)
-		if err == nil {
-			err = cfg.Validate()
-		}
-		if err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s: got %v, want an error with %q", name, err, c.want)
+		p := writeYAML(t, "sources:\n  jira_automation:\n    enabled: true\n    token: t\n"+yml)
+		_, err := Load("serve", []string{"--config", p}, nil)
+		if err == nil || !strings.Contains(err.Error(), "not found") {
+			t.Errorf("%s: got %v, want an unknown setting", name, err)
 		}
 	}
-}
-
-// The systemd launcher is gone (MMZ-112): a configuration that still
-// selects it, or still has its settings, is refused at start.
-func TestSystemdLauncherIsRefused(t *testing.T) {
-	cfg := Default()
-	cfg.Sources.JiraAutomation.Enabled = true
-	cfg.Sources.JiraAutomation.Token = "t"
-	cfg.Agent.Launcher = "systemd"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.launcher must be direct") {
-		t.Errorf("agent.launcher systemd: got %v", err)
-	}
-	// What ochell does at start: load, then validate.
-	for name, c := range map[string]struct{ yml, want string }{
-		"launcher": {"agent:\n  launcher: systemd\n  command: /usr/local/bin/claude\n", "agent.launcher must be direct"},
-		"settings": {"agent:\n  systemd:\n    launch_command: [sudo, -n, /opt/ochell-launch]\n", "field systemd not found"},
-		"empty":    {"agent:\n  systemd: {}\n", "field systemd not found"},
-	} {
-		p := writeYAML(t, "sources:\n  jira_automation:\n    enabled: true\n    token: t\n"+c.yml)
-		cfg, err := Load("serve", []string{"--config", p}, nil)
-		if err == nil {
-			err = cfg.Validate()
-		}
-		if err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s: got %v, want an error with %q", name, err, c.want)
-		}
+	if _, err := Load("serve", []string{"--agent-launcher", "direct"}, nil); err == nil {
+		t.Error("--agent-launcher: accepted, want an unknown flag")
 	}
 }
 

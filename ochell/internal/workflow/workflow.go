@@ -258,7 +258,7 @@ func AllowedStatus(status string, allowed []string) string {
 //   - review_status: one of the statuses the host lists, and no other;
 //   - hooks: only when the host allows a repository's hooks; they are run
 //     in addition to the host's, never in their place;
-//   - the prompt: text for the agent, which grants nothing.
+//   - the prompt: text for the agent, which gives it no access.
 //
 // A setting that is not stricter than the tier's, or that the host does
 // not allow, is left out and named in Ignored. The rest of the file holds.

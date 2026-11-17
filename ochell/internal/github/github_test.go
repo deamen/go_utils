@@ -124,13 +124,13 @@ func TestChecks(t *testing.T) {
 		t.Errorf("a commit without checks: %+v", got)
 	}
 	gh.SetChecks("aaa", githubtest.Check{Name: "build", Status: "completed", Conclusion: "success"}, githubtest.Check{Name: "test", Status: "in_progress"})
-	if got := state("aaa"); got.State != github.ChecksPending || len(got.Failed) != 0 {
+	if got := state("aaa"); got.State != github.ChecksRunning || len(got.Failed) != 0 {
 		t.Errorf("a check that still runs: %+v", got)
 	}
 	// A failure counts only when everything has finished, so that the
 	// list of failures is whole.
 	gh.SetChecks("aaa", githubtest.Check{Name: "build", Status: "completed", Conclusion: "failure", Title: "1 error", Summary: "main.go:3: undefined: x"}, githubtest.Check{Name: "test", Status: "queued"})
-	if got := state("aaa"); got.State != github.ChecksPending {
+	if got := state("aaa"); got.State != github.ChecksRunning {
 		t.Errorf("a failure while another check runs: %+v", got)
 	}
 	gh.SetChecks("aaa",

@@ -19,13 +19,14 @@ https:
 
 # The admin channel: a unix socket on which the running ochell takes the
 # commands "ochell pause", "resume", "status", "reset" and "stop". Only ochell's own
-# OS user can open it. Keep it where the agent cannot write.
+# OS user can open it, and so the agent, which runs as ochell, can too. Keep
+# it in a directory that other users cannot write to.
 admin:
   socket: /run/ochell/admin.sock
 
 # The SQLite file with the tickets, the task queue and the handled webhook
-# deliveries. It is created when missing. Keep it where the agent cannot
-# read it.
+# deliveries. It is created when missing, readable by ochell's own user
+# only. It holds ticket text; the agent, which runs as ochell, can read it.
 store:
   path: /var/lib/ochell/ochell.db
 
@@ -47,8 +48,7 @@ metrics:
   token: ${OCHELL_METRICS_TOKEN}
 
 # The scheduled backup of the store: a consistent copy at every interval,
-# the newest "keep" of them kept. Put "dir" where the agent cannot read,
-# and copy the backups off the host. Leave "dir" empty for none; "ochell
+# the newest "keep" of them kept. Copy the backups off the host. Leave "dir" empty for none; "ochell
 # backup --to FILE" still works. "ochell restore --from FILE" puts one back.
 backup:
   dir: /var/backups/ochell
@@ -67,8 +67,7 @@ retention:
 # ochell's own, read-only access to GitHub. With it, ochell follows the
 # pull requests that its tickets opened, and a ticket is done when a person
 # has merged or closed its pull request. The token needs read access to
-# pull requests only; it is not the agent's token. Leave "token" empty to
-# turn this off.
+# pull requests only. Leave "token" empty to turn this off.
 github:
   token: ${GITHUB_READ_TOKEN}
   poll_interval: 2m
@@ -82,7 +81,8 @@ github:
   # api_url: https://ghe.example.com/api/v3   # also for sources.github
 
 # The policy file: the risk tiers, and which tier a ticket runs under (see
-# examples/policy.yaml). It must not be writable by other users.
+# examples/policy.yaml). It must not be writable by other users; the agent
+# runs as ochell, so let it belong to root when the agent must not change it.
 # Leave it out for one built-in tier that every ticket runs under.
 policy:
   file: /etc/ochell/policy.yaml
@@ -101,7 +101,7 @@ repos:
 
 # The working directory of a ticket (agent.workdir): where it may be, how it
 # is prepared, and when it is removed. The hooks are commands that ochell
-# runs in the working directory, as the same OS user as the agent. They get
+# runs in the working directory, as its own OS user, like the agent. They get
 # ORCH_TASK_REPO and ORCH_TASK_BRANCH in their environment.
 workspace:
   # Every working directory must be inside this directory.
@@ -128,8 +128,8 @@ workspace:
 # and reported.
 workflow:
   enabled: false
-  # Let a repository add hooks, which run after the ones above, as the
-  # agent's OS user.
+  # Let a repository add hooks, which run after the ones above, as
+  # ochell's own OS user.
   allow_hooks: false
   # The Jira statuses a repository may choose for the hand-over, in the
   # place of sources.jira_api.review_status. Empty: it cannot choose.
@@ -196,9 +196,6 @@ agent:
   #            again resumes its session. It adds --output-format stream-json
   #            --verbose (and --resume) itself; leave them out of args.
   adapter: claude
-  # How the agent process is run. direct, the only launcher: a child process
-  # of ochell, under ochell's own OS user.
-  launcher: direct
   # Time between SIGTERM and SIGKILL when a run is stopped, at the time limit
   # or on shutdown. The whole agent is stopped, with its children.
   stop_grace: 10s
@@ -345,7 +342,7 @@ sources:
     # to it), and nothing else: never contents, never the right to merge.
     # With it ochell comments on the issue when a run starts and ends, and
     # asks GitHub about issues for the poller and scheduling.required_labels.
-    # It is not github.token, which only reads, and not the agent's. Empty: the issue gets no answer from ochell.
+    # It is not github.token, which only reads. Empty: the issue gets no answer from ochell.
     token: ${GITHUB_ISSUES_TOKEN}
     # The repositories whose issues may become tickets, as owner/name. A
     # delivery about any other repository starts nothing. The issue 12 of

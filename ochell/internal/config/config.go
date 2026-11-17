@@ -48,9 +48,6 @@ type Agent struct {
 	// output is read. "plain" works with any CLI; "claude" is Claude Code
 	// with its event stream, which gives the session id and the tools used.
 	Adapter string `yaml:"adapter"`
-	// Launcher is "direct": the agent is a child process of ochell. It is
-	// the only one.
-	Launcher string `yaml:"launcher"`
 	// StopGrace is how long an agent that is being stopped has between
 	// SIGTERM and SIGKILL.
 	StopGrace time.Duration `yaml:"stop_grace"`
@@ -487,8 +484,7 @@ type API struct {
 
 // GitHub is ochell's own, read-only access to GitHub: it asks what became
 // of the pull requests that its tickets opened. It is used when Token is
-// set. The token needs read access to pull requests and nothing else; it
-// is not the agent's.
+// set. The token needs read access to pull requests and nothing else.
 //
 // APIURL and BotLogin also hold for the GitHub source (sources.github),
 // which has a token of its own.
@@ -550,8 +546,7 @@ type Retention struct {
 // cannot be rebuilt from the trackers: the agents' session ids, queued
 // follow-ups and the record of every run.
 type Backup struct {
-	// Dir is where the backups go: a directory that the agent cannot read,
-	// best on another disk than the store. Empty: no scheduled backup.
+	// Dir is where the backups go, best on another disk than the store. Empty: no scheduled backup.
 	Dir string `yaml:"dir"`
 	// Interval is the time between two backups.
 	Interval time.Duration `yaml:"interval"`
@@ -668,7 +663,6 @@ func Default() *Config {
 			PromptTemplate: DefaultPromptTemplate,
 			Workdir:        ".",
 			Adapter:        "plain",
-			Launcher:       "direct",
 			StopGrace:      10 * time.Second,
 			DrainTimeout:   30 * time.Second,
 			Timeout:        2 * time.Hour,
@@ -816,7 +810,6 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.Var(&stringList{dst: &c.Agent.Args}, "agent-arg", "agent CLI argument, repeatable, Go template (replaces config args)")
 	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: stdin or arg")
 	fs.StringVar(&c.Agent.Adapter, "agent-adapter", c.Agent.Adapter, "kind of agent CLI: plain or claude")
-	fs.StringVar(&c.Agent.Launcher, "agent-launcher", c.Agent.Launcher, "how the agent is run: direct, the only launcher")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
 	fs.DurationVar(&c.Agent.Timeout, "agent-timeout", c.Agent.Timeout, "maximum agent run time")
 	fs.DurationVar(&c.Agent.StallTimeout, "agent-stall-timeout", c.Agent.StallTimeout, "stop an agent that wrote no output for this long, and start the ticket again (0: never)")
@@ -1034,9 +1027,6 @@ func (c *Config) Validate() error {
 		}
 	default:
 		errs = append(errs, errors.New("agent.adapter must be plain or claude"))
-	}
-	if c.Agent.Launcher != "direct" {
-		errs = append(errs, errors.New("agent.launcher must be direct"))
 	}
 	if c.Agent.StopGrace < 0 {
 		errs = append(errs, errors.New("agent.stop_grace must not be negative"))

@@ -156,7 +156,7 @@ func serve(args []string) error {
 	}()
 
 	// The policy is read before anything is started: ochell does not run
-	// with a policy that it cannot read, or that the agent could change.
+	// with a policy that it cannot read, or that another user could change.
 	pol, err := loadPolicy(cfg)
 	if err != nil {
 		return err

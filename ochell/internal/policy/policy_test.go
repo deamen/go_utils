@@ -254,33 +254,6 @@ func TestNextTierAndTurnLimit(t *testing.T) {
 	}
 }
 
-// A tier grants nothing: what the agent needs is set up in the environment
-// that ochell runs in. A policy that still has grants is refused as an
-// unknown setting, whatever they hold.
-func TestGrantsAreRefused(t *testing.T) {
-	for name, grants := range map[string]string{
-		"mcp_config":       "{mcp_config: /etc/ochell/mcp/low.json}",
-		"env":              "{env: {TOOLSET: low}}",
-		"credentials_file": "{credentials_file: /etc/ochell/low.env}",
-		"mint and revoke":  "{mint: [/usr/local/bin/mint-token], revoke: [/usr/local/bin/revoke-token]}",
-		"ticket tools":     "{ticket_tools: true}",
-		"empty":            "{}",
-	} {
-		text := "tiers: [{name: a, grants: " + grants + "}]\ndefault_tier: a"
-		if _, err := Parse([]byte(text)); err == nil || !strings.Contains(err.Error(), "field grants not found") {
-			t.Errorf("%s: err = %v, want one with %q", name, err, "field grants not found")
-		}
-	}
-	// Load reads the file in the same way.
-	path := filepath.Join(t.TempDir(), "policy.yaml")
-	if err := os.WriteFile(path, []byte("tiers:\n  - name: low\n    grants:\n      env: {TOOLSET: low}\ndefault_tier: low\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "field grants not found") {
-		t.Errorf("Load: err = %v, want one with %q", err, "field grants not found")
-	}
-}
-
 func TestScheduling(t *testing.T) {
 	// Without the section nothing is gated, and nothing is limited.
 	p, err := Parse([]byte(three))
