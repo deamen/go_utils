@@ -31,11 +31,9 @@ type Spec struct {
 	// for ochell (the result file). The launcher creates it when missing,
 	// so that the agent can write in it. Empty: none.
 	RunDir string
-	// Env is set for the agent, as NAME=VALUE: ORCH_TASK_* and agent.env.
+	// Env is the agent's whole environment, as NAME=VALUE: ochell's own
+	// environment with ORCH_TASK_* and agent.env on top. Nil means none.
 	Env []string
-	// Inherited is copied from ochell's own environment (agent.env_pass), as
-	// NAME=VALUE.
-	Inherited []string
 	// Stdin is written to the agent's stdin; nil means no input.
 	Stdin io.Reader
 	// Output receives the agent's stdout and stderr.

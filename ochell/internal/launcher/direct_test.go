@@ -38,7 +38,7 @@ func TestDirectLauncher(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "new", "dir")
 	p, err := Direct{}.Start(Spec{
 		Command: "/bin/sh", Args: []string{"-c", `pwd; cat; echo " a=$A b=$B"; exit 5`}, Dir: dir,
-		Env: []string{"A=1"}, Inherited: []string{"B=2"}, Stdin: strings.NewReader("in"), Output: out,
+		Env: []string{"A=1", "B=2"}, Stdin: strings.NewReader("in"), Output: out,
 	})
 	if err != nil {
 		t.Fatal(err)

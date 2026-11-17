@@ -88,6 +88,22 @@ func (w *workspaceRunner) ran(t *testing.T) []string {
 	return strings.Split(strings.TrimSpace(string(raw)), "\n")
 }
 
+// A hook gets ochell's whole environment, like the agent.
+func TestHookEnvironmentIsOchells(t *testing.T) {
+	t.Setenv("OCHELL_TEST_ONLY_IN_OCHELL", "from-ochell")
+	w := newWorkspaceRunner(t, config.Workspace{Hooks: config.Hooks{BeforeRun: helper("env")}})
+	res := w.run(t, "t1")
+	if res.Outcome != task.OutcomeFinished {
+		t.Fatalf("run: %+v", res)
+	}
+	logged, _ := os.ReadFile(res.LogFile)
+	for _, want := range []string{"env: OCHELL_TEST_ONLY_IN_OCHELL=from-ochell\n", "env: ORCH_HOOK=before_run\n"} {
+		if !strings.Contains(string(logged), want) {
+			t.Errorf("the hook environment lacks %q:\n%s", want, logged)
+		}
+	}
+}
+
 // after_create runs once for a working directory, before_run and after_run
 // around every run, all in the working directory and with the branch.
 func TestWorkspaceHooks(t *testing.T) {

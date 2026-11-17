@@ -143,14 +143,13 @@ func (r *Runner) runHook(ctx context.Context, name string, repo bool, tmpl []*te
 	start := time.Now()
 	fmt.Fprintf(out, "# ---- hook %s: %s (%d args) ----\n", label, argv[0], len(argv)-1)
 	spec := launcher.Spec{
-		TaskID:    id,
-		Command:   argv[0],
-		Args:      argv[1:],
-		Dir:       dir,
-		Env:       append(r.taskEnv(t), "ORCH_HOOK="+name),
-		Inherited: r.inheritedEnv(),
-		Output:    out,
-		Timeout:   r.ws.cfg.HookTimeout,
+		TaskID:  id,
+		Command: argv[0],
+		Args:    argv[1:],
+		Dir:     dir,
+		Env:     r.env(t, "ORCH_HOOK="+name),
+		Output:  out,
+		Timeout: r.ws.cfg.HookTimeout,
 	}
 	w, outcome := r.execute(ctx, spec, 0, nil)
 	var err error
