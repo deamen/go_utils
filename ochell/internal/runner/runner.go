@@ -168,11 +168,11 @@ func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 // UsePolicy sets the policy with the risk tiers. Call it before Start.
 // Without it the built-in policy holds.
 //
-// A policy with a budget needs an agent that can be kept to it. With any
-// other agent the budget would silently be no limit, so that is refused.
+// A policy with a turn limit needs an agent that can be kept to it. With
+// any other agent the limit would silently be none, so that is refused.
 func (r *Runner) UsePolicy(p *policy.Policy) error {
 	holds := store.Holds{Paused: p.Paused, MaxRunsPerHour: p.Throttles.MaxRunsPerHour,
-		MaxOpenPRsPerRepo: p.Throttles.MaxOpenPRsPerRepo, DailySpendUSD: p.Throttles.DailySpendUSD,
+		MaxOpenPRsPerRepo:    p.Throttles.MaxOpenPRsPerRepo,
 		MaxConcurrentPerRepo: p.Scheduling.MaxConcurrentPerRepo, MaxConcurrentPerTier: map[string]int{}}
 	for _, t := range p.Tiers {
 		if t.Paused {
@@ -182,15 +182,9 @@ func (r *Runner) UsePolicy(p *policy.Policy) error {
 			holds.MaxConcurrentPerTier[t.Name] = t.MaxConcurrent
 		}
 	}
-	if holds.DailySpendUSD > 0 && !agent.LimitsBudget(r.adapter) {
-		return fmt.Errorf("the policy sets throttles.daily_spend_usd, but agent.adapter %s reports no cost: use agent.adapter claude, or take the throttle out of the policy", r.cfg.Adapter)
-	}
 	r.store.SetHolds(holds)
-	if !agent.LimitsBudget(r.adapter) {
+	if !agent.LimitsTurns(r.adapter) {
 		for _, t := range p.Tiers {
-			if t.BudgetUSD > 0 {
-				return fmt.Errorf("the policy sets budget_usd for the tier %s, but agent.adapter %s reports no cost and cannot stop a run at a limit: use agent.adapter claude, or take budget_usd out of the policy", t.Name, r.cfg.Adapter)
-			}
 			if t.MaxTurns > 0 {
 				return fmt.Errorf("the policy sets max_turns for the tier %s, but agent.adapter %s cannot stop a run at a limit: use agent.adapter claude, or take max_turns out of the policy", t.Name, r.cfg.Adapter)
 			}
@@ -673,16 +667,9 @@ type CostReport struct {
 	Total, Today store.Cost
 	// Tickets are the tickets that ochell touched last; the one ticket
 	// when the report is about one.
-	Tickets []TicketCost
+	Tickets []store.TicketCost
 	// Runs are the runs of that one ticket.
 	Runs []store.RunCost
-}
-
-// TicketCost is what a ticket has cost, with the budget of its tier.
-type TicketCost struct {
-	store.TicketCost
-	// BudgetUSD is the budget of the ticket's tier; 0: none.
-	BudgetUSD float64
 }
 
 // maxCostTickets is how many tickets a report over all tickets lists.
@@ -700,16 +687,10 @@ func (r *Runner) Cost(source, key string) (*CostReport, error) {
 	if rep.Today, err = r.store.TotalCost(time.Now().UTC().Truncate(24 * time.Hour)); err != nil {
 		return nil, err
 	}
-	with := func(c store.TicketCost) TicketCost {
-		return TicketCost{TicketCost: c, BudgetUSD: r.policy.Tier(c.Tier).BudgetUSD}
-	}
 	if key == "" {
-		list, err := r.store.TicketCosts(maxCostTickets)
+		rep.Tickets, err = r.store.TicketCosts(maxCostTickets)
 		if err != nil {
 			return nil, err
-		}
-		for _, c := range list {
-			rep.Tickets = append(rep.Tickets, with(c))
 		}
 		return &rep, nil
 	}
@@ -720,18 +701,18 @@ func (r *Runner) Cost(source, key string) (*CostReport, error) {
 	if c == nil {
 		return nil, store.ErrUnknown
 	}
-	rep.Tickets = []TicketCost{with(*c)}
+	rep.Tickets = []store.TicketCost{*c}
 	rep.Runs, err = r.store.RunCosts(source, key)
 	return &rep, err
 }
 
-// ResetAttempts lets a ticket that used up its attempts or its budget be
-// started again: both count from zero.
+// ResetAttempts lets a ticket that used up its attempts be started again:
+// they count from zero.
 func (r *Runner) ResetAttempts(source, key string) error {
 	if err := r.store.ResetAttempts(source, key); err != nil {
 		return err
 	}
-	r.log.Info("attempts and budget reset", "source", source, "key", key)
+	r.log.Info("attempts reset", "source", source, "key", key)
 	return nil
 }
 
@@ -802,7 +783,7 @@ func (r *Runner) TierChanged(source, key, tier string) (stopped bool, err error)
 // would start by itself, or nil. raisedTo is the tier that the ticket moved
 // to in the tracker during the run, or "".
 //
-// The triggers: the budget or the turn limit of the tier; a temporary
+// The triggers: the turn limit of the tier; a temporary
 // failure when the ticket has no attempt left for another try; a move to a
 // higher tier during the run; and the agent's own word that it is not sure
 // of its result or that the ticket is out of its scope.
@@ -815,8 +796,6 @@ func (r *Runner) escalate(t *task.Task, res *task.Result, again *store.Again, ra
 	case raisedTo != "":
 		res.Escalation, to = task.EscalationTierChange, raisedTo
 		res.Err = fmt.Errorf("the run was stopped: the ticket moved from the risk tier %s to %s while the agent was working on it", t.Tier, raisedTo)
-	case res.Outcome == task.OutcomeOverBudget:
-		res.Escalation = task.EscalationBudget
 	case res.Outcome == task.OutcomeOverTurns:
 		res.Escalation = task.EscalationTurns
 	case again != nil && again.Cause == task.CauseRetry:
@@ -1048,20 +1027,15 @@ func (r *Runner) handle(ctx context.Context, t *task.Task) {
 	if wf.Tier.PlanGate == policy.PlanGateRequired && !t.PlanApproved {
 		t.Phase = task.PhasePlan
 	}
-	// A ticket that has used up the budget of its tier is not started, by
-	// whatever asked for this run. Otherwise the run gets what is left.
-	var res task.Result
-	if spent, budget, over := r.budget(t, wf.Tier, log); over {
-		res = task.Result{Outcome: task.OutcomeOverBudget, ExitCode: -1,
-			Err: fmt.Errorf("the run was not started: the ticket has cost %s of its budget of %s (tier %s)", usd(spent), usd(budget), t.Tier)}
-	} else {
-		if r.notify != nil && ctx.Err() == nil {
-			if err := r.notify.Started(notifyCtx, t); err != nil {
-				log.Warn("start notification failed", "err", err)
-			}
+	// The run gets the turn limit of the tier, as it holds for this run: a
+	// repository's WORKFLOW.md can have lowered it.
+	t.MaxTurns = wf.Tier.MaxTurns
+	if r.notify != nil && ctx.Err() == nil {
+		if err := r.notify.Started(notifyCtx, t); err != nil {
+			log.Warn("start notification failed", "err", err)
 		}
-		res = r.run(ctx, t, wf)
 	}
+	res := r.run(ctx, t, wf)
 	res.Workflow, res.Autonomy = wf.version, t.Autonomy
 	r.mu.Lock()
 	by, stopped := r.stops[k]
@@ -1130,35 +1104,6 @@ func phaseName(p task.Phase) string {
 		return "work"
 	}
 	return string(p)
-}
-
-// usd writes an amount of money for a person.
-func usd(v float64) string { return fmt.Sprintf("%.2f USD", v) }
-
-// budget sets the limits of the run of t from the ticket's tier:
-// t.MaxTurns, and t.BudgetUSD, which is what the ticket has left of the
-// tier's budget. over says that nothing is left.
-//
-// tier is the ticket's tier as it holds for this run. A repository's
-// WORKFLOW.md can have lowered its turns; the budget is the policy's alone.
-func (r *Runner) budget(t *task.Task, tier policy.Tier, log *slog.Logger) (spent, budget float64, over bool) {
-	t.MaxTurns = tier.MaxTurns
-	budget = tier.BudgetUSD
-	if budget <= 0 {
-		return 0, 0, false
-	}
-	cost, err := r.store.TicketCost(t.Source, t.Key)
-	if err != nil || cost == nil {
-		// Not knowing what was spent must not open the budget.
-		log.Error("cannot read what the ticket has cost; the run is not started", "err", err)
-		return 0, budget, true
-	}
-	spent = cost.SinceResetUSD
-	if spent >= budget {
-		return spent, budget, true
-	}
-	t.BudgetUSD = budget - spent
-	return spent, budget, false
 }
 
 // next says whether ochell itself starts the ticket of t again after a run
@@ -1246,7 +1191,7 @@ func (r *Runner) command(t *task.Task, prompt *template.Template, view promptVie
 		}
 		args = append(args, s)
 	}
-	run := agent.Run{Args: args, Prompt: t.Prompt, BudgetUSD: t.BudgetUSD, MaxTurns: t.MaxTurns}
+	run := agent.Run{Args: args, Prompt: t.Prompt, MaxTurns: t.MaxTurns}
 	if resume {
 		return r.adapter.Resume(run, t.AgentSession)
 	}
@@ -1452,10 +1397,6 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	case errors.Is(w.err, launcher.ErrNotStarted):
 		res.Outcome = task.OutcomeNotStarted
 		res.Err = w.err
-	case rep.OverBudget:
-		// The agent CLI stopped at the limit that ochell gave it.
-		res.Outcome = task.OutcomeOverBudget
-		res.Err = fmt.Errorf("the run was stopped: it used up what the ticket had left of its budget (%s; tier %s)", usd(t.BudgetUSD), t.Tier)
 	case rep.OverTurns:
 		res.Outcome = task.OutcomeOverTurns
 		res.Err = fmt.Errorf("the run was stopped: it reached the limit of %d turns of the tier %s", t.MaxTurns, t.Tier)

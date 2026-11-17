@@ -64,7 +64,7 @@ func TestParse(t *testing.T) {
 // A file narrows the tier's settings; what would widen them, or what the
 // host does not allow, is ignored and named, and the rest still holds.
 func TestApply(t *testing.T) {
-	strict := policy.Tier{Name: "high", PlanGate: "required", PRReview: "required", AutoMerge: "never", MaxTurns: 40, BudgetUSD: 5}
+	strict := policy.Tier{Name: "high", PlanGate: "required", PRReview: "required", AutoMerge: "never", MaxTurns: 40}
 	loose := policy.Tier{Name: "low", PlanGate: "skip", PRReview: "sampled", AutoMerge: "after_ci"}
 	hook := []string{"/bin/true"}
 	for name, c := range map[string]struct {
@@ -86,7 +86,7 @@ func TestApply(t *testing.T) {
 			File{PlanGate: "skip", PRReview: "sampled", AutoMerge: "after_ci"}, Host{Tier: loose}, loose, "", 0, nil},
 		"fewer turns than the tier": {
 			File{MaxTurns: 10}, Host{Tier: strict, LimitsTurns: true},
-			policy.Tier{Name: "high", PlanGate: "required", PRReview: "required", AutoMerge: "never", MaxTurns: 10, BudgetUSD: 5}, "", 0, nil},
+			policy.Tier{Name: "high", PlanGate: "required", PRReview: "required", AutoMerge: "never", MaxTurns: 10}, "", 0, nil},
 		"turns that nothing can enforce": {
 			File{MaxTurns: 10}, Host{Tier: loose}, loose, "", 0, []string{"max_turns: 10 is ignored: the agent adapter cannot stop a run at a limit"}},
 		"a status the host lists": {
@@ -109,7 +109,7 @@ func TestApply(t *testing.T) {
 			}
 		}
 		if e.Tier.Name != c.want.Name || e.Tier.PlanGate != c.want.PlanGate || e.Tier.PRReview != c.want.PRReview || e.Tier.AutoMerge != c.want.AutoMerge ||
-			e.Tier.MaxTurns != c.want.MaxTurns || e.Tier.BudgetUSD != c.want.BudgetUSD || e.ReviewStatus != c.status || hooks != c.hooks || e.Prompt != body {
+			e.Tier.MaxTurns != c.want.MaxTurns || e.ReviewStatus != c.status || hooks != c.hooks || e.Prompt != body {
 			t.Errorf("%s: %+v", name, e)
 		}
 		if len(e.Ignored) != len(c.ignored) {

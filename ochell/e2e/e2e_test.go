@@ -473,7 +473,7 @@ func TestAttemptCap(t *testing.T) {
 	}
 
 	// An operator looks at it and resets it; then it can be assigned again.
-	if out, code := o.Admin("reset", "linear", "ENG-45"); code != 0 || !strings.Contains(out, "attempts and the budget of linear ENG-45 are reset") {
+	if out, code := o.Admin("reset", "linear", "ENG-45"); code != 0 || !strings.Contains(out, "attempts of linear ENG-45 are reset") {
 		t.Fatalf("ochell reset: exit %d, %q", code, out)
 	}
 	if out, code := o.Admin("reset", "linear", "ENG-404"); code == 0 || !strings.Contains(out, "knows no linear ticket ENG-404") {
@@ -2008,9 +2008,9 @@ const tiersPolicy = `
 version: e2e-1
 owners: [policy.owner@example.com]
 tiers:
-  - {name: low, budget_usd: 5}
-  - {name: normal, budget_usd: 20}
-  - {name: high, plan_gate: skip, budget_usd: 50, labels: [risk-high]}
+  - {name: low, max_turns: 50}
+  - {name: normal, max_turns: 100}
+  - {name: high, plan_gate: skip, max_turns: 200, labels: [risk-high]}
 default_tier: normal
 rules:
   - {source: jira, project: OPS, issue_type: Bug, tier: low}
@@ -2018,7 +2018,7 @@ rules:
 `
 
 // claudeAdapter selects the Claude Code adapter, which a policy with a
-// budget needs. The fake agent ignores the arguments it adds.
+// turn limit needs. The fake agent ignores the arguments it adds.
 func claudeAdapter(c *config.Config) { c.Agent.Adapter = "claude" }
 
 // Risk tiers: each run records the tier that its ticket matched in the
@@ -2118,8 +2118,8 @@ func TestRiskTiers(t *testing.T) {
 func TestPolicyFileIsCheckedAtStart(t *testing.T) {
 	o := Start(t, Options{Policy: tiersPolicy, Configure: claudeAdapter})
 	if out, code := o.Admin("policy-check"); code != 0 || !strings.Contains(out, "policy.yaml is valid") ||
-		!strings.Contains(out, "high: plan_gate=skip pr_review=required auto_merge=never budget_usd=50 labels=risk-high") ||
-		!strings.Contains(out, "normal: plan_gate=skip pr_review=required auto_merge=never budget_usd=20 (default)") {
+		!strings.Contains(out, "high: plan_gate=skip pr_review=required auto_merge=never max_turns=200 labels=risk-high") ||
+		!strings.Contains(out, "normal: plan_gate=skip pr_review=required auto_merge=never max_turns=100 (default)") {
 		t.Errorf("ochell policy-check: exit %d, %q", code, out)
 	}
 	// "serve" reads the policy before it opens a port or the store, so a
@@ -2143,8 +2143,11 @@ func TestPolicyFileIsCheckedAtStart(t *testing.T) {
 		mode    os.FileMode
 		want    string
 	}{
-		"unknown-tier.yaml":   {"tiers: [{name: low}]\ndefault_tier: normal\n", 0o600, `default_tier: there is no tier "normal"`},
-		"misspelt.yaml":       {"tiers: [{name: low, budget: 5}]\ndefault_tier: low\n", 0o600, "field budget not found"},
+		"unknown-tier.yaml": {"tiers: [{name: low}]\ndefault_tier: normal\n", 0o600, `default_tier: there is no tier "normal"`},
+		"misspelt.yaml":     {"tiers: [{name: low, max_turn: 5}]\ndefault_tier: low\n", 0o600, "field max_turn not found"},
+		// What the work costs is not ochell's to manage.
+		"budget.yaml":         {"tiers: [{name: low, budget_usd: 5}]\ndefault_tier: low\n", 0o600, "field budget_usd not found"},
+		"daily-spend.yaml":    {"tiers: [{name: low}]\ndefault_tier: low\nthrottles: {daily_spend_usd: 100}\n", 0o600, "field daily_spend_usd not found"},
 		"bad-value.yaml":      {"tiers: [{name: low, plan_gate: sometimes}]\ndefault_tier: low\n", 0o600, "plan_gate must be skip or required"},
 		"group-writable.yaml": {tiersPolicy, 0o660, "writable by its group or by others"},
 		"world-writable.yaml": {tiersPolicy, 0o646, "writable by its group or by others"},
@@ -2157,10 +2160,10 @@ func TestPolicyFileIsCheckedAtStart(t *testing.T) {
 			t.Errorf("%s: policy-check exited with %d and said %q", name, code, out)
 		}
 	}
-	// A budget needs an agent that can be kept to it.
+	// A turn limit needs an agent that can be kept to it.
 	if out, code := o.Admin("serve", "--agent-adapter", "plain"); code == 0 || !strings.Contains(out, "invalid policy") ||
-		!strings.Contains(out, "budget_usd for the tier low, but agent.adapter plain reports no cost") {
-		t.Errorf("a budget with the plain adapter: exit %d, %q", code, out)
+		!strings.Contains(out, "max_turns for the tier low, but agent.adapter plain cannot stop a run at a limit") {
+		t.Errorf("a turn limit with the plain adapter: exit %d, %q", code, out)
 	}
 	if out, code := serve(filepath.Join(o.Dir, "missing.yaml")); code == 0 || !strings.Contains(out, "no such file") {
 		t.Errorf("a missing policy file: exit %d, %q", code, out)
@@ -2274,28 +2277,26 @@ rules:
 	o.WaitRun(o.LinearCreated("PAY-82", "session-allowed", "").TaskID(t), 15*time.Second)
 }
 
-// Cost accounting and the budget: each run and each ticket shows its
-// tokens and cost, a run that passes the budget of its tier is stopped and
-// its ticket waits for a human, and nothing starts the ticket again until
-// an operator gives it a new budget.
-func TestBudget(t *testing.T) {
+// Cost accounting without a budget: each run and each ticket shows its
+// tokens and cost, and what the work costs is not ochell's to manage. The
+// agent gets no spending limit, and no run is held or stopped for what the
+// runs before it cost.
+func TestCostIsNotLimited(t *testing.T) {
 	const session = "5f1c0d6e-9a55-4b0f-8c0e-1d2f3a4b5c6d"
-	event := func(subtype string, isError bool, total float64, in, out int) string {
-		return `{"type":"result","subtype":"` + subtype + `","is_error":` + strconv.FormatBool(isError) + `,"result":"","session_id":"` + session +
+	event := func(total float64, in, out int) string {
+		return `{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"` + session +
 			`","total_cost_usd":` + strconv.FormatFloat(total, 'f', -1, 64) + `,"usage":{"input_tokens":` + strconv.Itoa(in) + `,"output_tokens":` + strconv.Itoa(out) +
 			`,"cache_read_input_tokens":100,"cache_creation_input_tokens":10}}`
 	}
 	script := []Step{{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`}}
-	// Claude Code reports the cost of the session so far: 0.60, then 1.05,
-	// then 1.25. The second run reaches the limit it was given and stops.
-	script = append(script, OnRun(1, Step{Print: event("success", false, 0.6, 10, 20)}, Report("done", "Opened the pull request."))...)
-	script = append(script, OnRun(2, Step{Print: event("error_max_budget_usd", true, 1.05, 0, 0)}, Exit(1))...)
-	script = append(script, OnRun(3, Step{Print: event("success", false, 1.25, 30, 40)}, Report("done", "Addressed the comments."))...)
+	// Claude Code reports the cost of the session so far: 60, then 105,
+	// then 125 USD.
+	script = append(script, OnRun(1, Step{Print: event(60, 10, 20)}, Report("done", "Opened the pull request."))...)
+	script = append(script, OnRun(2, Step{Print: event(105, 0, 0)}, Report("done", "Updated the docs."))...)
+	script = append(script, OnRun(3, Step{Print: event(125, 30, 40)}, Report("done", "Addressed the comments."))...)
 	o := Start(t, Options{
 		Script: script,
-		// The tier with the budget is the highest: an escalation cannot move
-		// the ticket to a tier with more.
-		Policy: "tiers:\n  - {name: normal}\n  - {name: low, budget_usd: 1}\ndefault_tier: normal\nrules:\n  - {project: ENG, tier: low}\n",
+		Policy: "tiers:\n  - {name: normal}\n  - {name: low}\ndefault_tier: normal\nrules:\n  - {project: ENG, tier: low}\n",
 		Configure: func(c *config.Config) {
 			claudeAdapter(c)
 			c.Agent.MaxAttempts = 0
@@ -2306,123 +2307,61 @@ func TestBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	argsOf := func(id string) string {
-		t.Helper()
-		for _, rec := range o.Records() {
-			if got, _ := rec.Getenv("ORCH_TASK_ID"); got == id {
-				return strings.Join(rec.Args, " ")
-			}
-		}
-		t.Fatalf("no record of run %s", id)
-		return ""
-	}
-	ticket := func() *store.Ticket {
-		t.Helper()
-		tk, err := st.Ticket("linear", "ENG-90")
-		if err != nil || tk == nil {
-			t.Fatalf("ticket: %v, %v", tk, err)
-		}
-		return tk
-	}
 
-	// The first run gets the whole budget, and costs 0.60.
-	first := o.LinearCreated("ENG-90", "session-budget", "").TaskID(t)
+	first := o.LinearCreated("ENG-90", "session-cost", "").TaskID(t)
 	o.WaitRun(first, 15*time.Second)
-	if args := argsOf(first); !strings.HasSuffix(args, "--max-budget-usd 1.0000") {
-		t.Errorf("first run: arguments %q, want the whole budget as its limit", args)
-	}
-	if run := o.WaitStored(st, first, 10*time.Second); run.Result.CostUSD != 0.6 || run.Result.SessionCostUSD != 0.6 || run.Result.Usage.InputTokens != 10 || run.Result.Usage.OutputTokens != 20 {
+	if run := o.WaitStored(st, first, 10*time.Second); run.Result.CostUSD != 60 || run.Result.SessionCostUSD != 60 || run.Result.Usage.InputTokens != 10 || run.Result.Usage.OutputTokens != 20 {
 		t.Errorf("first run: %+v", run.Result)
 	}
-	o.WaitActivities("session-budget", 2, 10*time.Second)
-	if log := o.WaitRun(first, time.Second).Log; !strings.Contains(log, "# cost_usd=0.600000 tokens: input=10 output=20 cache_read=100 cache_write=10") {
+	o.WaitActivities("session-cost", 2, 10*time.Second)
+	if log := o.WaitRun(first, time.Second).Log; !strings.Contains(log, "# cost_usd=60.000000 tokens: input=10 output=20 cache_read=100 cache_write=10") {
 		t.Errorf("the log of the run does not show its cost:\n%s", log)
 	}
-
-	// A reply starts the second run, in the same session, with what is
-	// left: 0.40. The agent is stopped at that limit.
-	second := o.LinearPrompted("ENG-90", "session-budget", "Please also update the docs.").TaskID(t)
-	run := o.WaitStored(st, second, 15*time.Second)
-	if args := argsOf(second); !strings.HasSuffix(args, "--max-budget-usd 0.4000 --resume "+session) {
-		t.Errorf("second run: arguments %q, want what is left of the budget as its limit", args)
-	}
-	// What the run cost is what came on top of the session's 0.60.
-	if run.Result.Outcome != "over_budget" || !run.Result.Resumed || run.Result.SessionCostUSD != 1.05 || run.Result.CostUSD < 0.4499 || run.Result.CostUSD > 0.4501 {
+	// Replies go on in the same session, whatever the runs before cost.
+	second := o.LinearPrompted("ENG-90", "session-cost", "Please also update the docs.").TaskID(t)
+	if run := o.WaitStored(st, second, 15*time.Second); run.Result.Outcome != "finished" || !run.Result.Resumed || run.Result.SessionCostUSD != 105 || run.Result.CostUSD != 45 {
 		t.Errorf("second run: %+v", run.Result)
 	}
-	if tk := ticket(); tk.State != "waiting" || tk.Reason != "escalation" || tk.AgentSession != session {
-		t.Errorf("after the run that passed the budget: %s (%s), session %q; want waiting (escalation) with the session kept", tk.State, tk.Reason, tk.AgentSession)
-	}
-	acts := o.WaitActivities("session-budget", 4, 10*time.Second)
-	if acts[3].Type != "elicitation" || !strings.Contains(acts[3].Body, "The run was stopped: it used up what the ticket had left of its budget (0.40 USD; tier low)") ||
-		!strings.Contains(acts[3].Body, "ochell reset linear ENG-90") {
-		t.Errorf("the session got %+v", acts[3])
-	}
-
-	// Nothing starts the ticket again: not a reply, not a new assignment.
-	third := o.LinearPrompted("ENG-90", "session-budget", "Go on.").TaskID(t)
-	if run := o.WaitStored(st, third, 15*time.Second); run.Result.Outcome != "over_budget" || run.Result.CostUSD != 0 {
+	third := o.LinearPrompted("ENG-90", "session-cost", "Go on.").TaskID(t)
+	if run := o.WaitStored(st, third, 15*time.Second); run.Result.Outcome != "finished" || run.Result.CostUSD != 20 {
 		t.Errorf("third run: %+v", run.Result)
 	}
-	acts = o.WaitActivities("session-budget", 6, 10*time.Second)
-	if acts[5].Type != "elicitation" || !strings.Contains(acts[5].Body, "The run was not started: the ticket has cost 1.05 USD of its budget of 1.00 USD (tier low)") ||
-		!strings.Contains(acts[5].Body, "This is an escalation (budget): ENG-90 now waits for a human.") {
-		t.Errorf("the session got %+v", acts[5])
-	}
-	fourth := o.LinearCreated("ENG-90", "session-again", "").TaskID(t)
-	o.WaitStored(st, fourth, 15*time.Second)
-	o.WaitActivities("session-again", 2, 10*time.Second)
-	if n := len(o.Records()); n != 2 {
-		t.Fatalf("the agent was started %d times, want 2: a ticket over its budget must not start", n)
-	}
-	if tk := ticket(); tk.State != "waiting" || tk.Reason != "escalation" {
-		t.Errorf("ticket = %s (%s), want waiting (escalation)", tk.State, tk.Reason)
-	}
-
-	// The operator sees what each run and the ticket cost.
-	out, code := o.Admin("cost", "linear", "ENG-90")
-	if code != 0 || !strings.Contains(out, "linear ENG-90: tier low, waiting, 4 run(s), 1.0500 USD") ||
-		!strings.Contains(out, "budget: 1.0500 USD of 1.00 USD used since the last reset") {
-		t.Errorf("ochell cost linear ENG-90: exit %d\n%s", code, out)
-	}
-	for _, want := range []string{first + "  1        low   finished     0.6000    10     20      100         10", second + "  2        low   over_budget  0.4500", third + "  3        low   over_budget  0.0000"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("ochell cost linear ENG-90 has no line %q:\n%s", want, out)
+	recs := o.WaitRecords(3, 5*time.Second)
+	for _, rec := range recs {
+		if args := strings.Join(rec.Args, " "); strings.Contains(args, "budget") {
+			t.Errorf("the agent got a spending limit: %q", args)
 		}
 	}
-	if out, code := o.Admin("cost"); code != 0 || !strings.Contains(out, "all runs: 4 run(s), 1.0500 USD; today (UTC): 4 run(s), 1.0500 USD") ||
-		!strings.Contains(out, "linear ENG-90  low   waiting  4     1.0500    1.0500 of 1.00") {
+	if !strings.HasSuffix(strings.Join(recs[2].Args, " "), "--resume "+session) {
+		t.Errorf("third run: arguments %q", recs[2].Args)
+	}
+
+	// The operator sees what each run and the ticket cost, and no budget.
+	out, code := o.Admin("cost", "linear", "ENG-90")
+	if code != 0 || !strings.Contains(out, "linear ENG-90: tier low, in_review, 3 run(s), 125.0000 USD") || strings.Contains(strings.ToLower(out), "budget") {
+		t.Errorf("ochell cost linear ENG-90: exit %d\n%s", code, out)
+	}
+	lines := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) > 0 {
+			lines[f[0]] = strings.Join(f, " ")
+		}
+	}
+	for id, want := range map[string]string{first: first + " 1 low finished 60.0000 10 20 100 10", second: second + " 2 low finished 45.0000 0 0 100 10", third: third + " 3 low finished 20.0000 30 40 100 10"} {
+		if lines[id] != want {
+			t.Errorf("ochell cost linear ENG-90: the line of %s is %q, want %q:\n%s", id, lines[id], want, out)
+		}
+	}
+	if out, code := o.Admin("cost"); code != 0 || !strings.Contains(out, "all runs: 3 run(s), 125.0000 USD; today (UTC): 3 run(s), 125.0000 USD") ||
+		strings.Contains(strings.ToLower(out), "budget") {
 		t.Errorf("ochell cost: exit %d\n%s", code, out)
 	}
 	if out, code := o.Admin("cost", "linear", "ENG-404"); code == 0 || !strings.Contains(out, "knows no linear ticket ENG-404") {
 		t.Errorf("ochell cost of an unknown ticket: exit %d, %q", code, out)
 	}
-
-	// The operator gives it a new budget; a reply then goes on in the same
-	// session, with the whole budget again.
-	if out, code := o.Admin("reset", "linear", "ENG-90"); code != 0 || !strings.Contains(out, "attempts and the budget of linear ENG-90 are reset") {
+	// A reset is of the attempts alone.
+	if out, code := o.Admin("reset", "linear", "ENG-90"); code != 0 || !strings.Contains(out, "the attempts of linear ENG-90 are reset") || strings.Contains(out, "budget") {
 		t.Fatalf("ochell reset: exit %d, %q", code, out)
-	}
-	fifth := o.LinearPrompted("ENG-90", "session-again", "Go on now.").TaskID(t)
-	o.WaitRun(fifth, 15*time.Second)
-	if args := argsOf(fifth); !strings.HasSuffix(args, "--max-budget-usd 1.0000 --resume "+session) {
-		t.Errorf("run after the reset: arguments %q", args)
-	}
-	if run := o.WaitStored(st, fifth, 10*time.Second); run.Result.Outcome != "finished" || run.Result.CostUSD < 0.1999 || run.Result.CostUSD > 0.2001 {
-		t.Errorf("run after the reset: %+v", run.Result)
-	}
-	if tk := ticket(); tk.State != "in_review" {
-		t.Errorf("ticket = %s, want in_review", tk.State)
-	}
-	if out, _ := o.Admin("cost", "linear", "ENG-90"); !strings.Contains(out, "5 run(s), 1.2500 USD") || !strings.Contains(out, "budget: 0.2000 USD of 1.00 USD used since the last reset") {
-		t.Errorf("ochell cost after the reset:\n%s", out)
-	}
-
-	// A ticket of a tier without a budget gets no limit.
-	plain := o.LinearCreated("DOC-90", "session-no-budget", "").TaskID(t)
-	o.WaitRecords(4, 15*time.Second)
-	if args := argsOf(plain); strings.Contains(args, "budget") {
-		t.Errorf("a run without a budget: arguments %q", args)
 	}
 }
 
@@ -3101,28 +3040,6 @@ func TestThrottles(t *testing.T) {
 		queued(t, o, "running; 1 queued, 0 running\nheld: throttle max_runs_per_hour: 2 runs started in the last hour, the limit is 2")
 		if n := len(o.Records()); n != 2 {
 			t.Errorf("the agent was started %d times, want 2", n)
-		}
-	})
-
-	t.Run("daily spend", func(t *testing.T) {
-		cost := Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"6d5c4b3a-2190-4f8e-9d7c-6b5a49382716","total_cost_usd":0.6}`}
-		o := Start(t, Options{
-			Script:    []Step{cost, Report("done", "Done.")},
-			Policy:    "tiers: [{name: normal}]\ndefault_tier: normal\nthrottles: {daily_spend_usd: 1}\n",
-			Configure: claudeAdapter,
-		})
-		o.WaitRun(o.LinearCreated("ENG-153", "s-1", "").TaskID(t), 15*time.Second)
-		// 0.60 is under the cap: the second run starts, and takes the day
-		// to 1.20.
-		o.WaitRun(o.LinearCreated("ENG-154", "s-2", "").TaskID(t), 15*time.Second)
-		o.LinearCreated("ENG-155", "s-3", "")
-		queued(t, o, "held: throttle daily_spend_usd: the runs of today (UTC) have cost 1.20 USD, the limit is 1.00")
-		if n := len(o.Records()); n != 2 {
-			t.Errorf("the agent was started %d times, want 2", n)
-		}
-		// The throttle needs an agent that reports its cost.
-		if out, code := o.Admin("serve", "--agent-adapter", "plain"); code == 0 || !strings.Contains(out, "throttles.daily_spend_usd, but agent.adapter plain reports no cost") {
-			t.Errorf("the daily spend with the plain adapter: exit %d, %q", code, out)
 		}
 	})
 

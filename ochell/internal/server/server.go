@@ -1684,8 +1684,6 @@ func escalationText(t *task.Task, res task.Result) string {
 	fmt.Fprintf(&b, "\n- To change what it should do: change the ticket, and say so when you %s.", reply)
 	fmt.Fprintf(&b, "\n- To cancel: %s.", cancel)
 	switch res.Escalation {
-	case task.EscalationBudget:
-		fmt.Fprintf(&b, "\n\nA message cannot raise a budget. If the ticket has nothing left under its tier, someone who looks after the orchestrator has to give it a new budget first: \"ochell cost %s %s\" shows what it has cost, \"ochell reset %s %s\" starts the budget anew.", t.Source, t.Key, t.Source, t.Key)
 	case task.EscalationRetries:
 		b.WriteString("\n\nA message from a person starts the ticket's count of attempts anew.")
 	}

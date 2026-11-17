@@ -167,7 +167,7 @@ agent:
   - **Let it go on:** reply in the Linear session or comment on the Jira ticket, best with what the agent should do differently. The run continues the agent's session, and its run context tells the agent that it was stopped for repeating itself and must take another way.
   - **Stop:** the stop signal in Linear, `/stop` in a Jira comment, or take the ticket away from the digital employee.
 - **It is off by default.** Repeating a call is not always a fault: an agent that waits for the checks of its pull request asks for their status with the same command many times, alone or in turn with a `sleep`. Set `repeats` well above the longest such wait you expect, counted in calls, or leave it off; `60` is a start for an agent that asks once or twice a minute and should not wait longer than half an hour.
-- **It is a heuristic, and ochell asks no model.** ochell has no access to a model of its own, and what a run costs is not its business. So the watchdog does not judge whether the work is any good, only whether the calls repeat. An agent that goes wrong with a different call each time is not seen; `max_turns` and the budget of its tier, and `agent.timeout`, bound that.
+- **It is a heuristic, and ochell asks no model.** ochell has no access to a model of its own, and what a run costs is not its business. So the watchdog does not judge whether the work is any good, only whether the calls repeat. An agent that goes wrong with a different call each time is not seen; `max_turns` of its tier and `agent.timeout` bound that.
 - **It is not an [escalation](#escalation)**: the ticket does not move to another tier, and there is no trigger of that name. Nor does it change a tier's [level of autonomy](#graduated-autonomy): `ochell flag` is for a guardrail outside ochell, and the level follows what people send back.
 - **Only the host sets it.** It is a setting of `config.yaml`; neither the policy file, a ticket nor a repository's `WORKFLOW.md` can turn it off or raise it.
 - **It needs the `claude` adapter**, which reports each tool call from Claude Code's event stream. The `plain` adapter reports none: the watchdog then sees nothing, and ochell says so in its log at start. `agent.stall_timeout` works with every adapter, and covers the other case, an agent that says nothing at all.
@@ -219,7 +219,7 @@ ochell version
 ochell status --config config.yaml                # paused or running; what is queued and running, and what is held
 ochell pause  --config config.yaml [--tier NAME]  # hold the queue: no new run starts
 ochell resume --config config.yaml [--tier NAME]
-ochell reset <jira|linear|github> <KEY> --config config.yaml   # reset the attempts and the budget of a ticket; --tier NAME also sets its risk tier
+ochell reset <jira|linear|github> <KEY> --config config.yaml   # reset the attempts of a ticket; --tier NAME also sets its risk tier
 ochell cost [<jira|linear|github> <KEY>] --config config.yaml  # what the tickets have cost, or one ticket with its runs
 ochell outcomes [--since D] [--until D] --config config.yaml   # outcome metrics per tier for a period
 ochell backup [--to FILE] --config config.yaml          # back the store up, while ochell runs
@@ -460,7 +460,7 @@ retention:
 | workflow | the version of the repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) that the run ran under, if any |
 | autonomy | the [level of autonomy](#graduated-autonomy) that the ticket's tier had when the run started, for a policy with levels |
 | prompt hash | the SHA-256 of the prompt the agent was given. The prompt itself is in the run log, not in the store |
-| tokens, cost | input, output, cache read and cache write tokens, and the cost in USD (see [Cost and budgets](#cost-and-budgets)) |
+| tokens, cost | input, output, cache read and cache write tokens, and the cost in USD (see [Cost](#cost)) |
 | outcome | how the run ended, the agent's own result, its message, and the trigger if one stopped it |
 | phase, cause, times | whether it was a plan run, why it was queued, and when it was received, started and ended |
 
@@ -537,9 +537,9 @@ policy:
 version: "2026-11"
 owners: [platform-team@example.com]
 tiers:                      # from the lowest to the highest
-  - {name: low,    plan_gate: skip,     pr_review: required, auto_merge: never, budget_usd: 5}
-  - {name: normal, plan_gate: skip,     pr_review: required, auto_merge: never, budget_usd: 20}
-  - {name: high,   plan_gate: required, pr_review: required, auto_merge: never, budget_usd: 50, labels: [risk-high]}
+  - {name: low,    plan_gate: skip,     pr_review: required, auto_merge: never}
+  - {name: normal, plan_gate: skip,     pr_review: required, auto_merge: never}
+  - {name: high,   plan_gate: required, pr_review: required, auto_merge: never, labels: [risk-high]}
 default_tier: normal
 rules:                      # the first that matches wins
   - {source: jira, project: OPS, issue_type: Bug, tier: low}
@@ -570,14 +570,13 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
   | `plan_gate` | `skip`, `required` | `skip` |
   | `pr_review` | `required`, `sampled` | `required` |
   | `auto_merge` | `never`, `after_ci` | `never` |
-  | `budget_usd` | what one ticket may cost; `0`: no limit | `0` |
   | `max_turns` | how many turns one run may take; `0`: no limit. Needs the `claude` adapter | `0` |
   | `labels` | labels that raise a ticket to this tier | none |
   | `allowed_assigners` | who may assign work of this tier | everyone whom the source allows |
   | `approvers` | who may approve a plan of this tier (see [The plan gate](#the-plan-gate)) | everyone who may send follow-ups on the ticket |
   | `max_concurrent` | how many tickets of this tier may have an agent running at the same time (see [Scheduling](#scheduling)) | `0`: no limit |
 
-  `budget_usd` and `max_turns` are enforced (see [Cost and budgets](#cost-and-budgets) and [Escalation](#escalation)), and so is `plan_gate` (see [The plan gate](#the-plan-gate)). `pr_review` and `auto_merge` are checked and recorded: ochell itself reviews and merges nothing (see [Handoff](#handoff-review-merge-done)). With [graduated autonomy](#graduated-autonomy), `sampled` and `after_ci` count only from the level that carries them.
+  `max_turns` is enforced (see [Escalation](#escalation)), and so is `plan_gate` (see [The plan gate](#the-plan-gate)). `pr_review` and `auto_merge` are checked and recorded: ochell itself reviews and merges nothing (see [Handoff](#handoff-review-merge-done)). With [graduated autonomy](#graduated-autonomy), `sampled` and `after_ci` count only from the level that carries them.
 - **Who may assign work of a tier:** `allowed_assigners` of a tier lists Jira accountIds, and Linear user ids or email addresses.
   - It **narrows** the `allowed_assigners` of the source (see [Guards and the admin channel](#guards-and-the-admin-channel)), which is checked first. A tier without a list takes everyone whom the source allows.
   - It holds for the tier the ticket ends up in, so also for a ticket that a label raised into the tier.
@@ -664,7 +663,7 @@ The file is YAML front matter between two lines of `---`, and after it the promp
   - The tier is the ticket's own (see [Policy and risk tiers](#policy-and-risk-tiers)): the same file can narrow one tier and be ignored in part for another.
   - With [graduated autonomy](#graduated-autonomy), the tier is held back by its level first, and the file is compared with what is left. `pr_review: sampled` in the file is ignored while the tier's level does not carry `sampled` yet.
   - **A setting that would widen the policy is ignored and reported; the rest of the file holds.** Where it is reported: a warning in ochell's log, a `# workflow:` line in the log of the run, `ochell status`, and `GET /api/v1/state` of [the status API](#the-status-api) (`workflows`, with the reason for each setting). The ticket is not told: it would be told at every run.
-  - **Nothing else can be set.** The budget, the labels, who may assign or approve, the pauses, the throttles and the [scheduling](#scheduling) are the policy file's alone. A file that names one of them, or any setting that ochell does not know, is invalid as a whole.
+  - **Nothing else can be set.** The labels, who may assign or approve, the pauses, the throttles and the [scheduling](#scheduling) are the policy file's alone. A file that names one of them, or any setting that ochell does not know, is invalid as a whole.
   - A run that reaches the `max_turns` of the file ends like one that reaches the tier's (see [Escalation](#escalation)).
 - **An invalid file keeps the last good one.** ochell keeps the last version that was valid in [the store](#the-store), and it stays in force, also across a restart, while the default branch has a file that is invalid or that ochell cannot read (GitHub does not answer, or the token cannot see the repository). The reason is reported in the same places. Without an earlier good version the host's settings hold alone.
   - A file that was **removed** from the default branch is no longer in force: the host's settings hold alone.
@@ -699,13 +698,11 @@ The hard controls: an operator can hold what ochell starts, and the policy bound
 throttles:
   max_runs_per_hour: 20
   max_open_prs_per_repo: 5
-  daily_spend_usd: 100
 ```
 
 | Throttle | Holds | Until |
 |---|---|---|
 | `max_runs_per_hour` | every new run, when this many runs have started within the last hour | the oldest of them is an hour old |
-| `daily_spend_usd` | every new run, when the runs that started today (UTC) have cost this much | the next day (UTC). Needs the `claude` adapter, like a budget. A run that is going on can take the day above the cap |
 | `max_open_prs_per_repo` | a ticket that would open one more pull request in a repository where the bot has this many open | one of those tickets is closed or cancelled. Tickets of other repositories, and tickets that have a pull request already, are not held |
 
 - **`ochell status` names every throttle that holds** (`held: throttle …`), with the numbers.
@@ -846,7 +843,7 @@ recorded: by the operator deamen, with 12 ticket(s) with a pull request since 20
 - **The override rate is "sent back" of [`ochell outcomes`](#audit-trail-and-outcome-metrics)**: of the tickets that handed over a pull request, the ones that a person sent back with a follow-up (a comment on the ticket, a reply in the session, a review comment on the pull request).
 - **The numbers are those of the tier under its present level:** the tickets that handed over a pull request since the level last changed, and not longer ago than `window`. So a tier earns a new record at every level, and one bad stretch takes one level away, not all of them.
 - **`ochell flag` is the way in for a guardrail**: a CI watcher, a hook that denied something, a reviewer's tooling. It runs on the host as ochell's OS user, over the admin socket. The flag is recorded with the ticket and its last run. A tier at `observe` stays there, and the flag is recorded all the same.
-- **A change of level holds for the runs that start afterwards.** It stops no run, moves no ticket to another tier and changes no budget: it is not an [escalation](#escalation). A ticket that is under way when its tier goes down to `observe` gets a plan run as its next run (a follow-up, a retry, a run for failed checks), unless its plan was approved before.
+- **A change of level holds for the runs that start afterwards.** It stops no run and moves no ticket to another tier: it is not an [escalation](#escalation). A ticket that is under way when its tier goes down to `observe` gets a plan run as its next run (a follow-up, a retry, a run for failed checks), unless its plan was approved before.
 - A level that a tier can no longer have, because the policy file changed after the promotion, counts as the highest it can have.
 
 **Where to see it:**
@@ -896,7 +893,7 @@ The agent can write to its tickets with its own tool (`twg`), as the bot account
 And for everyone:
 - **A label that would lower the tier is ignored.** A tier only goes up while ochell knows the ticket, so removing a label, or a label that the policy gives a lower tier, changes nothing. Lowering is the operator's `ochell reset <jira|linear|github> <KEY> --tier <name>` (see [Policy and risk tiers](#policy-and-risk-tiers)).
 - **A plan is approved only with `/approve` from someone who may** (see [The plan gate](#the-plan-gate)). No status and no label approves anything.
-- **A budget is renewed only by an operator**, and a tier's limits are in the policy file, which the agent cannot write.
+- **A tier's limits are in the policy file**, which the agent cannot write.
 - **A repository's `WORKFLOW.md` can make a gate stricter, never looser** (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)). The agent can change that file on its own branch; ochell reads the default branch.
 - **A tier's level of autonomy goes up only by an operator's `ochell promote`** (see [Graduated autonomy](#graduated-autonomy)). Nothing on a ticket or in a repository raises it.
 
@@ -917,7 +914,6 @@ Some things stop a ticket and hand it to a human. Each of these triggers fires *
 
 | Trigger | Fires when | Detected by |
 |---|---|---|
-| `budget` | the ticket has used up `budget_usd` of its tier (see [Cost and budgets](#cost-and-budgets)) | ochell, through the limit it gives the run |
 | `turns` | a run reaches `max_turns` of its tier | ochell, through the limit it gives the run (`--max-turns` of Claude Code) |
 | `retries` | a run fails for a temporary reason again and the ticket has no attempt left (`agent.max_attempts`) | ochell |
 | `tier_change` | the ticket moves to a higher tier while the agent is working on it, for example because someone adds a label | ochell, from the tracker's update event |
@@ -937,7 +933,6 @@ What a human can do then:
 - **Cancel:** the stop signal in Linear, `/stop` in a Jira comment, or take the ticket away from the digital employee (see *Stopping from the ticket*).
 
 Notes:
-- **`budget` at the highest tier, or when the next tier has nothing left either, needs an operator:** a reply starts a run that is refused again. `ochell reset <jira|linear|github> <KEY>` gives the ticket a new budget.
 - **Only a move to a higher tier is a trigger.** An update that would lower the tier changes nothing. A ticket whose agent is not running only gets the new tier: there is nothing to stop.
 - **The tier's update events** are `jira:issue_updated` of the Jira system webhook, and `Issue` updates of Linear (the app's webhook must subscribe to issue events). Jira Automation sends none.
 - `needs_input` and `blocked` from the agent are not escalations: the ticket waits with its own reason and stays in its tier.
@@ -945,40 +940,32 @@ Notes:
 - A ticket that used up its attempts and is assigned again is refused as before (see [Guards and the admin channel](#guards-and-the-admin-channel)).
 - Two triggers of the findings come later, with the read-only GitHub access: CI that is still red after N fixes, and a review requested by CODEOWNERS.
 
-### Cost and budgets
-ochell records what each run cost, as far as the agent says, and stops a ticket that has used up the budget of its tier.
+### Cost
+ochell records what each run cost, as far as the agent says. What the work costs is not ochell's to manage: it gives the agent no spending limit, and holds or stops no run for what it cost.
 
 - **What is recorded** with each run: the cost in USD and the tokens (input, output, cache read, cache write). The run log ends with the same numbers. The `plain` adapter reports neither.
 - **`ochell cost`** shows it:
 
   ```
   $ ochell cost linear ENG-90 --config config.yaml
-  linear ENG-90: tier low, waiting, 3 run(s), 1.0500 USD
-  budget: 1.0500 USD of 1.00 USD used since the last reset
-  RUN                                   ATTEMPT  TIER  OUTCOME      COST USD  INPUT  OUTPUT  CACHE READ  CACHE WRITE
-  20261115T093000.000Z-linear-ENG-90    1        low   finished     0.6000    10     20      100         10
-  20261115T094500.000Z-linear-ENG-90    2        low   over_budget  0.4500    0      0       100         10
-  20261115T095000.000Z-linear-ENG-90    3        low   over_budget  0.0000    0      0       0           0
-  total                                                             1.0500    10     20      200         20
+  linear ENG-90: tier low, in_review, 3 run(s), 1.2500 USD
+  RUN                                   ATTEMPT  TIER  OUTCOME   COST USD  INPUT  OUTPUT  CACHE READ  CACHE WRITE
+  20261115T093000.000Z-linear-ENG-90    1        low   finished  0.6000    10     20      100         10
+  20261115T094500.000Z-linear-ENG-90    2        low   finished  0.4500    0      0       100         10
+  20261115T095000.000Z-linear-ENG-90    3        low   finished  0.2000    30     40      100         10
+  total                                                          1.2500    40     60      300         30
   ```
 
   Without a ticket, `ochell cost` lists the 50 tickets that ochell touched last, and the total over all runs and over the runs that started today (UTC).
 - **The cost of a run is the run's own.** Claude Code reports, in a resumed run, what the whole session has cost so far. ochell takes off what the session had cost before the run. The tokens it reports are already those of the run alone. So the cost of a ticket is the sum over its runs.
   - Checked against Claude Code 2.1.311 on 15 November 2026, with six runs in one session. It was not compared with the usage that the account shows.
   - A run that ends without a result event (it was stopped, or timed out) reports no cost. What it spent shows up in the cost of the ticket's next run in the same session.
-- **The budget of a ticket** is `budget_usd` of its tier. What counts against it is what the ticket's runs have cost since the last reset.
-  - **Each run gets what is left as its limit** (`--max-budget-usd` of Claude Code, which counts the run alone). Claude Code stops the run when it reaches the limit. It looks after each call to the model, so a run ends a little above the limit, by at most one call.
-  - **A ticket with nothing left is not started**, whatever asks for the run: a new assignment, a reply, a retry, the poller.
-  - **In both cases this is an [escalation](#escalation):** the ticket waits for a human, moves up one tier, and is told why and what to do. The run's outcome is `over_budget`. The agent session is kept.
-  - **After the escalation the ticket is one tier up, and that tier's budget counts.** If that leaves it something, a reply on the ticket lets it go on. If not, or if it was in the highest tier already:
-  - **Only an operator gives a ticket a new budget:** `ochell reset <jira|linear|github> <KEY>`. The count starts at zero again, the record of what was spent stays, and a reply on the ticket (or a new assignment) then continues in the same session. A message on the ticket cannot raise a budget.
-  - **A budget needs the `claude` adapter.** With `plain`, ochell would know no cost and could stop nothing, so it refuses to start when the policy sets `budget_usd`.
-  - The budget is what the agent CLI reports as its cost. It is not the bill.
+- **Runs recorded by an older ochell** can have the outcome `over_budget` and the escalation `budget`, from when ochell had budgets. They are shown as they are.
 
 ### Guards and the admin channel
 Limits on what starts a run, and one way to talk to the running ochell.
 
-- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). **A message from a person (a reply in the ticket's Linear session, a comment on the Jira ticket or the GitHub issue) starts the count again**: the cap is there to stop what runs without anyone looking, and here someone looked. The attempt number in the prompt still counts every run. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear|github> <KEY>` sets the count back to zero (and starts the ticket's [budget](#cost-and-budgets) anew); then assign the ticket again.
+- **Attempt cap:** `agent.max_attempts` (default 5; 0 for no limit) is how many runs one ticket may have. Every started run counts, whoever asked for it, also the ones ochell starts by itself (a retry, a run after a restart). **A message from a person (a reply in the ticket's Linear session, a comment on the Jira ticket or the GitHub issue) starts the count again**: the cap is there to stop what runs without anyone looking, and here someone looked. The attempt number in the prompt still counts every run. When a ticket has used them up, a new assignment starts nothing: the request is answered with 200 `not started: <KEY> has used its N attempts`, the ticket waits for a human with the reason `escalation`, ochell logs a warning, and a Linear session is told. After someone has looked at it, `ochell reset <jira|linear|github> <KEY>` sets the count back to zero; then assign the ticket again.
 - **Pause:** see also [Pauses and throttles](#pauses-and-throttles), for the pause of one tier. `ochell pause` holds the queue. No new run starts; running agents go on; webhooks are still accepted and queued. `ochell resume` ends it, and the queued tasks run. Both take effect at once, without a restart, and a pause is kept across a restart. `ochell status` says which it is, and how many tasks are queued and running.
 - **Assigner allowlist:** `allowed_assigners` of a source, when it is not empty, lists who may assign work. Anyone else is rejected, and the rejection is logged with the ticket and the assigner. Nothing is stored for a rejected assignment.
 
@@ -1078,7 +1065,7 @@ What a run leads to:
 | `stalled` | not looked at | `queued` again; `waiting`, reason `stalled`, when the attempts are used up |
 | `no_progress` | not looked at | `waiting`, reason `no_progress`; never `queued` again by ochell itself |
 | `cancelled` | not looked at | `cancelled` |
-| `over_budget`, `over_turns` | not looked at | `waiting`, reason `escalation` |
+| `over_turns` | not looked at | `waiting`, reason `escalation` |
 | any, with an [escalation](#escalation) trigger | | `waiting`, reason `escalation` |
 | `stopped`, `interrupted` | not looked at | `queued` again, for a new attempt with the recovery note; `waiting`, reason `interrupted`, when the attempts are used up |
 
@@ -1095,10 +1082,9 @@ An adapter holds what differs between agent CLIs: how a run is started, how an e
 `plain` works with any CLI that takes a prompt and prints an answer.
 
 **The `claude` adapter** (checked against Claude Code 2.1.311):
-- **Settings:** `adapter: claude` needs `prompt_via: stdin`. Keep your own flags in `agent.args`, for example `--permission-mode` or `--model`. ochell refuses to start when `args` holds a flag the adapter sets itself (`--output-format`, `--resume`, `--continue`, `--max-budget-usd`, `--max-turns`, `--mcp-config`, `--strict-mcp-config`), or `--bare`, which makes Claude Code ignore the OAuth token.
+- **Settings:** `adapter: claude` needs `prompt_via: stdin`. Keep your own flags in `agent.args`, for example `--permission-mode` or `--model`. ochell refuses to start when `args` holds a flag the adapter sets itself (`--output-format`, `--resume`, `--continue`, `--max-turns`, `--mcp-config`, `--strict-mcp-config`), or `--bare`, which makes Claude Code ignore the OAuth token.
 - **What the ticket gets:** the agent's final message, not the raw stream. The run log still has every event.
-- **What is stored** with each run: the message, the session id, the cost in USD and the token counts. See [Cost and budgets](#cost-and-budgets) for how the cost of a resumed run is worked out.
-- **Budget:** for a ticket whose tier has a budget, the adapter adds `--max-budget-usd` with what the ticket has left. `--max-budget-usd` must not be in `agent.args`.
+- **What is stored** with each run: the message, the session id, the cost in USD and the token counts. See [Cost](#cost) for how the cost of a resumed run is worked out.
 - **Resume:** when a ticket runs again, in the same working directory as before, ochell continues the session of its last run instead of starting from zero. The run log says `session=new` or `session=resumed <id>`.
   - Claude Code keeps its sessions under its configuration directory, so that directory must be the same for both runs.
   - If a resumed run fails without opening a session (the session is gone), ochell forgets the session, and the ticket's next run starts a new one.

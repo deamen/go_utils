@@ -109,9 +109,6 @@ type Task struct {
 	LastOutcome Outcome
 	// Prompt is rendered by the runner from the prompt template.
 	Prompt string
-	// BudgetUSD is what this run may cost: what the ticket has left of the
-	// budget of its tier. The runner sets it; 0: no limit.
-	BudgetUSD float64
 	// MaxTurns is how many turns this run may take, from its tier; 0: no
 	// limit. The runner sets it.
 	MaxTurns int
@@ -144,11 +141,12 @@ const (
 // Escalation says which trigger stopped a ticket and left it waiting for a
 // human. Each one fires before the work goes on: the run is stopped, or
 // not started, and nothing follows by itself.
+//
+// Runs recorded by an older ochell can hold the escalation "budget", which
+// is no longer set; it is read and shown as it is.
 type Escalation string
 
 const (
-	// EscalationBudget: the ticket used up the budget of its tier.
-	EscalationBudget Escalation = "budget"
 	// EscalationTurns: the run reached the turn limit of its tier.
 	EscalationTurns Escalation = "turns"
 	// EscalationRetries: the run failed for a temporary reason again, and
@@ -166,6 +164,9 @@ const (
 // Outcome says why a run ended. ochell sets it from its own record of what
 // it asked for; the exit code alone cannot tell a stopped run from a
 // finished one.
+//
+// Runs recorded by an older ochell can hold the outcome "over_budget",
+// which is no longer set; it is read and shown as it is.
 type Outcome string
 
 const (
@@ -188,10 +189,6 @@ const (
 	// OutcomeCancelled: a person stopped the run, or released the ticket:
 	// from the ticket, by unassigning it, or from ochell itself.
 	OutcomeCancelled Outcome = "cancelled"
-	// OutcomeOverBudget: the ticket has used up the budget of its tier.
-	// The agent was stopped when the run reached it, or was not started
-	// because nothing was left.
-	OutcomeOverBudget Outcome = "over_budget"
 	// OutcomeOverTurns: the agent was stopped at the turn limit of the
 	// ticket's tier.
 	OutcomeOverTurns Outcome = "over_turns"

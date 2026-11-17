@@ -6,7 +6,7 @@
 // so ochell reads it from the default branch only (source.go), where a
 // change is one that a person merged, and even then it can only narrow the
 // host's policy: a setting that would give a ticket more than its tier
-// does is ignored and reported (Apply). Budgets, tiers and who may assign
+// does is ignored and reported (Apply). Tiers and who may assign
 // or approve are not settings of this file at all.
 package workflow
 

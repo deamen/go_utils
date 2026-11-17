@@ -162,7 +162,9 @@ var migrations = []string{
 
 	// Version 15: what the agent's session had cost in total when a run
 	// ended, and the cost of a ticket at its last reset. From here on
-	// runs.cost_usd is the cost of the run alone.
+	// runs.cost_usd is the cost of the run alone. tickets.cost_base was
+	// for the budget of a ticket, which ochell no longer has; nothing
+	// reads or writes it.
 	`ALTER TABLE runs ADD COLUMN session_cost_usd REAL NOT NULL DEFAULT 0;
 	ALTER TABLE tickets ADD COLUMN cost_base REAL NOT NULL DEFAULT 0;`,
 
@@ -273,8 +275,6 @@ type Holds struct {
 	// MaxOpenPRsPerRepo is how many pull requests of the bot may be open
 	// in one repository.
 	MaxOpenPRsPerRepo int
-	// DailySpendUSD is what the runs of one day (UTC) may cost in total.
-	DailySpendUSD float64
 	// MaxConcurrentPerRepo is how many tickets of one repository may be
 	// running at the same time.
 	MaxConcurrentPerRepo int
@@ -795,16 +795,6 @@ func (s *Store) holding(tx *sql.Tx) (Holding, error) {
 			h.Throttles = append(h.Throttles, fmt.Sprintf("max_runs_per_hour: %d runs started in the last hour, the limit is %d", n, pol.MaxRunsPerHour))
 		}
 	}
-	if pol.DailySpendUSD > 0 {
-		var spent float64
-		if err := tx.QueryRow(`SELECT COALESCE(SUM(cost_usd), 0) FROM runs WHERE started_at IS NOT NULL AND started_at >= ?`,
-			ms(now.UTC().Truncate(24*time.Hour))).Scan(&spent); err != nil {
-			return h, err
-		}
-		if spent >= pol.DailySpendUSD {
-			h.Throttles = append(h.Throttles, fmt.Sprintf("daily_spend_usd: the runs of today (UTC) have cost %.2f USD, the limit is %.2f", spent, pol.DailySpendUSD))
-		}
-	}
 	return h, nil
 }
 
@@ -840,13 +830,11 @@ func (s *Store) Counts() (queued, running int, err error) {
 	return queued, running, err
 }
 
-// ResetAttempts sets the attempt count of a ticket back to zero and starts
-// its budget anew, so that a ticket that reached a limit can be started
-// again. What the ticket has cost is kept; the budget counts from here. It
-// returns ErrUnknown for a ticket that ochell has never seen.
+// ResetAttempts sets the attempt count of a ticket back to zero, so that a
+// ticket that used up its attempts can be started again. It returns
+// ErrUnknown for a ticket that ochell has never seen.
 func (s *Store) ResetAttempts(source, key string) error {
-	r, err := s.db.Exec(`UPDATE tickets SET attempts = 0, attempts_base = 0,
-			cost_base = (SELECT COALESCE(SUM(r.cost_usd), 0) FROM runs r WHERE r.source = tickets.source AND r.key = tickets.key)
+	r, err := s.db.Exec(`UPDATE tickets SET attempts = 0, attempts_base = 0
 		WHERE source = ? AND key = ?`, source, key)
 	if err != nil {
 		return err
@@ -884,24 +872,19 @@ type TicketCost struct {
 	Source, Key, Tier string
 	State             ticket.State
 	Cost
-	// SinceResetUSD is what the ticket has cost since its last reset: the
-	// part that counts against the budget of its tier.
-	SinceResetUSD float64
 }
 
 const ticketCostQuery = `SELECT t.source, t.key, t.tier, t.state, COUNT(r.id), COALESCE(SUM(r.cost_usd), 0),
 		COALESCE(SUM(r.input_tokens), 0), COALESCE(SUM(r.output_tokens), 0),
-		COALESCE(SUM(r.cache_read_tokens), 0), COALESCE(SUM(r.cache_write_tokens), 0), t.cost_base
+		COALESCE(SUM(r.cache_read_tokens), 0), COALESCE(SUM(r.cache_write_tokens), 0)
 	FROM tickets t LEFT JOIN runs r ON r.source = t.source AND r.key = t.key AND r.started_at IS NOT NULL`
 
 func scanTicketCost(row interface{ Scan(...any) error }) (*TicketCost, error) {
 	var c TicketCost
-	var base float64
 	if err := row.Scan(&c.Source, &c.Key, &c.Tier, &c.State, &c.Runs, &c.CostUSD,
-		&c.Usage.InputTokens, &c.Usage.OutputTokens, &c.Usage.CacheReadTokens, &c.Usage.CacheWriteTokens, &base); err != nil {
+		&c.Usage.InputTokens, &c.Usage.OutputTokens, &c.Usage.CacheReadTokens, &c.Usage.CacheWriteTokens); err != nil {
 		return nil, err
 	}
-	c.SinceResetUSD = max(c.CostUSD-base, 0)
 	return &c, nil
 }
 
