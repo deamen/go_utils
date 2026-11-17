@@ -30,13 +30,6 @@ owners:
 #                 credentials_file  secrets as NAME=VALUE lines; mode 0600
 #                 mint, revoke      commands that make credentials for one
 #                                   run, and take them back after it
-#                 ticket_tools      true: ochell's own tools for the run's
-#                                   ticket (get_ticket, add_comment), so
-#                                   that the agent needs no tracker token.
-#                                   The host needs ticket_tools.enabled,
-#                                   and with Claude Code the tier needs an
-#                                   mcp_config that names ochell's server
-#                                   (examples/mcp-ticket-tools.json)
 #   paused:     true holds the tickets of this tier
 #   max_concurrent: how many tickets of this tier may have an agent running
 #               at the same time; 0 or left out: no limit of its own

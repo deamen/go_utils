@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // The issues of the GitHub source. A pull request is an issue here, as it
@@ -178,46 +177,6 @@ func (c *Client) IssueEvents(ctx context.Context, ref Ref) ([]IssueEvent, error)
 			ev.Label = r.Label.Name
 		}
 		out = append(out, ev)
-	}
-	return out, nil
-}
-
-// IssueComments reads the newest comments of the conversation of an issue,
-// oldest first: at most n of them. total is how many the issue has.
-func (c *Client) IssueComments(ctx context.Context, ref Ref, total, n int) ([]Comment, error) {
-	type raw struct {
-		ID   int64  `json:"id"`
-		Body string `json:"body"`
-		User *struct {
-			Login string `json:"login"`
-		} `json:"user"`
-		Association string    `json:"author_association"`
-		Created     time.Time `json:"created_at"`
-	}
-	// The API lists the oldest first, so the newest are on the last page,
-	// and some of them on the one before when the last is not full.
-	last := (total + perPage - 1) / perPage
-	if last < 1 {
-		last = 1
-	}
-	var all []raw
-	for page := max(1, last-1); page <= last; page++ {
-		var part []raw
-		if err := c.get(ctx, ref.path(fmt.Sprintf("/issues/%d/comments?per_page=%d&page=%d", ref.Number, perPage, page)), &part); err != nil {
-			return nil, err
-		}
-		all = append(all, part...)
-	}
-	if len(all) > n {
-		all = all[len(all)-n:]
-	}
-	out := make([]Comment, 0, len(all))
-	for _, r := range all {
-		cm := Comment{ID: r.ID, Kind: "issue", Association: r.Association, Body: r.Body, Created: r.Created}
-		if r.User != nil {
-			cm.Author = r.User.Login
-		}
-		out = append(out, cm)
 	}
 	return out, nil
 }

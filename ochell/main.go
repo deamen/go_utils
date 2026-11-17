@@ -31,7 +31,6 @@ import (
 	"ochell/internal/config"
 	"ochell/internal/github"
 	"ochell/internal/ipsync"
-	"ochell/internal/mcp"
 	"ochell/internal/metrics"
 	"ochell/internal/policy"
 	"ochell/internal/runner"
@@ -186,7 +185,7 @@ func serve(args []string) error {
 	if gs := cfg.Sources.GitHub; gs.Enabled {
 		log.Info("GitHub source: issues and pull requests assigned to the digital employee are tickets", "path", gs.Path, "repositories", len(gs.Repos), "bot_login", cfg.GitHub.BotLogin)
 		if gs.Token == "" {
-			log.Warn("sources.github has no token: ochell writes nothing on the issues, the poller does not ask GitHub for missed assignments, and the gates of scheduling and the ticket tools cannot be used for GitHub tickets")
+			log.Warn("sources.github has no token: ochell writes nothing on the issues, the poller does not ask GitHub for missed assignments, and the gates of scheduling cannot be used for GitHub tickets")
 		}
 	}
 	if err := srv.CheckScheduling(); err != nil {
@@ -202,21 +201,6 @@ func serve(args []string) error {
 		status := api.New(cfg.API, st, r, log)
 		srv.UseAPI(api.Prefix, status, status.Link)
 		log.Info("status API", "path", api.Prefix, "public_url", cfg.API.PublicURL)
-	}
-	if cfg.TicketTools.Enabled {
-		// ochell's own MCP server, on the listeners of the webhooks. An
-		// agent is another OS user and cannot open a socket of ochell's;
-		// what keeps others out is the token of each run.
-		tools := mcp.New(version, log)
-		for _, source := range config.SourceNames {
-			if t := srv.Tickets(source); t != nil {
-				tools.Use(source, t)
-			}
-		}
-		lc, jc := cfg.Sources.Linear, cfg.Sources
-		r.UseTicketTools(tools, cfg.TicketToolsURL(), []string{jc.JiraAPI.Token, jc.JiraWebhook.Secret, jc.JiraAutomation.Token, lc.Secret, lc.ClientSecret, jc.GitHub.Token, jc.GitHub.Secret})
-		srv.Mount(mcp.Path, tools)
-		log.Info("ticket tools", "path", mcp.Path, "url", cfg.TicketToolsURL())
 	}
 	if err := r.UsePolicy(pol); err != nil {
 		return fmt.Errorf("invalid policy:\n%w", err)
@@ -407,11 +391,6 @@ func policyCheck(args []string) error {
 	fmt.Printf("version %s, %d rule(s); tiers from the lowest to the highest:\n", pol.Version, len(pol.Rules))
 	for _, line := range pol.Describe() {
 		fmt.Println("  " + line)
-	}
-	for _, t := range pol.Tiers {
-		if t.Grants.TicketTools && !cfg.TicketTools.Enabled {
-			fmt.Printf("note: the tier %s is granted the ticket tools, but ticket_tools.enabled is not set in this configuration; ochell would not start\n", t.Name)
-		}
 	}
 	if sch := pol.DescribeScheduling(); len(sch) > 0 {
 		fmt.Println("scheduling: " + strings.Join(sch, " "))

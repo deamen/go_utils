@@ -46,7 +46,7 @@ type repo struct {
 func (r repo) full() string { return r.owner + "/" + r.name }
 
 // Source is the GitHub source. It implements source.Source, and with a
-// token also tracker.Source and tracker.Tickets.
+// token also tracker.Source.
 type Source struct {
 	secret string
 	// bot is the login of the digital employee (github.bot_login).
@@ -301,15 +301,6 @@ func (s *Source) Tracker() tracker.Source {
 	return s
 }
 
-// Tickets returns the access for the agent's ticket tools: the source
-// itself, when it has a token.
-func (s *Source) Tickets() tracker.Tickets {
-	if s.api == nil {
-		return nil
-	}
-	return s
-}
-
 // CheckGates says which gates of scheduling can be checked for GitHub.
 func (s *Source) CheckGates(requiredLabels, blockedBy bool) error {
 	var errs []error
@@ -360,11 +351,6 @@ func (s *Source) Tell(ctx context.Context, key, text string) error {
 		return err
 	}
 	return s.api.CommentOnIssue(ctx, ref, text)
-}
-
-// Comment implements tracker.Tickets.
-func (s *Source) Comment(ctx context.Context, key, body string) error {
-	return s.Tell(ctx, key, body)
 }
 
 // Assigned returns the open issues and pull requests of the configured
@@ -476,34 +462,4 @@ func (s *Source) Scheduling(ctx context.Context, key string) (tracker.Scheduling
 		sch.Labels = append(sch.Labels, l)
 	}
 	return sch, nil
-}
-
-// Ticket returns an issue with its newest comments, for the ticket tools.
-func (s *Source) Ticket(ctx context.Context, key string) (tracker.Ticket, error) {
-	ref, _, err := s.ref(key)
-	if err != nil {
-		return tracker.Ticket{}, err
-	}
-	is, err := s.api.Issue(ctx, ref)
-	if ghapi.NotFound(err) {
-		return tracker.Ticket{}, tracker.ErrNotFound
-	}
-	if err != nil {
-		return tracker.Ticket{}, err
-	}
-	t := tracker.Ticket{Key: key, Title: is.Title, URL: is.URL, Description: is.Body, Status: is.State, Labels: is.Labels}
-	if is.Comments == 0 {
-		return t, nil
-	}
-	comments, err := s.api.IssueComments(ctx, ref, is.Comments, tracker.MaxComments)
-	if err != nil {
-		return tracker.Ticket{}, err
-	}
-	for _, c := range comments {
-		t.Comments = append(t.Comments, tracker.Comment{Author: c.Author, Bot: s.Bot(c.Author), At: c.Created, Body: c.Body})
-	}
-	if more := is.Comments - len(comments); more > 0 {
-		t.MoreComments = more
-	}
-	return t, nil
 }

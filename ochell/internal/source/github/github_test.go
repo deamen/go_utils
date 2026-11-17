@@ -244,7 +244,7 @@ func fake(t *testing.T) (*Source, *githubtest.Server) {
 
 func TestWithoutAToken(t *testing.T) {
 	s := testSource("")
-	if s.Tracker() != nil || s.Tickets() != nil {
+	if s.Tracker() != nil {
 		t.Error("a source without a token cannot be asked")
 	}
 	if err := s.Tell(context.Background(), "shop-1", "Hello."); !errors.Is(err, source.ErrSilent) {
@@ -364,33 +364,10 @@ func TestAssignerLookupAndScheduling(t *testing.T) {
 	}
 }
 
-func TestTicketAndComment(t *testing.T) {
-	s, gh := fake(t)
+// A token of another account writes nothing: its comment would come back
+// as a person's.
+func TestTellWithAnotherAccountsToken(t *testing.T) {
 	ctx := context.Background()
-	gh.AddIssue(githubtest.Issue{Owner: "acme", Repo: "shop", Number: 9, Title: "Fix it", Body: "The page is blank.", Author: "alice", Labels: []string{"bug"}})
-	tk, err := s.Ticket(ctx, "shop-9")
-	if err != nil || tk.Key != "shop-9" || tk.Title != "Fix it" || tk.Description != "The page is blank." || tk.Status != "open" || len(tk.Comments) != 0 {
-		t.Fatalf("Ticket = %+v, %v", tk, err)
-	}
-	for i := 0; i < 130; i++ {
-		gh.CommentIssue("acme", "shop", 9, "alice", fmt.Sprintf("comment %d", i))
-	}
-	if err := s.Comment(ctx, "shop-9", "I am on it."); err != nil {
-		t.Fatal(err)
-	}
-	tk, err = s.Ticket(ctx, "shop-9")
-	if err != nil || len(tk.Comments) != tracker.MaxComments || tk.MoreComments != 131-tracker.MaxComments {
-		t.Fatalf("Ticket with many comments: %d comments, %d more, %v", len(tk.Comments), tk.MoreComments, err)
-	}
-	if first, last := tk.Comments[0], tk.Comments[len(tk.Comments)-1]; first.Body != "comment 101" || first.Bot || last.Body != "I am on it." || !last.Bot || last.Author != bot {
-		t.Errorf("comments from %+v to %+v", first, last)
-	}
-	if _, err := s.Ticket(ctx, "shop-404"); !errors.Is(err, tracker.ErrNotFound) {
-		t.Errorf("a ticket that is gone: %v", err)
-	}
-
-	// A token of another account writes nothing: its comment would come
-	// back as a person's.
 	other, gh2 := fake(t)
 	gh2.Login = "alice"
 	gh2.AddIssue(githubtest.Issue{Owner: "acme", Repo: "shop", Number: 9})
