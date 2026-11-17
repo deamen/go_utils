@@ -1389,16 +1389,15 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 		}
 	})
 	spec := launcher.Spec{
-		TaskID:    runName,
-		Command:   r.cfg.Command,
-		Args:      cmd.Args,
-		Stdin:     cmd.Stdin,
-		Dir:       dir,
-		RunDir:    runDir,
-		Env:       append(r.taskEnv(t), result.EnvVar+"="+resultFile),
-		Inherited: r.inheritedEnv(),
-		Output:    io.MultiWriter(file, out),
-		Timeout:   r.cfg.Timeout,
+		TaskID:  runName,
+		Command: r.cfg.Command,
+		Args:    cmd.Args,
+		Stdin:   cmd.Stdin,
+		Dir:     dir,
+		RunDir:  runDir,
+		Env:     r.env(t, result.EnvVar+"="+resultFile),
+		Output:  io.MultiWriter(file, out),
+		Timeout: r.cfg.Timeout,
 	}
 	w, outcome := r.execute(ctx, spec, r.cfg.StallTimeout, dog.stopped())
 	if outcome == task.OutcomeNotStarted {
@@ -1572,14 +1571,29 @@ func (r *Runner) stop(proc launcher.Process, waited <-chan waitResult) waitResul
 	}
 }
 
-// The agent's environment. The agent reads untrusted ticket text, so it never
-// inherits ochell's own environment, which holds the webhook secrets and API
-// keys: only the variables named in env_pass are copied from it.
-func (r *Runner) inheritedEnv() []string {
-	env := []string{}
-	for _, name := range r.cfg.EnvPass {
-		if v, ok := os.LookupEnv(name); ok {
-			env = append(env, name+"="+v)
+// env is the whole environment of the agent and of the workspace hooks.
+// ochell is an employee and the agent gets all the access that ochell has,
+// so it starts from ochell's own environment; ORCH_TASK_*, agent.env and
+// extra follow, in that order. A later entry overrides an earlier one with
+// the same name, and every name occurs once.
+func (r *Runner) env(t *task.Task, extra ...string) []string {
+	return mergeEnv(os.Environ(), r.taskEnv(t), extra)
+}
+
+// mergeEnv joins lists of NAME=VALUE. A name keeps the place of its first
+// occurrence and the value of its last.
+func mergeEnv(lists ...[]string) []string {
+	var env []string
+	at := map[string]int{}
+	for _, list := range lists {
+		for _, kv := range list {
+			name, _, _ := strings.Cut(kv, "=")
+			if i, ok := at[name]; ok {
+				env[i] = kv
+				continue
+			}
+			at[name] = len(env)
+			env = append(env, kv)
 		}
 	}
 	return env

@@ -251,7 +251,6 @@ Common flags (run `ochell serve -h` for all of them):
 | `--agent-prompt-via` | `stdin` (default) or `arg` |
 | `--agent-adapter` | Kind of agent CLI: `plain` (default) or `claude`; see [Agent adapters](#agent-adapters) |
 | `--agent-launcher` | `direct`, the only launcher; see [Launchers](#launchers) |
-| `--agent-env-pass` | Variable the agent inherits from ochell's environment; repeatable; replaces the default list (see [Agent environment](#agent-environment)) |
 | `--agent-stall-timeout` | Stop an agent that wrote no output for this long, and start the ticket again (default `0`: never); see [Retry and stall detection](#retry-and-stall-detection) |
 | `--agent-watchdog-repeats` | Stop an agent that made the same tool call, or the same few calls in a row, this many times, and leave the ticket to a human (default `0`: never); see [The watchdog](#the-watchdog) |
 | `--agent-workdir`, `--agent-timeout`, `--agent-max-concurrent`, `--agent-max-attempts`, `--agent-log-dir`, `--agent-run-dir` | Execution settings |
@@ -511,7 +510,7 @@ api:
 | `GET /api/v1/tasks/<key>` | one ticket with every run: when it started and ended, why it was queued, its outcome, its cost, and what the agent said. Add `?source=jira`, `?source=linear` or `?source=github` when more than one source has the key |
 
 - **The answer is JSON.** A browser (a request that accepts `text/html`) gets a plain page with the same content.
-- **Every request needs the token**: `Authorization: Bearer <api.token>`, at least 16 characters. The pages show ticket titles and what agents said, and the agent runs on the same host and can reach any local port, so a loopback address is not enough. Do not put the token in the agent's environment.
+- **Every request needs the token**: `Authorization: Bearer <api.token>`, at least 16 characters. The pages show ticket titles and what agents said, and the agent runs on the same host and can reach any local port, so a loopback address is not enough.
 
   ```
   curl -H "Authorization: Bearer $OCHELL_API_TOKEN" http://127.0.0.1:8080/api/v1/state
@@ -1034,7 +1033,7 @@ workspace:
   | `after_run` | after every run in which the agent was started, except one cut short by a shutdown | a warning; the run's outcome stays |
   | `before_remove` | before the working directory is removed | a warning; the directory is removed all the same |
 
-  - A hook gets the task's environment (`ORCH_TASK_ID`, `…_SOURCE`, `…_KEY`, `…_URL`, `…_REPO`, `…_BRANCH`), `ORCH_HOOK` with its name, and `agent.env`. Its output is in the run log.
+  - A hook gets the same environment as the agent (see [Agent environment](#agent-environment)): ochell's own, with the task's variables (`ORCH_TASK_ID`, `…_SOURCE`, `…_KEY`, `…_URL`, `…_REPO`, `…_BRANCH`) and `agent.env`, and `ORCH_HOOK` with its name. Its output is in the run log.
   - Arguments are templates with `.ID`, `.Source`, `.Key`, `.Repo` and `.Branch`: nothing that holds ticket text. Prefer the environment variables inside a `sh -c` script, as above. Write `$NAME`, not `${NAME}`: the configuration file replaces `${NAME}` from ochell's own environment when it is loaded.
   - `hook_timeout` (10m) limits each hook.
   - A repository can add hooks of its own, which run after these, when `workflow.allow_hooks` is set (see [WORKFLOW.md in the repository](#workflowmd-in-the-repository)).
@@ -1189,14 +1188,14 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 - Result files are removed with their run directory after `retention.logs` (see [Retention](#retention)).
 
 ### Agent environment
-The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:
-- the variables named in `agent.env_pass`, copied from ochell's environment when they are set. The default list is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), `SSL_CERT_FILE` and `SSL_CERT_DIR`;
+ochell is treated like an employee: the agent gets all the access that ochell has, and that includes ochell's environment. The agent, and every [workspace hook](#workspaces), gets:
+- ochell's whole environment, as ochell was started with it;
 - `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL`, `ORCH_TASK_BRANCH`, `ORCH_TASK_TIER` (the ticket's [risk tier](#policy-and-risk-tiers)) and `ORCH_RESULT_FILE`, `ORCH_TASK_REPO` when a repository is mapped to the ticket, and `ORCH_TASK_AUTONOMY` (the tier's [level of autonomy](#graduated-autonomy)) when the policy has levels;
 - the variables set in `agent.env`.
 
-A run of any tier gets the same: a tier grants no tools or credentials of its own. What the agent needs (its tools, its MCP servers, its credentials) is set up in the environment that ochell runs in.
+A later item overrides an earlier one: a name in `agent.env` wins over the same name in ochell's environment, and every name is set once. `ORCH_RESULT_FILE` (and `ORCH_HOOK` for a hook) is always ochell's.
 
-Setting `env_pass` (or `--agent-env-pass`) replaces the default list. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, add that name to `env_pass`. Never add a variable that holds one of ochell's own secrets.
+A run of any tier gets the same: a tier grants no tools or credentials of its own. What the agent needs (its tools, its MCP servers, its credentials) is set up in the environment that ochell runs in. If the agent CLI takes its credential from the environment, for example `ANTHROPIC_API_KEY`, set it in ochell's environment; no setting names it.
 
 ## Setup
 ### Jira system webhook (recommended)
@@ -1346,7 +1345,7 @@ Notes:
   - Request bodies are limited to 1 MiB.
   - Ticket keys must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` before they are used in file names or templates.
   - Signatures and tokens are compared in constant time.
-- **Agent environment:** the agent gets an allowlisted environment, not ochell's own (see [Agent environment](#agent-environment)).
+- **Agent environment:** the agent gets ochell's whole environment, including the secrets that ochell holds there (see [Agent environment](#agent-environment)). The boundary is the host or container that ochell runs in.
 - **The watchdog** compares the agent's tool calls by a hash, and keeps nothing of their input (see [The watchdog](#the-watchdog)). It stops a run that repeats itself; it is not a guardrail against what the agent does.
 - **Metrics:** the endpoint needs its own token on every scrape (see [Metrics](#metrics)).
 - **Status API:** it needs its token on every request, also from the same host (see [The status API](#the-status-api)).

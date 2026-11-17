@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -93,7 +94,6 @@ func agentCfg(t *testing.T, mode string, extraArgs ...string) config.Agent {
 		PromptVia:      "arg",
 		PromptTemplate: "Fix {{.Key}}: {{.Title}}",
 		Workdir:        filepath.Join(dir, "work", "{{.Key}}"),
-		EnvPass:        config.DefaultEnvPass,
 		Env:            map[string]string{"ORCH_HELPER": "1"},
 		Timeout:        5 * time.Second,
 		MaxConcurrent:  1,
@@ -154,21 +154,14 @@ func TestRunStdin(t *testing.T) {
 	}
 }
 
-func TestRunEnvironmentIsAllowlisted(t *testing.T) {
-	// What ochell typically has in its own environment.
-	secrets := map[string]string{
-		"JIRA_WEBHOOK_SECRET":  "jira-secret-value",
-		"LINEAR_CLIENT_SECRET": "linear-secret-value",
-		"NGROK_API_KEY":        "ngrok-secret-value",
-		"ORCH_INHERITED":       "orch-secret-value",
-	}
-	for k, v := range secrets {
-		t.Setenv(k, v)
-	}
-	t.Setenv("LANG", "en_AU.UTF-8")
-	t.Setenv("OCHELL_TEST_PASSED", "passed-on")
+// The agent gets ochell's whole environment, with ORCH_TASK_* and
+// agent.env on top: a later one overrides an earlier one, and every name
+// occurs once.
+func TestRunEnvironmentIsOchells(t *testing.T) {
+	t.Setenv("OCHELL_TEST_ONLY_IN_OCHELL", "from-ochell")
+	t.Setenv("AGENT_SETTING", "from-ochell")
+	t.Setenv("ORCH_TASK_KEY", "from-ochell")
 	cfg := agentCfg(t, "env")
-	cfg.EnvPass = append([]string{"OCHELL_TEST_PASSED", "OCHELL_TEST_UNSET"}, cfg.EnvPass...)
 	cfg.Env["AGENT_SETTING"] = "from-config"
 	r, err := New(cfg, logger(), testStore(t))
 	if err != nil {
@@ -182,22 +175,32 @@ func TestRunEnvironmentIsAllowlisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := string(logged)
-	for k, v := range secrets {
-		if strings.Contains(out, k) || strings.Contains(out, v) {
-			t.Errorf("agent environment leaks %s", k)
+	seen := map[string]int{}
+	for _, line := range strings.Split(string(logged), "\n") {
+		if kv, ok := strings.CutPrefix(line, "env: "); ok {
+			name, _, _ := strings.Cut(kv, "=")
+			seen[name]++
+		}
+	}
+	for name, n := range seen {
+		if n > 1 {
+			t.Errorf("%s occurs %d times in the agent environment", name, n)
 		}
 	}
 	for _, want := range []string{
-		"env: PATH=" + os.Getenv("PATH"), "env: LANG=en_AU.UTF-8", "env: OCHELL_TEST_PASSED=passed-on",
+		"env: PATH=" + os.Getenv("PATH"), "env: OCHELL_TEST_ONLY_IN_OCHELL=from-ochell",
 		"env: ORCH_TASK_KEY=DEV-1", "env: ORCH_TASK_ID=t1", "env: AGENT_SETTING=from-config",
 	} {
-		if !strings.Contains(out, want+"\n") {
+		if !strings.Contains(string(logged), want+"\n") {
 			t.Errorf("agent environment missing %q", want)
 		}
 	}
-	if strings.Contains(out, "OCHELL_TEST_UNSET") {
-		t.Error("a variable that is not set must not be passed as empty")
+}
+
+func TestMergeEnv(t *testing.T) {
+	got := mergeEnv([]string{"A=1", "B=2", "C="}, []string{"B=3", "D=4"}, []string{"A=5"})
+	if want := []string{"A=5", "B=3", "C=", "D=4"}; !slices.Equal(got, want) {
+		t.Errorf("mergeEnv = %q, want %q", got, want)
 	}
 }
 

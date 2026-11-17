@@ -251,7 +251,6 @@ func TestWorkspaceValidation(t *testing.T) {
 func TestAgentEnvValidation(t *testing.T) {
 	p := writeYAML(t, `
 agent:
-  env_pass: [PATH, "BAD NAME"]
   env: { "A=B": x, GOOD_1: y }
 sources:
   jira_automation: { enabled: true, token: t }
@@ -264,24 +263,29 @@ sources:
 	if err == nil {
 		t.Fatal("expected validation errors")
 	}
-	for _, want := range []string{`agent.env_pass: "BAD NAME"`, `agent.env: "A=B"`} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("missing %q in:\n%v", want, err)
-		}
+	if want := `agent.env: "A=B"`; !strings.Contains(err.Error(), want) {
+		t.Errorf("missing %q in:\n%v", want, err)
 	}
-	if strings.Contains(err.Error(), "GOOD_1") || strings.Contains(err.Error(), `"PATH"`) {
+	if strings.Contains(err.Error(), "GOOD_1") {
 		t.Errorf("valid names rejected:\n%v", err)
 	}
+}
 
-	cfg, err = Load("serve", []string{"--agent-env-pass", "PATH", "--agent-env-pass", "ANTHROPIC_API_KEY"}, nil)
-	if err != nil {
-		t.Fatal(err)
+// The agent inherits ochell's whole environment; no setting names what it
+// gets. A config that still sets env_pass is refused at start.
+func TestEnvPassIsRefused(t *testing.T) {
+	for name, yml := range map[string]string{
+		"list":  "agent:\n  env_pass: [PATH, HOME, ANTHROPIC_API_KEY]\n",
+		"empty": "agent:\n  env_pass: []\n",
+	} {
+		p := writeYAML(t, "sources:\n  jira_automation:\n    enabled: true\n    token: t\n"+yml)
+		_, err := Load("serve", []string{"--config", p}, nil)
+		if want := "field env_pass not found"; err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: got %v, want an error with %q", name, err, want)
+		}
 	}
-	if got := strings.Join(cfg.Agent.EnvPass, ","); got != "PATH,ANTHROPIC_API_KEY" {
-		t.Errorf("flag should replace the default env_pass, got %q", got)
-	}
-	if got := Default().Agent.EnvPass; len(got) != len(DefaultEnvPass) {
-		t.Errorf("default env_pass changed by a flag: %v", got)
+	if _, err := Load("serve", []string{"--agent-env-pass", "PATH"}, nil); err == nil {
+		t.Error("--agent-env-pass: accepted, want an unknown flag")
 	}
 }
 

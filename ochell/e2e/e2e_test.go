@@ -115,31 +115,22 @@ func TestFailingAgentIsReported(t *testing.T) {
 	}
 }
 
-// The agent must not see the secrets that ochell holds in its environment.
-func TestAgentDoesNotSeeOchellSecrets(t *testing.T) {
-	secrets := []string{
-		"JIRA_WEBHOOK_SECRET=jira-env-secret",
-		"LINEAR_CLIENT_SECRET=linear-env-secret",
-		"NGROK_API_KEY=ngrok-env-secret",
+// ochell is an employee: the agent gets ochell's whole environment, also a
+// variable that no setting names, such as the agent's own credential.
+func TestAgentSeesOchellsEnvironment(t *testing.T) {
+	const name, value = "OCHELL_E2E_ONLY_IN_OCHELL", "ochells-own-value"
+	o := Start(t, Options{Env: []string{name + "=" + value}})
+	if raw, err := os.ReadFile(o.cfgFile); err != nil || strings.Contains(string(raw), name) {
+		t.Fatalf("the config names %s (or cannot be read: %v)", name, err)
 	}
-	o := Start(t, Options{Env: secrets})
 	id := o.JiraAssigned("DEV-1", "Print the environment").TaskID(t)
 	o.WaitRun(id, 15*time.Second)
 	rec := o.WaitRecords(1, 5*time.Second)[0]
-	env := strings.Join(rec.Env, "\n")
-	for _, s := range secrets {
-		name, value, _ := strings.Cut(s, "=")
-		if strings.Contains(env, name) || strings.Contains(env, value) {
-			t.Errorf("agent environment contains %s", name)
-		}
+	if got, ok := rec.Getenv(name); got != value {
+		t.Errorf("agent environment: %s = %q (set: %v), want %q", name, got, ok, value)
 	}
-	for _, s := range []string{JiraSecret, AutomationToken, LinearSecret, LinearToken} {
-		if strings.Contains(env, s) {
-			t.Errorf("agent environment contains a configured secret (%s)", s)
-		}
-	}
-	if _, ok := rec.Getenv("PATH"); !ok {
-		t.Error("agent environment has no PATH")
+	if got, _ := rec.Getenv("ORCH_TASK_KEY"); got != "DEV-1" {
+		t.Errorf("agent environment: ORCH_TASK_KEY = %q, want DEV-1", got)
 	}
 }
 
@@ -2972,11 +2963,8 @@ func TestEveryTierGetsTheSameAccess(t *testing.T) {
 	o := Start(t, Options{
 		Policy: projectTiers,
 		// A credential of the environment that ochell runs in.
-		Env: []string{"GH_TOKEN=ochells-own-token"},
-		Configure: func(c *config.Config) {
-			claudeAdapter(c)
-			c.Agent.EnvPass = append(c.Agent.EnvPass, "GH_TOKEN")
-		},
+		Env:       []string{"GH_TOKEN=ochells-own-token"},
+		Configure: claudeAdapter,
 	})
 	record := func(id string) Record {
 		t.Helper()

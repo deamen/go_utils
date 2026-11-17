@@ -57,10 +57,8 @@ type Agent struct {
 	// DrainTimeout is how long a shutdown waits for running agents to
 	// finish before it stops them.
 	DrainTimeout time.Duration `yaml:"drain_timeout"`
-	// EnvPass names the variables the agent inherits from ochell's own
-	// environment. Everything else, including ochell's secrets, is dropped.
-	EnvPass []string `yaml:"env_pass"`
-	// Env is set for the agent in addition to EnvPass and ORCH_TASK_*.
+	// Env is set for the agent and the workspace hooks on top of ochell's
+	// own environment and ORCH_TASK_*; a name in it overrides both.
 	Env     map[string]string `yaml:"env"`
 	Timeout time.Duration     `yaml:"timeout"`
 	// StallTimeout is how long an agent may write no output before ochell
@@ -651,14 +649,6 @@ Context provided by {{.Source}}:
 {{.ResultInstructions}}
 `
 
-// DefaultEnvPass is what an agent CLI needs to find its binaries, home
-// directory, locale, proxy and CA settings. It holds no ochell secret.
-var DefaultEnvPass = []string{
-	"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
-	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
-	"SSL_CERT_FILE", "SSL_CERT_DIR",
-}
-
 func Default() *Config {
 	return &Config{
 		LogLevel:  "info",
@@ -681,7 +671,6 @@ func Default() *Config {
 			Launcher:       "direct",
 			StopGrace:      10 * time.Second,
 			DrainTimeout:   30 * time.Second,
-			EnvPass:        append([]string(nil), DefaultEnvPass...),
 			Timeout:        2 * time.Hour,
 			Retry: Retry{
 				Patterns:   append([]string(nil), DefaultRetryPatterns...),
@@ -828,7 +817,6 @@ func bindFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.Agent.PromptVia, "agent-prompt-via", c.Agent.PromptVia, "how the prompt is passed: stdin or arg")
 	fs.StringVar(&c.Agent.Adapter, "agent-adapter", c.Agent.Adapter, "kind of agent CLI: plain or claude")
 	fs.StringVar(&c.Agent.Launcher, "agent-launcher", c.Agent.Launcher, "how the agent is run: direct, the only launcher")
-	fs.Var(&stringList{dst: &c.Agent.EnvPass}, "agent-env-pass", "environment variable the agent inherits from ochell, repeatable (replaces config env_pass)")
 	fs.StringVar(&c.Agent.Workdir, "agent-workdir", c.Agent.Workdir, "agent working directory, Go template")
 	fs.DurationVar(&c.Agent.Timeout, "agent-timeout", c.Agent.Timeout, "maximum agent run time")
 	fs.DurationVar(&c.Agent.StallTimeout, "agent-stall-timeout", c.Agent.StallTimeout, "stop an agent that wrote no output for this long, and start the ticket again (0: never)")
@@ -1055,11 +1043,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Agent.DrainTimeout < 0 {
 		errs = append(errs, errors.New("agent.drain_timeout must not be negative"))
-	}
-	for _, n := range c.Agent.EnvPass {
-		if !envName.MatchString(n) {
-			errs = append(errs, fmt.Errorf("agent.env_pass: %q is not a variable name", n))
-		}
 	}
 	for n := range c.Agent.Env {
 		if !envName.MatchString(n) {
