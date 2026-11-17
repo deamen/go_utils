@@ -1,8 +1,6 @@
 package runner
 
 import (
-	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,12 +43,8 @@ func (r *Runner) Sweep(now time.Time) {
 		before := now.Add(-keep)
 		logs := r.sweepDir(r.cfg.LogDir, before, func(e os.DirEntry) bool { return !e.IsDir() && strings.HasSuffix(e.Name(), ".log") },
 			func(path, _ string) error { return os.Remove(path) })
-		// A run directory belongs to the agent's OS user with the systemd
-		// launcher, so it goes the way a working directory goes.
 		runs := r.sweepDir(r.runDir, before, func(e os.DirEntry) bool { return e.IsDir() },
-			func(path, name string) error {
-				return r.remove(context.Background(), path, "sweep-"+unsafeName.ReplaceAllString(name, "_"), io.Discard)
-			})
+			func(path, _ string) error { return os.RemoveAll(path) })
 		if logs+runs > 0 {
 			r.log.Info("retention: removed what is older than retention.logs", "logs", logs, "run_directories", runs, "older_than", keep)
 		}

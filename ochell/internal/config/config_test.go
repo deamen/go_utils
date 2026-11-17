@@ -239,9 +239,6 @@ func TestWorkspaceValidation(t *testing.T) {
 		"workspace.branch is required":                     func(c *Config) { c.Workspace.Branch = "" },
 		"workspace.hook_timeout must be positive":          func(c *Config) { c.Workspace.HookTimeout = 0 },
 		"workspace.hooks.before_run: the command is empty": func(c *Config) { c.Workspace.Hooks.BeforeRun = []string{"", "x"} },
-		"workspace.hooks.after_create: agent.launcher systemd requires the command to be an absolute path": func(c *Config) {
-			c.Agent.Launcher, c.Agent.Command, c.Agent.RunDir = "systemd", "/usr/local/bin/claude", "/work/runs"
-		},
 	} {
 		cfg := base()
 		change(cfg)
@@ -323,12 +320,12 @@ func TestPodmanLauncherIsRefused(t *testing.T) {
 	cfg.Sources.JiraAutomation.Enabled = true
 	cfg.Sources.JiraAutomation.Token = "t"
 	cfg.Agent.Launcher = "podman"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.launcher must be direct or systemd") {
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.launcher must be direct") {
 		t.Errorf("agent.launcher podman: got %v", err)
 	}
 	// What ochell does at start: load, then validate.
 	for name, c := range map[string]struct{ yml, want string }{
-		"launcher": {"agent:\n  launcher: podman\n", "agent.launcher must be direct or systemd"},
+		"launcher": {"agent:\n  launcher: podman\n", "agent.launcher must be direct"},
 		"settings": {"agent:\n  podman:\n    image: localhost/agent:1\n", "field podman not found"},
 		"empty":    {"agent:\n  podman: {}\n", "field podman not found"},
 	} {
@@ -343,72 +340,38 @@ func TestPodmanLauncherIsRefused(t *testing.T) {
 	}
 }
 
-func TestSystemdLauncherValidation(t *testing.T) {
-	base := func() *Config {
-		cfg := Default()
-		cfg.Sources.JiraAutomation.Enabled = true
-		cfg.Sources.JiraAutomation.Token = "t"
-		cfg.Agent.Launcher = "systemd"
-		cfg.Agent.Command = "/usr/local/bin/claude"
-		cfg.Agent.Workdir = "/work/{{.Source}}/{{.Key}}"
-		cfg.Agent.RunDir = "/work/runs"
-		return cfg
+// The systemd launcher is gone (MMZ-112): a configuration that still
+// selects it, or still has its settings, is refused at start.
+func TestSystemdLauncherIsRefused(t *testing.T) {
+	cfg := Default()
+	cfg.Sources.JiraAutomation.Enabled = true
+	cfg.Sources.JiraAutomation.Token = "t"
+	cfg.Agent.Launcher = "systemd"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.launcher must be direct") {
+		t.Errorf("agent.launcher systemd: got %v", err)
 	}
-	if err := base().Validate(); err != nil {
-		t.Fatalf("valid systemd configuration: %v", err)
-	}
-	cfg := base()
-	cfg.Agent.PromptVia = "arg"
-	cfg.Agent.Args = []string{"-p", "{{.Prompt}}"}
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "requires prompt_via: stdin") {
-		t.Errorf("prompt_via arg with the systemd launcher: got %v", err)
-	}
-	cfg = base()
-	cfg.Agent.Command = "claude"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "absolute path") {
-		t.Errorf("relative command with the systemd launcher: got %v", err)
-	}
-	// The default workdir is ".", which the launch script refuses.
-	for _, dir := range []string{Default().Agent.Workdir, "work/{{.Key}}"} {
-		cfg = base()
-		cfg.Agent.Workdir = dir
-		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.workdir to be an absolute path") {
-			t.Errorf("workdir %q with the systemd launcher: got %v", dir, err)
+	// What ochell does at start: load, then validate.
+	for name, c := range map[string]struct{ yml, want string }{
+		"launcher": {"agent:\n  launcher: systemd\n  command: /usr/local/bin/claude\n", "agent.launcher must be direct"},
+		"settings": {"agent:\n  systemd:\n    launch_command: [sudo, -n, /opt/ochell-launch]\n", "field systemd not found"},
+		"empty":    {"agent:\n  systemd: {}\n", "field systemd not found"},
+	} {
+		p := writeYAML(t, "sources:\n  jira_automation:\n    enabled: true\n    token: t\n"+c.yml)
+		cfg, err := Load("serve", []string{"--config", p}, nil)
+		if err == nil {
+			err = cfg.Validate()
+		}
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want an error with %q", name, err, c.want)
 		}
 	}
-	cfg = base()
-	cfg.Agent.RunDir = "runs"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "agent.run_dir to be an absolute path") {
-		t.Errorf("relative run_dir with the systemd launcher: got %v", err)
-	}
-	cfg = base()
-	cfg.Agent.Systemd.StopCommand = nil
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "stop_command") {
-		t.Errorf("missing stop_command: got %v", err)
-	}
-	cfg = base()
-	cfg.Agent.Launcher = "docker"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be direct or systemd") {
-		t.Errorf("unknown launcher: got %v", err)
-	}
+}
 
-	p := writeYAML(t, `
-agent:
-  launcher: systemd
-  command: /usr/local/bin/claude
-  stop_grace: 20s
-  systemd:
-    launch_command: [sudo, -n, /opt/ochell-launch]
-`)
+func TestStopGrace(t *testing.T) {
+	p := writeYAML(t, "agent:\n  stop_grace: 20s\n")
 	cfg, err := Load("serve", []string{"--config", p}, nil)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if got := strings.Join(cfg.Agent.Systemd.LaunchCommand, " "); got != "sudo -n /opt/ochell-launch" {
-		t.Errorf("launch_command = %q", got)
-	}
-	if got := strings.Join(cfg.Agent.Systemd.StopCommand, " "); got != "sudo -n /usr/local/libexec/ochell/ochell-stop" {
-		t.Errorf("default stop_command lost: %q", got)
 	}
 	if cfg.Agent.StopGrace != 20*time.Second {
 		t.Errorf("stop_grace = %s", cfg.Agent.StopGrace)

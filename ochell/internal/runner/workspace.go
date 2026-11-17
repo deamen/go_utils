@@ -104,30 +104,30 @@ func (w *workspace) view(t *task.Task) hookView {
 	return v
 }
 
-// hook runs one workspace hook in dir and writes its output to out. unit
-// names the run for the launcher. It returns nil when there is no such
-// hook, and an error that names the hook when it does not succeed.
-func (r *Runner) hook(ctx context.Context, name string, t *task.Task, dir, unit string, out io.Writer) error {
-	return r.runHook(ctx, name, false, r.ws.hooks[name], t, dir, unit, out)
+// hook runs one workspace hook in dir and writes its output to out.
+// runName names the run for the launcher. It returns nil when there is no
+// such hook, and an error that names the hook when it does not succeed.
+func (r *Runner) hook(ctx context.Context, name string, t *task.Task, dir, runName string, out io.Writer) error {
+	return r.runHook(ctx, name, false, r.ws.hooks[name], t, dir, runName, out)
 }
 
 // hooks runs the host's hook with this name, and after it the one that the
 // WORKFLOW.md of the ticket's repository adds. The repository's hook never
 // takes the place of the host's, and does not run when the host's failed.
-func (r *Runner) hooks(ctx context.Context, name string, t *task.Task, dir, unit string, out io.Writer, wf *flow) error {
-	if err := r.hook(ctx, name, t, dir, unit, out); err != nil {
+func (r *Runner) hooks(ctx context.Context, name string, t *task.Task, dir, runName string, out io.Writer, wf *flow) error {
+	if err := r.hook(ctx, name, t, dir, runName, out); err != nil {
 		return err
 	}
-	return r.runHook(ctx, name, true, wf.hooks[name], t, dir, unit, out)
+	return r.runHook(ctx, name, true, wf.hooks[name], t, dir, runName, out)
 }
 
 // runHook runs the command of one hook. repo says that it is the
 // repository's and not the host's.
-func (r *Runner) runHook(ctx context.Context, name string, repo bool, tmpl []*template.Template, t *task.Task, dir, unit string, out io.Writer) error {
+func (r *Runner) runHook(ctx context.Context, name string, repo bool, tmpl []*template.Template, t *task.Task, dir, runName string, out io.Writer) error {
 	if len(tmpl) == 0 {
 		return nil
 	}
-	label, id := name, unit+"."+name
+	label, id := name, runName+"."+name
 	if repo {
 		label, id = name+" of "+workflow.FileName, id+".repo"
 	}
@@ -173,9 +173,9 @@ func (r *Runner) runHook(ctx context.Context, name string, repo bool, tmpl []*te
 
 // prepare runs the hooks that come before the agent: after_create once for
 // a working directory, before_run every time.
-func (r *Runner) prepare(ctx context.Context, t *task.Task, dir, unit string, out io.Writer, wf *flow) error {
+func (r *Runner) prepare(ctx context.Context, t *task.Task, dir, runName string, out io.Writer, wf *flow) error {
 	if len(r.ws.hooks["after_create"])+len(wf.hooks["after_create"]) > 0 && t.PreparedWorkspace != dir {
-		if err := r.hooks(ctx, "after_create", t, dir, unit, out, wf); err != nil {
+		if err := r.hooks(ctx, "after_create", t, dir, runName, out, wf); err != nil {
 			return err
 		}
 		t.PreparedWorkspace = dir
@@ -183,7 +183,7 @@ func (r *Runner) prepare(ctx context.Context, t *task.Task, dir, unit string, ou
 			return fmt.Errorf("record the prepared working directory: %w", err)
 		}
 	}
-	return r.hooks(ctx, "before_run", t, dir, unit, out, wf)
+	return r.hooks(ctx, "before_run", t, dir, runName, out, wf)
 }
 
 // ticketLocks serialises what happens in the working directory of one
@@ -284,21 +284,21 @@ func (r *Runner) removeWorkspace(source, key string) {
 	}
 
 	t := &task.Task{ID: fmt.Sprintf("%s-%s-%s", time.Now().UTC().Format("20060102T150405.000Z"), source, key), Source: source, Key: key, URL: tk.URL, Repo: tk.Repo}
-	unit := unsafeName.ReplaceAllString(t.ID, "_") + ".remove"
+	runName := unsafeName.ReplaceAllString(t.ID, "_") + ".remove"
 	out := io.Discard
 	if err := os.MkdirAll(r.cfg.LogDir, 0o750); err == nil {
-		if lf, err := os.OpenFile(filepath.Join(r.cfg.LogDir, unit+".log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640); err == nil {
+		if lf, err := os.OpenFile(filepath.Join(r.cfg.LogDir, runName+".log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640); err == nil {
 			defer lf.Close()
 			out = lf
 		}
 	}
 	fmt.Fprintf(out, "# removing the working directory %s of %s %s\n", clean, source, key)
 	ctx := context.Background()
-	if err := r.hook(ctx, "before_remove", t, clean, unit, out); err != nil {
+	if err := r.hook(ctx, "before_remove", t, clean, runName, out); err != nil {
 		// The directory goes all the same: the ticket is closed.
 		log.Warn("before_remove hook failed", "err", err)
 	}
-	if err := r.remove(ctx, clean, unit, out); err != nil {
+	if err := os.RemoveAll(clean); err != nil {
 		fmt.Fprintf(out, "# not removed: %v\n", err)
 		log.Error("cannot remove the working directory", "dir", clean, "err", err)
 		return
@@ -308,31 +308,4 @@ func (r *Runner) removeWorkspace(source, key string) {
 	}
 	fmt.Fprintf(out, "# removed\n")
 	log.Info("working directory removed", "dir", clean)
-}
-
-// remove deletes dir. With the direct launcher the files belong to ochell's
-// own user. With the systemd launcher they belong to the agent user, so rm
-// runs as that user, through the launcher, from the root.
-func (r *Runner) remove(ctx context.Context, dir, unit string, out io.Writer) error {
-	if r.cfg.Launcher != "systemd" {
-		return os.RemoveAll(dir)
-	}
-	spec := launcher.Spec{
-		TaskID:  unit + ".rm",
-		Command: "/bin/rm",
-		Args:    []string{"-rf", "--", dir},
-		Dir:     r.ws.root,
-		Output:  out,
-		Timeout: r.ws.cfg.HookTimeout,
-	}
-	w, outcome := r.execute(ctx, spec, 0, nil)
-	switch {
-	case outcome != task.OutcomeFinished:
-		return fmt.Errorf("rm did not finish: %s", outcome)
-	case w.err != nil:
-		return w.err
-	case w.code != 0:
-		return fmt.Errorf("rm: exit status %d", w.code)
-	}
-	return nil
 }

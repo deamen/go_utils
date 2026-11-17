@@ -337,33 +337,6 @@ func TestRunOutcomes(t *testing.T) {
 	}
 }
 
-// With the systemd launcher, ticket text must not be able to reach the
-// command line.
-func TestSystemdLauncherRefusesTicketTextInArguments(t *testing.T) {
-	for _, field := range []string{".Title", ".URL", ".Context", ".Prompt", ".DeliveryID"} {
-		cfg := agentCfg(t, "echo", "--name={{"+field+"}}")
-		cfg.Launcher = "systemd"
-		if _, err := New(cfg, logger(), testStore(t)); err == nil || !strings.Contains(err.Error(), "only .ID, .Source and .Key") {
-			t.Errorf("{{%s}} in an argument: got %v", field, err)
-		}
-	}
-	cfg := agentCfg(t, "echo", "--session={{.Source}}-{{.Key}}-{{.ID}}")
-	cfg.Launcher = "systemd"
-	if _, err := New(cfg, logger(), testStore(t)); err != nil {
-		t.Errorf(".ID, .Source and .Key must be allowed: %v", err)
-	}
-	cfg = agentCfg(t, "echo")
-	cfg.Launcher = "systemd"
-	cfg.Workdir = "/work/{{.Title}}"
-	if _, err := New(cfg, logger(), testStore(t)); err == nil {
-		t.Error("{{.Title}} in workdir must be refused")
-	}
-	// The direct launcher keeps the old behaviour.
-	if _, err := New(agentCfg(t, "echo", "{{.Title}}"), logger(), testStore(t)); err != nil {
-		t.Errorf("direct launcher: %v", err)
-	}
-}
-
 func TestSubmitBusyAndNotifications(t *testing.T) {
 	r, _ := New(agentCfg(t, "echo"), logger(), testStore(t))
 	f := &finished{done: make(chan string, 4)}

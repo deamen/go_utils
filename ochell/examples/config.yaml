@@ -82,7 +82,7 @@ github:
   # api_url: https://ghe.example.com/api/v3   # also for sources.github
 
 # The policy file: the risk tiers, and which tier a ticket runs under (see
-# examples/policy.yaml). It must not be writable by the agent's OS user.
+# examples/policy.yaml). It must not be writable by other users.
 # Leave it out for one built-in tier that every ticket runs under.
 policy:
   file: /etc/ochell/policy.yaml
@@ -182,7 +182,7 @@ agent:
   # {{.ResultInstructions}}, which tells the agent what to write, and
   # {{.RunContext}}, which tells a later attempt about the earlier ones.
   run_dir: /work/runs
-  # The last day on which the agent's own token works. ochell cannot read
+  # The last day on which the agent's own token works. ochell does not read
   # the token, so note its end here: a token from "claude setup-token"
   # lasts one year, and every run fails once it has expired. ochell warns
   # in its log from token_warn_days before that day.
@@ -196,25 +196,15 @@ agent:
   #            again resumes its session. It adds --output-format stream-json
   #            --verbose (and --resume) itself; leave them out of args.
   adapter: claude
-  # How the agent process is run:
-  #   direct   a child process of ochell, under ochell's own OS user. For
-  #            development; the agent can read ochell's files.
-  #   systemd  a transient unit under a separate OS user, started and stopped
-  #            through two root-owned scripts (see README, "Launchers").
-  #            Requires prompt_via: stdin and an absolute command, workdir and
-  #            run_dir; args and workdir may only use .ID .Source .Key;
-  #            env_pass is not used. ochell must be in the agent user's group
-  #            to read the result files.
+  # How the agent process is run. direct, the only launcher: a child process
+  # of ochell, under ochell's own OS user.
   launcher: direct
-  systemd:
-    launch_command: [sudo, -n, /usr/local/libexec/ochell/ochell-launch]
-    stop_command: [sudo, -n, /usr/local/libexec/ochell/ochell-stop]
   # Time between SIGTERM and SIGKILL when a run is stopped, at the time limit
   # or on shutdown. The whole agent is stopped, with its children.
   stop_grace: 10s
-  # How long a shutdown waits for running agents before it stops them. If
-  # ochell is a systemd service, keep the service's TimeoutStopSec above
-  # drain_timeout + stop_grace.
+  # How long a shutdown waits for running agents before it stops them. If a
+  # service manager runs ochell, give it longer than drain_timeout +
+  # stop_grace to stop it.
   drain_timeout: 30s
   # The agent does not inherit ochell's environment, which holds the secrets
   # above. Only the variables named here are copied from it. This is the
