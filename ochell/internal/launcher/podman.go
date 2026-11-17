@@ -33,8 +33,8 @@ const containerPrefix = "ochell-run-"
 //
 // A container sees its image and what is mounted in it: the working
 // directory of its ticket, the directory of its run, the state directory of
-// its ticket as its home, and read-only what its tier grants. Nothing of
-// ochell's is mounted, and nothing of another ticket.
+// its ticket as its home. Nothing of ochell's is mounted, and nothing of
+// another ticket.
 type Podman struct {
 	// Command is the podman program.
 	Command string
@@ -48,9 +48,6 @@ type Podman struct {
 	Args []string
 	// StopGrace is how long podman waits between SIGTERM and SIGKILL.
 	StopGrace time.Duration
-	// SecretsDir is a directory of ochell's own, for the file that carries
-	// the secrets of a run to its container.
-	SecretsDir string
 	// Protected are directories of ochell's own. A directory that holds
 	// one of them is never mounted.
 	Protected []string
@@ -75,10 +72,9 @@ func (p *Podman) mountable(path string) error {
 	return nil
 }
 
-// checkMounts refuses a run one of whose directories or files cannot be
-// mounted.
+// checkMounts refuses a run one of whose directories cannot be mounted.
 func (p *Podman) checkMounts(spec Spec) error {
-	paths := append([]string{spec.Dir}, spec.ReadOnly...)
+	paths := []string{spec.Dir}
 	for _, d := range []string{spec.RunDir, spec.Home} {
 		if d != "" {
 			paths = append(paths, d)
@@ -92,20 +88,19 @@ func (p *Podman) checkMounts(spec Spec) error {
 	return nil
 }
 
-// runArgs builds the arguments of "podman run" for one run. secretsFile is
-// the file with the run's secrets, or "".
+// runArgs builds the arguments of "podman run" for one run.
 //
 // No secret is among them: the process list shows them to every local
-// user. The secrets are in files that podman reads.
-func (p *Podman) runArgs(spec Spec, secretsFile string) ([]string, error) {
+// user. The agent's credential is in a file that podman reads.
+func (p *Podman) runArgs(spec Spec) ([]string, error) {
 	if err := p.checkMounts(spec); err != nil {
 		return nil, err
 	}
 	args := []string{
 		"run", "--rm", "--name=" + containerPrefix + spec.TaskID,
 		"--pull=" + p.Pull,
-		// The output goes to ochell alone, which takes the secrets out of
-		// it; podman's own log would be a second copy.
+		// The output goes to ochell alone; podman's own log would be a
+		// second copy.
 		"--log-driver=none",
 		// The agent has the same uid in the container as ochell has on the
 		// host, and it is not root there. So ochell owns every file that a
@@ -139,15 +134,8 @@ func (p *Podman) runArgs(spec Spec, secretsFile string) ([]string, error) {
 	if spec.Home != "" {
 		args = append(args, "--volume="+spec.Home+":"+ContainerHome+":Z", "--env=HOME="+ContainerHome)
 	}
-	for _, f := range spec.ReadOnly {
-		// Not relabelled: runs of the same tier share the file.
-		args = append(args, "--volume="+f+":"+f+":ro")
-	}
 	if p.EnvFile != "" {
 		args = append(args, "--env-file="+p.EnvFile)
-	}
-	if secretsFile != "" {
-		args = append(args, "--env-file="+secretsFile)
 	}
 	// As arguments and not in a file: a file has one variable per line, and
 	// a value from a ticket (its URL) could bring a line of its own.
@@ -157,36 +145,6 @@ func (p *Podman) runArgs(spec Spec, secretsFile string) ([]string, error) {
 	args = append(args, p.Args...)
 	args = append(args, p.Image, spec.Command)
 	return append(args, spec.Args...), nil
-}
-
-// writeSecrets writes the secrets of a run to a file of its own that only
-// ochell (and root) can read, and returns its path. podman reads it as an
-// env file; it is not mounted in the container.
-func (p *Podman) writeSecrets(taskID string, secrets []string) (string, error) {
-	if p.SecretsDir == "" {
-		return "", errors.New("podman launcher: agent.secrets_dir is required to pass credentials to a run")
-	}
-	for _, s := range secrets {
-		// A line without "=" would make podman copy the variable of that
-		// name from ochell's own environment.
-		if name, _, ok := strings.Cut(s, "="); !ok || name == "" || strings.ContainsAny(s, "\r\n") || strings.ContainsAny(name, "* \t#") {
-			return "", errors.New("podman launcher: a credential is not one line of the form NAME=VALUE")
-		}
-	}
-	if err := os.MkdirAll(p.SecretsDir, 0o700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(p.SecretsDir, taskID+".env")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_EXCL, 0o600)
-	if err != nil {
-		return "", err
-	}
-	_, werr := f.WriteString(strings.Join(secrets, "\n") + "\n")
-	if err := errors.Join(werr, f.Close()); err != nil {
-		os.Remove(path)
-		return "", err
-	}
-	return path, nil
 }
 
 func (p *Podman) Start(spec Spec) (Process, error) {
@@ -206,18 +164,8 @@ func (p *Podman) Start(spec Spec) (Process, error) {
 			return nil, fmt.Errorf("create %s: %w", d, err)
 		}
 	}
-	secretsFile := ""
-	if len(spec.Secrets) > 0 {
-		var err error
-		if secretsFile, err = p.writeSecrets(spec.TaskID, spec.Secrets); err != nil {
-			return nil, fmt.Errorf("%w: cannot hand the credentials to the run: %v", ErrNotStarted, err)
-		}
-	}
-	args, err := p.runArgs(spec, secretsFile)
+	args, err := p.runArgs(spec)
 	if err != nil {
-		if secretsFile != "" {
-			os.Remove(secretsFile)
-		}
 		return nil, fmt.Errorf("%w: podman launcher: %v", ErrNotStarted, err)
 	}
 	// podman itself has ochell's environment, which it needs to find its
@@ -229,28 +177,20 @@ func (p *Podman) Start(spec Spec) (Process, error) {
 	cmd.Stdout, cmd.Stderr = spec.Output, spec.Output
 	cmd.WaitDelay = 10 * time.Second
 	if err := cmd.Start(); err != nil {
-		if secretsFile != "" {
-			os.Remove(secretsFile)
-		}
 		return nil, fmt.Errorf("%w: %s: %v", ErrNotStarted, p.Command, err)
 	}
-	return &podmanProcess{p: p, name: containerPrefix + spec.TaskID, cmd: cmd, secretsFile: secretsFile}, nil
+	return &podmanProcess{p: p, name: containerPrefix + spec.TaskID, cmd: cmd}, nil
 }
 
 type podmanProcess struct {
-	p    *Podman
-	name string
-	cmd  *exec.Cmd
-	// secretsFile is removed when the run has ended.
-	secretsFile string
-	stopped     atomic.Bool
+	p       *Podman
+	name    string
+	cmd     *exec.Cmd
+	stopped atomic.Bool
 }
 
 func (c *podmanProcess) Wait() (int, error) {
 	code, err := exitCode(c.cmd, c.cmd.Wait())
-	if c.secretsFile != "" {
-		os.Remove(c.secretsFile)
-	}
 	if err == nil && code >= firstPodmanExitCode && code <= lastPodmanExitCode && !c.stopped.Load() {
 		return code, fmt.Errorf("%w: podman exit code %d", ErrNotStarted, code)
 	}

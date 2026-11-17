@@ -324,57 +324,19 @@ func TestStopScript(t *testing.T) {
 	}
 }
 
-// The credentials of a run reach the unit through a file, not through the
-// unit's own settings, and only a file of the caller's is taken.
-func TestLaunchScriptEnvFile(t *testing.T) {
+// ochell hands a run no credentials of its own: the launch script takes no
+// file with them.
+func TestLaunchScriptTakesNoEnvFile(t *testing.T) {
 	e := newScriptEnv(t)
-	dir := filepath.Join(e.root, "jira", "DEV-2")
-	secrets := filepath.Join(filepath.Dir(e.root), "secrets")
-	if err := os.Mkdir(secrets, 0o700); err != nil {
+	file := filepath.Join(t.TempDir(), "T-2.env")
+	if err := os.WriteFile(file, []byte("RUN_TOKEN=run-secret-value\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	file := filepath.Join(secrets, "T-2.env")
-	if err := os.WriteFile(file, []byte("TIER_TOKEN=tier-secret-value\nRUN_TOKEN=run-secret-value\n"), 0o600); err != nil {
-		t.Fatal(err)
+	res := run(t, "", e.launch, "--task", "T-2", "--workdir", e.root, "--env-file", file, "--", "/bin/true")
+	if res.code != 250 || !strings.Contains(res.stderr, "unexpected argument before --: --env-file") {
+		t.Errorf("exit %d, stderr %q; want a refusal of --env-file", res.code, res.stderr)
 	}
-	launch := func(task, envFile string) scriptResult {
-		return run(t, "", e.launch, "--task", task, "--workdir", dir, "--env-file", envFile,
-			"--", "/bin/sh", "-c", `echo "tier=$TIER_TOKEN run=$RUN_TOKEN agent=$AGENT_TOKEN"`)
-	}
-	res := launch("T-2", file)
-	if res.code != 0 || res.stdout != "tier=tier-secret-value run=run-secret-value agent=token-from-env-file\n" {
-		t.Fatalf("exit %d, output %q, stderr %s", res.code, res.stdout, res.stderr)
-	}
-	// The unit is given the file, never the values.
-	args := strings.Join(e.unitArgs("T-2"), "\n")
-	if !strings.Contains(args, "EnvironmentFile="+file) || strings.Contains(args, "secret-value") {
-		t.Errorf("arguments of systemd-run:\n%s", args)
-	}
-
-	// What is refused.
-	link := filepath.Join(secrets, "link.env")
-	if err := os.Symlink(file, link); err != nil {
-		t.Fatal(err)
-	}
-	open := filepath.Join(secrets, "open.env")
-	if err := os.WriteFile(open, []byte("A=b\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	for name, c := range map[string]struct{ file, want string }{
-		"relative":       {"secrets/T-2.env", "absolute path"},
-		"dots":           {secrets + "/../secrets/T-2.env", "must not contain"},
-		"missing":        {filepath.Join(secrets, "none.env"), "does not exist"},
-		"directory":      {secrets, "not a regular file"},
-		"symbolic link":  {link, "must not be a symbolic link"},
-		"group readable": {open, "must not be accessible to group or others"},
-		"odd characters": {secrets + "/a b.env", "absolute path without special characters"},
-	} {
-		res := launch("T-refused", c.file)
-		if res.code != 250 || !strings.Contains(res.stderr, c.want) {
-			t.Errorf("%s: exit %d, stderr %q; want a refusal with %q", name, res.code, res.stderr, c.want)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(e.systemd, "ochell-run-T-refused.args")); err == nil {
-		t.Error("a refused launch started a unit")
+	if e.started() {
+		t.Error("systemd-run was called with --env-file")
 	}
 }

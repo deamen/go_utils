@@ -154,21 +154,17 @@ func (r *Runner) runHook(ctx context.Context, name string, repo bool, tmpl []*te
 	start := time.Now()
 	fmt.Fprintf(out, "# ---- hook %s: %s (%d args) ----\n", label, argv[0], len(argv)-1)
 	spec := launcher.Spec{
-		TaskID:  id,
-		Command: argv[0],
-		Args:    argv[1:],
-		Dir:     dir,
-		// A hook gets what the run was granted: a clone needs the
-		// repository's credentials as much as the agent does.
-		Env:       append(append(r.taskEnv(t), r.grantOf(t.ID).env...), "ORCH_HOOK="+name),
-		Secrets:   r.grantOf(t.ID).secrets,
+		TaskID:    id,
+		Command:   argv[0],
+		Args:      argv[1:],
+		Dir:       dir,
+		Env:       append(r.taskEnv(t), "ORCH_HOOK="+name),
 		Inherited: r.inheritedEnv(),
 		// With the podman launcher a hook is in a container like the
 		// agent's, with the same directories.
-		Home:     r.home(t.Source, t.Key),
-		ReadOnly: r.grantOf(t.ID).files(),
-		Output:   out,
-		Timeout:  r.ws.cfg.HookTimeout,
+		Home:    r.home(t.Source, t.Key),
+		Output:  out,
+		Timeout: r.ws.cfg.HookTimeout,
 	}
 	w, outcome := r.execute(ctx, spec, 0, nil)
 	var err error

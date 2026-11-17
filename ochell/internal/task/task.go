@@ -234,12 +234,9 @@ type Result struct {
 	Branch        string
 	// Phase is the phase the run was for.
 	Phase Phase
-	// PromptHash is the SHA-256 of the prompt the agent was given, and
-	// Grants names what the run's tier granted it: the names of the tools
-	// file and of the variables, never a value. Both are for the audit
-	// record of the run.
+	// PromptHash is the SHA-256 of the prompt the agent was given, for the
+	// audit record of the run.
 	PromptHash string
-	Grants     string
 	// Workflow is the version of the repository's WORKFLOW.md that the
 	// run ran under; empty: none.
 	Workflow string

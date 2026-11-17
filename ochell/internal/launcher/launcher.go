@@ -47,10 +47,6 @@ type Spec struct {
 	// between the runs of a ticket. Only the podman launcher uses it, and
 	// creates it when missing. Empty: none.
 	Home string
-	// ReadOnly are files of the host that the run may read: what its tier
-	// grants (the MCP configuration). Only the podman launcher uses them,
-	// to mount them; with the others the agent sees the host's files.
-	ReadOnly []string
 	// Env is set for the agent, as NAME=VALUE: ORCH_TASK_* and agent.env.
 	// With the systemd and podman launchers other local users can read
 	// these values.
@@ -60,11 +56,6 @@ type Spec struct {
 	// environment of the agent user instead, and a container that of its
 	// image.
 	Inherited []string
-	// Secrets are set for the agent as well, as NAME=VALUE, and must not
-	// become visible to other local users: the systemd launcher hands them
-	// over in a file that only ochell and root can read, not as part of
-	// the unit, and so does the podman launcher, not on the command line.
-	Secrets []string
 	// Stdin is written to the agent's stdin; nil means no input.
 	Stdin io.Reader
 	// Output receives the agent's stdout and stderr.
@@ -105,20 +96,10 @@ func New(cfg config.Agent) (Launcher, error) {
 	case "", "direct":
 		return Direct{StopGrace: cfg.StopGrace}, nil
 	case "systemd":
-		// The launch script takes the file with a run's credentials only by
-		// its full path.
-		secrets := cfg.SecretsDir
-		if secrets != "" {
-			var err error
-			if secrets, err = filepath.Abs(secrets); err != nil {
-				return nil, fmt.Errorf("agent.secrets_dir: %w", err)
-			}
-		}
 		return &Systemd{
 			LaunchCommand: cfg.Systemd.LaunchCommand,
 			StopCommand:   cfg.Systemd.StopCommand,
 			StopGrace:     cfg.StopGrace,
-			SecretsDir:    secrets,
 		}, nil
 	case "podman":
 		p := &Podman{
@@ -141,9 +122,8 @@ func New(cfg config.Agent) (Launcher, error) {
 			}
 			return full
 		}
-		p.SecretsDir = abs("secrets_dir", cfg.SecretsDir)
 		p.EnvFile = abs("podman.env_file", cfg.Podman.EnvFile)
-		for name, dir := range map[string]string{"log_dir": cfg.LogDir, "run_dir": cfg.RunDir, "secrets_dir": cfg.SecretsDir, "podman.state_dir": cfg.Podman.StateDir} {
+		for name, dir := range map[string]string{"log_dir": cfg.LogDir, "run_dir": cfg.RunDir, "podman.state_dir": cfg.Podman.StateDir} {
 			if full := abs(name, dir); full != "" {
 				p.Protected = append(p.Protected, full)
 			}

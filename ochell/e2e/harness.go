@@ -173,7 +173,6 @@ func podmanDirs(t *testing.T, c *config.Config) string {
 	c.Agent.Launcher = "podman"
 	c.Agent.Podman.EnvFile = envFile
 	c.Agent.Podman.StateDir = filepath.Join(dir, "state")
-	c.Agent.SecretsDir = filepath.Join(dir, "secrets")
 	return dir
 }
 

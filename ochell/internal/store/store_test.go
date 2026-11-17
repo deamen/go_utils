@@ -527,6 +527,46 @@ func TestMigrateProvisionalStates(t *testing.T) {
 	}
 }
 
+// A file of schema version 23, whose runs recorded what their tier granted,
+// still opens: the column of the grants goes, and the rest of the audit
+// record stays.
+func TestMigrateDropsGrants(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ochell.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for v, m := range migrations[:23] {
+		if _, err := db.Exec(m); err != nil {
+			t.Fatalf("schema version %d: %v", v+1, err)
+		}
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 23;
+		INSERT INTO tickets (source, key, state, created_at, updated_at) VALUES ('linear', 'ENG-1', 'in_review', 0, 0);
+		INSERT INTO runs (id, source, key, status, received_at, ended_at, outcome, tier, prompt_hash, grants, autonomy) VALUES
+			('r1', 'linear', 'ENG-1', 'ended', 0, 1, 'finished', 'low', 'abc123', 'env=TOOLSET credentials=LOW_TOKEN', 'assisted');`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s := open(t, path)
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != len(migrations) || version != 24 {
+		t.Errorf("schema version %d (%v), want 24", version, err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'grants'`).Scan(&n); err != nil || n != 0 {
+		t.Errorf("runs.grants is still there (%d, %v)", n, err)
+	}
+	r, err := s.Run("r1")
+	if err != nil || r == nil {
+		t.Fatalf("the run of the old file: %v, %v", r, err)
+	}
+	if r.Tier != "low" || r.Result.PromptHash != "abc123" || r.Result.Autonomy != "assisted" || r.Result.Outcome != task.OutcomeFinished {
+		t.Errorf("the run of the old file = %+v", r)
+	}
+}
+
 func TestDeliveries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ochell.db")
 	s := open(t, path)
