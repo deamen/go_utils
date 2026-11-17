@@ -190,9 +190,6 @@ type Run struct {
 type Audit struct {
 	PolicyVersion string `json:"policy_version"`
 	Tier          string `json:"tier"`
-	// Grants names the tools file and the variables that the tier granted
-	// the run; never a value.
-	Grants string `json:"grants,omitempty"`
 	// Workflow is the version of the repository's WORKFLOW.md that the
 	// run ran under.
 	Workflow string `json:"workflow,omitempty"`
@@ -231,7 +228,7 @@ func runOf(r store.RunInfo) Run {
 	if !r.Started.IsZero() {
 		out.Started = &r.Started
 		u := r.Result.Usage
-		out.Audit = &Audit{PolicyVersion: r.PolicyVersion, Tier: r.Tier, Grants: r.Result.Grants, Workflow: r.Result.Workflow, Autonomy: r.Result.Autonomy, PromptSHA256: r.Result.PromptHash,
+		out.Audit = &Audit{PolicyVersion: r.PolicyVersion, Tier: r.Tier, Workflow: r.Result.Workflow, Autonomy: r.Result.Autonomy, PromptSHA256: r.Result.PromptHash,
 			InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CacheReadTokens: u.CacheReadTokens, CacheWriteTokens: u.CacheWriteTokens}
 	}
 	if !r.Ended.IsZero() {

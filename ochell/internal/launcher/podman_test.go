@@ -40,7 +40,7 @@ func newPodmanEnv(t *testing.T) *podmanEnv {
 		t.Fatal(err)
 	}
 	t.Setenv("FAKE_PODMAN_DIR", e.state)
-	e.p = &Podman{Command: fake, Image: "localhost/agent:1", Pull: "never", StopGrace: 2 * time.Second, SecretsDir: filepath.Join(dir, "secrets")}
+	e.p = &Podman{Command: fake, Image: "localhost/agent:1", Pull: "never", StopGrace: 2 * time.Second}
 	return e
 }
 
@@ -60,24 +60,22 @@ func TestPodmanRunArguments(t *testing.T) {
 	p := &Podman{
 		Command: "podman", Image: "registry.example.com/agent:7", Pull: "never",
 		EnvFile: "/etc/ochell/agent.env", Args: []string{"--memory=4g"},
-		Protected: []string{"/var/lib/ochell/logs", "/var/lib/ochell/secrets", "/var/lib/ochell/runs", "/var/lib/ochell/state"},
+		Protected: []string{"/var/lib/ochell/logs", "/var/lib/ochell/runs", "/var/lib/ochell/state"},
 	}
 	spec := Spec{
-		TaskID:   "T-1",
-		Command:  "claude",
-		Args:     []string{"-p", "${HOME} $(id)"},
-		Dir:      "/work/jira/DEV-1",
-		RunDir:   "/var/lib/ochell/runs/T-1",
-		Home:     "/var/lib/ochell/state/jira-DEV-1",
-		ReadOnly: []string{"/etc/ochell/mcp/low.json"},
-		Env:      []string{"ORCH_TASK_KEY=DEV-1", "ORCH_RESULT_FILE=/var/lib/ochell/runs/T-1/result.json"},
+		TaskID:  "T-1",
+		Command: "claude",
+		Args:    []string{"-p", "${HOME} $(id)"},
+		Dir:     "/work/jira/DEV-1",
+		RunDir:  "/var/lib/ochell/runs/T-1",
+		Home:    "/var/lib/ochell/state/jira-DEV-1",
+		Env:     []string{"ORCH_TASK_KEY=DEV-1", "ORCH_RESULT_FILE=/var/lib/ochell/runs/T-1/result.json"},
 		// Only for the direct launcher.
 		Inherited: []string{"PATH=/host/bin"},
-		Secrets:   []string{"GH_TOKEN=very-secret"},
 		Stdin:     strings.NewReader("prompt"),
 		Timeout:   time.Hour,
 	}
-	got, err := p.runArgs(spec, "/var/lib/ochell/secrets/T-1.env")
+	got, err := p.runArgs(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +88,7 @@ func TestPodmanRunArguments(t *testing.T) {
 		"--volume=/var/lib/ochell/runs/T-1:/var/lib/ochell/runs/T-1:Z",
 		"--workdir=/work/jira/DEV-1",
 		"--volume=/var/lib/ochell/state/jira-DEV-1:/home/agent:Z", "--env=HOME=/home/agent",
-		"--volume=/etc/ochell/mcp/low.json:/etc/ochell/mcp/low.json:ro",
-		"--env-file=/etc/ochell/agent.env", "--env-file=/var/lib/ochell/secrets/T-1.env",
+		"--env-file=/etc/ochell/agent.env",
 		"--env=ORCH_TASK_KEY=DEV-1", "--env=ORCH_RESULT_FILE=/var/lib/ochell/runs/T-1/result.json",
 		"--memory=4g",
 		"registry.example.com/agent:7", "claude", "-p", "${HOME} $(id)",
@@ -100,8 +97,8 @@ func TestPodmanRunArguments(t *testing.T) {
 		t.Errorf("podman arguments:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 	for _, a := range got {
-		if strings.Contains(a, "very-secret") || strings.Contains(a, "/host/bin") {
-			t.Errorf("argument %q holds a secret or a variable of ochell's own", a)
+		if strings.Contains(a, "/host/bin") {
+			t.Errorf("argument %q holds a variable of ochell's own", a)
 		}
 	}
 	// Exactly these paths of the host are in the container.
@@ -111,12 +108,12 @@ func TestPodmanRunArguments(t *testing.T) {
 			mounted = append(mounted, strings.SplitN(v, ":", 2)[0])
 		}
 	}
-	if want := []string{spec.Dir, spec.RunDir, spec.Home, spec.ReadOnly[0]}; !slices.Equal(mounted, want) {
+	if want := []string{spec.Dir, spec.RunDir, spec.Home}; !slices.Equal(mounted, want) {
 		t.Errorf("mounted %v, want %v", mounted, want)
 	}
 
-	// Without a time limit, stdin, run directory, home and files.
-	got, err = p.runArgs(Spec{TaskID: "T-2", Command: "git", Dir: "/work/jira/DEV-1"}, "")
+	// Without a time limit, stdin, run directory and home.
+	got, err = p.runArgs(Spec{TaskID: "T-2", Command: "git", Dir: "/work/jira/DEV-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +127,7 @@ func TestPodmanRunArguments(t *testing.T) {
 func TestPodmanRefusesMounts(t *testing.T) {
 	p := &Podman{Command: "podman", Image: "agent", Pull: "never", Protected: []string{"/var/lib/ochell/logs", "/var/lib/ochell/runs"}}
 	ok := Spec{TaskID: "T", Command: "true", Dir: "/work/jira/DEV-1", RunDir: "/var/lib/ochell/runs/T", Home: "/var/lib/ochell/state/jira-DEV-1"}
-	if _, err := p.runArgs(ok, ""); err != nil {
+	if _, err := p.runArgs(ok); err != nil {
 		t.Fatalf("valid mounts: %v", err)
 	}
 	cases := map[string]func(s *Spec){
@@ -142,14 +139,12 @@ func TestPodmanRefusesMounts(t *testing.T) {
 		"a home above ochell's files":      func(s *Spec) { s.Home = "/var/lib" },
 		"a relative working directory":     func(s *Spec) { s.Dir = "work/DEV-1" },
 		"a colon in the path":              func(s *Spec) { s.Dir = "/work/a:/etc" },
-		"a colon in a granted file":        func(s *Spec) { s.ReadOnly = []string{"/etc/mcp.json:rw"} },
-		"a relative granted file":          func(s *Spec) { s.ReadOnly = []string{"mcp.json"} },
-		"ochell's files as a granted file": func(s *Spec) { s.ReadOnly = []string{"/var/lib/ochell"} },
+		"a colon in the run directory":     func(s *Spec) { s.RunDir = "/var/lib/ochell/runs/T:x" },
 	}
 	for name, change := range cases {
 		spec := ok
 		change(&spec)
-		if _, err := p.runArgs(spec, ""); err == nil {
+		if _, err := p.runArgs(spec); err == nil {
 			t.Errorf("%s: mounted", name)
 		}
 	}
@@ -176,13 +171,12 @@ func TestPodmanLauncherRunsAgent(t *testing.T) {
 	p, err := e.p.Start(Spec{
 		TaskID:  "T-1",
 		Command: "/bin/sh",
-		Args:    []string{"-c", `cat; echo " dir=$PWD key=$ORCH_TASK_KEY home=$HOME token=$AGENT_TOKEN grant=$GH_TOKEN own=${OCHELL_SECRET:-unset}"; exit 4`},
+		Args:    []string{"-c", `cat; echo " dir=$PWD key=$ORCH_TASK_KEY home=$HOME token=$AGENT_TOKEN own=${OCHELL_SECRET:-unset}"; exit 4`},
 		Dir:     dir, RunDir: runDir, Home: home,
 		Env: []string{"ORCH_TASK_KEY=DEV-1"},
 		// Only for the direct launcher: a container does not get ochell's
 		// variables.
 		Inherited: []string{"OCHELL_SECRET=leak"},
-		Secrets:   []string{"GH_TOKEN=very-secret"},
 		Stdin:     strings.NewReader("the prompt"),
 		Output:    out,
 		Timeout:   time.Hour,
@@ -190,21 +184,13 @@ func TestPodmanLauncherRunsAgent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The secrets are in a file of ochell's own while the run goes on.
-	secrets := filepath.Join(e.p.SecretsDir, "T-1.env")
-	if info, err := os.Stat(secrets); err != nil || info.Mode().Perm() != 0o600 {
-		t.Errorf("the file with the secrets: %v, %v", info, err)
-	}
 	code, err := p.Wait()
 	if code != 4 || err != nil {
 		t.Errorf("Wait = %d, %v; want the agent's exit code 4", code, err)
 	}
-	want := "the prompt dir=" + dir + " key=DEV-1 home=" + home + " token=from-the-file grant=very-secret own=unset\n"
+	want := "the prompt dir=" + dir + " key=DEV-1 home=" + home + " token=from-the-file own=unset\n"
 	if got := out.String(); got != want {
 		t.Errorf("output %q, want %q", got, want)
-	}
-	if _, err := os.Stat(secrets); !os.IsNotExist(err) {
-		t.Errorf("the file with the secrets is still there after the run: %v", err)
 	}
 	for _, d := range []string{dir, runDir, home} {
 		if info, err := os.Stat(d); err != nil || !info.IsDir() {
@@ -212,11 +198,11 @@ func TestPodmanLauncherRunsAgent(t *testing.T) {
 		}
 	}
 	args := e.runArgs("T-1")
-	if slices.ContainsFunc(args, func(a string) bool { return strings.Contains(a, "very-secret") || strings.Contains(a, "from-the-file") }) {
+	if slices.ContainsFunc(args, func(a string) bool { return strings.Contains(a, "from-the-file") }) {
 		t.Errorf("a secret is on podman's command line:\n%s", strings.Join(args, "\n"))
 	}
-	if !slices.Contains(args, "--env-file="+secrets) || !slices.Contains(args, "--env-file="+envFile) {
-		t.Errorf("the env files are missing:\n%s", strings.Join(args, "\n"))
+	if !slices.Contains(args, "--env-file="+envFile) {
+		t.Errorf("the env file is missing:\n%s", strings.Join(args, "\n"))
 	}
 }
 
@@ -343,19 +329,6 @@ func TestPodmanLauncherNotStarted(t *testing.T) {
 	if _, err := e.p.Start(Spec{TaskID: "T-none", Command: "/bin/true", Dir: e.root, Output: out}); !errors.Is(err, ErrNotStarted) {
 		t.Errorf("missing podman: %v, want ErrNotStarted", err)
 	}
-
-	// A credential that is not one line would bring a line of its own
-	// into the file that podman reads.
-	q := &Podman{Command: "/bin/true", Image: "agent", Pull: "never", SecretsDir: t.TempDir()}
-	for _, bad := range []string{"A=1\nPATH", "NOVALUE", "=x", "ALL*=1"} {
-		if _, err := q.Start(Spec{TaskID: "T-bad", Command: "/bin/true", Dir: e.root, Secrets: []string{bad}, Output: out}); !errors.Is(err, ErrNotStarted) {
-			t.Errorf("credential %q: %v, want ErrNotStarted", bad, err)
-		}
-	}
-	q.SecretsDir = ""
-	if _, err := q.Start(Spec{TaskID: "T-nodir", Command: "/bin/true", Dir: e.root, Secrets: []string{"A=1"}, Output: out}); !errors.Is(err, ErrNotStarted) {
-		t.Errorf("secrets without a directory for them: %v, want ErrNotStarted", err)
-	}
 }
 
 // New makes the paths of the podman launcher absolute, and refuses a
@@ -379,10 +352,10 @@ func TestNewPodman(t *testing.T) {
 	if !ok {
 		t.Fatalf("New returned %T", l)
 	}
-	if p.Command != "podman" || p.Pull != "never" || p.EnvFile != envFile || !filepath.IsAbs(p.SecretsDir) || len(p.Args) != 1 {
+	if p.Command != "podman" || p.Pull != "never" || p.EnvFile != envFile || len(p.Args) != 1 {
 		t.Errorf("launcher = %+v", p)
 	}
-	if len(p.Protected) != 4 || slices.ContainsFunc(p.Protected, func(d string) bool { return !filepath.IsAbs(d) }) {
+	if len(p.Protected) != 3 || slices.ContainsFunc(p.Protected, func(d string) bool { return !filepath.IsAbs(d) }) {
 		t.Errorf("protected directories = %v", p.Protected)
 	}
 

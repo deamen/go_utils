@@ -188,10 +188,6 @@ agent:
   # in its log from token_warn_days before that day.
   token_expires: ""         # e.g. 2027-11-13
   token_warn_days: 30
-  # A directory of ochell's own, which the agent cannot read. With the
-  # systemd and podman launchers, the credentials that a tier grants its
-  # runs are in a file here for the time of a run.
-  secrets_dir: /var/lib/ochell/secrets
   # The kind of agent CLI: how it is called and how its output is read.
   #   plain    any CLI: the prompt goes in, the last part of the output is
   #            the result.

@@ -91,11 +91,6 @@ type Agent struct {
 	// TokenWarnDays is how many days before TokenExpires ochell starts to
 	// warn in its log.
 	TokenWarnDays int `yaml:"token_warn_days"`
-	// SecretsDir is a directory of ochell's own in which the systemd and
-	// podman launchers put, for the time of a run, the file with the run's
-	// credentials (the grants of its tier). Nobody but ochell and root may
-	// read it; the agent must not.
-	SecretsDir string `yaml:"secrets_dir"`
 }
 
 // TokenExpiry returns the day on which the agent's credential stops
@@ -745,7 +740,6 @@ func Default() *Config {
 			LogDir:        "logs",
 			RunDir:        "runs",
 			TokenWarnDays: 30,
-			SecretsDir:    "secrets",
 		},
 		Sources: Sources{
 			JiraWebhook:    JiraWebhook{Path: "/webhooks/jira", MaxSkew: 2 * time.Hour},

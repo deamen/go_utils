@@ -107,7 +107,7 @@ sources:
 - **No priority.** GitHub issues have none, so a GitHub ticket is queued without one.
 - **Telling the issue:** `github.token`, the token of the handoff, only reads, and stays that way. To comment on an issue ochell needs **`sources.github.token`**: a token of the digital employee's own account with read and write access to **issues** (and to **pull requests**, when pull requests are assigned to it), and nothing else. Never give it access to contents, or the right to merge. With it, the issue gets a comment when a run starts and when it ends, and when the ticket is not started, as a Jira ticket does; ochell also asks GitHub about issues with it, for [the poller](#the-poller) and the [gates of scheduling](#scheduling). Without it the issue gets no answer from ochell, as a Jira ticket without `sources.jira_api`, and GitHub is not asked.
   - **The token must belong to `github.bot_login`.** ochell asks GitHub once whose it is, and writes nothing with a token of another account: a comment by any other account would come back as a person's and start a run. A token of a GitHub App installation cannot be asked that way, and is not supported.
-  - It is not the agent's token. The agent reaches GitHub with its own (see [Tools and credentials per tier](#tools-and-credentials-per-tier)).
+  - It is not the agent's token. The agent reaches GitHub with its own, from the environment that ochell runs in (see [Agent environment](#agent-environment)).
 - **What GitHub cannot do here** is refused at start, not left to do nothing: `scheduling.blocked_by: wait` (ochell reads no dependencies between issues), and `scheduling.required_labels` without `sources.github.token`. There is no status to move an issue to at the hand-over (`review_status` is Jira's).
 - **The prompt:** the default prompt tells the agent to read the ticket with `twg`. For a GitHub ticket the context of the prompt names the issue (`The ticket is the issue #12 of the GitHub repository acme/shop.`), so an agent with `gh` finds it; adapt `agent.prompt_template` where it has neither.
 
@@ -485,7 +485,6 @@ retention:
 | policy version, tier | the version of the [policy](#policy-and-risk-tiers) in force when the run started, and the tier it ran under |
 | workflow | the version of the repository's [`WORKFLOW.md`](#workflowmd-in-the-repository) that the run ran under, if any |
 | autonomy | the [level of autonomy](#graduated-autonomy) that the ticket's tier had when the run started, for a policy with levels |
-| grants | what the tier granted the run, by name: the tools file, and the names of the variables from `env`, the credentials file and `mint`. Never a value |
 | prompt hash | the SHA-256 of the prompt the agent was given. The prompt itself is in the run log, not in the store |
 | tokens, cost | input, output, cache read and cache write tokens, and the cost in USD (see [Cost and budgets](#cost-and-budgets)) |
 | outcome | how the run ended, the agent's own result, its message, and the trigger if one stopped it |
@@ -601,7 +600,6 @@ See [examples/policy.yaml](examples/policy.yaml) for the file with comments.
   | `max_turns` | how many turns one run may take; `0`: no limit. Needs the `claude` adapter | `0` |
   | `labels` | labels that raise a ticket to this tier | none |
   | `allowed_assigners` | who may assign work of this tier | everyone whom the source allows |
-  | `grants` | the tools and credentials of the tier's runs (see [Tools and credentials per tier](#tools-and-credentials-per-tier)) | none |
   | `approvers` | who may approve a plan of this tier (see [The plan gate](#the-plan-gate)) | everyone who may send follow-ups on the ticket |
   | `max_concurrent` | how many tickets of this tier may have an agent running at the same time (see [Scheduling](#scheduling)) | `0`: no limit |
 
@@ -643,41 +641,6 @@ A tier with `plan_gate: required` splits the work on a ticket in two: first a pl
 - **What keeps the agent from doing the work in the plan run is its prompt.** ochell does not start the work run without the approval, and that is what it enforces. To also take the tools away in the plan run, give the agent its own restrictions (for Claude Code: its permission settings); ochell does not switch them per phase.
 - **`plan_gate: skip`** (the default): there is no plan run, unless the tier is at the level `observe` (see [Graduated autonomy](#graduated-autonomy)).
 - On a Jira ticket the approval needs the system webhook with the *Comment created* event; Jira Automation carries no comments.
-
-### Tools and credentials per tier
-`grants` of a tier says which tools and credentials a run of that tier gets, on top of what every run has. A run gets the grants of its own tier and nothing of another.
-
-```yaml
-# policy.yaml
-tiers:
-  - name: low
-    grants:
-      mcp_config: /etc/ochell/mcp/read-only.json
-      env: {DOCS_SITE: https://docs.example.com}
-      credentials_file: /etc/ochell/credentials/low.env
-      mint: [/usr/local/libexec/ochell/mint-token, --scope, read]
-      revoke: [/usr/local/libexec/ochell/revoke-token]
-```
-
-| Grant | What the run gets |
-|---|---|
-| `mcp_config` | the MCP servers of this file, and no others. The `claude` adapter passes `--mcp-config <file> --strict-mcp-config`; every agent also gets the path in `ORCH_MCP_CONFIG`. The agent user must be able to read the file; with the `podman` launcher ochell mounts it in the run's container, read-only, under the same path. Connectors of a claude.ai account are not available to the agent's token, so a tier's tools are local MCP configuration |
-| `env` | these variables. **Not for secrets**: with the `systemd` and `podman` launchers, other local users can read them. With the `systemd` launcher the names must be allowed by `ALLOWED_ENV` of the launch script |
-| `credentials_file` | the secrets of this file (`NAME=VALUE` lines; `#` starts a comment) in its environment. The file is read anew for each run |
-| `mint` | credentials made for this one run: ochell runs the command before the run, and what it prints as `NAME=VALUE` lines goes into the run's environment |
-| `revoke` | nothing; ochell runs the command when the run has ended, in whatever way, with the minted variables in its environment, so that it can make them useless |
-
-- **Secrets do not pass through the unit's settings or the command line.** With the `systemd` launcher, ochell writes the run's secrets to a file of its own in `agent.secrets_dir` (mode 0600, in a directory with mode 0700), and the launch script hands that file to systemd as an `EnvironmentFile`, like the launcher's `ENV_FILE`. Other users cannot read the values back with `systemctl show`, and they are not in `ps`. ochell removes the file when the run has ended. With the `podman` launcher the same file is what podman reads as an `--env-file`; it is not mounted in the container, and the values are not in `ps`. With the `direct` launcher they are in the environment of the agent process.
-- **Secrets are taken out of what ochell writes down and passes on.** In the run log, in the message that goes to the ticket, in what is stored about the run and in the tool activities, each value is replaced by `[redacted NAME]`. That covers the values of `credentials_file` and of `mint`; values shorter than 6 characters are left alone. The prompt never holds a secret: ochell does not put one there.
-  - It does not cover the launcher's `ENV_FILE` or `agent.podman.env_file` (the agent's own token), or a secret that the agent rewrites (encoded, or split up).
-  - What the agent itself writes on the ticket or pushes, with its own tool, does not pass through ochell.
-- **`mint` and `revoke` run as ochell itself**, without a shell, with ochell's own environment plus `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_TIER` and `ORCH_TASK_REPO`. They are part of the host's configuration, like ochell, and are where a token is made from the digital employee's identity (for example with Entra ID). Each has one minute.
-  - **If `mint` fails, or the credentials file cannot be read, the run is not started** (`not_started`).
-  - **If `revoke` fails, ochell logs an error**: the credentials may still work. Give minted tokens a short life of their own as well; when ochell itself is killed during a run, nothing calls `revoke` for that run.
-- **The workspace hooks of a run get the same grants** as its agent: a clone needs the repository's credentials too.
-- **Read-only by default** is a matter of what you put in the files: give each tier the narrowest tokens that its work needs, and the tiers with more autonomy the least.
-- **The files are checked at start** (see [Policy and risk tiers](#policy-and-risk-tiers)): `credentials_file` must belong to root or to ochell's user and must not be accessible to its group or to others; `mcp_config` must exist; `mint` and `revoke` must be programs.
-- **A tier without `grants`** gets what every run has: the launcher's `ENV_FILE` (with `podman`: `agent.podman.env_file`), `agent.env`, and the agent user's own MCP configuration (with `podman`: what the image and the ticket's home directory hold).
 
 ### WORKFLOW.md in the repository
 A repository can say how its tickets are worked, in a file `WORKFLOW.md` at its top: the prompt, hooks, the status of the hand-over, and limits that are stricter than the tier's. The file is versioned with the code, and the people who own the repository change it in a pull request.
@@ -727,11 +690,11 @@ The file is YAML front matter between two lines of `---`, and after it the promp
   - The tier is the ticket's own (see [Policy and risk tiers](#policy-and-risk-tiers)): the same file can narrow one tier and be ignored in part for another.
   - With [graduated autonomy](#graduated-autonomy), the tier is held back by its level first, and the file is compared with what is left. `pr_review: sampled` in the file is ignored while the tier's level does not carry `sampled` yet.
   - **A setting that would widen the policy is ignored and reported; the rest of the file holds.** Where it is reported: a warning in ochell's log, a `# workflow:` line in the log of the run, `ochell status`, and `GET /api/v1/state` of [the status API](#the-status-api) (`workflows`, with the reason for each setting). The ticket is not told: it would be told at every run.
-  - **Nothing else can be set.** The budget, the grants, the labels, who may assign or approve, the pauses, the throttles and the [scheduling](#scheduling) are the policy file's alone. A file that names one of them, or any setting that ochell does not know, is invalid as a whole.
+  - **Nothing else can be set.** The budget, the labels, who may assign or approve, the pauses, the throttles and the [scheduling](#scheduling) are the policy file's alone. A file that names one of them, or any setting that ochell does not know, is invalid as a whole.
   - A run that reaches the `max_turns` of the file ends like one that reaches the tier's (see [Escalation](#escalation)).
 - **An invalid file keeps the last good one.** ochell keeps the last version that was valid in [the store](#the-store), and it stays in force, also across a restart, while the default branch has a file that is invalid or that ochell cannot read (GitHub does not answer, or the token cannot see the repository). The reason is reported in the same places. Without an earlier good version the host's settings hold alone.
   - A file that was **removed** from the default branch is no longer in force: the host's settings hold alone.
-- **Why hooks need the host's yes.** A hook is a command that ochell runs for every ticket of the repository, as the agent's OS user and with the run's [grants](#tools-and-credentials-per-tier), before anyone has looked at the run. The agent can already run commands there, so a hook reaches nothing new; but it runs without the agent deciding to, also in a run that is only for a plan. The host decides whether repositories may do that. `before_remove` cannot be set: a working directory is removed outside any run.
+- **Why hooks need the host's yes.** A hook is a command that ochell runs for every ticket of the repository, as the agent's OS user and with the agent's environment, before anyone has looked at the run. The agent can already run commands there, so a hook reaches nothing new; but it runs without the agent deciding to, also in a run that is only for a plan. The host decides whether repositories may do that. `before_remove` cannot be set: a working directory is removed outside any run.
 - **The templates are not Go templates.** In the prompt and in a hook's arguments only `{{.Name}}` is replaced, so that text from a repository is never run as a template program. Anything else in `{{ }}` makes the file invalid.
   - The prompt: `.Source`, `.Key`, `.Title`, `.URL`, `.Repo`, `.Context`, `.ID`, `.Attempt`, `.ResultFile`, and `.RunContext` and `.ResultInstructions`, which **must** both be there (see [The prompt](#the-prompt)). The run context is where ochell tells the agent that a run is for a plan only.
   - A hook's arguments: `.ID`, `.Source`, `.Key`, `.Repo`, `.Branch`. With the `systemd` launcher the command must be an absolute path; otherwise the hook is ignored and reported.
@@ -1229,22 +1192,21 @@ agent:
   | the working directory of the ticket | read and write | `agent.workdir`, rendered for the ticket |
   | the directory of the run | read and write | `<agent.run_dir>/<task id>`, where the agent leaves its [result file](#the-result-file); `ORCH_RESULT_FILE` holds in the container as it is |
   | the home directory of the ticket | read and write, as `/home/agent` | `<agent.podman.state_dir>/<source>-<key>`; `HOME` is `/home/agent` |
-  | the tier's `mcp_config` | read-only | only for a tier that [grants](#tools-and-credentials-per-tier) one. A server that the file starts as a program must be in the image |
 
-  Nothing else: not ochell's configuration, store, policy file, token file, logs, admin socket or secrets directory, and not the working directory, run directory or home directory of another ticket. ochell refuses to start a run (`not_started`) whose working directory holds `log_dir`, `run_dir`, `secrets_dir` or `state_dir`; keep the working directories away from ochell's other files yourself.
+  Nothing else: not ochell's configuration, store, policy file, token file, logs or admin socket, and not the working directory, run directory or home directory of another ticket. ochell refuses to start a run (`not_started`) whose working directory holds `log_dir`, `run_dir` or `state_dir`; keep the working directories away from ochell's other files yourself.
 - **Working directory:** `workdir` must be an absolute path with `{{.Key}}` in it, so that a container holds the directory of one ticket only. The default `.` is refused at start.
 - **The home directory** is what the agent CLI keeps between the runs of one ticket: for Claude Code its sessions, so that a later run [resumes](#agent-adapters) the earlier one. Every ticket has its own, so an agent cannot read the sessions of another ticket. It is removed with the ticket's working directory (`workspace.cleanup`). What the agent CLI needs in its home directory on every run (settings, a `.gitconfig`) is not there in a new one: put it in the image outside `/home/agent`, or write it in an `after_create` hook.
 - **The image** is `agent.podman.image`. It must hold the agent CLI (`agent.command`; a name is enough, the image has its own `PATH`) and what the hooks call, such as `git`. ochell does not build it.
   - **`pull: never`** is the default: a run uses an image that is already on the host (`podman pull`, or `podman build`), and fails as `not_started` when there is none. So what an agent runs does not change because a registry changed, and a run does not wait for a download or fail with the registry. `missing`, `newer` and `always` are podman's other policies; with them, name the image by its digest.
 - **Who the agent is:** the same uid in the container as ochell has on the host (`--userns=keep-id`), and not root there. So every file that a run leaves in the mounted directories belongs to ochell's user: ochell reads the result file and removes working directories itself, with no group to set up. The agent has no capabilities (`--cap-drop=all`) and cannot gain any (`--security-opt=no-new-privileges`).
-- **Credentials:** the agent authenticates with a token from `agent.podman.env_file` (`NAME=VALUE` lines: `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`). podman reads the file; it is not mounted. It must not be accessible to its group or to others (mode 0600), which ochell checks at start. What a tier grants reaches the container in the same way, in a file of the run in `agent.secrets_dir`. No secret is on podman's command line.
+- **Credentials:** the agent authenticates with a token from `agent.podman.env_file` (`NAME=VALUE` lines: `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`). podman reads the file; it is not mounted. It must not be accessible to its group or to others (mode 0600), which ochell checks at start. No secret is on podman's command line.
 - **Environment:** the container has the environment of its image, so `env_pass` is not used, and nothing of ochell's own environment is passed on (`--env-host=false`, `--http-proxy=false`). ochell passes `ORCH_TASK_*` and `agent.env` as arguments of `podman run`, where other local users can read them, so **no secret goes in `agent.env`**. A proxy for the agent goes there too.
 - **Arguments:** podman changes nothing in them, so the rules of `systemd` about `prompt_via` and the templates do not apply. What [The prompt](#the-prompt) says about ticket text in arguments still does.
 - **Output:** the container's stdout and stderr go to ochell alone (`--log-driver=none`), which writes the run log.
 - **Time limit:** ochell keeps the timer and stops the container. The container also gets its own limit (`--timeout`), one minute longer, in case ochell is gone. The container of a hook that ochell did not see the end of ends at that limit.
 - **Stop:** the agent is the first process of its container. A program in that place gets SIGTERM only if it handles the signal; otherwise it runs on until `stop_grace` is over and podman kills the container. Add `--init` to `args` when the agent should be signalled like any other process.
 - **`args`** are added to every `podman run` after ochell's own options: limits (`--memory`, `--cpus`, `--pids-limit`), `--read-only`, a network. They are the host's; nothing in a ticket or in a repository's `WORKFLOW.md` adds an option. ochell does not check them: an option there can undo what the launcher sets, and a `--volume` there mounts more.
-- **SELinux:** the three directories are mounted with `:Z`, so podman labels them for the one container. The tier's `mcp_config` is shared by runs and is not relabelled; give it a label that containers may read (`chcon -t container_file_t`).
+- **SELinux:** the three directories are mounted with `:Z`, so podman labels them for the one container.
 - **The network is not restricted.** The agent needs the model's API and the git remote. A container reaches whatever the host reaches, also other services on the host that listen on more than the loopback address. What the sandbox isolates is the file system and the processes. Restrict the network with an option in `args` if you need to.
 - **Not a boundary against podman itself:** the containers are rootless and belong to ochell's user. A flaw in podman, the runtime or the kernel that lets a process leave its container gives it what ochell's user has.
 
@@ -1323,8 +1285,9 @@ The agent tells ochell how its run ended by writing a small JSON file. This work
 The agent does **not** inherit ochell's environment, because that holds the webhook secrets, the Linear client secret and the ngrok API key, and the agent reads untrusted ticket text. It gets only:
 - the variables named in `agent.env_pass`, copied from ochell's environment when they are set. The default list is `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in both cases), `SSL_CERT_FILE` and `SSL_CERT_DIR`;
 - `ORCH_TASK_ID`, `ORCH_TASK_SOURCE`, `ORCH_TASK_KEY`, `ORCH_TASK_URL`, `ORCH_TASK_BRANCH`, `ORCH_TASK_TIER` (the ticket's [risk tier](#policy-and-risk-tiers)) and `ORCH_RESULT_FILE`, `ORCH_TASK_REPO` when a repository is mapped to the ticket, and `ORCH_TASK_AUTONOMY` (the tier's [level of autonomy](#graduated-autonomy)) when the policy has levels;
-- the variables set in `agent.env`;
-- what the ticket's tier grants: `ORCH_MCP_CONFIG`, the tier's `env`, and its credentials (see [Tools and credentials per tier](#tools-and-credentials-per-tier)).
+- the variables set in `agent.env`.
+
+A run of any tier gets the same: a tier grants no tools or credentials of its own. What the agent needs (its tools, its MCP servers, its credentials) is set up in the environment that ochell runs in.
 
 With the `systemd` and `podman` launchers `env_pass` is not used: a unit has the environment of the agent user, and a container that of its image.
 

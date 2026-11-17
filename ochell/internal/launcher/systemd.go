@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -38,33 +36,6 @@ type Systemd struct {
 	StopCommand   []string
 	// StopGrace is how long systemd waits between SIGTERM and SIGKILL.
 	StopGrace time.Duration
-	// SecretsDir is a directory of ochell's own, for the file that carries
-	// the secrets of a run to its unit.
-	SecretsDir string
-}
-
-// writeSecrets writes the secrets of a run to a file of its own that only
-// ochell (and root) can read, and returns its path. systemd loads it into
-// the unit's environment as an EnvironmentFile, which other users cannot
-// read back, unlike variables that are set on the unit.
-func (s *Systemd) writeSecrets(taskID string, secrets []string) (string, error) {
-	if s.SecretsDir == "" {
-		return "", errors.New("systemd launcher: agent.secrets_dir is required to pass credentials to a run")
-	}
-	if err := os.MkdirAll(s.SecretsDir, 0o700); err != nil {
-		return "", err
-	}
-	path := filepath.Join(s.SecretsDir, taskID+".env")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_EXCL, 0o600)
-	if err != nil {
-		return "", err
-	}
-	_, werr := f.WriteString(strings.Join(secrets, "\n") + "\n")
-	if err := errors.Join(werr, f.Close()); err != nil {
-		os.Remove(path)
-		return "", err
-	}
-	return path, nil
 }
 
 func seconds(d time.Duration) string {
@@ -91,14 +62,6 @@ func (s *Systemd) Start(spec Spec) (Process, error) {
 	for _, e := range spec.Env {
 		args = append(args, "--setenv", e)
 	}
-	secretsFile := ""
-	if len(spec.Secrets) > 0 {
-		var err error
-		if secretsFile, err = s.writeSecrets(spec.TaskID, spec.Secrets); err != nil {
-			return nil, fmt.Errorf("%w: cannot hand the credentials to the run: %v", ErrNotStarted, err)
-		}
-		args = append(args, "--env-file", secretsFile)
-	}
 	args = append(args, "--", spec.Command)
 	args = append(args, spec.Args...)
 
@@ -109,27 +72,19 @@ func (s *Systemd) Start(spec Spec) (Process, error) {
 	cmd.Stdout, cmd.Stderr = spec.Output, spec.Output
 	cmd.WaitDelay = 10 * time.Second
 	if err := cmd.Start(); err != nil {
-		if secretsFile != "" {
-			os.Remove(secretsFile)
-		}
 		return nil, fmt.Errorf("%w: %s: %v", ErrNotStarted, s.LaunchCommand[0], err)
 	}
-	return &systemdProcess{s: s, taskID: spec.TaskID, cmd: cmd, secretsFile: secretsFile}, nil
+	return &systemdProcess{s: s, taskID: spec.TaskID, cmd: cmd}, nil
 }
 
 type systemdProcess struct {
 	s      *Systemd
 	taskID string
 	cmd    *exec.Cmd
-	// secretsFile is removed when the run has ended.
-	secretsFile string
 }
 
 func (p *systemdProcess) Wait() (int, error) {
 	code, err := exitCode(p.cmd, p.cmd.Wait())
-	if p.secretsFile != "" {
-		os.Remove(p.secretsFile)
-	}
 	if err == nil && code >= firstLaunchExitCode {
 		return code, fmt.Errorf("%w: launch exit code %d", ErrNotStarted, code)
 	}

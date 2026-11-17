@@ -113,9 +113,6 @@ type Runner struct {
 	// level is read, decided on and written under it (autonomy.go). It is
 	// never held while mu is asked for.
 	levelMu sync.Mutex
-	// grants holds what each run in progress was granted, by task id, for
-	// the workspace hooks of that run. Guarded by mu.
-	grants map[string]*granted
 	// raised holds, for a ticket whose run is being stopped because the
 	// ticket moved to a higher tier, that tier. Guarded by mu.
 	raised map[string]string
@@ -131,7 +128,7 @@ type Runner struct {
 // New returns a runner that keeps its queue in st.
 func New(cfg config.Agent, log *slog.Logger, st *store.Store) (*Runner, error) {
 	r := &Runner{cfg: cfg, log: log, store: st, policy: policy.Builtin(), wake: make(chan struct{}, 1), quit: make(chan struct{}),
-		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}, raised: map[string]string{}, grants: map[string]*granted{}}
+		cancels: map[string]context.CancelFunc{}, stops: map[string]string{}, closing: map[string]bool{}, raised: map[string]string{}}
 	r.runCtx, r.stopRuns = context.WithCancel(context.Background())
 	var err error
 	if r.prompt, err = parse("prompt_template", cfg.PromptTemplate); err != nil {
@@ -1277,7 +1274,7 @@ type promptView struct {
 //
 // prompt is the template of the run: the host's, or that of the
 // repository's WORKFLOW.md.
-func (r *Runner) command(t *task.Task, prompt *template.Template, view promptView, resume bool, mcpConfig string) (agent.Command, error) {
+func (r *Runner) command(t *task.Task, prompt *template.Template, view promptView, resume bool) (agent.Command, error) {
 	view.RunContext = runContext(t, resume)
 	var err error
 	if t.Prompt, err = render(prompt, view); err != nil {
@@ -1291,7 +1288,7 @@ func (r *Runner) command(t *task.Task, prompt *template.Template, view promptVie
 		}
 		args = append(args, s)
 	}
-	run := agent.Run{Args: args, Prompt: t.Prompt, BudgetUSD: t.BudgetUSD, MaxTurns: t.MaxTurns, MCPConfig: mcpConfig}
+	run := agent.Run{Args: args, Prompt: t.Prompt, BudgetUSD: t.BudgetUSD, MaxTurns: t.MaxTurns}
 	if resume {
 		return r.adapter.Resume(run, t.AgentSession)
 	}
@@ -1342,20 +1339,6 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	// the launcher runs it. A ticket that ran before, in the same working
 	// directory, continues its session if the agent can do that. The
 	// prompt tells the agent which of the two this is.
-	// What the tier grants the run: its tools and credentials. The ones
-	// that are made for this run are taken back when it has ended.
-	g, err := r.grant(ctx, t)
-	if err != nil {
-		res.Err = fmt.Errorf("%w: %v", errGrant, err)
-		return res
-	}
-	defer r.takeBack(t, g)
-	r.setGrant(t.ID, g)
-	defer r.setGrant(t.ID, nil)
-	// No secret of the run goes into the log or to the ticket.
-	rd := newRedactor(g.secrets)
-	res.Grants = g.describe()
-
 	view := promptView{Task: t, ResultFile: resultFile, ResultInstructions: result.Instructions}
 	prompt := r.prompt
 	if wf.prompt != nil {
@@ -1364,11 +1347,11 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	var cmd agent.Command
 	err = agent.ErrNoResume
 	if t.AgentSession != "" && t.Workspace == dir {
-		cmd, err = r.command(t, prompt, view, true, g.mcpConfig)
+		cmd, err = r.command(t, prompt, view, true)
 		res.Resumed = err == nil
 	}
 	if errors.Is(err, agent.ErrNoResume) {
-		cmd, err = r.command(t, prompt, view, false, g.mcpConfig)
+		cmd, err = r.command(t, prompt, view, false)
 	}
 	if err != nil {
 		res.Err = fmt.Errorf("build the agent command: %w", err)
@@ -1390,46 +1373,42 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 		return res
 	}
 	defer file.Close()
-	// Everything that is written to the log goes through lf, which takes
-	// the run's secrets out.
-	lf := rd.writer(file)
-	defer lf.Flush()
 	session := "new"
 	if res.Resumed {
 		session = "resumed " + t.AgentSession
 	}
-	fmt.Fprintf(lf, "# task=%s source=%s key=%s url=%s tier=%s phase=%s\n# command=%s (%d args) workdir=%s session=%s\n",
+	fmt.Fprintf(file, "# task=%s source=%s key=%s url=%s tier=%s phase=%s\n# command=%s (%d args) workdir=%s session=%s\n",
 		t.ID, t.Source, t.Key, t.URL, t.Tier, phaseName(t.Phase), r.cfg.Command, len(cmd.Args), dir, session)
 	if t.Autonomy != "" {
-		fmt.Fprintf(lf, "# autonomy=%s (the level of the tier %s)\n", t.Autonomy, t.Tier)
+		fmt.Fprintf(file, "# autonomy=%s (the level of the tier %s)\n", t.Autonomy, t.Tier)
 	}
 	if wf.version != "" {
-		fmt.Fprintf(lf, "# workflow=%s (%s of %s, from its default branch)\n", wf.version, workflow.FileName, t.Repo)
+		fmt.Fprintf(file, "# workflow=%s (%s of %s, from its default branch)\n", wf.version, workflow.FileName, t.Repo)
 	}
 	for _, note := range wf.notes {
-		fmt.Fprintf(lf, "# workflow: %s\n", note)
+		fmt.Fprintf(file, "# workflow: %s\n", note)
 	}
-	fmt.Fprintf(lf, "# prompt:\n%s\n", t.Prompt)
+	fmt.Fprintf(file, "# prompt:\n%s\n", t.Prompt)
 	// signal is what the footer of the log says about the result file.
 	signal := "none"
 	defer func() {
-		fmt.Fprintf(lf, "\n# ---- exit=%d outcome=%s result=%s err=%v duration=%s ----\n", res.ExitCode, res.Outcome, signal, res.Err, time.Since(start))
+		fmt.Fprintf(file, "\n# ---- exit=%d outcome=%s result=%s err=%v duration=%s ----\n", res.ExitCode, res.Outcome, signal, res.Err, time.Since(start))
 		// After the footer, which the harness and people look for at the
 		// end of the run's own part.
 		u := res.Usage
-		fmt.Fprintf(lf, "# cost_usd=%.6f tokens: input=%d output=%d cache_read=%d cache_write=%d\n", res.CostUSD, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
+		fmt.Fprintf(file, "# cost_usd=%.6f tokens: input=%d output=%d cache_read=%d cache_write=%d\n", res.CostUSD, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
 	}()
 
 	// The workspace hooks come first. If one fails, the agent is not
 	// started in a directory that is not ready.
-	if err := r.prepare(ctx, t, dir, runName, lf, wf); err != nil {
+	if err := r.prepare(ctx, t, dir, runName, file, wf); err != nil {
 		res.Err = err
 		if ctx.Err() != nil {
 			res.Outcome = task.OutcomeStopped
 		}
 		return res
 	}
-	fmt.Fprintf(lf, "# ---- agent output ----\n")
+	fmt.Fprintf(file, "# ---- agent output ----\n")
 
 	// The session is recorded as soon as the agent names it, not only at
 	// the end: if ochell does not live to see the end of this run, the run
@@ -1439,11 +1418,10 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	dog := newWatchdog(r.cfg.Watchdog.Repeats)
 	out := r.adapter.Output(func(ev agent.Event) {
 		if ev.Tool != "" {
-			param := rd.text(ev.Param)
 			if r.progress != nil {
-				r.progress.ToolUsed(t, ev.Tool, param)
+				r.progress.ToolUsed(t, ev.Tool, ev.Param)
 			}
-			dog.observe(toolCall{id: ev.Call, tool: ev.Tool, param: param})
+			dog.observe(toolCall{id: ev.Call, tool: ev.Tool, param: ev.Param})
 		}
 		if ev.SessionID == "" {
 			return
@@ -1459,12 +1437,10 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 		Stdin:     cmd.Stdin,
 		Dir:       dir,
 		RunDir:    runDir,
-		Env:       append(append(r.taskEnv(t), g.env...), result.EnvVar+"="+resultFile),
-		Secrets:   g.secrets,
+		Env:       append(r.taskEnv(t), result.EnvVar+"="+resultFile),
 		Inherited: r.inheritedEnv(),
 		Home:      r.home(t.Source, t.Key),
-		ReadOnly:  g.files(),
-		Output:    io.MultiWriter(lf, out),
+		Output:    io.MultiWriter(file, out),
 		Timeout:   r.cfg.Timeout,
 	}
 	w, outcome := r.execute(ctx, spec, r.cfg.StallTimeout, dog.stopped())
@@ -1474,7 +1450,7 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	}
 	res.Outcome = outcome
 	rep := out.Report()
-	res.Message, res.SessionID, res.CostUSD, res.Usage = rd.text(rep.Message), rep.SessionID, rep.CostUSD, rep.Usage
+	res.Message, res.SessionID, res.CostUSD, res.Usage = rep.Message, rep.SessionID, rep.CostUSD, rep.Usage
 	if rep.CostIsSessionTotal {
 		// The agent reports what its session has cost so far. What this
 		// run cost is the part that came on top of the earlier runs in
@@ -1494,7 +1470,7 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	// agent ran, and stored; it decides the ticket's state only for a run
 	// that ended by itself with status 0 (ticket.AfterRun).
 	if f, err := result.Read(r.runDir, runName); err == nil {
-		res.Signal, res.SignalMessage, res.PRURL, res.Branch = f.Status, rd.text(f.Message), rd.text(f.PRURL), rd.text(f.Branch)
+		res.Signal, res.SignalMessage, res.PRURL, res.Branch = f.Status, f.Message, f.PRURL, f.Branch
 		signal = string(f.Status)
 		if t.Phase == task.PhasePlan && res.Signal == result.Done {
 			// The run was for a plan only. Whatever the agent calls it,
@@ -1547,7 +1523,7 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	// after_run follows every run in which the agent was started, but not
 	// one that a shutdown cut short. It does not change how the run ended.
 	if res.Outcome != task.OutcomeNotStarted && ctx.Err() == nil {
-		if err := r.hooks(ctx, "after_run", t, dir, runName, lf, wf); err != nil {
+		if err := r.hooks(ctx, "after_run", t, dir, runName, file, wf); err != nil {
 			r.log.Warn("after_run hook failed", "task", t.ID, "err", err)
 		}
 	}

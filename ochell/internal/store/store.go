@@ -246,6 +246,10 @@ var migrations = []string{
 	);
 	CREATE INDEX autonomy_by_class ON autonomy (class, id);
 	ALTER TABLE runs ADD COLUMN autonomy TEXT NOT NULL DEFAULT '';`,
+
+	// Version 24: a tier grants nothing any more, so the audit record of a
+	// run no longer says what was granted.
+	`ALTER TABLE runs DROP COLUMN grants;`,
 }
 
 // Store is safe for concurrent use.
@@ -1412,12 +1416,12 @@ func (s *Store) end(tx *sql.Tx, id string, res task.Result) error {
 			workdir = ?, resumed = ?, agent_session = ?, message = ?, cost_usd = ?,
 			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
 			signal = ?, signal_message = ?, pr_url = ?, branch = ?, session_cost_usd = ?, escalation = ?, phase = ?,
-			prompt_hash = ?, grants = ?, workflow = ?, autonomy = ?
+			prompt_hash = ?, workflow = ?, autonomy = ?
 		WHERE id = ? AND status != ?`, runEnded, now, string(res.Outcome), exit, msg, res.LogFile,
 		res.Workdir, res.Resumed, res.SessionID, res.Message, res.CostUSD,
 		res.Usage.InputTokens, res.Usage.OutputTokens, res.Usage.CacheReadTokens, res.Usage.CacheWriteTokens,
 		res.Signal, res.SignalMessage, res.PRURL, res.Branch, res.SessionCostUSD, res.Escalation, res.Phase,
-		res.PromptHash, res.Grants, res.Workflow, res.Autonomy,
+		res.PromptHash, res.Workflow, res.Autonomy,
 		id, runEnded)
 	if err != nil {
 		return err
@@ -1734,7 +1738,7 @@ type RunInfo struct {
 func (s *Store) Runs(source, key string) ([]RunInfo, error) {
 	rows, err := s.db.Query(`SELECT id, status, attempt, tier, policy_version, cause, received_at, started_at, ended_at,
 			outcome, exit_code, error, log_file, resumed, agent_session, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			signal, signal_message, pr_url, branch, escalation, phase, prompt_hash, grants, workflow, autonomy
+			signal, signal_message, pr_url, branch, escalation, phase, prompt_hash, workflow, autonomy
 		FROM runs WHERE source = ? AND key = ? ORDER BY received_at, rowid`, source, key)
 	if err != nil {
 		return nil, err
@@ -1750,7 +1754,7 @@ func (s *Store) Runs(source, key string) ([]RunInfo, error) {
 		if err := rows.Scan(&r.ID, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &r.Cause, &received, &started, &ended,
 			&outcome, &exit, &msg, &res.LogFile, &res.Resumed, &res.SessionID, &res.CostUSD,
 			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
-			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.Escalation, &res.Phase, &res.PromptHash, &res.Grants, &res.Workflow, &res.Autonomy); err != nil {
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.Escalation, &res.Phase, &res.PromptHash, &res.Workflow, &res.Autonomy); err != nil {
 			return nil, err
 		}
 		r.Received = time.UnixMilli(received).UTC()
@@ -2075,12 +2079,12 @@ func (s *Store) Run(id string) (*Run, error) {
 	res := &r.Result
 	err := s.db.QueryRow(`SELECT source, key, status, attempt, tier, policy_version, outcome, exit_code, error, log_file,
 			workdir, resumed, agent_session, message, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			signal, signal_message, pr_url, branch, session_cost_usd, escalation, phase, prompt_hash, grants, workflow, autonomy
+			signal, signal_message, pr_url, branch, session_cost_usd, escalation, phase, prompt_hash, workflow, autonomy
 		FROM runs WHERE id = ?`, id).
 		Scan(&r.Source, &r.Key, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &outcome, &exit, &msg, &res.LogFile,
 			&res.Workdir, &res.Resumed, &res.SessionID, &res.Message, &res.CostUSD,
 			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
-			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD, &res.Escalation, &res.Phase, &res.PromptHash, &res.Grants, &res.Workflow, &res.Autonomy)
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD, &res.Escalation, &res.Phase, &res.PromptHash, &res.Workflow, &res.Autonomy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
