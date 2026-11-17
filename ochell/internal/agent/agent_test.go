@@ -61,7 +61,7 @@ func TestPlainOutputKeepsTheTail(t *testing.T) {
 	if len(rep.Message) != tailSize || !strings.HasSuffix(rep.Message, "xthe last words") {
 		t.Errorf("message has %d bytes and ends with %q", len(rep.Message), rep.Message[len(rep.Message)-20:])
 	}
-	if rep.SessionID != "" || rep.CostUSD != 0 {
-		t.Errorf("the plain adapter knows no session and no cost: %+v", rep)
+	if rep.SessionID != "" {
+		t.Errorf("the plain adapter knows no session: %+v", rep)
 	}
 }

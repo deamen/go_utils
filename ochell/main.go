@@ -59,7 +59,6 @@ var availCmds = [][2]string{
 	{"backup", "back the store of the running ochell up: to backup.dir, or to a file with --to"},
 	{"restore", "put a backup in the place of the store, while ochell is stopped: ochell restore --from FILE"},
 	{"outcomes", "show the outcome metrics per tier for a period: ochell outcomes [--since 2026-11-01] [--until 2026-11-15]"},
-	{"cost", "show what the tickets have cost, or one ticket with its runs: ochell cost [<jira|linear|github> <KEY>]"},
 	{"stop", "stop the run of a ticket and release the ticket: ochell stop <jira|linear|github> <KEY>"},
 	{"autonomy", "show the level of autonomy of each tier, with its numbers and the last changes"},
 	{"promote", "raise the level of autonomy of a tier by one step: ochell promote <TIER> [--reason TEXT]"},
@@ -111,7 +110,7 @@ func main() {
 		err = workflowCheck(args)
 	case "restore":
 		err = restore(args)
-	case "pause", "resume", "status", "reset", "stop", "cost", "outcomes", "backup", "autonomy", "promote", "demote", "flag":
+	case "pause", "resume", "status", "reset", "stop", "outcomes", "backup", "autonomy", "promote", "demote", "flag":
 		err = adminCommand(cmd, args)
 	case "version":
 		fmt.Printf("%s-%s\n", version, build)
@@ -572,16 +571,6 @@ func adminCommand(cmd string, args []string) error {
 		}
 		query.Set("since", from.UTC().Format(time.RFC3339Nano))
 		query.Set("until", to.UTC().Format(time.RFC3339Nano))
-	case "cost":
-		method = "GET"
-		if len(rest) != 0 && (len(rest) != 2 || !slices.Contains(config.SourceNames, rest[0])) {
-			return errors.New("usage: ochell cost [<jira|linear|github> <KEY>] [flags]")
-		}
-		if len(rest) == 2 {
-			query.Set("source", rest[0])
-			query.Set("key", rest[1])
-		}
-		rest = nil
 	case "reset", "stop":
 		if len(rest) != 2 || !slices.Contains(config.SourceNames, rest[0]) {
 			return fmt.Errorf("usage: ochell %s <jira|linear|github> <KEY> [flags]", cmd)

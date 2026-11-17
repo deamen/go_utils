@@ -14,11 +14,9 @@ import (
 type Record struct {
 	Since time.Time `json:"since"`
 	Until time.Time `json:"until"`
-	// Tickets had a run that started in the period, Runs is how many, and
-	// CostUSD what they cost.
-	Tickets int     `json:"tickets"`
-	Runs    int     `json:"runs"`
-	CostUSD float64 `json:"cost_usd"`
+	// Tickets had a run that started in the period, and Runs is how many.
+	Tickets int `json:"tickets"`
+	Runs    int `json:"runs"`
 	// PullRequests is how many tickets first handed over a pull request in
 	// the period, and SentBack how many of them a person then sent back
 	// with a follow-up: the override rate of the class is SentBack of
@@ -67,7 +65,7 @@ func (s *Store) RecordOf(tier string, since, until time.Time) (Record, error) {
 		if o.Tier != tier {
 			continue
 		}
-		rec.Tickets, rec.Runs, rec.CostUSD = o.Tickets, o.Runs, o.CostUSD
+		rec.Tickets, rec.Runs = o.Tickets, o.Runs
 		rec.PullRequests, rec.SentBack, rec.TimeToPR = o.PullRequests, o.Reworked, Median(o.TimeToPR)
 		rec.Merged, rec.MergedUntouched, rec.Reopened = o.Merged, o.MergedUntouched, o.Reopened
 	}

@@ -793,7 +793,7 @@ func TestRunContextInThePrompt(t *testing.T) {
 
 // The claude adapter: the agent is called with the event stream as output,
 // the final message (not the raw stream) goes to the ticket, the session id
-// and the cost are stored, and the ticket's next run resumes the session.
+// is stored, and the ticket's next run resumes the session.
 func TestClaudeAdapterRecordsAndResumesTheSession(t *testing.T) {
 	const session = "3dc26999-bd50-487b-b445-cb41a233c6a2"
 	o := Start(t, Options{
@@ -801,7 +801,7 @@ func TestClaudeAdapterRecordsAndResumesTheSession(t *testing.T) {
 			{Eprint: `[claude-code:notice] a line on stderr that is not an event`},
 			{Print: `{"type":"system","subtype":"init","session_id":"` + session + `","tools":["Bash"]}`},
 			{Print: `{"type":"assistant","message":{"content":[{"type":"text","text":"Reading the ticket."},{"type":"tool_use","name":"Bash"}]},"session_id":"` + session + `"}`},
-			{Print: `{"type":"result","subtype":"success","is_error":false,"result":"Opened PR #7.","session_id":"` + session + `","total_cost_usd":0.25,"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}`},
+			{Print: `{"type":"result","subtype":"success","is_error":false,"result":"Opened PR #7.","session_id":"` + session + `","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}`},
 			// No message of its own: the final message of the stream is used.
 			Report("done", ""),
 		},
@@ -826,8 +826,7 @@ func TestClaudeAdapterRecordsAndResumesTheSession(t *testing.T) {
 	if err != nil || run == nil {
 		t.Fatalf("stored run: %v, %v", run, err)
 	}
-	if res := run.Result; res.SessionID != session || res.CostUSD != 0.25 || res.Message != "Opened PR #7." || res.Resumed ||
-		res.Usage.InputTokens != 10 || res.Usage.OutputTokens != 20 || res.Usage.CacheReadTokens != 30 || res.Usage.CacheWriteTokens != 40 {
+	if res := run.Result; res.SessionID != session || res.Message != "Opened PR #7." || res.Resumed {
 		t.Errorf("stored result = %+v", res)
 	}
 	if tk, _ := st.Ticket("linear", "ENG-81"); tk == nil || tk.AgentSession != session {
@@ -2143,11 +2142,8 @@ func TestPolicyFileIsCheckedAtStart(t *testing.T) {
 		mode    os.FileMode
 		want    string
 	}{
-		"unknown-tier.yaml": {"tiers: [{name: low}]\ndefault_tier: normal\n", 0o600, `default_tier: there is no tier "normal"`},
-		"misspelt.yaml":     {"tiers: [{name: low, max_turn: 5}]\ndefault_tier: low\n", 0o600, "field max_turn not found"},
-		// What the work costs is not ochell's to manage.
-		"budget.yaml":         {"tiers: [{name: low, budget_usd: 5}]\ndefault_tier: low\n", 0o600, "field budget_usd not found"},
-		"daily-spend.yaml":    {"tiers: [{name: low}]\ndefault_tier: low\nthrottles: {daily_spend_usd: 100}\n", 0o600, "field daily_spend_usd not found"},
+		"unknown-tier.yaml":   {"tiers: [{name: low}]\ndefault_tier: normal\n", 0o600, `default_tier: there is no tier "normal"`},
+		"misspelt.yaml":       {"tiers: [{name: low, max_turn: 5}]\ndefault_tier: low\n", 0o600, "field max_turn not found"},
 		"bad-value.yaml":      {"tiers: [{name: low, plan_gate: sometimes}]\ndefault_tier: low\n", 0o600, "plan_gate must be skip or required"},
 		"group-writable.yaml": {tiersPolicy, 0o660, "writable by its group or by others"},
 		"world-writable.yaml": {tiersPolicy, 0o646, "writable by its group or by others"},
@@ -2277,91 +2273,48 @@ rules:
 	o.WaitRun(o.LinearCreated("PAY-82", "session-allowed", "").TaskID(t), 15*time.Second)
 }
 
-// Cost accounting without a budget: each run and each ticket shows its
-// tokens and cost, and what the work costs is not ochell's to manage. The
-// agent gets no spending limit, and no run is held or stopped for what the
-// runs before it cost.
-func TestCostIsNotLimited(t *testing.T) {
+// ochell records no cost and no token count: the token counts that the
+// agent reports are not read, the run's log, the status API, the metrics
+// and the outcome metrics show none, and there is no command to ask for a
+// cost.
+func TestCostIsNotRecorded(t *testing.T) {
 	const session = "5f1c0d6e-9a55-4b0f-8c0e-1d2f3a4b5c6d"
-	event := func(total float64, in, out int) string {
-		return `{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"` + session +
-			`","total_cost_usd":` + strconv.FormatFloat(total, 'f', -1, 64) + `,"usage":{"input_tokens":` + strconv.Itoa(in) + `,"output_tokens":` + strconv.Itoa(out) +
-			`,"cache_read_input_tokens":100,"cache_creation_input_tokens":10}}`
-	}
-	script := []Step{{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`}}
-	// Claude Code reports the cost of the session so far: 60, then 105,
-	// then 125 USD.
-	script = append(script, OnRun(1, Step{Print: event(60, 10, 20)}, Report("done", "Opened the pull request."))...)
-	script = append(script, OnRun(2, Step{Print: event(105, 0, 0)}, Report("done", "Updated the docs."))...)
-	script = append(script, OnRun(3, Step{Print: event(125, 30, 40)}, Report("done", "Addressed the comments."))...)
 	o := Start(t, Options{
-		Script: script,
-		Policy: "tiers:\n  - {name: normal}\n  - {name: low}\ndefault_tier: normal\nrules:\n  - {project: ENG, tier: low}\n",
+		Script: []Step{
+			{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`},
+			{Print: `{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"` + session +
+				`","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":100,"cache_creation_input_tokens":10}}`},
+			Report("done", "Opened the pull request."),
+		},
 		Configure: func(c *config.Config) {
 			claudeAdapter(c)
-			c.Agent.MaxAttempts = 0
+			withAPI(c)
+			c.Metrics = config.Metrics{Enabled: true, Token: "e2e-metrics-token-02"}
 		},
 	})
-	st, err := store.Open(o.Config.Store.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
 	first := o.LinearCreated("ENG-90", "session-cost", "").TaskID(t)
-	o.WaitRun(first, 15*time.Second)
-	if run := o.WaitStored(st, first, 10*time.Second); run.Result.CostUSD != 60 || run.Result.SessionCostUSD != 60 || run.Result.Usage.InputTokens != 10 || run.Result.Usage.OutputTokens != 20 {
-		t.Errorf("first run: %+v", run.Result)
-	}
+	run := o.WaitRun(first, 15*time.Second)
 	o.WaitActivities("session-cost", 2, 10*time.Second)
-	if log := o.WaitRun(first, time.Second).Log; !strings.Contains(log, "# cost_usd=60.000000 tokens: input=10 output=20 cache_read=100 cache_write=10") {
-		t.Errorf("the log of the run does not show its cost:\n%s", log)
-	}
-	// Replies go on in the same session, whatever the runs before cost.
-	second := o.LinearPrompted("ENG-90", "session-cost", "Please also update the docs.").TaskID(t)
-	if run := o.WaitStored(st, second, 15*time.Second); run.Result.Outcome != "finished" || !run.Result.Resumed || run.Result.SessionCostUSD != 105 || run.Result.CostUSD != 45 {
-		t.Errorf("second run: %+v", run.Result)
-	}
-	third := o.LinearPrompted("ENG-90", "session-cost", "Go on.").TaskID(t)
-	if run := o.WaitStored(st, third, 15*time.Second); run.Result.Outcome != "finished" || run.Result.CostUSD != 20 {
-		t.Errorf("third run: %+v", run.Result)
-	}
-	recs := o.WaitRecords(3, 5*time.Second)
-	for _, rec := range recs {
-		if args := strings.Join(rec.Args, " "); strings.Contains(args, "budget") {
-			t.Errorf("the agent got a spending limit: %q", args)
+	// The log keeps the agent's output as it was; what ochell adds to it
+	// says nothing of a cost or tokens.
+	for _, line := range strings.Split(run.Log, "\n") {
+		if strings.HasPrefix(line, "# ") && (strings.Contains(line, "cost") || strings.Contains(line, "tokens")) {
+			t.Errorf("the log of the run has the line %q", line)
 		}
 	}
-	if !strings.HasSuffix(strings.Join(recs[2].Args, " "), "--resume "+session) {
-		t.Errorf("third run: arguments %q", recs[2].Args)
+	code, body := o.get("/api/v1/tasks/ENG-90", apiToken, false)
+	if code != 200 || !strings.Contains(body, first) || strings.Contains(body, "cost") || strings.Contains(body, "_tokens") {
+		t.Errorf("GET /api/v1/tasks/ENG-90: %d\n%s", code, body)
 	}
-
-	// The operator sees what each run and the ticket cost, and no budget.
-	out, code := o.Admin("cost", "linear", "ENG-90")
-	if code != 0 || !strings.Contains(out, "linear ENG-90: tier low, in_review, 3 run(s), 125.0000 USD") || strings.Contains(strings.ToLower(out), "budget") {
-		t.Errorf("ochell cost linear ENG-90: exit %d\n%s", code, out)
+	code, body = o.get("/metrics", "e2e-metrics-token-02", false)
+	if code != 200 || !strings.Contains(body, "ochell_runs_started_total") || strings.Contains(body, "cost") || strings.Contains(body, "ochell_tokens") {
+		t.Errorf("GET /metrics: %d\n%s", code, body)
 	}
-	lines := map[string]string{}
-	for _, line := range strings.Split(out, "\n") {
-		if f := strings.Fields(line); len(f) > 0 {
-			lines[f[0]] = strings.Join(f, " ")
-		}
+	if out, code := o.Admin("outcomes", "--since", "1h"); code != 0 || !strings.Contains(out, "TICKETS") || strings.Contains(strings.ToLower(out), "cost") {
+		t.Errorf("ochell outcomes: exit %d\n%s", code, out)
 	}
-	for id, want := range map[string]string{first: first + " 1 low finished 60.0000 10 20 100 10", second: second + " 2 low finished 45.0000 0 0 100 10", third: third + " 3 low finished 20.0000 30 40 100 10"} {
-		if lines[id] != want {
-			t.Errorf("ochell cost linear ENG-90: the line of %s is %q, want %q:\n%s", id, lines[id], want, out)
-		}
-	}
-	if out, code := o.Admin("cost"); code != 0 || !strings.Contains(out, "all runs: 3 run(s), 125.0000 USD; today (UTC): 3 run(s), 125.0000 USD") ||
-		strings.Contains(strings.ToLower(out), "budget") {
+	if out, code := o.Admin("cost"); code == 0 {
 		t.Errorf("ochell cost: exit %d\n%s", code, out)
-	}
-	if out, code := o.Admin("cost", "linear", "ENG-404"); code == 0 || !strings.Contains(out, "knows no linear ticket ENG-404") {
-		t.Errorf("ochell cost of an unknown ticket: exit %d, %q", code, out)
-	}
-	// A reset is of the attempts alone.
-	if out, code := o.Admin("reset", "linear", "ENG-90"); code != 0 || !strings.Contains(out, "the attempts of linear ENG-90 are reset") || strings.Contains(out, "budget") {
-		t.Fatalf("ochell reset: exit %d, %q", code, out)
 	}
 }
 
@@ -2381,7 +2334,7 @@ default_tier: low
 func TestEscalationAtTheTurnLimit(t *testing.T) {
 	const session = "0b6a7c1e-2d3f-4a5b-8c9d-0e1f2a3b4c5d"
 	script := []Step{{Print: `{"type":"system","subtype":"init","session_id":"` + session + `"}`}}
-	script = append(script, OnRun(1, Step{Print: `{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":4,"session_id":"` + session + `","total_cost_usd":0.2}`}, Exit(1))...)
+	script = append(script, OnRun(1, Step{Print: `{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":4,"session_id":"` + session + `"}`}, Exit(1))...)
 	script = append(script, OnRun(2, Report("done", "Finished after the question."))...)
 	o := Start(t, Options{Script: script, Policy: escalationPolicy, Configure: claudeAdapter})
 	st, err := store.Open(o.Config.Store.Path)
@@ -3557,19 +3510,15 @@ func TestCIFeedback(t *testing.T) {
 }
 
 // The audit trail: every run has a record with the policy version and the
-// tier it ran under, the hash of its prompt, its tokens and
-// cost, and its outcome; and the outcome metrics can be queried per tier
-// for a period.
+// tier it ran under, the hash of its prompt and its outcome; and the
+// outcome metrics can be queried per tier for a period.
 func TestAuditTrail(t *testing.T) {
 	gh := githubtest.New(t)
 	pr := gh.Open(githubtest.PullRequest{Owner: "example", Repo: "web", Number: 7, HeadRef: "bot/LOW-200"})
 	const session = "4e3d2c1b-0a99-4887-b665-544332211000"
-	result := func(cost float64) Step {
-		return Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"` + session + `","total_cost_usd":` +
-			strconv.FormatFloat(cost, 'f', -1, 64) + `,"usage":{"input_tokens":11,"output_tokens":22,"cache_read_input_tokens":33,"cache_creation_input_tokens":44}}`}
-	}
-	script := append(OnRun(1, result(0.5), Report("done", "Opened a pull request.", "pr_url", pr)), OnRun(2, result(0.75), Report("done", "Renamed it."))...)
-	script = append(script, OnRun(3, result(2), Report("needs_input", "Which service?"))...)
+	result := Step{Print: `{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"` + session + `"}`}
+	script := append(OnRun(1, result, Report("done", "Opened a pull request.", "pr_url", pr)), OnRun(2, result, Report("done", "Renamed it."))...)
+	script = append(script, OnRun(3, result, Report("needs_input", "Which service?"))...)
 	o := Start(t, Options{Script: script, Policy: "version: audit-1" + projectTiers, Configure: func(c *config.Config) {
 		claudeAdapter(c)
 		withAPI(c)
@@ -3599,8 +3548,7 @@ func TestAuditTrail(t *testing.T) {
 	rec := o.WaitRecords(1, 5*time.Second)[0]
 	sum := sha256.Sum256([]byte(rec.Stdin))
 	run := o.WaitStored(st, first, 10*time.Second)
-	if run.PolicyVersion != "audit-1" || run.Tier != "low" || run.Result.PromptHash != hex.EncodeToString(sum[:]) || run.Result.Outcome != "finished" ||
-		run.Result.CostUSD != 0.5 || run.Result.Usage.InputTokens != 11 || run.Result.Usage.OutputTokens != 22 || run.Result.Usage.CacheReadTokens != 33 || run.Result.Usage.CacheWriteTokens != 44 {
+	if run.PolicyVersion != "audit-1" || run.Tier != "low" || run.Result.PromptHash != hex.EncodeToString(sum[:]) || run.Result.Outcome != "finished" {
 		t.Errorf("record of the first run: policy %q, tier %q, %+v", run.PolicyVersion, run.Tier, run.Result)
 	}
 	if run := o.WaitStored(st, third, 10*time.Second); run.Tier != "high" || run.Result.Signal != "needs_input" {
@@ -3613,13 +3561,10 @@ func TestAuditTrail(t *testing.T) {
 		Tickets []struct {
 			Runs []struct {
 				ID, Outcome string
-				CostUSD     float64 `json:"cost_usd"`
 				Audit       struct {
 					PolicyVersion string `json:"policy_version"`
 					Tier          string
 					PromptSHA256  string `json:"prompt_sha256"`
-					InputTokens   int64  `json:"input_tokens"`
-					OutputTokens  int64  `json:"output_tokens"`
 				}
 			}
 		}
@@ -3627,8 +3572,8 @@ func TestAuditTrail(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &entry); code != 200 || err != nil || len(entry.Tickets) != 1 || len(entry.Tickets[0].Runs) != 2 {
 		t.Fatalf("GET /api/v1/tasks/LOW-200: %d %v\n%s", code, err, body)
 	}
-	if r := entry.Tickets[0].Runs[0]; r.ID != first || r.Outcome != "finished" || r.CostUSD != 0.5 || r.Audit.PolicyVersion != "audit-1" || r.Audit.Tier != "low" ||
-		r.Audit.PromptSHA256 != hex.EncodeToString(sum[:]) || r.Audit.InputTokens != 11 || r.Audit.OutputTokens != 22 {
+	if r := entry.Tickets[0].Runs[0]; r.ID != first || r.Outcome != "finished" || r.Audit.PolicyVersion != "audit-1" || r.Audit.Tier != "low" ||
+		r.Audit.PromptSHA256 != hex.EncodeToString(sum[:]) {
 		t.Errorf("the first run in the API = %+v", r)
 	}
 	if strings.Contains(body, `"grants"`) {
@@ -3640,12 +3585,11 @@ func TestAuditTrail(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("ochell outcomes: exit %d, %q", code, out)
 	}
-	// low: one ticket, two runs, 0.75 (the session's 0.50, then 0.25
-	// more); a pull request that a person sent back once, then merged.
-	// high: one ticket, one run, 2.00, no pull request.
+	// low: one ticket, two runs; a pull request that a person sent back
+	// once, then merged. high: one ticket, one run, no pull request.
 	for _, want := range []*regexp.Regexp{
-		regexp.MustCompile(`(?m)^high\s+1\s+1\s+2\.0000\s+2\.0000\s+0\s+-\s+-\s+0\s+-\s+0$`),
-		regexp.MustCompile(`(?m)^low\s+1\s+2\s+0\.7500\s+0\.7500\s+1\s+\S+\s+1 of 1 \(100%\)\s+1\s+0 of 1 \(0%\)\s+0$`),
+		regexp.MustCompile(`(?m)^high\s+1\s+1\s+0\s+-\s+-\s+0\s+-\s+0$`),
+		regexp.MustCompile(`(?m)^low\s+1\s+2\s+1\s+\S+\s+1 of 1 \(100%\)\s+1\s+0 of 1 \(0%\)\s+0$`),
 	} {
 		if !want.MatchString(out) {
 			t.Errorf("ochell outcomes lacks a line like %s:\n%s", want, out)
@@ -3881,7 +3825,7 @@ func TestMetricsEndpoint(t *testing.T) {
 		"ochell_run_failures_total": 1, "ochell_run_retries_total": 0,
 		"ochell_run_duration_seconds_count": 2, `ochell_run_duration_seconds_bucket{le="60"}`: 2, `ochell_run_duration_seconds_bucket{le="+Inf"}`: 2,
 		`ochell_tickets{state="in_review"}`: 1, `ochell_tickets{state="failed"}`: 1, `ochell_tickets{state="running"}`: 1, `ochell_tickets{state="queued"}`: 1,
-		"ochell_cost_usd_total": 0, "ochell_agent_token_days_left": 10,
+		"ochell_agent_token_days_left": 10,
 	})
 	if m["ochell_run_duration_seconds_sum"] <= 0 || m["ochell_agent_token_expiry_timestamp_seconds"] < float64(time.Now().Unix()) {
 		t.Errorf("duration sum %v, token expiry %v", m["ochell_run_duration_seconds_sum"], m["ochell_agent_token_expiry_timestamp_seconds"])
@@ -3995,13 +3939,13 @@ func TestRepoWorkflow(t *testing.T) {
 
 	// An invalid file is merged: it names a setting that is not the
 	// repository's to set. The last good version stays in force.
-	merge("---\nbudget_usd: 1000\n---\nRules of example/web, third version." + tail)
+	merge("---\nmax_attempts: 1000\n---\nRules of example/web, third version." + tail)
 	logged, third := run(o.LinearPrompted("ENG-300", "session-wf", "And the changelog.").TaskID(t))
 	if !strings.Contains(logged, "second version.") || strings.Contains(logged, "third version") || third.Result.Workflow != second.Result.Workflow ||
 		!strings.Contains(logged, "# workflow: WORKFLOW.md on the default branch (sha:") || !strings.Contains(logged, "is invalid") {
 		t.Fatalf("the run after the invalid change: workflow %q, log:\n%s", third.Result.Workflow, logged)
 	}
-	if body := state(); !strings.Contains(body, "field budget_usd not found") || !strings.Contains(body, "the last good version ("+second.Result.Workflow+") stays in force") ||
+	if body := state(); !strings.Contains(body, "field max_attempts not found") || !strings.Contains(body, "the last good version ("+second.Result.Workflow+") stays in force") ||
 		!strings.Contains(body, `"version": "`+second.Result.Workflow+`"`) {
 		t.Errorf("the state page does not report the invalid file:\n%s", body)
 	}
@@ -4049,7 +3993,7 @@ func TestRepoWorkflow(t *testing.T) {
 			t.Errorf("the state page lacks %q:\n%s", want, body)
 		}
 	}
-	if strings.Contains(body, "budget_usd") {
+	if strings.Contains(body, "max_attempts") {
 		t.Errorf("the state page still reports the invalid file:\n%s", body)
 	}
 	if code, page := o.get("/api/v1/state", apiToken, true); code != 200 || !strings.Contains(page, "WORKFLOW.md of the repositories") || !strings.Contains(page, "plan_gate: skip is ignored") {
@@ -5071,11 +5015,11 @@ func TestGitHubIssueStartsARun(t *testing.T) {
 	}
 
 	// The admin commands take the source.
-	if out, code := o.Admin("cost", "github", "shop-12"); code != 0 || !strings.Contains(out, "shop-12") {
-		t.Errorf("ochell cost github shop-12: %d %s", code, out)
+	if out, code := o.Admin("reset", "github", "shop-12"); code != 0 || !strings.Contains(out, "github shop-12") {
+		t.Errorf("ochell reset github shop-12: %d %s", code, out)
 	}
-	if out, code := o.Admin("cost", "gitlab", "shop-12"); code == 0 || !strings.Contains(out, "<jira|linear|github>") {
-		t.Errorf("ochell cost gitlab: %d %s", code, out)
+	if out, code := o.Admin("reset", "gitlab", "shop-12"); code == 0 || !strings.Contains(out, "<jira|linear|github>") {
+		t.Errorf("ochell reset gitlab: %d %s", code, out)
 	}
 
 	// A close by the bot is no acceptance; a close by a person makes the

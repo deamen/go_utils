@@ -57,9 +57,7 @@ func (Claude) command(run Run, extra ...string) Command {
 //
 // Checked against Claude Code 2.1.311 on 15 Nov 2026:
 //   - a run that reaches --max-turns ends with a result event of the
-//     subtype error_max_turns, with is_error set and no result text;
-//   - total_cost_usd of a result event is the cost of the whole session,
-//     earlier runs included; usage counts the tokens of the run alone.
+//     subtype error_max_turns, with is_error set and no result text.
 func (Claude) LimitsTurns() bool { return true }
 
 func (c Claude) Start(run Run) (Command, error) { return c.command(run), nil }
@@ -90,19 +88,12 @@ const (
 // claudeEvent is the part of a stream-json line that ochell uses. The
 // stream has more event types and fields; they are ignored.
 type claudeEvent struct {
-	Type      string  `json:"type"`
-	Subtype   string  `json:"subtype"`
-	SessionID string  `json:"session_id"`
-	Result    string  `json:"result"`
-	IsError   bool    `json:"is_error"`
-	CostUSD   float64 `json:"total_cost_usd"`
-	Usage     *struct {
-		Input      int64 `json:"input_tokens"`
-		Output     int64 `json:"output_tokens"`
-		CacheRead  int64 `json:"cache_read_input_tokens"`
-		CacheWrite int64 `json:"cache_creation_input_tokens"`
-	} `json:"usage"`
-	Message *struct {
+	Type      string `json:"type"`
+	Subtype   string `json:"subtype"`
+	SessionID string `json:"session_id"`
+	Result    string `json:"result"`
+	IsError   bool   `json:"is_error"`
+	Message   *struct {
 		Content []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
@@ -198,11 +189,7 @@ func (o *claudeOutput) event(line []byte) {
 		o.gotResult = true
 		o.rep.Failed = ev.IsError
 		o.rep.Message = ev.Result
-		o.rep.CostUSD, o.rep.CostIsSessionTotal = ev.CostUSD, true
 		o.rep.OverTurns = ev.Subtype == "error_max_turns"
-		if u := ev.Usage; u != nil {
-			o.rep.Usage = Usage{InputTokens: u.Input, OutputTokens: u.Output, CacheReadTokens: u.CacheRead, CacheWriteTokens: u.CacheWrite}
-		}
 	}
 }
 

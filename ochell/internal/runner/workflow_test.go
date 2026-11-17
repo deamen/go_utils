@@ -98,12 +98,12 @@ func TestWorkflowIsReadForEveryRun(t *testing.T) {
 	}
 
 	// Invalid: a setting that ochell does not know.
-	src.set("v3", "---\nbudget_usd: 1000\n---\nRules of the repository, third version."+promptTail)
+	src.set("v3", "---\nmax_attempts: 1000\n---\nRules of the repository, third version."+promptTail)
 	if res, logged = w.runRepo(t, "t3"); res.Workflow != "v2" || !strings.Contains(logged, "second version") || strings.Contains(logged, "third version") ||
 		!strings.Contains(logged, "# workflow: WORKFLOW.md on the default branch (v3) is invalid") {
 		t.Errorf("after an invalid change: workflow %q, log:\n%s", res.Workflow, logged)
 	}
-	if st := status(); st.Version != "v2" || !strings.Contains(st.Error, "field budget_usd not found") || !strings.Contains(st.Error, "the last good version (v2) stays in force") {
+	if st := status(); st.Version != "v2" || !strings.Contains(st.Error, "field max_attempts not found") || !strings.Contains(st.Error, "the last good version (v2) stays in force") {
 		t.Errorf("status with an invalid file: %+v", st)
 	}
 

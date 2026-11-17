@@ -220,7 +220,7 @@ type fakeOutput struct{ n int }
 
 func (o *fakeOutput) Write(p []byte) (int, error) { o.n += len(p); return len(p), nil }
 func (o *fakeOutput) Report() agent.Report {
-	return agent.Report{Message: fmt.Sprintf("the adapter read %d bytes", o.n), SessionID: "sess-1", CostUSD: 0.5}
+	return agent.Report{Message: fmt.Sprintf("the adapter read %d bytes", o.n), SessionID: "sess-1"}
 }
 
 // The second run of a ticket resumes the session of the first, when it runs
@@ -254,8 +254,8 @@ func TestSecondRunResumesTheSession(t *testing.T) {
 	}
 
 	first, again, log := second(t, agentCfg(t, "echo"))
-	if first.Result.Resumed || first.Result.SessionID != "sess-1" || first.Result.CostUSD != 0.5 {
-		t.Errorf("first run = %+v, want a new session sess-1 and its cost", first.Result)
+	if first.Result.Resumed || first.Result.SessionID != "sess-1" {
+		t.Errorf("first run = %+v, want a new session sess-1", first.Result)
 	}
 	if !again.Result.Resumed || !strings.Contains(log, "args: --resume|sess-1") || !strings.Contains(log, "session=resumed sess-1") {
 		t.Errorf("second run: resumed = %v, log:\n%s", again.Result.Resumed, log)

@@ -18,7 +18,6 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -178,10 +177,9 @@ type Run struct {
 	Escalation string `json:"escalation,omitempty"`
 	Error      string `json:"error,omitempty"`
 	// Message is what the agent said for the people on the ticket.
-	Message string  `json:"message,omitempty"`
-	CostUSD float64 `json:"cost_usd,omitempty"`
-	// Audit is the rest of the run's record: under which policy it ran,
-	// what it was given, and what it used.
+	Message string `json:"message,omitempty"`
+	// Audit is the rest of the run's record: under which policy it ran and
+	// what it was given.
 	Audit *Audit `json:"audit,omitempty"`
 }
 
@@ -197,11 +195,7 @@ type Audit struct {
 	// when the run started; left out for a policy without levels.
 	Autonomy string `json:"autonomy,omitempty"`
 	// PromptSHA256 is the hash of the prompt the agent was given.
-	PromptSHA256     string `json:"prompt_sha256,omitempty"`
-	InputTokens      int64  `json:"input_tokens"`
-	OutputTokens     int64  `json:"output_tokens"`
-	CacheReadTokens  int64  `json:"cache_read_tokens"`
-	CacheWriteTokens int64  `json:"cache_write_tokens"`
+	PromptSHA256 string `json:"prompt_sha256,omitempty"`
 }
 
 func ticketOf(t store.Ticket) Ticket {
@@ -223,13 +217,10 @@ func runOf(r store.RunInfo) Run {
 	out := Run{
 		ID: r.ID, Attempt: r.Attempt, Status: r.Status, Cause: string(r.Cause), Phase: string(r.Result.Phase), Tier: r.Tier,
 		Received: r.Received, Outcome: string(r.Result.Outcome), Result: string(r.Result.Signal), Escalation: string(r.Result.Escalation),
-		CostUSD: r.Result.CostUSD,
 	}
 	if !r.Started.IsZero() {
 		out.Started = &r.Started
-		u := r.Result.Usage
-		out.Audit = &Audit{PolicyVersion: r.PolicyVersion, Tier: r.Tier, Workflow: r.Result.Workflow, Autonomy: r.Result.Autonomy, PromptSHA256: r.Result.PromptHash,
-			InputTokens: u.InputTokens, OutputTokens: u.OutputTokens, CacheReadTokens: u.CacheReadTokens, CacheWriteTokens: u.CacheWriteTokens}
+		out.Audit = &Audit{PolicyVersion: r.PolicyVersion, Tier: r.Tier, Workflow: r.Result.Workflow, Autonomy: r.Result.Autonomy, PromptSHA256: r.Result.PromptHash}
 	}
 	if !r.Ended.IsZero() {
 		out.Ended = &r.Ended
@@ -456,12 +447,6 @@ var funcs = template.FuncMap{
 		}
 		return ""
 	},
-	"usd": func(v float64) string {
-		if v == 0 {
-			return ""
-		}
-		return fmt.Sprintf("%.4f", v)
-	},
 }
 
 const style = `<style>
@@ -497,9 +482,9 @@ var taskPage = template.Must(template.New("task").Funcs(funcs).Parse(`<!doctype 
 <p>State: <b>{{.State}}</b>{{if .Reason}} ({{.Reason}}){{end}}{{if .Tier}} &nbsp; Tier: {{.Tier}}{{end}} &nbsp; Attempts: {{.Attempts}} &nbsp; Changed: {{when .Updated}}</p>
 <p class="dim">{{if .Repo}}Repository: {{.Repo}}<br>{{end}}{{if .Branch}}Branch: {{.Branch}}<br>{{end}}{{range .PullRequests}}Pull request: {{.URL}} ({{.State}}{{if .ClosedBy}} by {{.ClosedBy}}{{end}}{{if .Note}}: {{.Note}}{{end}})<br>{{end}}{{if .URL}}Ticket: {{.URL}}{{end}}</p>
 <h2>Runs</h2>
-{{if .Runs}}<table><tr><th>#</th><th>Started</th><th>Ended</th><th>Status</th><th>Why</th><th>Outcome</th><th>Cost USD</th><th>What the agent said</th></tr>
+{{if .Runs}}<table><tr><th>#</th><th>Started</th><th>Ended</th><th>Status</th><th>Why</th><th>Outcome</th><th>What the agent said</th></tr>
 {{range .Runs}}<tr><td>{{.Attempt}}</td><td>{{when .Started}}</td><td>{{when .Ended}}</td><td>{{.Status}}</td><td>{{.Cause}}{{if .Phase}} {{.Phase}}{{end}}</td>
-<td>{{.Outcome}}{{if .Result}} / {{.Result}}{{end}}{{if .Escalation}} / escalation: {{.Escalation}}{{end}}{{if .Error}}<br><span class="dim">{{.Error}}</span>{{end}}</td><td>{{usd .CostUSD}}</td><td><pre>{{.Message}}</pre></td></tr>
+<td>{{.Outcome}}{{if .Result}} / {{.Result}}{{end}}{{if .Escalation}} / escalation: {{.Escalation}}{{end}}{{if .Error}}<br><span class="dim">{{.Error}}</span>{{end}}</td><td><pre>{{.Message}}</pre></td></tr>
 {{end}}</table>{{else}}<p class="dim">No run yet.</p>{{end}}
 {{end}}</body></html>`))
 

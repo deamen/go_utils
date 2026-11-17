@@ -71,23 +71,8 @@ type Report struct {
 	// SessionID identifies the agent's session, for Resume. Empty when the
 	// agent has no sessions.
 	SessionID string
-	// CostUSD is what the agent reports as the cost, 0 when it does not
-	// say. With CostIsSessionTotal it is the cost of the whole session so
-	// far, earlier runs included, and not of this run alone.
-	CostUSD            float64
-	CostIsSessionTotal bool
-	// Usage is the token count of this run alone.
-	Usage Usage
 	// OverTurns says that the agent CLI stopped the run at Run.MaxTurns.
 	OverTurns bool
-}
-
-// Usage is the token count of one run, as far as the agent reports it.
-type Usage struct {
-	InputTokens      int64
-	OutputTokens     int64
-	CacheReadTokens  int64
-	CacheWriteTokens int64
 }
 
 // Event is something an adapter read from the output while the agent is

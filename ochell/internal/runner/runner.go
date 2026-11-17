@@ -660,52 +660,6 @@ func (r *Runner) Outcomes(since, until time.Time) ([]store.Outcomes, error) {
 	return r.store.Outcomes(since, until)
 }
 
-// CostReport is what the tickets have cost.
-type CostReport struct {
-	// Total is over every run in the store, Today over the runs that
-	// started since midnight UTC.
-	Total, Today store.Cost
-	// Tickets are the tickets that ochell touched last; the one ticket
-	// when the report is about one.
-	Tickets []store.TicketCost
-	// Runs are the runs of that one ticket.
-	Runs []store.RunCost
-}
-
-// maxCostTickets is how many tickets a report over all tickets lists.
-const maxCostTickets = 50
-
-// Cost reports what the runs have cost: for one ticket with each of its
-// runs, or, with an empty key, for the tickets that ochell touched last. It
-// returns store.ErrUnknown for a ticket that ochell has never seen.
-func (r *Runner) Cost(source, key string) (*CostReport, error) {
-	var rep CostReport
-	var err error
-	if rep.Total, err = r.store.TotalCost(time.Time{}); err != nil {
-		return nil, err
-	}
-	if rep.Today, err = r.store.TotalCost(time.Now().UTC().Truncate(24 * time.Hour)); err != nil {
-		return nil, err
-	}
-	if key == "" {
-		rep.Tickets, err = r.store.TicketCosts(maxCostTickets)
-		if err != nil {
-			return nil, err
-		}
-		return &rep, nil
-	}
-	c, err := r.store.TicketCost(source, key)
-	if err != nil {
-		return nil, err
-	}
-	if c == nil {
-		return nil, store.ErrUnknown
-	}
-	rep.Tickets = []store.TicketCost{*c}
-	rep.Runs, err = r.store.RunCosts(source, key)
-	return &rep, err
-}
-
 // ResetAttempts lets a ticket that used up its attempts be started again:
 // they count from zero.
 func (r *Runner) ResetAttempts(source, key string) error {
@@ -1296,10 +1250,6 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	signal := "none"
 	defer func() {
 		fmt.Fprintf(file, "\n# ---- exit=%d outcome=%s result=%s err=%v duration=%s ----\n", res.ExitCode, res.Outcome, signal, res.Err, time.Since(start))
-		// After the footer, which the harness and people look for at the
-		// end of the run's own part.
-		u := res.Usage
-		fmt.Fprintf(file, "# cost_usd=%.6f tokens: input=%d output=%d cache_read=%d cache_write=%d\n", res.CostUSD, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
 	}()
 
 	// The workspace hooks come first. If one fails, the agent is not
@@ -1351,21 +1301,7 @@ func (r *Runner) run(ctx context.Context, t *task.Task, wf *flow) (res task.Resu
 	}
 	res.Outcome = outcome
 	rep := out.Report()
-	res.Message, res.SessionID, res.CostUSD, res.Usage = rep.Message, rep.SessionID, rep.CostUSD, rep.Usage
-	if rep.CostIsSessionTotal {
-		// The agent reports what its session has cost so far. What this
-		// run cost is the part that came on top of the earlier runs in
-		// the same session.
-		res.SessionCostUSD = rep.CostUSD
-		if res.Resumed && rep.SessionID == t.AgentSession {
-			before, err := r.store.SessionCost(t.Source, t.Key, t.AgentSession)
-			if err != nil {
-				r.log.Warn("cannot read what the session cost before this run; the run is charged the session's total", "task", t.ID, "err", err)
-			} else if before <= rep.CostUSD {
-				res.CostUSD = rep.CostUSD - before
-			}
-		}
-	}
+	res.Message, res.SessionID = rep.Message, rep.SessionID
 	res.AgentError = rep.Failed
 	// What the agent says about its run. The file is read whenever the
 	// agent ran, and stored; it decides the ticket's state only for a run

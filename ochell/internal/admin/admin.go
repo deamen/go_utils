@@ -22,7 +22,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"ochell/internal/agent"
 	"ochell/internal/runner"
 	"ochell/internal/store"
 )
@@ -35,9 +34,6 @@ type Control interface {
 	Resume(tier string) error
 	Status() (runner.Status, error)
 	ResetAttempts(source, key string) error
-	// Cost reports what one ticket, or with an empty key the last tickets,
-	// have cost.
-	Cost(source, key string) (*runner.CostReport, error)
 	// Outcomes returns the outcome metrics per tier for a period.
 	Outcomes(since, until time.Time) ([]store.Outcomes, error)
 	// Backup writes a consistent copy of the store: to the file dest, or
@@ -175,18 +171,6 @@ func routes(c Control, log *slog.Logger) http.Handler {
 			return
 		}
 		status(w, "")
-	})
-	mux.HandleFunc("GET /cost", func(w http.ResponseWriter, r *http.Request) {
-		source, key := r.URL.Query().Get("source"), r.URL.Query().Get("key")
-		switch rep, err := c.Cost(source, key); {
-		case err == nil:
-			answer(w, http.StatusOK, strings.TrimRight(costText(rep, key != ""), "\n"))
-		case errors.Is(err, store.ErrUnknown):
-			answer(w, http.StatusNotFound, fmt.Sprintf("ochell knows no %s ticket %s", source, key))
-		default:
-			log.Error("admin: cost failed", "err", err)
-			answer(w, http.StatusInternalServerError, err.Error())
-		}
 	})
 	mux.HandleFunc("GET /outcomes", func(w http.ResponseWriter, r *http.Request) {
 		since, err1 := time.Parse(time.RFC3339, r.URL.Query().Get("since"))
@@ -401,41 +385,6 @@ func AutonomyText(classes []runner.Class, changes []store.LevelChange) string {
 	return b.String()
 }
 
-// costText writes a cost report for the operator: one ticket with its
-// runs, or the last tickets.
-func costText(rep *runner.CostReport, one bool) string {
-	var b strings.Builder
-	tokens := func(u agent.Usage) string {
-		return fmt.Sprintf("%d\t%d\t%d\t%d", u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
-	}
-	tw := tabwriter.NewWriter(&b, 0, 8, 2, ' ', 0)
-	if one && len(rep.Tickets) == 1 {
-		t := rep.Tickets[0]
-		fmt.Fprintf(&b, "%s %s: tier %s, %s, %d run(s), %.4f USD\n", t.Source, t.Key, t.Tier, t.State, t.Runs, t.CostUSD)
-		fmt.Fprintln(tw, "RUN\tATTEMPT\tTIER\tOUTCOME\tCOST USD\tINPUT\tOUTPUT\tCACHE READ\tCACHE WRITE")
-		for _, r := range rep.Runs {
-			outcome := string(r.Outcome)
-			if outcome == "" {
-				outcome = "running"
-			}
-			fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%.4f\t%s\n", r.ID, r.Attempt, r.Tier, outcome, r.CostUSD, tokens(r.Usage))
-		}
-		fmt.Fprintf(tw, "total\t\t\t\t%.4f\t%s\n", t.CostUSD, tokens(t.Usage))
-		tw.Flush()
-		return b.String()
-	}
-	fmt.Fprintf(&b, "all runs: %d run(s), %.4f USD; today (UTC): %d run(s), %.4f USD\n", rep.Total.Runs, rep.Total.CostUSD, rep.Today.Runs, rep.Today.CostUSD)
-	if len(rep.Tickets) == 0 {
-		return b.String()
-	}
-	fmt.Fprintln(tw, "TICKET\tTIER\tSTATE\tRUNS\tCOST USD\tINPUT\tOUTPUT\tCACHE READ\tCACHE WRITE")
-	for _, t := range rep.Tickets {
-		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%d\t%.4f\t%s\n", t.Source, t.Key, t.Tier, t.State, t.Runs, t.CostUSD, tokens(t.Usage))
-	}
-	tw.Flush()
-	return b.String()
-}
-
 // share writes a part of a whole as "3 of 4 (75%)", and "-" for no whole.
 func share(part, whole int) string {
 	if whole == 0 {
@@ -453,19 +402,16 @@ func OutcomesText(list []store.Outcomes, since, until time.Time) string {
 		return b.String()
 	}
 	tw := tabwriter.NewWriter(&b, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(tw, "TIER\tTICKETS\tRUNS\tCOST USD\tCOST PER TICKET\tPULL REQUESTS\tTIME TO PR (MEDIAN)\tSENT BACK\tMERGED\tMERGED UNTOUCHED\tREOPENED")
+	fmt.Fprintln(tw, "TIER\tTICKETS\tRUNS\tPULL REQUESTS\tTIME TO PR (MEDIAN)\tSENT BACK\tMERGED\tMERGED UNTOUCHED\tREOPENED")
 	for _, o := range list {
-		tier, per, ttp := o.Tier, "-", "-"
+		tier, ttp := o.Tier, "-"
 		if tier == "" {
 			tier = "(none)"
-		}
-		if o.Tickets > 0 {
-			per = fmt.Sprintf("%.4f", o.CostUSD/float64(o.Tickets))
 		}
 		if len(o.TimeToPR) > 0 {
 			ttp = store.Median(o.TimeToPR).Round(time.Second).String()
 		}
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%.4f\t%s\t%d\t%s\t%s\t%d\t%s\t%d\n", tier, o.Tickets, o.Runs, o.CostUSD, per, o.PullRequests, ttp,
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%s\t%s\t%d\t%s\t%d\n", tier, o.Tickets, o.Runs, o.PullRequests, ttp,
 			share(o.Reworked, o.PullRequests), o.Merged, share(o.MergedUntouched, o.Merged), o.Reopened)
 	}
 	tw.Flush()

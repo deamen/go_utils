@@ -22,7 +22,6 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"ochell/internal/agent"
 	"ochell/internal/task"
 	"ochell/internal/ticket"
 )
@@ -252,6 +251,18 @@ var migrations = []string{
 	// Version 24: a tier grants nothing any more, so the audit record of a
 	// run no longer says what was granted.
 	`ALTER TABLE runs DROP COLUMN grants;`,
+
+	// Version 25: ochell records no cost and no token count of a run: what
+	// the work costs is for whoever set ochell up. The cost and the tokens
+	// of each run go, and the cost of a ticket at its last reset, which
+	// nothing reads any more.
+	`ALTER TABLE runs DROP COLUMN cost_usd;
+	ALTER TABLE runs DROP COLUMN session_cost_usd;
+	ALTER TABLE runs DROP COLUMN input_tokens;
+	ALTER TABLE runs DROP COLUMN output_tokens;
+	ALTER TABLE runs DROP COLUMN cache_read_tokens;
+	ALTER TABLE runs DROP COLUMN cache_write_tokens;
+	ALTER TABLE tickets DROP COLUMN cost_base;`,
 }
 
 // Store is safe for concurrent use.
@@ -845,127 +856,6 @@ func (s *Store) ResetAttempts(source, key string) error {
 	return nil
 }
 
-// SessionCost returns what an agent session of a ticket had cost in total
-// when ochell last heard of it: the highest total that a run in that
-// session reported. 0 when none did.
-func (s *Store) SessionCost(source, key, session string) (float64, error) {
-	if session == "" {
-		return 0, nil
-	}
-	var cost float64
-	// A run from before version 15 has the session's total in cost_usd.
-	err := s.db.QueryRow(`SELECT COALESCE(MAX(MAX(session_cost_usd, cost_usd)), 0) FROM runs
-		WHERE source = ? AND key = ? AND agent_session = ?`, source, key, session).Scan(&cost)
-	return cost, err
-}
-
-// Cost is what a ticket, or a run, has cost.
-type Cost struct {
-	// Runs is the number of runs that were started.
-	Runs    int
-	CostUSD float64
-	Usage   agent.Usage
-}
-
-// TicketCost is what one ticket has cost.
-type TicketCost struct {
-	Source, Key, Tier string
-	State             ticket.State
-	Cost
-}
-
-const ticketCostQuery = `SELECT t.source, t.key, t.tier, t.state, COUNT(r.id), COALESCE(SUM(r.cost_usd), 0),
-		COALESCE(SUM(r.input_tokens), 0), COALESCE(SUM(r.output_tokens), 0),
-		COALESCE(SUM(r.cache_read_tokens), 0), COALESCE(SUM(r.cache_write_tokens), 0)
-	FROM tickets t LEFT JOIN runs r ON r.source = t.source AND r.key = t.key AND r.started_at IS NOT NULL`
-
-func scanTicketCost(row interface{ Scan(...any) error }) (*TicketCost, error) {
-	var c TicketCost
-	if err := row.Scan(&c.Source, &c.Key, &c.Tier, &c.State, &c.Runs, &c.CostUSD,
-		&c.Usage.InputTokens, &c.Usage.OutputTokens, &c.Usage.CacheReadTokens, &c.Usage.CacheWriteTokens); err != nil {
-		return nil, err
-	}
-	return &c, nil
-}
-
-// TicketCost returns what a ticket has cost over all its runs, or nil for
-// a ticket that ochell has never seen.
-func (s *Store) TicketCost(source, key string) (*TicketCost, error) {
-	c, err := scanTicketCost(s.db.QueryRow(ticketCostQuery+` WHERE t.source = ? AND t.key = ? GROUP BY t.source, t.key`, source, key))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	return c, err
-}
-
-// TicketCosts returns what the tickets have cost, the ones that ochell
-// touched last first, at most limit of them.
-func (s *Store) TicketCosts(limit int) ([]TicketCost, error) {
-	rows, err := s.db.Query(ticketCostQuery+` GROUP BY t.source, t.key ORDER BY t.updated_at DESC, t.key LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []TicketCost
-	for rows.Next() {
-		c, err := scanTicketCost(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *c)
-	}
-	return out, rows.Err()
-}
-
-// TotalCost returns what all runs have cost that started at or after
-// since; the zero time: all runs there are.
-func (s *Store) TotalCost(since time.Time) (Cost, error) {
-	var c Cost
-	from := int64(0)
-	if !since.IsZero() {
-		from = ms(since)
-	}
-	err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
-			COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0)
-		FROM runs WHERE started_at IS NOT NULL AND started_at >= ?`, from).
-		Scan(&c.Runs, &c.CostUSD, &c.Usage.InputTokens, &c.Usage.OutputTokens, &c.Usage.CacheReadTokens, &c.Usage.CacheWriteTokens)
-	return c, err
-}
-
-// RunCost is what one run has cost.
-type RunCost struct {
-	ID      string
-	Attempt int
-	Tier    string
-	// Outcome is empty for a run that is still going.
-	Outcome task.Outcome
-	Started time.Time
-	Cost
-}
-
-// RunCosts returns what the runs of a ticket that were started have cost,
-// oldest first.
-func (s *Store) RunCosts(source, key string) ([]RunCost, error) {
-	rows, err := s.db.Query(`SELECT id, attempt, tier, outcome, started_at, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
-		FROM runs WHERE source = ? AND key = ? AND started_at IS NOT NULL ORDER BY started_at, rowid`, source, key)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []RunCost
-	for rows.Next() {
-		c := RunCost{Cost: Cost{Runs: 1}}
-		var started int64
-		if err := rows.Scan(&c.ID, &c.Attempt, &c.Tier, &c.Outcome, &started, &c.CostUSD,
-			&c.Usage.InputTokens, &c.Usage.OutputTokens, &c.Usage.CacheReadTokens, &c.Usage.CacheWriteTokens); err != nil {
-			return nil, err
-		}
-		c.Started = time.UnixMilli(started).UTC()
-		out = append(out, c)
-	}
-	return out, rows.Err()
-}
-
 // SetTier sets the risk tier of a ticket. It returns ErrUnknown for a
 // ticket that ochell has never seen.
 func (s *Store) SetTier(source, key, tier string) error {
@@ -1396,14 +1286,12 @@ func (s *Store) end(tx *sql.Tx, id string, res task.Result) error {
 		msg = res.Err.Error()
 	}
 	r, err := tx.Exec(`UPDATE runs SET status = ?, ended_at = ?, outcome = ?, exit_code = ?, error = ?, log_file = ?,
-			workdir = ?, resumed = ?, agent_session = ?, message = ?, cost_usd = ?,
-			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
-			signal = ?, signal_message = ?, pr_url = ?, branch = ?, session_cost_usd = ?, escalation = ?, phase = ?,
+			workdir = ?, resumed = ?, agent_session = ?, message = ?,
+			signal = ?, signal_message = ?, pr_url = ?, branch = ?, escalation = ?, phase = ?,
 			prompt_hash = ?, workflow = ?, autonomy = ?
 		WHERE id = ? AND status != ?`, runEnded, now, string(res.Outcome), exit, msg, res.LogFile,
-		res.Workdir, res.Resumed, res.SessionID, res.Message, res.CostUSD,
-		res.Usage.InputTokens, res.Usage.OutputTokens, res.Usage.CacheReadTokens, res.Usage.CacheWriteTokens,
-		res.Signal, res.SignalMessage, res.PRURL, res.Branch, res.SessionCostUSD, res.Escalation, res.Phase,
+		res.Workdir, res.Resumed, res.SessionID, res.Message,
+		res.Signal, res.SignalMessage, res.PRURL, res.Branch, res.Escalation, res.Phase,
 		res.PromptHash, res.Workflow, res.Autonomy,
 		id, runEnded)
 	if err != nil {
@@ -1720,7 +1608,7 @@ type RunInfo struct {
 // Runs returns the runs of a ticket, oldest first.
 func (s *Store) Runs(source, key string) ([]RunInfo, error) {
 	rows, err := s.db.Query(`SELECT id, status, attempt, tier, policy_version, cause, received_at, started_at, ended_at,
-			outcome, exit_code, error, log_file, resumed, agent_session, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			outcome, exit_code, error, log_file, resumed, agent_session,
 			signal, signal_message, pr_url, branch, escalation, phase, prompt_hash, workflow, autonomy
 		FROM runs WHERE source = ? AND key = ? ORDER BY received_at, rowid`, source, key)
 	if err != nil {
@@ -1735,8 +1623,7 @@ func (s *Store) Runs(source, key string) ([]RunInfo, error) {
 		var outcome, msg string
 		res := &r.Result
 		if err := rows.Scan(&r.ID, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &r.Cause, &received, &started, &ended,
-			&outcome, &exit, &msg, &res.LogFile, &res.Resumed, &res.SessionID, &res.CostUSD,
-			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
+			&outcome, &exit, &msg, &res.LogFile, &res.Resumed, &res.SessionID,
 			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.Escalation, &res.Phase, &res.PromptHash, &res.Workflow, &res.Autonomy); err != nil {
 			return nil, err
 		}
@@ -2061,13 +1948,12 @@ func (s *Store) Run(id string) (*Run, error) {
 	var outcome, msg string
 	res := &r.Result
 	err := s.db.QueryRow(`SELECT source, key, status, attempt, tier, policy_version, outcome, exit_code, error, log_file,
-			workdir, resumed, agent_session, message, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			signal, signal_message, pr_url, branch, session_cost_usd, escalation, phase, prompt_hash, workflow, autonomy
+			workdir, resumed, agent_session, message,
+			signal, signal_message, pr_url, branch, escalation, phase, prompt_hash, workflow, autonomy
 		FROM runs WHERE id = ?`, id).
 		Scan(&r.Source, &r.Key, &r.Status, &r.Attempt, &r.Tier, &r.PolicyVersion, &outcome, &exit, &msg, &res.LogFile,
-			&res.Workdir, &res.Resumed, &res.SessionID, &res.Message, &res.CostUSD,
-			&res.Usage.InputTokens, &res.Usage.OutputTokens, &res.Usage.CacheReadTokens, &res.Usage.CacheWriteTokens,
-			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.SessionCostUSD, &res.Escalation, &res.Phase, &res.PromptHash, &res.Workflow, &res.Autonomy)
+			&res.Workdir, &res.Resumed, &res.SessionID, &res.Message,
+			&res.Signal, &res.SignalMessage, &res.PRURL, &res.Branch, &res.Escalation, &res.Phase, &res.PromptHash, &res.Workflow, &res.Autonomy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -2120,8 +2006,6 @@ type Outcomes struct {
 	Tier string
 	// Tickets had a run that started in the period, and Runs is how many.
 	Tickets, Runs int
-	// CostUSD is what those runs cost.
-	CostUSD float64
 	// PullRequests is how many tickets first handed over a pull request in
 	// the period, and TimeToPR how long each of them took from the start
 	// of its first run to that hand-over.
@@ -2151,7 +2035,7 @@ func (s *Store) Outcomes(since, until time.Time) ([]Outcomes, error) {
 		}
 		return byTier[tier]
 	}
-	rows, err := s.db.Query(`SELECT t.tier, COUNT(DISTINCT t.source || ' ' || t.key), COUNT(*), COALESCE(SUM(r.cost_usd), 0),
+	rows, err := s.db.Query(`SELECT t.tier, COUNT(DISTINCT t.source || ' ' || t.key), COUNT(*),
 			COUNT(DISTINCT CASE WHEN r.reopened = 1 THEN t.source || ' ' || t.key END)
 		FROM runs r JOIN tickets t USING (source, key)
 		WHERE r.started_at >= ? AND r.started_at < ? GROUP BY t.tier`, from, to)
@@ -2161,12 +2045,12 @@ func (s *Store) Outcomes(since, until time.Time) ([]Outcomes, error) {
 	for rows.Next() {
 		var tier string
 		var o Outcomes
-		if err := rows.Scan(&tier, &o.Tickets, &o.Runs, &o.CostUSD, &o.Reopened); err != nil {
+		if err := rows.Scan(&tier, &o.Tickets, &o.Runs, &o.Reopened); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		got := get(tier)
-		got.Tickets, got.Runs, got.CostUSD, got.Reopened = o.Tickets, o.Runs, o.CostUSD, o.Reopened
+		got.Tickets, got.Runs, got.Reopened = o.Tickets, o.Runs, o.Reopened
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -2316,9 +2200,6 @@ type Metrics struct {
 	DurationCount  int
 	DurationSum    float64
 	DurationBucket []int
-	// CostUSD and Usage are what all runs cost.
-	CostUSD float64
-	Usage   agent.Usage
 }
 
 // Metrics counts what is in the store.
@@ -2351,10 +2232,8 @@ func (s *Store) Metrics() (*Metrics, error) {
 		if err := group(`SELECT outcome, COUNT(*) FROM runs WHERE status = 'ended' GROUP BY outcome`, func(name string, n int) { m.Ended[task.Outcome(name)] = n }); err != nil {
 			return err
 		}
-		if err := tx.QueryRow(`SELECT COUNT(*) FILTER (WHERE status = ?), COUNT(*) FILTER (WHERE status = ?), COALESCE(SUM(cost_usd), 0),
-				COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0)
-			FROM runs`, runQueued, runRunning).Scan(&m.Queued, &m.Running, &m.CostUSD,
-			&m.Usage.InputTokens, &m.Usage.OutputTokens, &m.Usage.CacheReadTokens, &m.Usage.CacheWriteTokens); err != nil {
+		if err := tx.QueryRow(`SELECT COUNT(*) FILTER (WHERE status = ?), COUNT(*) FILTER (WHERE status = ?)
+			FROM runs`, runQueued, runRunning).Scan(&m.Queued, &m.Running); err != nil {
 			return err
 		}
 		// How long the runs took that ran and have ended.

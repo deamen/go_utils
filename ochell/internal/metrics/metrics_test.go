@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"ochell/internal/agent"
 	"ochell/internal/runner"
 	"ochell/internal/store"
 	"ochell/internal/task"
@@ -24,7 +23,6 @@ func (fakeStore) Metrics() (*store.Metrics, error) {
 		Started:       map[string]int{"assigned": 7, "retry": 2, "stalled": 1, "follow_up": 4},
 		Ended:         map[task.Outcome]int{task.OutcomeFinished: 9, task.OutcomeFailed: 2, task.OutcomeTimedOut: 1, task.OutcomeCancelled: 1, task.OutcomeNoProgress: 2},
 		DurationCount: 13, DurationSum: 4321.5, DurationBucket: []int{4, 8, 10, 11, 12, 13},
-		CostUSD: 12.75, Usage: agent.Usage{InputTokens: 100, OutputTokens: 200, CacheReadTokens: 300, CacheWriteTokens: 400},
 	}, nil
 }
 
@@ -64,13 +62,16 @@ func TestMetrics(t *testing.T) {
 		`ochell_runs_ended_total{outcome="no_progress"} 2`, "ochell_run_failures_total 5", "ochell_run_retries_total 3",
 		`ochell_run_duration_seconds_bucket{le="60"} 4`, `ochell_run_duration_seconds_bucket{le="7200"} 13`, `ochell_run_duration_seconds_bucket{le="+Inf"} 13`,
 		"ochell_run_duration_seconds_sum 4321.5", "ochell_run_duration_seconds_count 13",
-		"ochell_cost_usd_total 12.75", `ochell_tokens_total{kind="cache_read"} 300`, `ochell_tokens_total{kind="output"} 200`,
 		"ochell_agent_token_expiry_timestamp_seconds 1826150400", "ochell_agent_token_days_left 12",
 		"# TYPE ochell_runs_ended_total counter", "# TYPE ochell_queue_length gauge", "# TYPE ochell_run_duration_seconds histogram",
 	} {
 		if !strings.Contains(body, want+"\n") {
 			t.Errorf("the metrics lack the line %q", want)
 		}
+	}
+	// ochell records no cost and no token count of a run.
+	if strings.Contains(body, "cost") || strings.Contains(body, "ochell_tokens") {
+		t.Errorf("the metrics have a cost or a token count:\n%s", body)
 	}
 	// Every sample belongs to a metric that was announced.
 	announced := map[string]bool{}
